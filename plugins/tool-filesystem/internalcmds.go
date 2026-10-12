@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"dsc-sdk"
 	"dsc/core"
@@ -152,6 +153,48 @@ func openReader(hc interp.HandlerContext, file string) (io.Reader, func(), error
 		return nil, nil, err
 	}
 	return f, func() { _ = f.Close() }, nil
+}
+
+// lineReader 逐行读取（对齐 bufio.ScanLines：以 \n 分行、剥行尾 \r、末行无换行也算一行），
+// 且不受 bufio.Scanner 默认 64 KiB 行长上限约束——Scanner 超限会直接停止扫描，那等于静默
+// 丢弃余下内容（head/tail/sort 都吃过这个亏），故统一走此实现。
+type lineReader struct {
+	br      *bufio.Reader
+	readErr error
+}
+
+func newLineReader(r io.Reader) *lineReader { return &lineReader{br: bufio.NewReader(r)} }
+
+// next 取下一行；ok=false 表示已到末尾或读取失败（用 err() 区分）。
+func (lr *lineReader) next() (string, bool) {
+	for lr.readErr == nil {
+		s, err := lr.br.ReadString('\n')
+		if len(s) > 0 {
+			return strings.TrimSuffix(strings.TrimSuffix(s, "\n"), "\r"), true
+		}
+		if err != nil {
+			if err != io.EOF {
+				lr.readErr = err
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// err 返回读取过程中的真实错误（正常到末尾返回 nil）。
+func (lr *lineReader) err() error { return lr.readErr }
+
+// capHint 限制环形缓冲的初始容量：计数可能被模型写成极大值（如 tail -n 999999999），按 N
+// 直接预分配会瞬时吃掉巨量内存；append 会按需增长，初始容量给个合理上限即可。
+func capHint(n int64) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > 4096 {
+		return 4096
+	}
+	return int(n)
 }
 
 // ---------- mkdir ----------
@@ -905,124 +948,325 @@ func grepStream(hc interp.HandlerContext, r io.Reader, re *regexp.Regexp, invert
 
 // ---------- head / tail ----------
 
-func cmdHead(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	n := int64(10)
-	var files []string
+// headTailMode 计数模式：行（默认）或字节（-c）。
+type headTailMode int
+
+const (
+	headTailLines headTailMode = iota
+	headTailBytes
+)
+
+// headTailArgs head/tail 的解析结果（两者参数面相同，故解析与执行各一份、共用）。
+type headTailArgs struct {
+	n     int64        // 计数：行数或字节数
+	fromN bool         // +N 语义（tail）：自第 N 行/字节起至末尾
+	mode  headTailMode // -c 时为按字节
+	quiet bool         // -q：多文件也不打表头
+	force bool         // -v：单文件也打表头
+	files []string
+}
+
+// headTailSupported 报错文案里列出的受支持旗标。
+func headTailSupported(tail bool) string {
+	if tail {
+		return "-n N/-nN、-c N/-cN、传统 -N 与 +N、-q、-v；不支持 -f/--follow"
+	}
+	return "-n N/-nN、-c N/-cN、传统 -N、-q、-v"
+}
+
+// parseHeadTail 解析 head/tail 参数。
+//
+// 此前实现对未识别旗标**静默忽略**，比报错更糟——`head -2 f.txt` 会输出 10 行、`tail -2`
+// 同理、`head -c 5 f.txt` 会把 "5" 当成文件名去打开，模型据此拿到错结果却毫不知情。现改为：
+// 支持传统 -N 与 -n/-c 的常用形式（含 tail 的 +N），其余一律响亮报错并列出支持清单。
+func parseHeadTail(cmd string, args []string, tail bool) (headTailArgs, error) {
+	a := headTailArgs{n: 10, mode: headTailLines}
 	for i := 0; i < len(args); i++ {
-		a := args[i]
+		arg := args[i]
 		switch {
-		case a == "-n" && i+1 < len(args):
-			nl, err := strconv.ParseInt(args[i+1], 10, 64)
-			if err != nil {
-				return interp.NewExitStatus(2)
+		case arg == "--":
+			a.files = append(a.files, args[i+1:]...)
+			i = len(args)
+		case arg == "-" || (!strings.HasPrefix(arg, "-") && !(tail && strings.HasPrefix(arg, "+"))):
+			a.files = append(a.files, arg)
+		case strings.HasPrefix(arg, "-n") || strings.HasPrefix(arg, "-c"):
+			mode := headTailLines
+			if arg[1] == 'c' {
+				mode = headTailBytes
 			}
-			n = nl
-			i++
-		case strings.HasPrefix(a, "-n") && len(a) > 2:
-			nl, err := strconv.ParseInt(a[2:], 10, 64)
-			if err != nil {
-				return interp.NewExitStatus(2)
+			val := arg[2:]
+			if val == "" {
+				if i+1 >= len(args) {
+					return a, fmt.Errorf("option %s requires an argument", arg)
+				}
+				i++
+				val = args[i]
 			}
-			n = nl
-		case a == "--":
-		case strings.HasPrefix(a, "-") && a != "-":
-			// 其余旗标忽略
+			nv, err := strconv.ParseInt(val, 10, 64)
+			if err != nil {
+				return a, fmt.Errorf("invalid argument %q for %s", val, arg)
+			}
+			a.mode, a.n = mode, nv
+			// GNU tail -n +N：自第 N 行/字节起至末尾（head 的 +N 只是等价于 N）
+			a.fromN = tail && strings.HasPrefix(val, "+")
+		case arg == "-q" || arg == "--quiet":
+			a.quiet = true
+		case arg == "-v" || arg == "--verbose":
+			a.force = true
+		case tail && strings.HasPrefix(arg, "+"):
+			// 传统 tail +N：自第 N 行起至末尾
+			nv, err := strconv.ParseInt(arg[1:], 10, 64)
+			if err != nil {
+				return a, fmt.Errorf("invalid argument %q", arg)
+			}
+			a.fromN, a.n, a.mode = true, nv, headTailLines
+		case isLegacyCount(arg):
+			// 传统 -N：行数
+			nv, err := strconv.ParseInt(arg[1:], 10, 64)
+			if err != nil {
+				return a, fmt.Errorf("invalid argument %q", arg)
+			}
+			a.n, a.mode = nv, headTailLines
 		default:
-			files = append(files, a)
+			return a, fmt.Errorf("unsupported option: %s (supported here: %s)", arg, headTailSupported(tail))
 		}
 	}
-	if len(files) == 0 {
-		files = []string{"-"}
+	return a, nil
+}
+
+// isLegacyCount 判断是否为传统 -N 形式（连字符后全为数字，如 -5）。
+func isLegacyCount(arg string) bool {
+	if len(arg) < 2 || arg[0] != '-' {
+		return false
 	}
-	return headTail(ctx, hc, files, n, false)
+	for i := 1; i < len(arg); i++ {
+		if arg[i] < '0' || arg[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func cmdHead(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	a, err := parseHeadTail("head", args, false)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "head: %s\n", err)
+		return interp.NewExitStatus(2)
+	}
+	return runHeadTail(ctx, hc, "head", a, false)
 }
 
 func cmdTail(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	n := int64(10)
-	var files []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "-n" && i+1 < len(args):
-			nl, err := strconv.ParseInt(args[i+1], 10, 64)
-			if err != nil {
-				return interp.NewExitStatus(2)
-			}
-			n = nl
-			i++
-		case strings.HasPrefix(a, "-n") && len(a) > 2:
-			nl, err := strconv.ParseInt(a[2:], 10, 64)
-			if err != nil {
-				return interp.NewExitStatus(2)
-			}
-			n = nl
-		case a == "--":
-		case strings.HasPrefix(a, "-") && a != "-":
-		default:
-			files = append(files, a)
-		}
+	a, err := parseHeadTail("tail", args, true)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "tail: %s\n", err)
+		return interp.NewExitStatus(2)
 	}
-	if len(files) == 0 {
-		files = []string{"-"}
-	}
-	return headTail(ctx, hc, files, n, true)
+	return runHeadTail(ctx, hc, "tail", a, true)
 }
 
-func headTail(ctx context.Context, hc interp.HandlerContext, files []string, n int64, tail bool) error {
-	multi := len(files) > 1
-	for _, f := range files {
+// runHeadTail 执行 head/tail：多文件默认打 `==> name <==` 表头（-q 抑制、-v 单文件也打）。
+func runHeadTail(ctx context.Context, hc interp.HandlerContext, cmd string, a headTailArgs, tail bool) error {
+	if len(a.files) == 0 {
+		a.files = []string{"-"}
+	}
+	header := a.force || (len(a.files) > 1 && !a.quiet)
+	for _, f := range a.files {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r, close, err := openReader(hc, f)
+		r, closeFn, err := openReader(hc, f)
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", map[bool]string{true: "tail", false: "head"}[tail], f, err)
+			fmt.Fprintf(hc.Stderr, "%s: %s: %s\n", cmd, f, slashErr(err))
 			return interp.NewExitStatus(1)
 		}
-		if multi {
+		if header {
 			fmt.Fprintf(hc.Stdout, "==> %s <==\n", f)
 		}
-		if tail {
-			tailLines(hc.Stdout, r, n)
-		} else {
-			headLines(hc.Stdout, r, n)
+		var runErr error
+		switch {
+		case a.mode == headTailBytes && tail:
+			runErr = tailBytes(hc.Stdout, r, a)
+		case a.mode == headTailBytes:
+			runErr = headBytes(hc.Stdout, r, a.n)
+		case tail:
+			runErr = tailLines(hc.Stdout, r, a)
+		default:
+			runErr = headLines(hc.Stdout, r, a.n)
 		}
-		close()
+		closeFn()
+		if runErr != nil {
+			fmt.Fprintf(hc.Stderr, "%s: %s: %s\n", cmd, f, slashErr(runErr))
+			return interp.NewExitStatus(1)
+		}
 	}
 	return nil
 }
 
-func headLines(w io.Writer, r io.Reader, n int64) {
-	sc := bufio.NewScanner(r)
-	var line int64
-	for sc.Scan() {
-		if n >= 0 && line >= n {
-			return
+// headLines 输出前 n 行；n<0 时输出「除末尾 |n| 行之外的全部」（GNU head -n -K），以
+// |n|+1 行环形缓冲流式实现，内存 O(|n|)、无需整体读入。
+func headLines(w io.Writer, r io.Reader, n int64) error {
+	lr := newLineReader(r)
+	if n >= 0 {
+		for i := int64(0); i < n; i++ {
+			line, ok := lr.next()
+			if !ok {
+				return lr.err()
+			}
+			fmt.Fprintln(w, line)
 		}
-		line++
-		fmt.Fprintln(w, sc.Text())
+		return nil
+	}
+	ring := make([]string, 0, capHint(-n))
+	for {
+		line, ok := lr.next()
+		if !ok {
+			return lr.err()
+		}
+		ring = append(ring, line)
+		if int64(len(ring)) > -n {
+			fmt.Fprintln(w, ring[0])
+			ring = ring[1:]
+		}
 	}
 }
 
-func tailLines(w io.Writer, r io.Reader, n int64) {
-	if n < 0 {
-		return
+// tailLines 输出末尾 n 行（n<0 与 n 同义，对齐 GNU tail -n -K）；fromN 时自第 n 行起输出
+// 至末尾（GNU tail -n +N / 传统 +N）。
+func tailLines(w io.Writer, r io.Reader, a headTailArgs) error {
+	lr := newLineReader(r)
+	if a.fromN {
+		for i := int64(1); i < a.n; i++ {
+			if _, ok := lr.next(); !ok {
+				return lr.err()
+			}
+		}
+		for {
+			line, ok := lr.next()
+			if !ok {
+				return lr.err()
+			}
+			fmt.Fprintln(w, line)
+		}
 	}
-	sc := bufio.NewScanner(r)
-	ring := make([]string, 0, n)
-	for sc.Scan() {
-		ring = append(ring, sc.Text())
+	n := a.n
+	if n < 0 {
+		n = -n
+	}
+	ring := make([]string, 0, capHint(n))
+	for {
+		line, ok := lr.next()
+		if !ok {
+			break
+		}
+		ring = append(ring, line)
 		if int64(len(ring)) > n {
 			ring = ring[1:]
 		}
 	}
+	if err := lr.err(); err != nil {
+		return err
+	}
 	for _, l := range ring {
 		fmt.Fprintln(w, l)
 	}
+	return nil
+}
+
+// headBytes 输出前 n 字节（n<0 时输出除末尾 |n| 字节外的全部）。可 seek 的普通文件按大小
+// 直接截断（不必整体读入）；管道等不可 seek 的输入在 n<0 时需整体读入（罕见组合，接受）。
+func headBytes(w io.Writer, r io.Reader, n int64) error {
+	if n >= 0 {
+		_, err := io.CopyN(w, r, n)
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+	if f, ok := r.(*os.File); ok {
+		if size, err := f.Seek(0, io.SeekEnd); err == nil {
+			if _, err := f.Seek(0, io.SeekStart); err == nil {
+				take := size + n
+				if take < 0 {
+					take = 0
+				}
+				_, cerr := io.CopyN(w, f, take)
+				if cerr == io.EOF {
+					return nil
+				}
+				return cerr
+			}
+		}
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > -n {
+		data = data[:int64(len(data))+n]
+	}
+	_, werr := w.Write(data)
+	return werr
+}
+
+// tailBytes 输出末尾 n 字节；fromN 时自第 n 字节起输出至末尾。可 seek 的普通文件直接定位
+// （tail -c 100 大文件不必整体读入）；管道等不可 seek 的输入用滚动缓冲只保留末尾 n 字节。
+func tailBytes(w io.Writer, r io.Reader, a headTailArgs) error {
+	if a.fromN {
+		if skip := a.n - 1; skip > 0 {
+			if _, err := io.CopyN(io.Discard, r, skip); err != nil && err != io.EOF {
+				return err
+			}
+		}
+		_, err := io.Copy(w, r)
+		return err
+	}
+	n := a.n
+	if n < 0 {
+		n = -n
+	}
+	if n == 0 {
+		return nil
+	}
+	if f, ok := r.(*os.File); ok {
+		if size, err := f.Seek(0, io.SeekEnd); err == nil {
+			start := size - n
+			if start < 0 {
+				start = 0
+			}
+			if _, err := f.Seek(start, io.SeekStart); err == nil {
+				_, cerr := io.Copy(w, f)
+				return cerr
+			}
+		}
+	}
+	buf := make([]byte, 0, capHint(n))
+	chunk := make([]byte, 32*1024)
+	for {
+		nr, err := r.Read(chunk)
+		if nr > 0 {
+			buf = append(buf, chunk[:nr]...)
+			if int64(len(buf)) > n {
+				buf = buf[int64(len(buf))-n:]
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	_, werr := w.Write(buf)
+	return werr
 }
 
 // ---------- wc ----------
 
+// cmdWc 统计行/词/字节/字符：-l 行、-w 词、-c 字节、-m 字符（UTF-8 码点）。
+//
+// 此前实现把**任意字母**都收进旗标集合，未识别的（如 -m/-L/--bytes）会被静默忽略：`wc -m f`
+// 因 printWc 找不到可打印项而只输出一个空格行——静默错结果。现改为白名单 + 响亮报错。
 func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	flags := map[byte]bool{}
 	var files []string
@@ -1031,7 +1275,13 @@ func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		case a == "--":
 		case strings.HasPrefix(a, "-") && len(a) > 1 && a != "-":
 			for _, f := range a[1:] {
-				flags[byte(f)] = true
+				switch byte(f) {
+				case 'l', 'w', 'c', 'm':
+					flags[byte(f)] = true
+				default:
+					fmt.Fprintf(hc.Stderr, "wc: unsupported option: -%c (supported here: -l -w -c -m)\n", f)
+					return interp.NewExitStatus(2)
+				}
 			}
 		default:
 			files = append(files, a)
@@ -1040,7 +1290,7 @@ func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	if len(files) == 0 {
 		files = []string{"-"}
 	}
-	var tl, tw, tc int64
+	var tl, tw, tc, tm int64
 	for _, f := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1050,31 +1300,37 @@ func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			fmt.Fprintf(hc.Stderr, "wc: %s: %s\n", f, slashErr(err))
 			return interp.NewExitStatus(1)
 		}
-		l, w, c := countWc(r)
+		l, w, c, m := countWc(r)
 		tl += l
 		tw += w
 		tc += c
+		tm += m
 		// 对齐 GNU wc：stdin（"-"）单文件时不回显名字（如 find ... | wc -l 只出计数）
 		displayName := f
 		if f == "-" && len(files) == 1 {
 			displayName = ""
 		}
-		printWc(hc, flags, l, w, c, displayName)
+		printWc(hc, flags, l, w, m, c, displayName)
 		close()
 	}
 	if len(files) > 1 {
-		printWc(hc, flags, tl, tw, tc, "total")
+		printWc(hc, flags, tl, tw, tm, tc, "total")
 	}
 	return nil
 }
 
-func countWc(r io.Reader) (lines, words, bytes int64) {
-	inWord := false
+// countWc 统计行/词/字节/字符：字符按 UTF-8 码点计（对齐 GNU wc -m），跨读取块的不完整
+// 多字节序列留待下一块续接；末尾残缺序列与非法字节各计一个字符。
+func countWc(r io.Reader) (lines, words, bytes, chars int64) {
 	buf := make([]byte, 4096)
+	var pending []byte
+	inWord := false
 	for {
 		n, err := r.Read(buf)
-		for i := 0; i < n; i++ {
-			b := buf[i]
+		data := append(pending, buf[:n]...) // pending 已复制，可安全拼接
+		pending = nil
+		for i := 0; i < len(data); i++ {
+			b := data[i]
 			bytes++
 			if b == '\n' {
 				lines++
@@ -1086,14 +1342,28 @@ func countWc(r io.Reader) (lines, words, bytes int64) {
 				words++
 			}
 		}
+		rest := data
+		for len(rest) > 0 {
+			r0, size := utf8.DecodeRune(rest)
+			if r0 == utf8.RuneError && size == 1 && !utf8.FullRune(rest) {
+				break // 不完整序列：留待下一块续接
+			}
+			chars++
+			rest = rest[size:]
+		}
+		if len(rest) > 0 {
+			pending = append([]byte(nil), rest...)
+		}
 		if err != nil {
 			break
 		}
 	}
+	chars += int64(utf8.RuneCount(pending))
 	return
 }
 
-func printWc(hc interp.HandlerContext, flags map[byte]bool, l, w, c int64, name string) {
+// printWc 按 GNU 的固定列序输出：行、词、字符、字节（与旗标书写顺序无关）。
+func printWc(hc interp.HandlerContext, flags map[byte]bool, l, w, m, c int64, name string) {
 	if len(flags) == 0 {
 		if name == "" {
 			fmt.Fprintf(hc.Stdout, " %7d %7d %7d\n", l, w, c)
@@ -1108,6 +1378,9 @@ func printWc(hc interp.HandlerContext, flags map[byte]bool, l, w, c int64, name 
 	}
 	if flags['w'] {
 		parts = append(parts, strconv.FormatInt(w, 10))
+	}
+	if flags['m'] {
+		parts = append(parts, strconv.FormatInt(m, 10))
 	}
 	if flags['c'] {
 		parts = append(parts, strconv.FormatInt(c, 10))

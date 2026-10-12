@@ -28,7 +28,6 @@ package main
 // 不存在回落到外部程序的可能，静默失败只会让模型空转。
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -290,23 +289,17 @@ func numPrefix(s string) float64 {
 	return v
 }
 
-// readLines 读取全部行：以 \n 分行、剥行尾 \r、末行无换行也算一行（对齐
-// bufio.ScanLines），但不受 Scanner 默认 64 KiB 行长上限约束。
+// readLines 读取全部行（行切分口径与上限见 lineReader：\n 分行、剥行尾 \r、末行无换行亦
+// 算一行，不受 Scanner 64 KiB 行长上限约束）。
 func readLines(r io.Reader) ([]string, error) {
-	br := bufio.NewReader(r)
+	lr := newLineReader(r)
 	var lines []string
 	for {
-		s, err := br.ReadString('\n')
-		if len(s) > 0 {
-			s = strings.TrimSuffix(strings.TrimSuffix(s, "\n"), "\r")
-			lines = append(lines, s)
+		line, ok := lr.next()
+		if !ok {
+			return lines, lr.err()
 		}
-		if err != nil {
-			if err == io.EOF {
-				return lines, nil
-			}
-			return lines, err
-		}
+		lines = append(lines, line)
 	}
 }
 
