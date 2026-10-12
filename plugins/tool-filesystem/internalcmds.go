@@ -14,6 +14,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -671,8 +672,27 @@ func copyFile(src, dst string) error {
 
 // ---------- grep ----------
 
+// grepSkipDirs 递归搜索（-r/-R）时跳过的噪声目录：VCS 元数据与依赖/缓存目录。
+// .git 内多为二进制对象、node_modules/__pycache__ 内是依赖与缓存，模型在真实项目里
+// grep -rn 时它们只会带来海量无意义命中，与编辑器目录列举、技能扫描的噪声目录口径一致。
+// 其余目录（含 .github、.env 等点条目）一律照常搜索——不静默丢弃可能的真实命中。
+var grepSkipDirs = map[string]bool{
+	".git":         true,
+	"node_modules": true,
+	"__pycache__":  true,
+	".svn":         true,
+	".hg":          true,
+}
+
+// grepTarget 单个搜索目标：display 为模型可见路径（保留参数的书写形态，递归时为
+// 「参数/相对路径」，按工作区路径纪律统一正斜杆），path 为磁盘路径（"-" 表示 stdin）。
+type grepTarget struct {
+	display string
+	path    string
+}
+
 func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	var ignoreCase, invert, lineNum, countOnly bool
+	var ignoreCase, invert, lineNum, countOnly, recursive bool
 	var files []string
 	pat := ""
 	for _, a := range args {
@@ -690,6 +710,10 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 					lineNum = true
 				case 'c':
 					countOnly = true
+				case 'r', 'R':
+					// -r/-R 递归搜索目录（对齐 grep -r；R 与 r 同义——遍历中遇到的
+					// 目录/文件符号链接一律不跟随，防环、防挂起，见 grepCollect）
+					recursive = true
 				case 'E':
 					// -E (extended regex) 对齐 POSIX grep -E
 					// 内置实现用 Go regexp（RE2），已支持 extended regex 语法
@@ -725,30 +749,60 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		return interp.NewExitStatus(2)
 	}
 	if len(files) == 0 {
-		files = []string{"-"}
-	}
-	multi := len(files) > 1
-	exit, matchedTotal := 0, 0
-	for _, f := range files {
-		if err := ctx.Err(); err != nil {
-			return err
+		// -r 未给路径时按 . 搜索（对齐 GNU grep -r）；否则读 stdin
+		if recursive {
+			files = []string{"."}
+		} else {
+			files = []string{"-"}
 		}
-		r, close, err := openReader(hc, f)
-		if err != nil {
-			fmt.Fprintf(hc.Stderr, "grep: %s: %v\n", f, err)
+	}
+	// 目标展开：-r 下目录参数递归收集普通文件；未给 -r 时目录按 POSIX 报错（Is a directory）
+	exit := 0
+	targets := make([]grepTarget, 0, len(files))
+	for _, f := range files {
+		if f == "-" {
+			targets = append(targets, grepTarget{display: f, path: "-"})
+			continue
+		}
+		p := res(hc, f)
+		fi, statErr := os.Stat(p)
+		if statErr != nil {
+			fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", f, slashErr(statErr))
 			exit = 2
 			continue
 		}
-		count := grepStream(hc, r, re, invert, lineNum, multi, f, countOnly)
+		if !fi.IsDir() {
+			targets = append(targets, grepTarget{display: f, path: p})
+			continue
+		}
+		if !recursive {
+			fmt.Fprintf(hc.Stderr, "grep: %s: Is a directory (use -r to search recursively)\n", f)
+			exit = 2
+			continue
+		}
+		grepCollect(ctx, hc, p, dsc.PClean(f), &targets)
+	}
+	// 递归或多目标时每行带文件名前缀（对齐 grep -r 的 path:line:text）
+	showName := recursive || len(targets) > 1
+	matchedTotal := 0
+	for _, tg := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		count, err := grepOne(hc, tg, re, invert, lineNum, showName, countOnly)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", tg.display, slashErr(err))
+			exit = 2
+			continue
+		}
 		matchedTotal += count
 		if countOnly {
-			if multi {
-				fmt.Fprintf(hc.Stdout, "%s:%d\n", f, count)
+			if showName {
+				fmt.Fprintf(hc.Stdout, "%s:%d\n", tg.display, count)
 			} else {
 				fmt.Fprintf(hc.Stdout, "%d\n", count)
 			}
 		}
-		close()
 	}
 	if exit != 0 {
 		return interp.NewExitStatus(uint8(exit))
@@ -757,6 +811,61 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		return interp.NewExitStatus(1)
 	}
 	return nil
+}
+
+// grepOne 搜索单个目标并回显命中，返回命中行数。磁盘文件先探测是否二进制：
+// 二进制文件不逐行回显（二进制「行」对模型毫无意义，只会把乱码灌进上下文），
+// 命中时按 GNU 口径只报一行 `Binary file <path> matches`。stdin 不做探测（与既有
+// 管道行为保持一致：管道内容按文本处理）。
+func grepOne(hc interp.HandlerContext, tg grepTarget, re *regexp.Regexp, invert, lineNum, showName, countOnly bool) (int, error) {
+	if tg.path == "-" {
+		return grepStream(hc, hc.Stdin, re, invert, lineNum, showName, tg.display, countOnly), nil
+	}
+	f, err := os.Open(tg.path)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	br := bufio.NewReader(f)
+	if head, _ := br.Peek(8192); bytes.IndexByte(head, 0) >= 0 {
+		n := grepStream(hc, br, re, invert, false, false, tg.display, true)
+		if n > 0 && !countOnly {
+			fmt.Fprintf(hc.Stdout, "Binary file %s matches\n", tg.display)
+		}
+		return n, nil
+	}
+	return grepStream(hc, br, re, invert, lineNum, showName, tg.display, countOnly), nil
+}
+
+// grepCollect 递归收集 dir 下可搜索的普通文件（对齐 grep -r）：目录项按名升序深度
+// 优先——os.ReadDir 已按文件名排序，故同一目录树的命中顺序确定；工具结果会进入模型
+// 上下文，有序产物不得随文件系统返回序漂移（确定性要求）。
+//
+// 遍历中不跟随目录与文件符号链接（防环、防挂起）；跳过 grepSkipDirs 噪声目录；单个
+// 目录不可读（权限等）只报一行并继续，不因单点失败丢弃其余分支的命中。
+func grepCollect(ctx context.Context, hc interp.HandlerContext, dir, display string, out *[]grepTarget) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", display, slashErr(err))
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			if grepSkipDirs[name] {
+				continue
+			}
+			grepCollect(ctx, hc, dsc.PJoin(dir, name), dsc.PJoin(display, name), out)
+			continue
+		}
+		if !e.Type().IsRegular() {
+			continue
+		}
+		*out = append(*out, grepTarget{display: dsc.PJoin(display, name), path: dsc.PJoin(dir, name)})
+	}
 }
 
 // grepStream 把 r 按行匹配；非 countOnly 时输出命中行；返回命中行数。

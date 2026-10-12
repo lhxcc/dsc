@@ -13,10 +13,8 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// runShell 以「空 PATH」构造 shell runner 并执行脚本，以此证明 internalcmds 是进程内
-// 实现、不依赖外部可执行文件（在 Windows 且 PATH 被宿主过滤时仍可用）。
-// 返回 stdout 与 Run 返回的 error（经 interp.IsExitStatus 可判退出码）。
-func runShell(t *testing.T, dir, script string) (string, error) {
+// runShellIO 与 runShell 同款，但额外返回 stderr（供断言错误文案，如目录参数报错）。
+func runShellIO(t *testing.T, dir, script string) (string, string, error) {
 	t.Helper()
 	var out, errb bytes.Buffer
 	r, err := interp.New(
@@ -33,10 +31,19 @@ func runShell(t *testing.T, dir, script string) (string, error) {
 		t.Fatalf("parse %q: %v", script, err)
 	}
 	err = r.Run(context.Background(), f)
-	if errb.Len() > 0 {
-		t.Logf("stderr: %s", errb.String())
+	return out.String(), errb.String(), err
+}
+
+// runShell 以「空 PATH」构造 shell runner 并执行脚本，以此证明 internalcmds 是进程内
+// 实现、不依赖外部可执行文件（在 Windows 且 PATH 被宿主过滤时仍可用）。
+// 返回 stdout 与 Run 返回的 error（经 interp.IsExitStatus 可判退出码）。
+func runShell(t *testing.T, dir, script string) (string, error) {
+	t.Helper()
+	out, errb, err := runShellIO(t, dir, script)
+	if errb != "" {
+		t.Logf("stderr: %s", errb)
 	}
-	return out.String(), err
+	return out, err
 }
 
 func exitCode(t *testing.T, err error) int {
