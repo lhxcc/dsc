@@ -58,6 +58,21 @@ func exitCode(t *testing.T, err error) int {
 	return -1
 }
 
+// writeTree 在 dir 下按「相对路径 → 内容」写出一棵测试目录树（自动建父目录）。
+// grep/find 等递归命令的用例共用此原语，各自声明自己的树形。
+func writeTree(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for rel, content := range files {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // TestSlashErr 断言错误字符串里的 Windows 反斜杆路径被归一为正斜杆，
 // 使 shell 报错与模型/用户见到的其余路径展示风格一致。
 func TestSlashErr(t *testing.T) {

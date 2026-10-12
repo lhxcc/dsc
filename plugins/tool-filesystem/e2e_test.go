@@ -120,6 +120,27 @@ func TestE2EWithHostClient(t *testing.T) {
 		t.Fatalf("exit 3 view = %+v", v)
 	}
 
+	// 6.1 内建 find 经 /workspace 虚拟根可用：AST 层把字面量重写为真实工作区路径后
+	// 交给进程内 find，覆盖「模型书写 /workspace 前缀 → 重写 → 内建命令」这一跳
+	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "sub", "b.txt"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if resp := run(`{"command":"find /workspace -name '*.txt'"}`); resp.Error != "" {
+		t.Fatalf("find = %+v", resp)
+	} else if !strings.Contains(resp.Content, "a.txt") || !strings.Contains(resp.Content, "b.txt") {
+		t.Fatalf("find 未列出工作区内文件: %q", resp.Content)
+	} else if strings.Index(resp.Content, "a.txt") > strings.Index(resp.Content, "b.txt") {
+		t.Fatalf("find 输出应按名升序确定: %q", resp.Content)
+	} else if strings.Contains(resp.Content, `\`) {
+		t.Fatalf("find 输出的路径应统一正斜杆: %q", resp.Content)
+	}
+
 	// 7. 空钩子：宿主调用无副作用（SDK 默认注册 PluginHookService）
 	hook := proto.NewPluginHookServiceClient(conn)
 	bt, err := hook.BeforeTool(ctx, &proto.BeforeToolRequest{ToolName: "shell", ArgumentsJson: `{"command":"pwd"}`})

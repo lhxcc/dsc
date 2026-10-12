@@ -27,23 +27,14 @@ import (
 func setupGrepTree(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	files := map[string]string{
+	writeTree(t, dir, map[string]string{
 		".git/config":         "needme git\n",
 		"node_modules/dep.js": "needme dep\n",
 		"src/a.js":            "needme a\n",
 		"src/nested/b.txt":    "needme b\n",
 		"src/other.js":        "no hit here\n",
 		"top.txt":             "needme top\n",
-	}
-	for rel, content := range files {
-		p := filepath.Join(dir, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	})
 	return dir
 }
 

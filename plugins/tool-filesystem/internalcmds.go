@@ -101,6 +101,9 @@ func shellExecHandler(ctx context.Context, args []string) error {
 // 非零退出用 interp.NewExitStatus 返回。
 type internalCommand func(ctx context.Context, hc interp.HandlerContext, args []string) error
 
+// internalCommands 进程内命令表：命中即不再回落 PATH 外部程序（含 Windows 上
+// C:\Windows\tree.com 之类同名程序）。find 的实现独立成文件（内含表达式解析与
+// fnmatch 匹配，见 internalcmds_find.go）。
 var internalCommands = map[string]internalCommand{
 	"mkdir": cmdMkdir,
 	"ls":    cmdLs,
@@ -109,6 +112,7 @@ var internalCommands = map[string]internalCommand{
 	"rm":    cmdRm,
 	"cp":    cmdCp,
 	"mv":    cmdMv,
+	"find":  cmdFind,
 	"grep":  cmdGrep,
 	"head":  cmdHead,
 	"tail":  cmdTail,
