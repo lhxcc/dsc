@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -71,6 +73,50 @@ func writeTree(t *testing.T, dir string, files map[string]string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// makeJunction 在 Windows 上创建指向 target 目录的 junction（`mklink /J`，无需任何
+// 特权——pnpm 等工具在 Windows 上正以 junction 组织 node_modules，是真实工作区里的
+// 常见形态）；非 Windows 或创建失败返回 false。
+func makeJunction(t *testing.T, target, link string) bool {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	out, err := exec.Command("cmd", "/c", "mklink", "/J",
+		filepath.FromSlash(link), filepath.FromSlash(target)).CombinedOutput()
+	if err != nil {
+		t.Logf("mklink /J 失败（%v）: %s", err, strings.TrimSpace(string(out)))
+		return false
+	}
+	return true
+}
+
+// makeDirLinks 为 target 创建当前环境下所有可用的目录链接形态，返回链接名（顺序固定，
+// 便于确定性断言）与「是否为符号链接」的表：
+//   - "link"：符号链接（POSIX 无特殊权限；Windows 需开发者模式或
+//     SeCreateSymbolicLinkPrivilege，故按能力探测——硬编码按 GOOS 跳过会在具备能力的
+//     机器上白丢覆盖），不可用时退化为 junction；
+//   - "jlink"：仅 Windows，junction（无特权）。
+//
+// 两种形态在 Go 里报不同的 Mode（符号链接 ModeSymlink、junction ModeIrregular），
+// 走的是不同判定分支，故两者都要覆盖；一个都创建不出来时由调用方跳过。
+func makeDirLinks(t *testing.T, dir, target string) (names []string, isSymlink map[string]bool) {
+	t.Helper()
+	isSymlink = map[string]bool{}
+	if err := os.Symlink(target, filepath.Join(dir, "link")); err == nil {
+		names = append(names, "link")
+		isSymlink["link"] = true
+	} else {
+		t.Logf("符号链接不可用（%v）", err)
+		if makeJunction(t, target, filepath.Join(dir, "link")) {
+			names = append(names, "link")
+		}
+	}
+	if makeJunction(t, target, filepath.Join(dir, "jlink")) {
+		names = append(names, "jlink")
+	}
+	return names, isSymlink
 }
 
 // TestSlashErr 断言错误字符串里的 Windows 反斜杆路径被归一为正斜杆，

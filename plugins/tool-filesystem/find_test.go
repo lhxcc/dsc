@@ -1,9 +1,7 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -170,35 +168,56 @@ func TestInternalFindUnsupportedPredicate(t *testing.T) {
 	}
 }
 
-// TestInternalFindDoesNotFollowSymlinks 遍历中遇到的符号链接按 lstat 视为链接本身
-// （-type l 可见）且不下探，与 GNU 默认 -P 一致，天然防环。
-// Windows 建符号链接需开发者模式/管理员权限，故仅在非 Windows 上断言。
-func TestInternalFindDoesNotFollowSymlinks(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 上创建符号链接需开发者模式/管理员权限，跳过链接语义断言")
-	}
+// TestInternalFindDoesNotFollowLinks 遍历中遇到的目录链接不下探——既防环，也避免
+// node_modules 之类的「链接农场」被重复遍历（pnpm 在 Windows 上正是以 junction 组织
+// node_modules，真实工作区里很常见）；把链接本身作为路径参数时则按 Stat 解、正常下探
+// （模型据此可显式进入链接目录）。
+//
+// 链接形态按环境能力覆盖（符号链接 + Windows junction），不按 GOOS 硬编码跳过。
+func TestInternalFindDoesNotFollowLinks(t *testing.T) {
 	dir := t.TempDir()
 	writeTree(t, dir, map[string]string{"real/inside.txt": "x\n"})
-	if err := os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "link")); err != nil {
-		t.Skipf("当前环境无法创建符号链接: %v", err)
+	names, isSymlink := makeDirLinks(t, dir, filepath.Join(dir, "real"))
+	if len(names) == 0 {
+		t.Skip("当前环境无法创建目录链接（符号链接需特权、junction 亦不可用），跳过链接语义断言")
 	}
+	t.Logf("链接形态: %v（符号链接: %v）", names, isSymlink)
 
-	out, err := runShell(t, dir, `find . -type l`)
-	if got := exitCode(t, err); got != 0 {
-		t.Fatalf("find -type l 应成功: exit=%d out=%q", got, out)
-	}
-	if out != "./link\n" {
-		t.Fatalf("符号链接应作为链接本身列出: %q", out)
-	}
-
-	out, err = runShell(t, dir, `find . -type f`)
+	// 遍历中遇到链接：一律不下探，故不出现 <link>/inside.txt；真实目录照常列出
+	out, err := runShell(t, dir, `find . -type f`)
 	if got := exitCode(t, err); got != 0 {
 		t.Fatalf("find -type f 应成功: exit=%d out=%q", got, out)
 	}
-	if strings.Contains(out, "link/") {
-		t.Fatalf("不应下探遍历中遇到的符号链接: %q", out)
-	}
 	if !strings.Contains(out, "./real/inside.txt") {
 		t.Fatalf("真实目录内的文件应列出: %q", out)
+	}
+	for _, n := range names {
+		if strings.Contains(out, n+"/inside.txt") {
+			t.Fatalf("不应下探遍历中遇到的链接 %s: %q", n, out)
+		}
+	}
+
+	// 链接作为路径参数：按 Stat 解（指向目录即下探）
+	for _, n := range names {
+		out, err = runShell(t, dir, `find `+n+` -type f`)
+		if got := exitCode(t, err); got != 0 {
+			t.Fatalf("find %s -type f 应成功: exit=%d out=%q", n, got, out)
+		}
+		if want := n + "/inside.txt\n"; out != want {
+			t.Fatalf("链接作为路径参数应正常下探: got %q want %q", out, want)
+		}
+	}
+
+	// 符号链接按 lstat 视为链接本身（-type l 可见）。Windows junction 由 Go 报为
+	// irregular（既非目录也非符号链接），-type l 不匹配——Go 对 junction 的既有口径，
+	// 非本实现的取舍，故仅在符号链接形态下断言。
+	if isSymlink["link"] {
+		out, err = runShell(t, dir, `find . -type l`)
+		if got := exitCode(t, err); got != 0 {
+			t.Fatalf("find -type l 应成功: exit=%d out=%q", got, out)
+		}
+		if out != "./link\n" {
+			t.Fatalf("符号链接应作为链接本身列出（junction 不匹配 -type l）: %q", out)
+		}
 	}
 }

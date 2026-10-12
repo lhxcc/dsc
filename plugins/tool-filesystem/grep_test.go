@@ -148,3 +148,33 @@ func TestInternalGrepRecursiveBinaryFile(t *testing.T) {
 		t.Fatalf("文本文件仍应逐行回显: %q", out)
 	}
 }
+
+// TestInternalGrepRecursiveDoesNotFollowLinks 递归搜索遇到目录链接不下探：否则
+// node_modules 之类的「链接农场」（pnpm 在 Windows 上以 junction 组织）会被重复搜索
+// ——同一文件以两条不同路径各命中一次，既浪费上下文也误导模型文件个数。
+// 链接形态按环境能力覆盖（符号链接 + Windows junction）。
+func TestInternalGrepRecursiveDoesNotFollowLinks(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{"real/inside.txt": "needme\n"})
+	names, _ := makeDirLinks(t, dir, filepath.Join(dir, "real"))
+	if len(names) == 0 {
+		t.Skip("当前环境无法创建目录链接（符号链接需特权、junction 亦不可用），跳过链接语义断言")
+	}
+	t.Logf("链接形态: %v", names)
+
+	out, err := runShell(t, dir, `grep -rn needme .`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("grep -rn 应成功: exit=%d out=%q", got, out)
+	}
+	if n := strings.Count(out, "needme"); n != 1 {
+		t.Fatalf("链接目标只应命中一次（下探链接会重复命中）: n=%d out=%q", n, out)
+	}
+	if !strings.Contains(out, "real/inside.txt:1:needme") {
+		t.Fatalf("真实目录内的命中应带路径前缀: %q", out)
+	}
+	for _, n := range names {
+		if strings.Contains(out, n+"/") {
+			t.Fatalf("不应下探遍历中遇到的链接 %s: %q", n, out)
+		}
+	}
+}
