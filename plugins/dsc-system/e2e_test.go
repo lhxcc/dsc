@@ -263,6 +263,44 @@ func TestFsObservationE2E(t *testing.T) {
 	if dec, err = pre("str_replace", "s3"); err != nil || dec.GetAction() != "deny" || !strings.Contains(dec.GetReason(), "removed") {
 		t.Fatalf("观察后删除应 deny: dec=%+v err=%v", dec, err)
 	}
+
+	// 4.8 模型书写的路径形态（/workspace 虚拟根别名、相对路径）必须与存在性探针同源：
+	//     view 成功即算真实观察，随后的同路径 str_replace 必须放行。
+	//     报告场景——模型 view /workspace/assets/game.html 成功，紧接着 str_replace 同
+	//     路径却被误判「cannot modify ...: file does not exist」（探针拿模型原始路径去
+	//     os.Stat，未走 keyFor 归并，相对路径还会锚到插件进程 cwd，而非工作空间根）。
+	alias := filepath.Join(ws, "sub", "game.html")
+	if err := os.MkdirAll(filepath.Dir(alias), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alias, []byte("<html></html>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	byPath := func(kind, command, path, session string) (*proto.PolicyDecision, error) {
+		return pc.OnEvent(ctx, &proto.PolicyEvent{Kind: kind, Tool: "str_replace_editor", Session: session,
+			ArgumentsJson: `{"command":"` + command + `","path":"` + path + `"}`})
+	}
+	for _, p := range []string{"/workspace/sub/game.html", "sub/game.html"} {
+		if _, err = byPath("tool/post-execute", "view", p, "s4"); err != nil {
+			t.Fatalf("post view(%s): %v", p, err)
+		}
+		if dec, err = byPath("tool/pre-execute", "str_replace", p, "s4"); err != nil || dec.GetAction() == "deny" {
+			t.Fatalf("虚拟根/相对路径读后改写应放行: path=%s dec=%+v err=%v", p, dec, err)
+		}
+	}
+	// 同根因的另一种表现：create 成功落盘后（工具按映射写到真实路径，见上方文件写入）
+	// 紧随其后的 str_replace 亦须放行——否则策略称「file does not exist」、create 又称
+	// 「File already exists」，模型陷入两边都走不通的死循环。
+	created := "/workspace/sub/created.html"
+	if err := os.WriteFile(filepath.Join(ws, "sub", "created.html"), []byte("<p/>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = byPath("tool/post-execute", "create", created, "s4"); err != nil {
+		t.Fatalf("post create: %v", err)
+	}
+	if dec, err = byPath("tool/pre-execute", "str_replace", created, "s4"); err != nil || dec.GetAction() == "deny" {
+		t.Fatalf("create 成功后的改写应放行: dec=%+v err=%v", dec, err)
+	}
 }
 
 // TestSpillE2E 端到端验证 spill 外置策略驻留（自 plugins/policy-spill 迁入）：

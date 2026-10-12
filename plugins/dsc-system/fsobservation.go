@@ -91,8 +91,7 @@ func (s *fsObservationServer) onPreExecute(session string, args toolArgs) *proto
 	if args.Command != "str_replace" && args.Command != "insert" {
 		return &proto.PolicyDecision{}
 	}
-	key := keyFor(session, args.Path)
-	cur := statObservation(args.Path)
+	key, cur := observe(session, args.Path)
 	s.mu.Lock()
 	obs, seen := s.observed[session][key]
 	s.mu.Unlock()
@@ -129,11 +128,10 @@ func (s *fsObservationServer) onPostExecute(session, toolErr string, args toolAr
 // record 记录一次权威观察（stat 判定存在性，普通文件附内容 sha256）。
 // 目录不进入观察词汇（view 目录返回列表，无可编辑内容）。
 func (s *fsObservationServer) record(session, path string) {
-	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+	key, obs := observe(session, path)
+	if fi, err := os.Stat(key); err == nil && fi.IsDir() {
 		return
 	}
-	key := keyFor(session, path)
-	obs := statObservation(path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	bySession := s.observed[session]
@@ -144,7 +142,24 @@ func (s *fsObservationServer) record(session, path string) {
 	bySession[key] = obs
 }
 
-// statObservation 当前文件状态的权威快照：存在（普通文件且可读）时附内容 sha256；
+// observe 一次观察的两个同源产物：规范化观察键 + 该键上的当前状态快照。
+//
+// 键与探针必须同源——探针不得直接用模型书写的原始路径去 os.Stat：
+//   - 相对路径会被解析到插件进程 cwd（宿主以 ExecDir 拉起插件，非工作空间根），
+//   - /workspace 虚拟根别名会被当成宿主盘根下的真实目录（Windows 上 C:\workspace\...）。
+//
+// 两者都会把「刚刚 view 成功」的文件记成 present=false，随后同路径的 str_replace
+// 被误判「file does not exist — create it with the 'create' command first」（报告
+// 场景：模型 view /workspace/assets/game.html 成功，紧接着 str_replace 同路径被拒；
+// 既有的绝对真实路径用例走不到这条分支，故长期未被发现）。keyFor 已把键归并为
+// 真实绝对路径，探针一律以键为输入。
+func observe(session, path string) (string, observation) {
+	key := keyFor(session, path)
+	return key, statObservation(key)
+}
+
+// statObservation 当前文件状态的权威快照（入参为 keyFor 归并后的真实绝对路径，
+// 见 observe——不得直接喂模型书写的原始路径）：存在（普通文件且可读）时附内容 sha256；
 // 缺失或不可读按未观察到场处理（present=false）。读失败（权限等）不冒充缺失语义，
 // 后续改写会因 unseen 被拦截，模型重新 view 时自然获得真实错误。
 func statObservation(path string) observation {
