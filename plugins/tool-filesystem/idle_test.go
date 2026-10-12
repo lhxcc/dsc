@@ -11,23 +11,27 @@ import (
 
 // TestShellOutputTouchesKeepsAlive 活动信号链路端到端（插件侧）：命令持续产生
 // 输出时，每次写入经 activityWriter 上报活动（core.TouchActivity）——总运行
-// 时长（~500ms）远超空闲预算（200ms），全程有输出故能跑完不被看门狗取消。
+// 时长（~1s）远超空闲预算（500ms），全程有输出故能跑完不被看门狗取消。
+//
+// 预算与写入间隔的余量：写入间隔 50ms、预算 500ms（10× 余量，高负载下调度抖动亦不至于
+// 触发误判），同时循环总时长 1s 仍是预算的 2×——仍能证明「运行时长 > 预算且未被取消」。
+// （此前为 200ms 预算 / 500ms 循环，4× 余量；并发满载时曾偶发失败。）
 func TestShellOutputTouchesKeepsAlive(t *testing.T) {
 	sess, err := getOrCreateSession("idle-test-alive", "")
 	if err != nil {
 		t.Fatalf("getOrCreateSession: %v", err)
 	}
-	ctx, cancel := core.WithIdleDeadline(context.Background(), 200*time.Millisecond)
+	ctx, cancel := core.WithIdleDeadline(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	out, code, err := execSessionCommand(ctx, sess, "for i in 1 2 3 4 5 6 7 8 9 10; do echo tick-$i; sleep 0.05; done")
+	out, code, err := execSessionCommand(ctx, sess, "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo tick-$i; sleep 0.05; done")
 	if err != nil {
 		t.Fatalf("持续输出的命令不应被看门狗取消: %v", err)
 	}
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(out, "tick-10") {
+	if !strings.Contains(out, "tick-20") {
 		t.Fatalf("output 缺失末尾输出: %q", out)
 	}
 	if core.IdleDeadlineExceeded(ctx) {
