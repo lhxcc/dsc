@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -48,28 +49,6 @@ func isFileSystemCaseInsensitive(path string) bool {
 		return true
 	}
 	return false
-}
-
-// TestWorkspacePathToRootBoundary 验证 /workspace 别名前缀须跟分隔符或结尾，
-// /workspacefoo 之类不应被映射。
-func TestWorkspacePathToRootBoundary(t *testing.T) {
-	orig := WorkspaceRoot
-	WorkspaceRoot = "/root/ws"
-	defer func() { WorkspaceRoot = orig }()
-
-	cases := []struct{ in, want string }{
-		{"/workspace", "/root/ws"},
-		{"/workspace/a.txt", "/root/ws/a.txt"},
-		{`\workspace\b.txt`, "/root/ws/b.txt"},
-		// 前綴後直接接字符 → 唔係別名，維持原樣
-		{"/workspacefoo/x", "/workspacefoo/x"},
-		{"/workspacex", "/workspacex"},
-	}
-	for _, c := range cases {
-		if got := workspacePathToRoot(c.in); got != c.want {
-			t.Errorf("workspacePathToRoot(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
 }
 
 // jsonPath 将路径转义后嵌入 JSON 字面量：Windows 的 t.TempDir() 含反斜杆，
@@ -168,6 +147,46 @@ func TestSandboxWorkspaceAcceptsVirtualPrefix(t *testing.T) {
 			json.RawMessage(`{"command":"str_replace","path":"`+jsonPath(p)+`","old_str":"a","new_str":"b"}`)); err != nil {
 			t.Fatalf("write under virtual /workspace prefix %q should pass: %v", p, err)
 		}
+	}
+	// 别名边界仍须守住：前缀后未跟分隔符（/workspacefoo、/workspacex）是独立绝对
+	// 路径，不得被当作工作区根别名而放行越界写。
+	for _, p := range []string{"/workspacefoo/x", "/workspacex"} {
+		_, err := m.ExecuteTool(context.Background(), "str_replace_editor",
+			json.RawMessage(`{"command":"str_replace","path":"`+jsonPath(p)+`","old_str":"a","new_str":"b"}`))
+		if err == nil || !strings.Contains(err.Error(), "file access denied under workspace-write mode") {
+			t.Fatalf("path %q 不是 /workspace 别名，应被拒: err=%v", p, err)
+		}
+	}
+}
+
+// TestSandboxWorkspaceAcceptsWSLFormPath 沙箱与工具侧共用同一份虚拟根映射
+// （core.MapWorkspacePath），不得各存一套：Windows 上模型的 WSL 习惯路径
+// /mnt/<drive>/... 与工具侧同源映射为 <drive>:/...，故指向工作区内的 WSL 形态写法
+// 必须与真实路径等价放行（沙箱若把它当宿主盘根下的 /mnt/... 目录，就会把工具实际
+// 能写的工作区文件判成越界）。
+//
+// 该映射按设计仅在 Windows 生效（非 Windows 上 /mnt/c/... 是合法 POSIX 真实路径，
+// 可能是真实挂载点），故断言按 GOOS 门控。
+func TestSandboxWorkspaceAcceptsWSLFormPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("WSL 形态路径映射仅 Windows 启用（非 Windows 上 /mnt/<drive> 是真实 POSIX 路径）")
+	}
+	orig := WorkspaceRoot
+	WorkspaceRoot = t.TempDir() + "/ws"
+	defer func() { WorkspaceRoot = orig }()
+	_ = os.MkdirAll(WorkspaceRoot, 0o755)
+
+	// 由工作区真实路径构造 WSL 形态：C:/a/b → /mnt/c/a/b
+	root := canonicalWorkspaceRoot()
+	if len(root) < 2 || root[1] != ':' {
+		t.Skipf("工作区不在盘符路径下（%q），无法构造 WSL 形态", root)
+	}
+	wsl := "/mnt/" + strings.ToLower(root[:1]) + root[2:]
+	if !inWorkspace(root + "/inside.txt") {
+		t.Fatalf("前置条件失败：真实路径 %q 应判为工作区内", root+"/inside.txt")
+	}
+	if !inWorkspace(wsl + "/inside.txt") {
+		t.Fatalf("WSL 形态路径 %q 与真实路径同源映射，应判为工作区内", wsl+"/inside.txt")
 	}
 }
 

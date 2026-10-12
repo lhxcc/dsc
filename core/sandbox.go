@@ -102,28 +102,6 @@ func writeCallInfo(toolName, argsJSON string) (path string, write bool) {
 	}
 }
 
-// workspacePathToRoot 将模型按工具描述传入的虚拟根前缀 /workspace（或 \workspace）
-// 映射到真实 WorkspaceRoot，使 sandbox 与 tool-str-replace-editor 对同一路径约定
-// 使用同一根目录（对齐 DSH 单一策略归属：fs 围栏与流水线判定不漂移）。
-func workspacePathToRoot(p string) string {
-	for _, prefix := range []string{"/workspace", `\workspace`} {
-		if !strings.HasPrefix(p, prefix) {
-			continue
-		}
-		rest := p[len(prefix):]
-		// 边界检查：前綴後必須是分隔符或結尾，否則 /workspacefoo 之類唔應被當作
-		// /workspace 別名，維持其係獨立絕對路徑嘅語義。
-		if rest != "" && !strings.HasPrefix(rest, "/") && !strings.HasPrefix(rest, `\`) {
-			continue
-		}
-		if rest == "" {
-			return WorkspaceRoot
-		}
-		return PJoin(WorkspaceRoot, strings.TrimLeft(rest, `/\\`))
-	}
-	return p
-}
-
 // canonicalWorkspaceRoot 解析 WorkspaceRoot 的真实路径：绝对化后解析符号链接
 // （失败时回退绝对化结果）。Windows 下盘符/路径大小写不敏感且可能存在 8.3 短名、
 // 符号链接等别名，统一解析可避免真实路径与根因大小写/别名差异被误判为越界。
@@ -138,8 +116,16 @@ func canonicalWorkspaceRoot() string {
 	return abs
 }
 
-// inWorkspace 判断路径是否位于 WorkspaceRoot 之下（含 /workspace 虚拟根映射）。
-// 先把根与目标都经 CanonicalPath 解析到真实路径（Windows 上用
+// inWorkspace 判断路径是否位于 WorkspaceRoot 之下。
+//
+// 路径先经 core.MapWorkspacePath 归并——沙箱与各工具插件（str_replace_editor、
+// tool-filesystem 的 shell AST 字面量重写）必须用同一份「虚拟根 = 工作空间根」
+// 映射，故此处不得另立一套实现：/workspace（含 \workspace 形态）别名锚定工作区根、
+// Windows 上 WSL 习惯路径 /mnt/<drive>/... 映射为盘符路径；前缀后必须跟分隔符或
+// 结尾（/workspacefoo 之类是独立绝对路径，不认作别名）。否则沙箱会把工具实际能写
+// 的路径判成越界（或反之），重演「判定与执行各说各话」的历史缺陷。
+//
+// 归并后：先经 CanonicalPath 解析到真实路径（Windows 上用
 // GetFinalPathNameByHandle 穿透 junction/symlink，Unix 用 EvalSymlinks），
 // 再做包含判定——从而避免 workspace 内指向外部的 junction/symlink 令词法前缀
 // 比较误判为「在根内」而写穿沙箱（P0-3）。
@@ -151,7 +137,7 @@ func canonicalWorkspaceRoot() string {
 // 工作区相对路径，若并入 WorkspaceRoot 会把 /etc/hosts 之类误判为工作区内而放行
 // 越界写，故维持既有语义（按当前盘根解析，本就落于工作区外）。
 func inWorkspace(path string) bool {
-	p := workspacePathToRoot(path)
+	p := MapWorkspacePath(path)
 	driveLessRoot := runtime.GOOS == "windows" && !filepath.IsAbs(p) &&
 		(strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`))
 	if !filepath.IsAbs(p) && !driveLessRoot {
