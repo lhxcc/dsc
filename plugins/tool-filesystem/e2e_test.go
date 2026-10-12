@@ -141,6 +141,14 @@ func TestE2EWithHostClient(t *testing.T) {
 		t.Fatalf("find 输出的路径应统一正斜杆: %q", resp.Content)
 	}
 
+	// 6.2 统计管道 sort | uniq -c | sort -rn：Windows 上原本整条断掉（sort 命中非 POSIX 的
+	// System32\sort.exe、uniq 无同名程序），内建后应完整可用
+	if resp := run(`{"command":"printf 'b\\na\\nb\\nc\\nb\\n' | sort | uniq -c | sort -rn"}`); resp.Error != "" {
+		t.Fatalf("sort|uniq 管道 = %+v", resp)
+	} else if !strings.Contains(resp.Content, "3 b") || !strings.Contains(resp.Content, "1 c") {
+		t.Fatalf("统计管道输出不符: %q", resp.Content)
+	}
+
 	// 7. 空钩子：宿主调用无副作用（SDK 默认注册 PluginHookService）
 	hook := proto.NewPluginHookServiceClient(conn)
 	bt, err := hook.BeforeTool(ctx, &proto.BeforeToolRequest{ToolName: "shell", ArgumentsJson: `{"command":"pwd"}`})
