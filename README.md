@@ -155,6 +155,24 @@ DSC 與 DSH 同源於「一切皆插件」的設計哲學，兩者在概念層�
 
 - `llm-ollama`（Ollama 兼容端點：本地 Ollama server。與 `llm-openai`/`llm-anthropic` 同為 LLM provider 插件，經 Ollama Go SDK 直連 `/api/chat`；支持 reasoning/thinking 模型（默認開啓，`OLLAMA_THINKING=0` 可關閉），從響應 `Message.Thinking` 提取思維鏈幀渲染到 TUI；@文本附件引用（`dsc-txt://`）解析為文本串前綴拼入 user 消息 Content）
 
+#### 統一推理強度（DSC_REASONING_EFFORT）
+
+DSC 提供跨 provider 統一的推理強度開關 `DSC_REASONING_EFFORT`（取值 `low` / `medium` / `high` / `max`，大小寫不敏感），由 SDK 的 `LoadLLMConfig` 按各 LLM 接口語義映射為具體參數，免去逐家記憶不同字段名。各接口映射如下：
+
+| `DSC_REASONING_EFFORT` | `llm-anthropic` 思考 token 預算 | `llm-openai` reasoning_effort 字面量 |
+| ---------------------- | ----------------------------- | --------------------------------- |
+| `low`                  | 4096                          | `low`                             |
+| `medium`               | 8192                          | `medium`                          |
+| `high`                 | 16384                         | `high`                            |
+| `max`                  | 32768                         | `high`（鉗制，見下）                |
+
+**覆寫優先序（高 → 低）**：接口專屬變量 > 統一 `DSC_REASONING_EFFORT` > 未設（走插件默認）。
+
+- `llm-anthropic`：思考 token 預算可用 `DSC_ANTHROPIC_THINKING_BUDGET`（數值，直接覆寫預算；舊名 `ANTHROPIC_THINKING_BUDGET` 在無 `DSC_` 時仍回退）覆寫；`ANTHROPIC_THINKING=0` 可整體關閉擴展思考。未設任何推理強度時預算預設 4096。注意 DeepSeek 的 `/anthropic` 口忽略 budget 值，預算數值對該端點無實際影響。
+- `llm-openai`：推理強度字面量可用 `DSC_OPENAI_REASONING_EFFORT` 直接覆寫（如端點支持 `xhigh` 等文檔外檔位，傳字面量即可繞過上表鉗制）；未設則不攜帶 `reasoning_effort` 參數。OpenAI/DeepSeek 文檔化檔位僅 `low`/`medium`/`high`，故 `max` 統一檔位鉗到 `high`。
+
+兩條路徑只需在 config.yaml 任一口設一次 `DSC_REASONING_EFFORT: "high"` 即可同時生效；需針對單一口微調時再用對應接口專屬變量。
+
 #### 圖像輸入（視覺）
 
 `llm-openai` 與 `llm-anthropic` 支持把本地圖片作為視覺輸入傳給視覺模型（如
