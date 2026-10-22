@@ -164,7 +164,7 @@ DSC 提供跨 provider 統一的推理強度開關 `DSC_REASONING_EFFORT`（取�
 | `low`                  | 4096                          | `low`                             |
 | `medium`               | 8192                          | `medium`                          |
 | `high`                 | 16384                         | `high`                            |
-| `max`                  | 32768                         | `high`（鉗制，見下）                |
+| `max`                  | 16384（= high）               | `high`（鉗制）                    |
 
 **覆寫優先序（高 → 低）**：接口專屬變量 > 統一 `DSC_REASONING_EFFORT` > 未設（走插件默認）。
 

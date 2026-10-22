@@ -225,11 +225,11 @@ func TestLoadLLMConfigReasoningEffort(t *testing.T) {
 		t.Errorf("openai high = %q, want high", cfg.OpenAIReasoningEffort)
 	}
 
-	// 2) 统一 max → anthropic 32768 / openai 钳到 high
+	// 2) 统一 max → anthropic 16384（=high）/ openai 钳到 high
 	clearReasoningEnv()
 	t.Setenv("DSC_REASONING_EFFORT", "max")
-	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 32768 {
-		t.Errorf("anthropic max ThinkingBudget = %d, want 32768", cfg.ThinkingBudget)
+	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 16384 {
+		t.Errorf("anthropic max ThinkingBudget = %d, want 16384 (collapses to high)", cfg.ThinkingBudget)
 	}
 	if cfg := LoadLLMConfig("openai"); cfg.OpenAIReasoningEffort != "high" {
 		t.Errorf("openai max 应钳到 high, got %q", cfg.OpenAIReasoningEffort)
