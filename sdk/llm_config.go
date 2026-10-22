@@ -41,6 +41,8 @@ type LLMConfig struct {
 	// 其中 none 表示关闭推理（anthropic 路径据此关闭 thinking；openai 路径下发
 	// reasoning_effort=none）。xhigh 等文档外档位不在统一枚举内，用
 	// DSC_OPENAI_REASONING_EFFORT 直传即可。
+	// anthropic 路径：档位同时驱动 thinking.budget_tokens（真实 Anthropic 用）与
+	// output_config.effort（DeepSeek /anthropic 口用，因其忽略 budget_tokens）。
 	ReasoningEffort string
 	// ThinkingBudget anthropic 路径思考 token 预算（DSC_ANTHROPIC_THINKING_BUDGET，
 	// 回退旧名 ANTHROPIC_THINKING_BUDGET）；未设且 ReasoningEffort 已设时由档位映射；

@@ -27,6 +27,11 @@ type AnthropicProvider struct {
 	// 支持并返回 thinking 块）；ANTHROPIC_THINKING=0 可关闭。
 	thinking       bool
 	thinkingBudget int64
+	// reasoningEffort 统一推理强度档位（DSC_REASONING_EFFORT 的原文 none/minimal/
+	// low/medium/high/max）。用于构造 output_config.effort：DeepSeek 的 /anthropic 口
+	// 忽略 thinking.budget_tokens，改以 output_config.effort 控制思考强度；真实 Anthropic
+	// 则吃 budget_tokens。两者同时下发互不冲突。
+	reasoningEffort string
 	// maxTokens 单轮输出上限（插件级默认）。取值来源：显式 ANTHROPIC_MAX_OUTPUT_TOKENS
 	// > 宿主注入 DSC_MAX_OUTPUT_TOKENS（一律注入=有效上下文窗口值：探测命中 LLAMACPP
 	// 时=探测窗口，云端=配置 context_window）> 0 = 不携带。请求级参数（压缩等场景的
@@ -200,6 +205,13 @@ func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []
 	//    其内容经 chat 流式增量转发为 reasoning 帧最终渲染到 TUI。
 	if p.thinking {
 		msgParams.Thinking = anthropic.ThinkingConfigParamOfEnabled(p.thinkingBudget)
+		// output_config.effort：DeepSeek 的 /anthropic 口忽略 thinking.budget_tokens，
+		// 改以 effort 控制思考强度；真实 Anthropic 则吃 budget_tokens。两者同时下发互不
+		// 冲突。none 已在上游关闭 thinking，此处不再下发 effort；minimal 在 Anthropic/DeepSeek
+		// effort 枚举中无对应值，按最接近降级为 low。
+		if eff := anthropicEffortForLevel(p.reasoningEffort); eff != "" {
+			msgParams.OutputConfig = anthropic.OutputConfigParam{Effort: eff}
+		}
 	}
 	return msgParams, usesBetaHeader
 }
@@ -224,6 +236,29 @@ func visionEnabled(baseURL, model string, envNoVisionOverride bool) bool {
 // （llamacpp 等本地 server 无 Files API，始终内联）。
 func isDeepSeekEndpoint(baseURL string) bool {
 	return strings.Contains(baseURL, "deepseek.com")
+}
+
+// anthropicEffortForLevel 将 DSC 统一推理强度档位映射为 anthropic 路径
+// output_config.effort 取值（low/medium/high/max）。
+//   - none：思考已在上游关闭，返回空（不携带 effort）。
+//   - minimal：Anthropic/DeepSeek 的 effort 枚举无 minimal，按最接近降级为 low。
+//   - low/medium/high/max：1:1 透传（与 OpenAI 路径的 reasoning_effort 字面量一致）。
+//
+// 真实 Anthropic 端点同时仍由 thinking.budget_tokens 控制预算；DeepSeek 忽略
+// budget_tokens、只认 effort，于是同一请求对两类端点都生效。
+func anthropicEffortForLevel(level string) anthropic.OutputConfigEffort {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "low", "minimal":
+		return anthropic.OutputConfigEffortLow
+	case "medium":
+		return anthropic.OutputConfigEffortMedium
+	case "high":
+		return anthropic.OutputConfigEffortHigh
+	case "max":
+		return anthropic.OutputConfigEffortMax
+	default:
+		return "" // none 或空
+	}
 }
 
 // fileContentBlocks 构造用户消息的多模态内容块：文本块 + 文件附件块。
@@ -649,7 +684,8 @@ func main() {
 	// DSC_REASONING_EFFORT=none 同样关闭思考；思考 token 预算由 DSC 统一推理强度控制：
 	// DSC_ANTHROPIC_THINKING_BUDGET 直接指定，否则 DSC_REASONING_EFFORT
 	// （none/minimal/low/medium/high/max）按 DSC 标准档位映射
-	// （0/2048/4096/8192/16384/32768），均未设时默认 4096（DeepSeek 忽略 budget 值）。
+	// （0/2048/4096/8192/16384/32768），均未设时默认 4096（DeepSeek 忽略 budget 值，
+	// 故强度改由下方 output_config.effort 表达，二者同时下发互不冲突）。
 	thinking := os.Getenv("ANTHROPIC_THINKING") != "0"
 	// DSC_REASONING_EFFORT=none 显式关闭扩展思考（对应 OpenAI 路径 reasoning_effort=none）
 	if cfg.ReasoningEffort == "none" {
@@ -667,16 +703,17 @@ func main() {
 	maxTokens := cfg.MaxOutputTokens
 
 	provider := &AnthropicProvider{
-		client:         anthropic.NewClient(opts...),
-		model:          model,
-		thinking:       thinking,
-		thinkingBudget: thinkingBudget,
-		maxTokens:      maxTokens,
-		vision:         visionEnabled(baseURL, model, !cfg.VisionEnabled),
-		filesAPI:       isDeepSeekEndpoint(baseURL),
-		fileCache:      map[string]string{},
-		apiKey:         apiKey,
-		baseURL:        baseURL,
+		client:          anthropic.NewClient(opts...),
+		model:           model,
+		thinking:        thinking,
+		thinkingBudget:  thinkingBudget,
+		reasoningEffort: cfg.ReasoningEffort,
+		maxTokens:       maxTokens,
+		vision:          visionEnabled(baseURL, model, !cfg.VisionEnabled),
+		filesAPI:        isDeepSeekEndpoint(baseURL),
+		fileCache:       map[string]string{},
+		apiKey:          apiKey,
+		baseURL:         baseURL,
 	}
 
 	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 core.LLMGRPCPlugin
