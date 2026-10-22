@@ -143,9 +143,14 @@ func res(hc interp.HandlerContext, p string) string {
 	return dsc.PJoin(hc.Dir, p)
 }
 
-// openContentFiles 打开文件列表（"-" 表示 stdin）读写；返回待 close 句柄。
+// openReader 打开文件（"-" 表示 stdin）读取；返回待 close 句柄。
+// stdin 为 nil 时（生产 runner 用 interp.StdIO(nil, ...)）按空输入处理：
+// 否则任何在 nil io.Reader 上读的内建命令（grep/cat/sort…）都会 nil 解引用 panic。
 func openReader(hc interp.HandlerContext, file string) (io.Reader, func(), error) {
 	if file == "-" {
+		if hc.Stdin == nil {
+			return strings.NewReader(""), func() {}, nil
+		}
 		return hc.Stdin, func() {}, nil
 	}
 	f, err := os.Open(res(hc, file))
@@ -744,10 +749,20 @@ type grepTarget struct {
 func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	var ignoreCase, invert, lineNum, countOnly, recursive bool
 	var files []string
-	pat := ""
-	for _, a := range args {
+	var pat string
+	patSet := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case a == "--":
+		case a == "-e":
+			// -e <pattern>：模式由下一参数给出（含空模式；对齐 POSIX grep -e）
+			if i+1 >= len(args) {
+				fmt.Fprintln(hc.Stderr, "grep: option requires an argument -- e")
+				return interp.NewExitStatus(2)
+			}
+			i++
+			pat, patSet = args[i], true
 		case strings.HasPrefix(a, "-") && len(a) > 1 && a != "-":
 			ok := true
 			for _, f := range a[1:] {
@@ -767,9 +782,6 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 				case 'E':
 					// -E (extended regex) 对齐 POSIX grep -E
 					// 内置实现用 Go regexp（RE2），已支持 extended regex 语法
-				case 'e':
-					// -e <pattern> 后跟模式参数（对齐 POSIX grep -e）
-					// 简化处理：下一个参数作为 pattern
 				default:
 					ok = false
 				}
@@ -779,14 +791,18 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 				return interp.NewExitStatus(2)
 			}
 		default:
-			if pat == "" {
-				pat = a
+			// 用 patSet 而非 pat=="" 区分「未提供模式」与「提供了空模式」：空模式在
+			// POSIX grep 里合法（匹配所有行），`grep -c "" file` 就是数行数的常用写法。
+			// 早期实现按 pat=="" 判空，会把空模式吞掉、把紧随的文件名误当模式，进而
+			// 落到「无文件 → 读 stdin」分支，在生产 runner（Stdin 为 nil）上 panic。
+			if !patSet {
+				pat, patSet = a, true
 			} else {
 				files = append(files, a)
 			}
 		}
 	}
-	if pat == "" {
+	if !patSet {
 		fmt.Fprintln(hc.Stderr, "grep: missing pattern")
 		return interp.NewExitStatus(2)
 	}
@@ -869,7 +885,13 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 // 管道行为保持一致：管道内容按文本处理）。
 func grepOne(hc interp.HandlerContext, tg grepTarget, re *regexp.Regexp, invert, lineNum, showName, countOnly bool) (int, error) {
 	if tg.path == "-" {
-		return grepStream(hc, hc.Stdin, re, invert, lineNum, showName, tg.display, countOnly), nil
+		r := io.Reader(hc.Stdin)
+		if r == nil {
+			// 生产 runner 不提供 stdin（interp.StdIO(nil, ...)）→ 空输入，
+			// 避免 bufio.Scanner(nil) 在 Scan 内 nil 解引用。
+			r = strings.NewReader("")
+		}
+		return grepStream(hc, r, re, invert, lineNum, showName, tg.display, countOnly), nil
 	}
 	f, err := os.Open(tg.path)
 	if err != nil {

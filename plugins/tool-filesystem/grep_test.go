@@ -178,3 +178,41 @@ func TestInternalGrepRecursiveDoesNotFollowLinks(t *testing.T) {
 		}
 	}
 }
+
+// TestInternalGrepEmptyPatternCountsLines 真实报告回归：模型用 `grep -c "" file`
+// 统计行数时 shell 工具 panic（nil pointer dereference）。
+//
+// 根因有两层：
+//  1. 参数解析用 `pat == ""` 判断「未提供模式」，于是空模式被静默吞掉，紧随的文件名
+//     被误当成模式，files 变空 → 转去读 stdin；
+//  2. 生产 runner 是 interp.StdIO(nil, ...)，hc.Stdin 为 nil，bufio.Scanner(nil)
+//     在 Scan() 里解引用 nil Reader → panic。
+//
+// 空模式在 POSIX grep 里是合法的（匹配所有行），这里同时锁定两条修复。
+func TestInternalGrepEmptyPatternCountsLines(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{"f.txt": "a\nb\nc\n"})
+
+	for _, script := range []string{
+		`grep -c "" f.txt`,    // 空模式作为第一个非选项参数
+		`grep -c -e "" f.txt`, // 空模式经 -e 传入
+	} {
+		out, errb, err := runShellNilStdin(t, dir, script)
+		if err != nil {
+			t.Fatalf("%s: 应成功（不得 panic），stderr=%q err=%v", script, errb, err)
+		}
+		if got := strings.TrimSpace(out); got != "3" {
+			t.Fatalf("%s: 空模式应匹配全部 3 行，got %q", script, got)
+		}
+	}
+}
+
+// TestInternalGrepNoStdinDoesNotPanic 无文件参数且无 stdin 时按空输入处理：
+// 退出码 1（无命中），绝不能 panic。
+func TestInternalGrepNoStdinDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	_, errb, err := runShellNilStdin(t, dir, `grep needme`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("空输入无命中应退出 1，got %d（stderr=%q）", got, errb)
+	}
+}

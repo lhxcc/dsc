@@ -36,6 +36,29 @@ func runShellIO(t *testing.T, dir, script string) (string, string, error) {
 	return out.String(), errb.String(), err
 }
 
+// runShellNilStdin 复刻生产 runner 的 stdio 配置：interp.StdIO(nil, ...)。
+// 生产路径（main.go 的 getOrCreateSession）不提供 stdin，内建命令若无条件把
+// hc.Stdin 交给 bufio.Scanner 就会 nil 解引用 panic——测试必须覆盖这个形态。
+func runShellNilStdin(t *testing.T, dir, script string) (string, string, error) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	r, err := interp.New(
+		interp.Env(expand.ListEnviron()), // 空环境：无 PATH
+		interp.Dir(dir),
+		interp.StdIO(nil, &out, &errb),
+		interp.ExecHandler(shellExecHandler),
+	)
+	if err != nil {
+		t.Fatalf("new runner: %v", err)
+	}
+	f, err := syntax.NewParser().Parse(strings.NewReader(script), "")
+	if err != nil {
+		t.Fatalf("parse %q: %v", script, err)
+	}
+	err = r.Run(context.Background(), f)
+	return out.String(), errb.String(), err
+}
+
 // runShell 以「空 PATH」构造 shell runner 并执行脚本，以此证明 internalcmds 是进程内
 // 实现、不依赖外部可执行文件（在 Windows 且 PATH 被宿主过滤时仍可用）。
 // 返回 stdout 与 Run 返回的 error（经 interp.IsExitStatus 可判退出码）。
