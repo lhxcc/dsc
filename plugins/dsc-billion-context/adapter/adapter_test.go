@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	bcacp "dsc-billion-context/acp"
+	dsc "dsc-sdk"
 	"dsc/proto"
 )
 
@@ -79,5 +80,25 @@ func TestStateStoreSaveAtomic(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Fatalf("不应残留临时文件: %s", e.Name())
 		}
+	}
+}
+
+// TestStateStoreUsesSessionsDirWithSuffix state 必须与宿主会话同目录、靠后缀区分：
+// 不再单独占用 ExecDir/billion-context/，且文件名带 .acp.json 以免被 session.Store
+// （只扫描 *.jsonl）或人工清理会话时误认。
+func TestStateStoreUsesSessionsDirWithSuffix(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStateStore(dir)
+	st := bcacp.CreateInitialState()
+	if err := store.Save("session-7", st); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	want := dsc.PJoin(dir, "session-7"+StateFileSuffix)
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("应写入 %s: %v", want, err)
+	}
+	// 不得产生裸 <id>.json（旧命名），否则与新版并存时行为不确定
+	if _, err := os.Stat(dsc.PJoin(dir, "session-7.json")); err == nil {
+		t.Fatalf("不应再写旧命名 session-7.json")
 	}
 }

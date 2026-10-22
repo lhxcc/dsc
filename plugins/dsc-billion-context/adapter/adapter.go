@@ -103,15 +103,22 @@ func defaultIDProvider(idx int, _ *proto.Message) string {
 	return fmt.Sprintf("msg-%d", idx)
 }
 
+// StateFileSuffix 是 acp state 文件的强制后缀。
+//
+// state 与宿主会话存档放在同一目录（ExecDir/sessions），靠后缀区分：宿主会话是
+// <id>.jsonl，acp state 是 <id>.acp.json。好处：一个会话的落盘数据集中在一处，
+// 备份/排查不必跨目录；session.Store 只认 *.jsonl，state 不会被误当作会话。
+const StateFileSuffix = ".acp.json"
+
 // StateStore 负责 acp state 的持久化（JSON 文件）。
-// 每个 session 一个 state 文件，路径为 dir/<sessionID>.json。
+// 每个 session 一个 state 文件，路径为 dir/<sessionID>.acp.json。
 type StateStore struct {
 	mu    sync.Mutex
 	dir   string
 	cache map[string]*bcacp.CompressionState // sessionID → state
 }
 
-// NewStateStore 创建状态存储。dir 为存储目录（通常 ExecDir/billion-context）。
+// NewStateStore 创建状态存储。dir 为存储目录（ExecDir/sessions，与宿主会话同目录）。
 func NewStateStore(dir string) *StateStore {
 	return &StateStore{
 		dir:   dir,
@@ -165,7 +172,7 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cache[sessionID] = state
-	if err := os.MkdirAll(s.dir, 0700); err != nil {
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
 		return fmt.Errorf("create acp state dir: %w", err)
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
@@ -208,7 +215,7 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 func (s *StateStore) path(sessionID string) string {
 	// 防止路径遍历：sessionID 仅允许字母数字与 -_
 	safe := sanitizeSessionID(sessionID)
-	return dsc.PJoin(s.dir, safe+".json")
+	return dsc.PJoin(s.dir, safe+StateFileSuffix)
 }
 
 // sanitizeSessionID 把 sessionID 限制为安全字符（防止路径遍历）。

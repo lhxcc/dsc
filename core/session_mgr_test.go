@@ -69,3 +69,30 @@ func TestManagerDeleteMissingSessionIdempotent(t *testing.T) {
 		t.Fatalf("delete missing should be idempotent: %v", err)
 	}
 }
+
+// TestDeleteSessionRemovesACPState 会话的压缩状态与会话存档同目录（<id>.acp.json）：
+// 删除会话时必须一并清掉，否则 sessions/ 里会留下指向已删会话的孤儿状态。
+func TestDeleteSessionRemovesACPState(t *testing.T) {
+	m := newSessionMgr(t)
+	id, err := m.CreateSession()
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	st, _ := session.NewStore(filepath.Join(m.config.ExecDir, "sessions"))
+	sess, _ := st.Ensure(id)
+	sess.Append(session.UserMessage, &session.UserMessageData{Content: "x", Source: "user"},
+		&session.SurfaceOp{Op: session.SurfaceAppend})
+	_ = st.Save(sess)
+
+	acpPath := filepath.Join(m.config.ExecDir, "sessions", id+".acp.json")
+	if err := os.WriteFile(acpPath, []byte(`{"session":"x"}`), 0600); err != nil {
+		t.Fatalf("write acp state: %v", err)
+	}
+
+	if err := m.DeleteSession(id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(acpPath); !os.IsNotExist(err) {
+		t.Fatalf("acp state 应随会话删除: err=%v", err)
+	}
+}

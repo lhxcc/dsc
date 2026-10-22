@@ -180,7 +180,7 @@ func HideConsumedCompressCalls(state *CompressionState, messages []CoreMessage) 
 	allBlockCallIDs := map[string]bool{}
 	activeCallIDs := map[string]bool{}
 	liveKeysByCallID := map[string]map[string]bool{}
-	legacyLiveByCallID := map[string]bool{}
+	noRangeLiveByCallID := map[string]bool{}
 	for i := range state.Blocks {
 		b := &state.Blocks[i]
 		if b.CompressCallID == "" {
@@ -192,7 +192,7 @@ func HideConsumedCompressCalls(state *CompressionState, messages []CoreMessage) 
 		}
 		activeCallIDs[b.CompressCallID] = true
 		if b.StartRef == "" || b.EndRef == "" {
-			legacyLiveByCallID[b.CompressCallID] = true
+			noRangeLiveByCallID[b.CompressCallID] = true
 			continue
 		}
 		keys, ok := liveKeysByCallID[b.CompressCallID]
@@ -245,7 +245,7 @@ func HideConsumedCompressCalls(state *CompressionState, messages []CoreMessage) 
 		}
 		// 存活调用：重写 args（剔除已消费范围 + summary 存根化）
 		if isCompressCall && m.ToolCallID != "" && keepCallIDs[m.ToolCallID] {
-			if keys := liveKeysByCallID[m.ToolCallID]; len(keys) > 0 && !legacyLiveByCallID[m.ToolCallID] {
+			if keys := liveKeysByCallID[m.ToolCallID]; len(keys) > 0 && !noRangeLiveByCallID[m.ToolCallID] {
 				if rewritten := rewriteCompressText(m.Text, keys); rewritten != "" {
 					nm := m
 					nm.Text = rewritten

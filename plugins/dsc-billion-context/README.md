@@ -10,7 +10,7 @@ DSC 上下文管理插件：以 [acp-kernel](https://github.com/ranxianglei/acp-
 - **3 層 LSM-tree**：T1 標準壓縮、T2 蒸餾（T1→T2）、T3 凝結（T2→T3）
 - **前綴緩存穩定**：summary 原位嵌入（不堆到頭部）、不注入 `<acp>` 標籤到消息文本、nudge 作為尾部 user 消息
 - **孤兒配對清理**：壓縮邊界切斷 tool-call ↔ tool-result / reasoning ↔ assistant 時自動清理
-- **state 持久化**：每個 session 一個 JSON 文件（`ExecDir/billion-context/<session>.json`）
+- **state 持久化**：每個 session 一個 JSON 文件，與會話存檔同目錄（`ExecDir/sessions/<session>.acp.json`，以 `.acp.json` 後綴與 `<session>.jsonl` 區分）
 
 ## 4 個模型可見工具
 

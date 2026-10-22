@@ -50,7 +50,7 @@ func TestHandlePreStepAdoptsEventSession(t *testing.T) {
 	if got := bc.getSessionID(); got != "sess-A" {
 		t.Fatalf("应采用事件会话，got %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "sess-A.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "sess-A"+bcadapter.StateFileSuffix)); err != nil {
 		t.Fatalf("state 应写入 sess-A.json（会话隔离）: %v", err)
 	}
 
@@ -59,7 +59,7 @@ func TestHandlePreStepAdoptsEventSession(t *testing.T) {
 	if _, err := bc.handlePreStep(context.Background(), payload); err != nil {
 		t.Fatalf("pre-step(B) 失败: %v", err)
 	}
-	for _, name := range []string{"sess-A.json", "sess-B.json"} {
+	for _, name := range []string{"sess-A" + bcadapter.StateFileSuffix, "sess-B" + bcadapter.StateFileSuffix} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("应保留 %s: %v", name, err)
 		}
