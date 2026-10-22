@@ -1,0 +1,18 @@
+{
+  "schema_version": 2,
+  "harness": "dsc-tool-agentic-bench",
+  "bench_root": "/tmp/bench",
+  "started_at": "2026-01-01T00:00:00Z",
+  "duration_ms": 10000,
+  "passed": 3,
+  "failed": 1,
+  "total": 4,
+  "score": "75.00",
+  "ratio": "3:1",
+  "cases": [
+    {"id": "arith_power", "title": "整数幂运算", "status": "pass", "weight": 1, "earned": 1, "duration_ms": 1000, "feedback": "", "artifact_content": ""},
+    {"id": "file_sum", "title": "计算并落盘", "status": "pass", "weight": 1, "earned": 1, "duration_ms": 2000, "feedback": "", "artifact_content": "5050"},
+    {"id": "prime_below_20", "title": "数论", "status": "pass", "weight": 1, "earned": 1, "duration_ms": 1500, "feedback": "", "artifact_content": ""},
+    {"id": "sqrt_2", "title": "开平方精度", "status": "fail", "weight": 1, "earned": 0, "duration_ms": 1200, "feedback": "超差", "artifact_content": ""}
+  ]
+}

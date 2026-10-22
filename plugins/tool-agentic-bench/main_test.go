@@ -452,8 +452,14 @@ func TestCaseBudgetSkipsOverdue(t *testing.T) {
 func TestRenderTaskPlaceholders(t *testing.T) {
 	c := CaseQuery{ID: "x", Task: "写到 <caseOut>/reply.txt（根 <benchRoot>）"}
 	out := renderTask(c, `C:\tmp`)
-	if !strings.Contains(out, filepath.ToSlash(filepath.Join(`C:\tmp`, benchOutDirName, "x"))+"/reply.txt") {
-		t.Errorf("占位符未正确替换: %q", out)
+	// Windows 风格输入在每个平台都必须归一化为正斜杆（filepath.ToSlash 在 Unix 上
+	// 不会转换反斜杆，故用插件内的 posixSlash 口径断言）。
+	want := `C:/tmp/` + benchOutDirName + "/x/reply.txt"
+	if !strings.Contains(out, want) {
+		t.Errorf("占位符未正确替换: %q, want contains %q", out, want)
+	}
+	if !strings.Contains(out, `（根 C:/tmp）`) {
+		t.Errorf("<benchRoot> 未归一化为正斜杆: %q", out)
 	}
 	if strings.Contains(out, "<caseOut>") || strings.Contains(out, "<benchRoot>") {
 		t.Errorf("占位符残留: %q", out)

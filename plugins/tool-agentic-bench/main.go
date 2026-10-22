@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +56,15 @@ func caseOutDir(root, id string) string {
 // renderTask 把用例任务陈述里的 <benchRoot>/<caseOut> 占位符替换为真实路径后返回。
 func renderTask(c CaseQuery, root string) string {
 	out := caseOutDir(root, c.ID)
-	return strings.ReplaceAll(strings.ReplaceAll(c.Task, "<caseOut>", filepath.ToSlash(out)), "<benchRoot>", filepath.ToSlash(root))
+	return strings.ReplaceAll(strings.ReplaceAll(c.Task, "<caseOut>", posixSlash(out)), "<benchRoot>", posixSlash(root))
+}
+
+// posixSlash 把路径统一为正斜杆。必须连续替换双反斜杆与单反斜杆两份：
+// filepath.ToSlash 只转换当前平台的分隔符——Windows 风格的输入（D:\a\b）在
+// Unix 上不会被转换，而模型/用户传入的路径可能带反斜杆。
+func posixSlash(s string) string {
+	s = strings.ReplaceAll(s, `\\`, "/")
+	return strings.ReplaceAll(s, "\\", "/")
 }
 
 // findNextCase 返回下一个待办（尚无 pass/fail，且非显式 skip 终态）用例下标，
@@ -142,7 +149,7 @@ func hBenchStart(ctx context.Context, args json.RawMessage) (string, error) {
 	payload, _ := json.Marshal(map[string]any{
 		"harness":     "dsc-tool-agentic-bench",
 		"bench_root":  state.root,
-		"out_dir":     filepath.ToSlash(outRoot),
+		"out_dir":     posixSlash(outRoot),
 		"total_cases": len(benchCases),
 		"cases":       list,
 	})
@@ -191,7 +198,7 @@ func serveNext(root string) (map[string]any, bool) {
 		"case_id": c.ID,
 		"title":   c.Title,
 		"kind":    c.Kind,
-		"out_dir": filepath.ToSlash(caseOutDir(root, c.ID)),
+		"out_dir": posixSlash(caseOutDir(root, c.ID)),
 		"task":    renderTask(c, root),
 	}, false
 }
@@ -287,7 +294,7 @@ func hBenchReport(ctx context.Context, args json.RawMessage) (string, error) {
 	}
 	summary, _, _ := buildReport(root, state.results, totalMs())
 	// 报告 JSON 已落盘到 <root>/bench-out/report.json，结果字符串给出摘要与路径。
-	return fmt.Sprintf("%s（报告已写入 %s）", summary, filepath.ToSlash(dsc.PJoin(root, benchOutDirName, "report.json"))), nil
+	return fmt.Sprintf("%s（报告已写入 %s）", summary, posixSlash(dsc.PJoin(root, benchOutDirName, "report.json"))), nil
 }
 
 // totalMs 返回从 bench_start 到现在（或上次已报告节点）的总耗时毫秒；未开始为 0。

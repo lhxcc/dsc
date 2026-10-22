@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	dsc "dsc-sdk"
+
+	"dsc-plugin-tool-agentic-bench/internal/benchreport"
 )
 
 // benchOutDirName 是 bench 产物在 workspace 根下的固定子目录；各用例按
@@ -15,9 +18,12 @@ const benchOutDirName = "bench-out"
 
 // buildReport 依据各用例结果自动计分并生成汇总。
 // totalMs 为从 bench_start 起算的总耗时毫秒，落盘进报告并以徽标展示。
+// 设置 DSC_BENCH_BASELINE（既有 report.json 路径）时额外产出基线比较：
+// report.json 内嵌 baseline/diff，并另写 report.diff.json。
 // 返回：摘要文本、报告 JSON 字符串、表格视图 spec。
 func buildReport(root string, results map[string]CaseResult, totalMs int64) (string, string, json.RawMessage) {
 	passed, total := 0, len(benchCases)
+	hasBaseline := strings.TrimSpace(os.Getenv("DSC_BENCH_BASELINE")) != ""
 	columns := []dsc.ViewColumn{
 		{Key: "id", Title: "Case"},
 		{Key: "title", Title: "任务"},
@@ -25,8 +31,11 @@ func buildReport(root string, results map[string]CaseResult, totalMs int64) (str
 		{Key: "score", Title: "得分"},
 		{Key: "dur", Title: "耗时"},
 	}
+	if hasBaseline {
+		columns = append(columns, dsc.ViewColumn{Key: "delta", Title: "变化"})
+	}
 	rows := []dsc.ViewRow{}
-	recs := make([]map[string]any, 0, len(benchCases))
+	recs := make([]benchreport.ReportCase, 0, len(benchCases))
 	for _, c := range benchCases {
 		res, ok := results[c.ID]
 		if !ok || res.Status == "" {
@@ -36,26 +45,30 @@ func buildReport(root string, results map[string]CaseResult, totalMs int64) (str
 			passed++
 		}
 		symbol := map[string]string{"pass": "PASS", "fail": "FAIL", "skip": "SKIP"}[res.Status]
-		rows = append(rows, dsc.ViewRow{
+		row := dsc.ViewRow{
 			"id":     c.ID,
 			"title":  c.Title,
 			"status": symbol,
 			"score":  fmt.Sprintf("%d/%d", scoreOf(c, res), c.Weight),
 			"dur":    fmt.Sprintf("%dms", res.DurationMs),
-		})
+		}
 		got := ""
 		if details, err := dsc.ReadFile(dsc.PJoin(root, benchOutDirName, c.ID, "reply.txt")); err == nil {
 			got = strings.TrimSpace(string(details))
 		}
-		recs = append(recs, map[string]any{
-			"id":               c.ID,
-			"title":            c.Title,
-			"status":           res.Status,
-			"weight":           c.Weight,
-			"earned":           scoreOf(c, res),
-			"duration_ms":      res.DurationMs,
-			"feedback":         res.Feedback,
-			"artifact_content": got,
+		if hasBaseline {
+			row["delta"] = "=" // 基线加载失败或未匹配时保持中性
+		}
+		rows = append(rows, row)
+		recs = append(recs, benchreport.ReportCase{
+			ID:              c.ID,
+			Title:           c.Title,
+			Status:          res.Status,
+			Weight:          c.Weight,
+			Earned:          scoreOf(c, res),
+			DurationMS:      res.DurationMs,
+			Feedback:        res.Feedback,
+			ArtifactContent: got,
 		})
 	}
 	// 汇总口径（单点制：每用例 1 点，只判成败）：
@@ -70,7 +83,36 @@ func buildReport(root string, results map[string]CaseResult, totalMs int64) (str
 		}
 	}
 	ratioStr := fmt.Sprintf("%d:%d", passed, failed)
-	// 表格末尾补一行汇总（总得分 + 成败比 + 总耗时）。
+
+	report := benchreport.Report{
+		SchemaVersion: benchreport.SchemaVersion,
+		Harness:       "dsc-tool-agentic-bench",
+		BenchRoot:     root,
+		StartedAt:     state.startedAt.Format(time.RFC3339Nano),
+		DurationMS:    totalMs,
+		Passed:        passed,
+		Failed:        failed,
+		Total:         total,
+		Score:         scoreStr,
+		Ratio:         ratioStr,
+		Cases:         recs,
+	}
+	// 基线比较：加载失败显式留痕（baseline_error），不静默当作无基线。
+	if path := strings.TrimSpace(os.Getenv("DSC_BENCH_BASELINE")); path != "" {
+		if base, err := benchreport.Load(path); err != nil {
+			report.BaselineError = err.Error()
+		} else {
+			report.Baseline = &benchreport.BaselineRef{
+				Path:       path,
+				Score:      base.Score,
+				Passed:     base.Passed,
+				Failed:     base.Failed,
+				DurationMS: base.DurationMS,
+			}
+			report.Diff = benchreport.DiffReports(base, &report)
+			applyDiffColumn(rows, report.Diff)
+		}
+	}
 	rows = append(rows, dsc.ViewRow{
 		"id":     "— 汇总 —",
 		"title":  fmt.Sprintf("通过 %d/%d · 成败 %s", passed, total, ratioStr),
@@ -78,31 +120,59 @@ func buildReport(root string, results map[string]CaseResult, totalMs int64) (str
 		"score":  scoreStr,
 		"dur":    humanMs(totalMs),
 	})
+	if report.Diff != nil {
+		rows[len(rows)-1]["delta"] = report.Diff.ScoreDelta
+	}
 
-	summaryJSON, _ := json.MarshalIndent(map[string]any{
-		"harness":     "dsc-tool-agentic-bench",
-		"bench_root":  root,
-		"started_at":  state.startedAt.Format(time.RFC3339Nano),
-		"duration_ms": totalMs,
-		"passed":      passed,
-		"failed":      failed,
-		"total":       total,
-		"score":       scoreStr, // 总得分（0–100，两位小数）
-		"ratio":       ratioStr, // 成败比 = 成功数:失败数
-		"cases":       recs,
-	}, "", "  ")
-
+	summaryJSON, _ := json.MarshalIndent(report, "", "  ")
 	// 便于无人值守运行收集的固定路径 JSON 报告。
 	reportPath := dsc.PJoin(root, benchOutDirName, "report.json")
 	_ = dsc.MkdirAll(dsc.PDir(reportPath))
 	_ = dsc.WriteFile(reportPath, summaryJSON)
+	if report.Diff != nil {
+		if diffJSON, err := json.MarshalIndent(report.Diff, "", "  "); err == nil {
+			_ = dsc.WriteFile(dsc.PJoin(root, benchOutDirName, "report.diff.json"), diffJSON)
+		}
+	}
 
 	badgeTone := "red"
 	if passed == total {
 		badgeTone = "green"
 	}
-	view := dsc.TableView("bench 结果", &dsc.ViewBadge{Text: fmt.Sprintf("%d/%d PASS · 得分 %s · %s", passed, total, scoreStr, humanMs(totalMs)), Tone: badgeTone}, columns, rows)
-	return fmt.Sprintf("通过 %d/%d，得分 %s，耗时 %s", passed, total, scoreStr, humanMs(totalMs)), string(summaryJSON), view
+	summary := fmt.Sprintf("通过 %d/%d，得分 %s，耗时 %s", passed, total, scoreStr, humanMs(totalMs))
+	if report.Diff != nil {
+		summary += fmt.Sprintf("（对比基线 %s，回归 %d / 改进 %d）",
+			report.Diff.ScoreDelta, len(report.Diff.Regressions), len(report.Diff.Improvements))
+	}
+	badge := fmt.Sprintf("%d/%d PASS · 得分 %s · %s", passed, total, scoreStr, humanMs(totalMs))
+	if report.Diff != nil {
+		badge += " · 基线 " + report.Diff.ScoreDelta
+	}
+	view := dsc.TableView("bench 结果", &dsc.ViewBadge{Text: badge, Tone: badgeTone}, columns, rows)
+	return summary, string(summaryJSON), view
+}
+
+// applyDiffColumn 把 diff 的变化分类写进表格行（仅基线加载成功时调用）。
+func applyDiffColumn(rows []dsc.ViewRow, diff *benchreport.Diff) {
+	if diff == nil {
+		return
+	}
+	mark := map[string]string{
+		benchreport.KindRegression:  "↓",
+		benchreport.KindImprovement: "↑",
+		benchreport.KindNew:         "new",
+		benchreport.KindMissing:     "missing",
+		benchreport.KindSame:        "=",
+		benchreport.KindChanged:     "~",
+	}
+	for _, c := range diff.Cases {
+		for _, row := range rows {
+			if row["id"] == c.ID {
+				row["delta"] = mark[c.Kind]
+				break
+			}
+		}
+	}
 }
 
 // humanMs 把毫秒格式化为可读时长（<1000ms 用毫秒，否则秒/分）。

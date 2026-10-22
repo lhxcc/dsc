@@ -41,6 +41,30 @@
 > 交卷，`bench_submit` 會按真實結果**重新評分**（覆蓋 skip）——最終報告呈現“超時後補齊”的
 > 正確得分；只有從頭到尾沒交的題才保留 skip。預算用 `>30s` 的寬鬆值通常不誤傷正常慢題。
 
+## 基線對比與回歸檢查
+
+設置 `DSC_BENCH_BASELINE=<既有 report.json 路徑>` 後，`bench_report` 會：
+
+- 在 `report.json` 中內嵌 `baseline` 與 `diff`（報告自 `schema_version: 2` 起含此結構）；
+- 另寫 `bench-out/report.diff.json`（僅 diff 部分，供 CI 收集）；
+- 在表格追加「變化」列：`↑` 改進 / `↓` 回歸 / `=` 不變 / `new` 新增 / `missing` 缺失 / `~` 狀態遷移。
+
+基線加載失敗不會靜默跳過——報告寫入 `baseline_error` 字段說明原因。變化分類口徑：
+`pass→fail` / `pass→skip` 記回歸，`fail/skip→pass` 記改進，`fail↔skip` 記中性遷移。
+
+獨立比較命令（純 Go、無 CGO，CI 用）：
+
+```bash
+cd plugins/tool-agentic-bench
+go run ./cmd/benchcmp --baseline <baseline.json> --current <report.json> \
+  --fail-on-regression --fail-on-new-fail
+```
+
+退出碼：`0` 未命中斷言；`1` 命中回歸/新增失敗；`2` 用法或解析錯誤（與「有回歸」區分，
+避免壞輸入被當成通過）。
+
+> 真實模型評測需要模型端點與密鑰，不進 PR CI；CI 只用固定固件驗證比較邏輯與退出碼契約。
+
 ## 用例
 
 內置 18 例，覆蓋：計算/數論/精確分數推理、常識/文言史實/多語言書寫、結構化輸出、工具端態、多步文件鏈與 shell 管道、StrReplaceEditor 編輯流程、**DSC CRON 機制真實調用**。
