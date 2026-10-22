@@ -39,6 +39,12 @@ git clone -b master https://github.com/naamfung/dsc.git
 - **配置自癒**：每個成功啟動後，把已生效的 `config.yaml` 與當前 mode 的 preset（如 `standard.yaml`）**各自獨立備份**到源文件同目錄的備份子目錄（`config.yaml` → `config-backups/`、preset → `preset-backups/`；旋轉保留最近 10 份、按各自前綴區分、互不串擾）。當某份配置因改壞或壞插件導致啟動報錯時，宿主會先把壞版各自留檔，再**分別還原各自最近正常備份**、重建插件集重試一次並以降級模式繼續啟動——而非直接退出，避免「模型搞壞配置就再也起不來」。同時 config.yaml 中啟用的 tool/policy/dsc 插件正式併入啟動合併集（與 preset 按名去重、**preset 優先**——preset 屬具體的預設，同名衝突取 preset，config 僅補 preset 沒有的，使模型安裝的插件仍能跨重啟生效）。
 - **插件目錄自癒**：維持 `plugins/` 的「上次正常」快照（兄弟目錄 `plugins-backup/`，二進制大故僅當有新內容才刷新）。當插件目錄與配置無法對齊（如插件二進制缺失/損壞）導致啟動加載失敗時，從快照回拷合併恢復（**容錯拷貝**：運行中的插件 `.exe` 被進程鎖住會跳過——本就正常；真正缺失/損壞、未運行的二進制會被回拷）後再續啟。恢復後還會盤點「未被當前配置引用的孤立插件目錄」並**僅告警、不刪除**——此類插件從未啟用，無法判斷其可用性、亦不能替用户保證將來不用，故先保留；日後若用户啟用其卻導致啟動加載失敗，再由本機制兜底處理。
 
+### 工具並行與瞬態重試
+
+- **只讀工具並行**：同一條 assistant 消息內的多次工具調用，若全部為只讀且非宿主本地工具，則並發執行——RPC 並發發出，`tool/call`、`tool/result` 事件與 TUI 幀仍按模型給出的順序落盤與呈現（會話可回放、前綴緩存不受影響）。只讀資格只來自工具自聲明的能力標籤 `read-only`（或 `read-only-when:<arg>=<value>` 命中）；未聲明能力的工具一律按不可並行處理（fail-closed），混合批次整批走串行。`DSC_TOOL_PARALLELISM` 控制單批最大併發（默認 4，0/1 關閉）。
+- **工具級瞬態重試**：只讀工具遇到連接級瞬態錯誤（`ECONNRESET`/`ECONNREFUSED`/`EPIPE`/`EOF`/`net.Error` 超時/gRPC `Unavailable`）自動重試，默認 2 次、200ms 線性退避；取消、工具超時、panic、寫語義或寫語義未知的調用一律不重試（避免重複副作用與超時翻倍）。`DSC_TOOL_RETRY` 可調（0 關閉）。
+- **壓縮邊界與工具對完整性**：壓縮保留區的切點會吸附到工具對邊界（保留區不得以 `tool` 消息開頭）；請求前另做一次工具對校驗，發現孤立 `tool` 消息或無結果的 `tool_call` 時做最小修復並留 Warn（只作用於請求副本，事件日誌仍全量保留）。
+
 ## 模型自助動態插件管理
 
 宿主內置六個模型工具，讓模型可以自助地安裝、升級、卸載、列出，以及在**運行期**載入/卸載 DSC 自身插件——即本機二進制 Go 程序、經 `dsc-sdk` 構建、go-plugin/gRPC 加載的插件（有別於 Go 標準庫的 `plugin` 包；對齊 SKILL 安裝，經聚合 Tool 服務暴露給模型）。插件**用與不用由配置決定**，與是否被構建解耦；這些工具在運行時動態生效、無需重啟。
@@ -230,7 +236,7 @@ TUI 輸入框按 `@` 會彈出當前工作區的文件候選篩選列表（對�
 - `tool-harness-webui`（獨立 HTTP 服務，代理宿主 admin API 的前端）
 - `tool-ssh`（SSH 遠程命令執行終端：`ssh_connect` / `ssh_exec` / `ssh_list` / `ssh_close` 四類持久會話，登錄支持密碼或私鑰，會話按 id 緩存複用，方便模型在遠程主機上連續執行命令；提供 `ssh` 能力）
 - `tool-musicplayer`（後台音樂播放器：`music_play` / `music_stop` / `music_status` / `music_setdir`，異步播放 MP3/WAV 文件或目錄、單曲/列表循環、隨機播放（shuffle）、音量百分比調節；`music_setdir` 持久化默認播放目錄到 `~/.dsc/musicplayer_src.txt`，`music_play` 的 path 可省略以用默認目錄，`music_status` 查詢播放模式/當前曲目/時長/音量）
-- `tool-agentic-bench`（模型能力自動評分測試台：`bench_start` / `bench_next` / `bench_submit` / `bench_report`，內置 18 例運行時集成測試用例（含 CRON 機制真實調用案例 `cron_add_id` / `cron_list_roundtrip`），模型經真實工具逐一完成、插件進程自動計分並輸出彙總表與 `bench-out/report.json`；期望答案只存插件進程內、不外泄給模型，file 類用例由插件直接讀產物文件判定，可作無人值守運行——把 `DSC_WORKSPACE_ROOT` 指向臨時目錄後可用 `-input` 單回合跑全集，詳見 `plugins/tool-agentic-bench/README.md`；注意無人值守須把 stdin 重定向（如 `"" | .\dsc.exe -input …`）以關閉 `DSC_SINGLE_TURN` 單輪上限，否則模型跑 1 輪即退出、無法完成多用例循環；提供 `agentic-bench` 能力）
+- `tool-agentic-bench`（模型能力自動評分測試台：`bench_start` / `bench_next` / `bench_submit` / `bench_report`，內置 18 例運行時集成測試用例（含 CRON 機制真實調用案例 `cron_add_id` / `cron_list_roundtrip`），模型經真實工具逐一完成、插件進程自動計分並輸出彙總表與 `bench-out/report.json`；期望答案只存插件進程內、不外泄給模型，file 類用例由插件直接讀產物文件判定，可作無人值守運行——把 `DSC_WORKSPACE_ROOT` 指向臨時目錄後可用 `-input` 單回合跑全集，詳見 `plugins/tool-agentic-bench/README.md`；注意無人值守須把 stdin 重定向（如 `"" | .\dsc.exe -input …`）以關閉 `DSC_SINGLE_TURN` 單輪上限，否則模型跑 1 輪即退出、無法完成多用例循環；**基線對比**：`DSC_BENCH_BASELINE` 指向既有 `report.json` 時，`bench_report` 在報告中內嵌 `baseline`/`diff` 並另寫 `bench-out/report.diff.json`，獨立命令 `go run ./cmd/benchcmp --baseline … --current … --fail-on-regression` 以退出碼供 CI 判定回歸；提供 `agentic-bench` 能力）
 
 ### Policy 插件
 
