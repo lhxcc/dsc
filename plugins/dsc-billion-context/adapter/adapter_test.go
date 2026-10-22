@@ -93,12 +93,36 @@ func TestStateStoreUsesSessionsDirWithSuffix(t *testing.T) {
 	if err := store.Save("session-7", st); err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
-	want := dsc.PJoin(dir, "session-7"+StateFileSuffix)
+	want := dsc.PJoin(dir, "session-7"+dsc.ACPStateSuffix)
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("应写入 %s: %v", want, err)
 	}
 	// 不得产生裸 <id>.json（旧命名），否则与新版并存时行为不确定
 	if _, err := os.Stat(dsc.PJoin(dir, "session-7.json")); err == nil {
 		t.Fatalf("不应再写旧命名 session-7.json")
+	}
+}
+
+// TestStateStorePathUsesSessionIDVerbatim state 文件名必须与会话 id 一一对应：
+// 旧实现把非法字符替换为 '_'（"a b" 与 "a_b" 折成同一文件，两个会话串状态），
+// 现在只用 SDK 的统一校验，不做字符替换；非法 id 直接报错而非静默改名。
+func TestStateStorePathUsesSessionIDVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStateStore(dir)
+
+	for _, id := range []string{"a b", "a_b", "O=--Agents--dsc", "x~db"} {
+		p, err := store.path(id)
+		if err != nil {
+			t.Fatalf("%q 应可作文件名: %v", id, err)
+		}
+		if want := dsc.PJoin(dir, id+dsc.ACPStateSuffix); p != want {
+			t.Fatalf("path(%q) = %q, want %q", id, p, want)
+		}
+	}
+
+	for _, bad := range []string{"", "..", "a/b", `a\b`} {
+		if _, err := store.path(bad); err == nil {
+			t.Fatalf("%q 应被拒绝（防路径穿越）", bad)
+		}
 	}
 }

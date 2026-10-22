@@ -1221,15 +1221,20 @@ func (m *Manager) DeleteSession(id string) error {
 	}
 	// 会话的压缩状态与会话存档同目录（<id>.acp.json，见 dsc-billion-context）：一并清掉，
 	// 否则 sessions/ 会留下指向已删会话的孤儿状态文件。best-effort：失败不影响删除结果。
-	_ = os.Remove(PJoin(m.config.ExecDir, "sessions", id+".acp.json"))
+	_ = os.Remove(PJoin(m.sessionDir(), id+session.ACPSuffix))
 	m.logger.Info("session deleted", "id", id)
 	return nil
 }
 
+// sessionDir 返回会话数据目录（<ExecDir>/sessions）。目录名与命名约定集中在
+// session 包，宿主各处（Store、压缩状态清理、日志）一律经此取路径。
+func (m *Manager) sessionDir() string {
+	return session.Dir(m.config.ExecDir)
+}
+
 // sessionStore 打开/创建多会话 store（ExecDir/sessions）。
 func (m *Manager) sessionStore() (*session.Store, error) {
-	dir := PJoin(m.config.ExecDir, "sessions")
-	return session.NewStore(dir)
+	return session.NewStore(m.sessionDir())
 }
 
 // ExportSession 导出指定会话为 Markdown transcript（ExecDir/exports/<id>.md），

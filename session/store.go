@@ -127,6 +127,34 @@ type SessionInfo struct {
 	Preview  string    `json:"preview"` // 首条 user 消息截断预览
 }
 
+// 会话存储的文件命名与目录约定（全仓唯一实现，宿主与各插件一律引用，
+// 不得自行拼字符串——多方实现会在分隔符/后缀/校验上产生分歧）。
+const (
+	// DirName 是会话数据目录名（相对 DSC ExecDir）。
+	DirName = "sessions"
+	// FileSuffix 是会话事件日志后缀：<id>.jsonl。
+	FileSuffix = ".jsonl"
+	// ACPSuffix 是压缩状态后缀：<id>.acp.json（与会话日志同目录，靠后缀区分）。
+	ACPSuffix = ".acp.json"
+)
+
+// Dir 返回会话数据目录（ExecDir 由宿主经 DSC 环境注入，各进程一致）。
+func Dir(execDir string) string {
+	return posixJoin(execDir, DirName)
+}
+
+// ValidID 校验会话 id 是否为安全的单组件文件名：非空、不含路径分隔符、
+// 不含路径穿越段（..）或绝对路径特征，避免 <id>.<suffix> 逃逸会话目录。
+func ValidID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	if strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") {
+		return false
+	}
+	return true
+}
+
 // Store 按目录管理多会话。
 type Store struct {
 	dir    string
@@ -145,11 +173,11 @@ func NewStore(dir string) (*Store, error) {
 		return nil, fmt.Errorf("session store: read dir: %w", err)
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), FileSuffix) {
 			continue
 		}
 		var n int
-		if _, err := fmt.Sscanf(e.Name(), "session-%d.jsonl", &n); err == nil && n >= s.nextID {
+		if _, err := fmt.Sscanf(e.Name(), "session-%d"+FileSuffix, &n); err == nil && n >= s.nextID {
 			s.nextID = n + 1
 		}
 	}
@@ -158,22 +186,10 @@ func NewStore(dir string) (*Store, error) {
 
 // path 返回指定会话的文件路径；id 须为安全的单组件文件名，拒绝路径穿越。
 func (s *Store) path(id string) (string, error) {
-	if !safeSessionID(id) {
+	if !ValidID(id) {
 		return "", fmt.Errorf("session store: invalid session id %q", id)
 	}
-	return posixJoin(s.dir, id+".jsonl"), nil
-}
-
-// safeSessionID 校验会话 id 是否为安全的单组件文件名：非空、不含路径分隔符、
-// 不含路径穿越段（..）或绝对路径特征，避免 <id>.jsonl 逃逸 sessions 目录。
-func safeSessionID(id string) bool {
-	if id == "" || id == "." || id == ".." {
-		return false
-	}
-	if strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") {
-		return false
-	}
-	return true
+	return posixJoin(s.dir, id+FileSuffix), nil
 }
 
 // Create 创建新会话，id 为 session-<n>（按内存计数器递增，避免未落盘会话重复编号）。
@@ -247,14 +263,14 @@ func (s *Store) List() ([]SessionInfo, error) {
 	}
 	var infos []SessionInfo
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), FileSuffix) {
 			continue
 		}
 		info, err := scanInfo(posixJoin(s.dir, e.Name()))
 		if err != nil {
 			continue // 单会话损坏不影响列表
 		}
-		info.ID = strings.TrimSuffix(e.Name(), ".jsonl")
+		info.ID = strings.TrimSuffix(e.Name(), FileSuffix)
 		infos = append(infos, info)
 	}
 	sort.Slice(infos, func(i, j int) bool {

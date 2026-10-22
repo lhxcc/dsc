@@ -103,15 +103,9 @@ func defaultIDProvider(idx int, _ *proto.Message) string {
 	return fmt.Sprintf("msg-%d", idx)
 }
 
-// StateFileSuffix 是 acp state 文件的强制后缀。
-//
-// state 与宿主会话存档放在同一目录（ExecDir/sessions），靠后缀区分：宿主会话是
-// <id>.jsonl，acp state 是 <id>.acp.json。好处：一个会话的落盘数据集中在一处，
-// 备份/排查不必跨目录；session.Store 只认 *.jsonl，state 不会被误当作会话。
-const StateFileSuffix = ".acp.json"
-
 // StateStore 负责 acp state 的持久化（JSON 文件）。
-// 每个 session 一个 state 文件，路径为 dir/<sessionID>.acp.json。
+// 每个 session 一个 state 文件，路径为 dir/<sessionID>.acp.json——后缀取自 SDK 的
+// ACPStateSuffix（与宿主同一份定义），目录由调用方传 dsc.SessionDir()。
 type StateStore struct {
 	mu    sync.Mutex
 	dir   string
@@ -133,7 +127,10 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 	if st, ok := s.cache[sessionID]; ok {
 		return st, nil
 	}
-	path := s.path(sessionID)
+	path, err := s.path(sessionID)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -203,8 +200,12 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp acp state: %w", err)
 	}
+	dst, err := s.path(sessionID)
+	if err != nil {
+		return err
+	}
 	// os.Rename 在 Windows 上等价于 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，可覆盖目标
-	if err := os.Rename(tmpName, s.path(sessionID)); err != nil {
+	if err := os.Rename(tmpName, dst); err != nil {
 		return fmt.Errorf("commit acp state: %w", err)
 	}
 	committed = true
@@ -212,29 +213,11 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 }
 
 // path 返回 session state 文件路径。
-func (s *StateStore) path(sessionID string) string {
-	// 防止路径遍历：sessionID 仅允许字母数字与 -_
-	safe := sanitizeSessionID(sessionID)
-	return dsc.PJoin(s.dir, safe+StateFileSuffix)
-}
-
-// sanitizeSessionID 把 sessionID 限制为安全字符（防止路径遍历）。
-// 会话键里的 '+'、'='、'~' 必须保留：它们来自 session.SessionKeyForProject 的
-// 编码（名字里的 '+' 原样保留，盘符冒号编码为 '='，转义引导符为 '~'）；替换掉
-// 会让不同项目的 state 文件名撞在一起。
-func sanitizeSessionID(id string) string {
-	out := make([]byte, 0, len(id))
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '+' || c == '=' || c == '~' {
-			out = append(out, c)
-		} else {
-			out = append(out, '_')
-		}
+// 会话 id 只做校验、不做字符替换：替换会把两个不同会话折成同一个文件名（例如
+// 空格与下划线），使 state 串到别的会话上。合法性判断复用 SDK 的唯一实现。
+func (s *StateStore) path(sessionID string) (string, error) {
+	if !dsc.ValidSessionID(sessionID) {
+		return "", fmt.Errorf("invalid session id %q", sessionID)
 	}
-	if len(out) == 0 {
-		return "default"
-	}
-	return string(out)
+	return dsc.PJoin(s.dir, sessionID+dsc.ACPStateSuffix), nil
 }

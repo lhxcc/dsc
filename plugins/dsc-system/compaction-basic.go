@@ -47,7 +47,6 @@ import (
 	"dsc/core"
 	"dsc/core/llmclient"
 	"dsc/proto"
-	"dsc/session"
 )
 
 // llmChat 聚合 LLM 的最小接口（*llmclient.Client 满足；单测以 fake 注入）。
@@ -496,11 +495,11 @@ func (s *compactionBasicServer) stateFor(sessID string) *compactionState {
 }
 
 // sessionKey 会话状态键：优先事件透传的 session_id（宿主 ChatRequest.session_id），
-// 缺省按工作区派生项目级键（对齐宿主 session 存储的 SessionKeyForProject——
+// 缺省按工作区派生项目级键（SDK 的 ProjectSessionKey，与宿主 session 存储同一实现——
 // 同一项目同名、不同项目隔离）。
 func (s *compactionBasicServer) sessionKey(sessID string) string {
 	if sessID == "" {
-		return session.SessionKeyForProject(dsc.WorkspaceRoot())
+		return dsc.ProjectSessionKey()
 	}
 	return sessID
 }

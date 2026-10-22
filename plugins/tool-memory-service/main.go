@@ -58,13 +58,11 @@ type resultItem struct {
 	Score float64 `json:"score"`
 }
 
-// dbPath 返回记忆库文件路径：位于 DSC 程序可执行目录下的 memory 目录中
+// dbPath 返回记忆库文件路径：目录经 SDK 统一解析（DSC_MEMORY_DIR，
+// 缺省 <ExecDir>/memory）。不按进程 cwd 定位——cwd 会随启动方式漂移，
+// 同一份记忆会被写到不同目录。
 func dbPath() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "."
-	}
-	return dsc.PJoin(cwd, "memory", "memory.db")
+	return dsc.PJoin(dsc.MemoryDir(), "memory.db")
 }
 
 // initDB 初始化数据库：常规表自动迁移 + FTS5 虚拟表与同步触发器。

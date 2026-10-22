@@ -29,7 +29,6 @@ import (
 	dsc "dsc-sdk"
 	"dsc/core"
 	"dsc/proto"
-	"dsc/session"
 
 	bcacp "dsc-billion-context/acp"
 	bcadapter "dsc-billion-context/adapter"
@@ -57,11 +56,9 @@ type BillionContext struct {
 }
 
 func main() {
-	// 从环境变量读取配置
-	execDir := dsc.ExecDir()
-	// state 与会话存档同目录（ExecDir/sessions），靠 <id>.acp.json 后缀区分，
-	// 不再单独开 billion-context/ 目录。
-	store := bcadapter.NewStateStore(dsc.PJoin(execDir, "sessions"))
+	// state 与会话存档同目录，靠 <id>.acp.json 后缀区分，不再单独开 billion-context/。
+	// 目录一律经 SDK 解析（DSC_SESSION_DIR 优先），与宿主 Store 同一来源。
+	store := bcadapter.NewStateStore(dsc.SessionDir())
 
 	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖——宿主按配置 context_window
 	// 或端点探测值把该键注入所有插件，故云端 1M 窗口下应为 1048576；实际值在首个
@@ -288,8 +285,8 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// 首个 pre-step 打印实际生效的窗口（此时 gRPC 已握手，stderr 会被宿主转发到日志），
 	// 用于核对云端 1M 窗口是否真的取代了 128K 默认值。
 	bc.logWindowOnce.Do(func() {
-		fmt.Fprintf(os.Stderr, "[billion-context] context window=%d state=sessions/%s\n",
-			bc.config.ModelContextLimit, bcadapter.StateFileSuffix)
+		fmt.Fprintf(os.Stderr, "[billion-context] context window=%d state=%s/<id>%s\n",
+			bc.config.ModelContextLimit, dsc.SessionDir(), dsc.ACPStateSuffix)
 	})
 	var ev core.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
@@ -515,9 +512,9 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 }
 
 // getSessionID 获取当前会话 ID。
-// 优先级：环境变量 DSC_SESSION_ID > 项目级键（工作区路径派生，对齐宿主 session
-// 存储的 SessionKeyForProject——同一项目同名、不同项目隔离；替代硬编码 default，
-// 避免跨项目压缩状态被混入）。
+// 优先级：pre-step 事件透传的宿主真实会话 > 项目级键（SDK 的 ProjectSessionKey，
+// 与宿主 session 存储同一实现——同一项目同名、不同项目隔离）。
+// 不用环境变量承载会话 id：env 在子进程 spawn 时快照，中途切换会话不会同步。
 func (bc *BillionContext) getSessionID() string {
 	bc.mu.Lock()
 	cur := bc.sessionID
@@ -525,10 +522,7 @@ func (bc *BillionContext) getSessionID() string {
 	if cur != "" {
 		return cur
 	}
-	if id := os.Getenv("DSC_SESSION_ID"); id != "" {
-		return id
-	}
-	return session.SessionKeyForProject(dsc.WorkspaceRoot())
+	return dsc.ProjectSessionKey()
 }
 
 // setSessionID 记录当前会话 ID（pre-step 事件携带的宿主真实会话）。
