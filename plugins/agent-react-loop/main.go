@@ -1375,30 +1375,60 @@ func (a *ReactLoopAgent) compactHistory(ctx context.Context, llmClient proto.LLM
 // exit_plan_mode 评审等场景经 ensureUserQuestionsClient 惰性连接并调用。
 func (a *ReactLoopAgent) SetUserQuestionsService(ctx context.Context, serviceID uint32) error {
 	a.uqMu.Lock()
-	defer a.uqMu.Unlock()
 	a.uqServiceID = serviceID
-	fmt.Printf("[Agent Loop] user-questions service set (id=%d)\n", serviceID)
+	// 热重载会下发新 id（新 broker 上的新服务）：先释放旧连接，避免复用失效客户端。
+	if a.uqConn != nil {
+		_ = a.uqConn.Close()
+	}
+	a.uqConn = nil
+	a.uqClient = nil
+	a.uqMu.Unlock()
+
+	if serviceID == 0 {
+		return nil
+	}
+	// 立即建立连接（与 RegisterServices 同规）：go-plugin broker 的 ConnInfo 是一次性
+	// 通告、约 5 秒后过期；此前这里是惰性连接（模型首次提问才 Dial），实际使用时
+	// 早已超出窗口，Dial 必然失败并回落到「no user-questions channel is available」。
+	if _, err := a.dialUserQuestions(); err != nil {
+		fmt.Printf("[Agent Loop] user-questions eager connect failed: %v\n", err)
+		return err
+	}
+	fmt.Printf("[Agent Loop] user-questions service connected (id=%d)\n", serviceID)
 	return nil
 }
 
-// ensureUserQuestionsClient 惰性建立 UserQuestionsService 连接（返回 nil 表示无通道）。
+// ensureUserQuestionsClient 取 UserQuestionsService 客户端（现有连接优先，否则重试连接；
+// 返回 nil 表示无通道，调用方给出可行动提示）。
 func (a *ReactLoopAgent) ensureUserQuestionsClient() proto.UserQuestionsServiceClient {
+	c, err := a.dialUserQuestions()
+	if err != nil {
+		fmt.Printf("[Agent Loop] user-questions unavailable: %v\n", err)
+		return nil
+	}
+	return c
+}
+
+// dialUserQuestions 建立/复用 UserQuestionsService 连接。
+func (a *ReactLoopAgent) dialUserQuestions() (proto.UserQuestionsServiceClient, error) {
 	a.uqMu.Lock()
 	defer a.uqMu.Unlock()
 	if a.uqServiceID == 0 {
-		return nil
+		return nil, fmt.Errorf("user-questions service not injected")
 	}
 	if a.uqClient != nil {
-		return a.uqClient
+		return a.uqClient, nil
+	}
+	if a.broker == nil {
+		return nil, fmt.Errorf("agent broker not available")
 	}
 	conn, err := a.broker.Dial(a.uqServiceID)
 	if err != nil {
-		fmt.Printf("[Agent Loop] dial user-questions service failed: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("dial user-questions service: %w", err)
 	}
 	a.uqConn = conn
 	a.uqClient = proto.NewUserQuestionsServiceClient(conn)
-	return a.uqClient
+	return a.uqClient, nil
 }
 
 // SwitchSession 切换当前会话：从 store 按 id 加载并接管（事件溯源日志）。

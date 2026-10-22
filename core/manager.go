@@ -849,9 +849,14 @@ func (m *Manager) hotReloadAgent(name, newBinaryPath string, execDir string, han
 		m.setReloadFailed(name, err)
 		return fmt.Errorf("failed to register service IDs on agent: %w", err)
 	}
-	// 重新注入用户评审通道 serviceID（挂在新 agent 的 broker 上）
+	// 重新注入用户评审通道 serviceID（挂在新 agent 的 broker 上）；agent 会在注入时
+	// 立即 Dial（broker ConnInfo 有 5 秒窗口），失败必须留痕，否则表现为「提问无弹层」。
 	if newUQ != 0 {
-		_, _ = agentClient.SetUserQuestionsService(context.Background(), &proto.SetUserQuestionsServiceRequest{ServiceId: newUQ})
+		if resp, err := agentClient.SetUserQuestionsService(context.Background(), &proto.SetUserQuestionsServiceRequest{ServiceId: newUQ}); err != nil {
+			m.logger.Warn("inject user-questions service failed after reload", "agent", name, "error", err)
+		} else if !resp.GetSuccess() {
+			m.logger.Warn("inject user-questions service rejected after reload", "agent", name, "message", resp.GetMessage())
+		}
 	}
 
 	raw, err := rpcClient.Dispense("agent")
@@ -1768,7 +1773,11 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 	if uqID != 0 {
 		m.userQuestionsServiceID = uqID
 		if agent, ok := m.agents[agentEntry.Name]; ok {
-			_ = agent.SetUserQuestionsService(context.Background(), uqID)
+			// agent 侧注入后立即 Dial（broker ConnInfo 约 5 秒窗口）；失败记录而非静默，
+			// 否则用户只会在模型提问时看到「no user-questions channel」。
+			if err := agent.SetUserQuestionsService(context.Background(), uqID); err != nil {
+				m.logger.Warn("inject user-questions service failed", "agent", agentEntry.Name, "error", err)
+			}
 		}
 	}
 	// 插件通知 / 用户评审通道：provider 就绪后统一挂载（避免提前发 ConnInfo 超时）
