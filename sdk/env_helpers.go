@@ -36,6 +36,22 @@ func EnvWithFallback(primary, legacy, def string) string {
 	return def
 }
 
+// EnvLookupSet 返回第一个「已设置且非空白」的 env 值；都未设置返回 ("", false)。
+// 与 EnvWithFallback 的差别：调用方能区分「未设置」与「显式给了值（含 0）」，
+// 后者对输出上限这类语义很关键——显式 0 表示不携带，不能被兜底默认值覆盖。
+func EnvLookupSet(keys ...string) (string, bool) {
+	for _, k := range keys {
+		v, ok := os.LookupEnv(k)
+		if !ok {
+			continue
+		}
+		if v = strings.TrimSpace(v); v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // EnvInt 读取 int env；缺席/非法返回 def。
 func EnvInt(key string, def int) int {
 	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))

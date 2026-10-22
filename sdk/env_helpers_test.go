@@ -190,6 +190,44 @@ func TestLoadLLMConfig(t *testing.T) {
 	}
 }
 
+// TestLoadLLMConfigMaxOutputTokensPrefix 验证单轮输出上限的 DSC_ 前缀优先/旧名回退：
+// 此前只读旧名 <PROVIDER>_MAX_OUTPUT_TOKENS，写 DSC_ 名不生效（与文档自相矛盾）。
+func TestLoadLLMConfigMaxOutputTokensPrefix(t *testing.T) {
+	t.Setenv("DSC_OPENAI_MAX_OUTPUT_TOKENS", "65536")
+	t.Setenv("OPENAI_MAX_OUTPUT_TOKENS", "8192")
+	t.Setenv("DSC_MAX_OUTPUT_TOKENS", "131072")
+
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 65536 {
+		t.Fatalf("DSC_ 前缀应优先，got %d", cfg.MaxOutputTokens)
+	}
+
+	// 无 DSC_ 前缀 → 回退旧名。
+	os.Unsetenv("DSC_OPENAI_MAX_OUTPUT_TOKENS")
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 8192 {
+		t.Fatalf("应回退旧名，got %d", cfg.MaxOutputTokens)
+	}
+
+	// 两者都缺席 → DSC_MAX_OUTPUT_TOKENS 兜底。
+	os.Unsetenv("OPENAI_MAX_OUTPUT_TOKENS")
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 131072 {
+		t.Fatalf("应回退宿主通用 DSC_MAX_OUTPUT_TOKENS，got %d", cfg.MaxOutputTokens)
+	}
+
+	// 显式 0 = 不携带：不能被 DSC_MAX_OUTPUT_TOKENS 兜底覆盖（否则用户无法关闭
+	// 宿主一律注入的默认上限，与文档承诺不符）。
+	t.Setenv("DSC_OPENAI_MAX_OUTPUT_TOKENS", "0")
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 0 {
+		t.Fatalf("显式 0 应表示不携带，got %d", cfg.MaxOutputTokens)
+	}
+
+	// anthropic 同规则。
+	t.Setenv("DSC_ANTHROPIC_MAX_OUTPUT_TOKENS", "65536")
+	t.Setenv("ANTHROPIC_MAX_OUTPUT_TOKENS", "8192")
+	if cfg := LoadLLMConfig("anthropic"); cfg.MaxOutputTokens != 65536 {
+		t.Fatalf("anthropic 的 DSC_ 前缀应优先，got %d", cfg.MaxOutputTokens)
+	}
+}
+
 // TestLoadLLMConfigDSCPrefixGroup 验证 anthropic/openai 的三个键（API_KEY/BASE_URL/
 // MODEL）作为一个整体决定前缀：任一 DSC_ 前缀键存在即整组采用 DSC_ 前缀，禁止与
 // 旧名混用。

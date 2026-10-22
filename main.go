@@ -755,7 +755,7 @@ func main() {
 	// 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带窗口值在
 	// LLAMACPP 侧被服务端上下文自然钳制（生成至 EOS 或窗口满）。云端若模型输出上限低于
 	// 注入值而被 400 拒绝，属用户可显式调整的范围：下调 context_window，或设插件 env
-	// （ANTHROPIC_/OPENAI_MAX_OUTPUT_TOKENS=0）恢复不携带——可调整性优先于差异化默认。
+	// （DSC_ANTHROPIC_/DSC_OPENAI_MAX_OUTPUT_TOKENS=0，旧名兼容）恢复不携带——可调整性优先于差异化默认。
 	injectMaxOutputTokens(merged, contextWindow)
 	logger.Info("max output tokens defaulted to effective context window", "max_tokens", contextWindow, "source", windowSource)
 

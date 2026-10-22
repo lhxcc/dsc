@@ -116,8 +116,8 @@ DSC 與 DSH 同源於「一切皆插件」的設計哲學，兩者在概念層�
 
 ### LLM 插件
 
-- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）取探測窗口值，探測不到（雲端）取配置 `context_window` 值（不正確可隨時再設），不分本地/雲端、行為一致；`OPENAI_MAX_OUTPUT_TOKENS` 顯式配置優先（>0 隨請求攜帶，顯式 0=不攜帶）；壓縮等請求級參數優先於以上兩者）
-- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`，與 anthropic 口同端口）取探測窗口值，探測不到（雲端）取配置 `context_window` 值（不正確可隨時再設），不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，顯式攜帶窗口值在 llama.cpp 側受上下文自然鉗制、無害，並對抗其對缺席值自填的保守默認（laamaafung 為 4096）；`ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
+- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）取探測窗口值，探測不到（雲端）取配置 `context_window` 值（不正確可隨時再設），不分本地/雲端、行為一致；`DSC_OPENAI_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `OPENAI_MAX_OUTPUT_TOKENS` 仍兼容；>0 隨請求攜帶，顯式 0=不攜帶）；壓縮等請求級參數優先於以上兩者）
+- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`，與 anthropic 口同端口）取探測窗口值，探測不到（雲端）取配置 `context_window` 值（不正確可隨時再設），不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，顯式攜帶窗口值在 llama.cpp 側受上下文自然鉗制、無害，並對抗其對缺席值自填的保守默認（laamaafung 為 4096）；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
 - `llm-ollama`（Ollama 兼容端點：本地 Ollama server。與 `llm-openai`/`llm-anthropic` 同為 LLM provider 插件，經 Ollama Go SDK 直連 `/api/chat`；支持 reasoning/thinking 模型（默認開啓，`DSC_OLLAMA_THINKING=0` 可關閉，舊名 `OLLAMA_THINKING` 仍兼容），從響應 `Message.Thinking` 提取思維鏈幀渲染到 TUI；@文本附件引用（`dsc-txt://`）解析為文本串前綴拼入 user 消息 Content）
 
 #### 統一推理強度（DSC_REASONING_EFFORT）

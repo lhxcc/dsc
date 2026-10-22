@@ -2,15 +2,16 @@ package dsc
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
 // LLMConfig 是 LLM 插件的通用配置面，把 apiKey / baseURL / model / maxTokens /
 // visionEnabled 五个散落各 LLM 插件 main() 的 env 解析合一，并额外承载推理强度
 // （reasoning effort）配置。provider 参数取 "anthropic" / "openai" / "ollama" 等，
-// 对应 <PROVIDER>_API_KEY / <PROVIDER>_BASE_URL / <PROVIDER>_MODEL /
-// <PROVIDER>_MAX_OUTPUT_TOKENS env；DSC_MAX_OUTPUT_TOKENS 与 DSC_NO_VISION 是跨
-// provider 的宿主通用 env。
+// 对应 DSC_<PROVIDER>_API_KEY / _BASE_URL / _MODEL / _MAX_OUTPUT_TOKENS（前三个
+// 整组决定前缀，旧名 <PROVIDER>_* 回退）；DSC_MAX_OUTPUT_TOKENS 与 DSC_NO_VISION
+// 是跨 provider 的宿主通用 env。
 //
 // 推理强度采用 DSC 统一命名 DSC_REASONING_EFFORT，取值对齐 OpenAI 官方档位（统一 6 档：
 // none / minimal / low / medium / high / max；xhigh 等文档外档位仍可用
@@ -20,9 +21,9 @@ import (
 // openai 路径→ reasoning_effort 字面量（OpenAIReasoningEffort，6 档 1:1 透传，亦可被
 // DSC_OPENAI_REASONING_EFFORT 直接覆盖为端点支持的字面量）。
 //
-// 解析顺序（先显式 provider env，后宿主通用 DSC_ env）对齐既有 llm-anthropic
-// 与 llm-openai 的实现（maxTokensFromEnv 先读 ANTHROPIC_MAX_OUTPUT_TOKENS，
-// 回退 DSC_MAX_OUTPUT_TOKENS），消除两份复制粘贴。
+// 解析顺序（先 provider 专属 env，后宿主通用 DSC_ env）对齐既有 llm-anthropic
+// 与 llm-openai 的实现（先读 DSC_<P>_MAX_OUTPUT_TOKENS / 旧名 <P>_MAX_OUTPUT_TOKENS，
+// 再回退 DSC_MAX_OUTPUT_TOKENS），消除两份复制粘贴。
 type LLMConfig struct {
 	// APIKey 来自 <PROVIDER>_API_KEY；缺席返回空串（由调用方决定是否兜底）。
 	APIKey string
@@ -30,7 +31,8 @@ type LLMConfig struct {
 	BaseURL string
 	// Model 来自 <PROVIDER>_MODEL；缺席返回空串。
 	Model string
-	// MaxOutputTokens 来自 <PROVIDER>_MAX_OUTPUT_TOKENS，回退 DSC_MAX_OUTPUT_TOKENS；
+	// MaxOutputTokens 来自 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS（旧名
+	// <PROVIDER>_MAX_OUTPUT_TOKENS 回退），再回退 DSC_MAX_OUTPUT_TOKENS；
 	// 均缺席或非法返回 0（请求不携带 max_tokens，由模型自然结束）。
 	MaxOutputTokens int64
 	// VisionEnabled 按 DSC_NO_VISION 强制关闭；否则返回 true（由调用方按模型
@@ -85,15 +87,26 @@ func LoadLLMConfig(provider string) LLMConfig {
 		}
 		return prefix + suffix
 	}
+	// 单轮输出上限：DSC_<P>_MAX_OUTPUT_TOKENS 优先、旧名 <P>_MAX_OUTPUT_TOKENS 回退。
+	// 「显式 0」表示本插件不携带 max_tokens，此时不得再用 DSC_MAX_OUTPUT_TOKENS 兜底
+	// （否则用户无法关闭宿主一律注入的默认上限）。
+	maxOut, maxOutSet := int64(0), false
+	if v, ok := EnvLookupSet("DSC_"+prefix+"MAX_OUTPUT_TOKENS", prefix+"MAX_OUTPUT_TOKENS"); ok {
+		maxOutSet = true
+		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil && n >= 0 {
+			maxOut = n
+		}
+	}
 	cfg := LLMConfig{
-		APIKey:          strings.TrimSpace(os.Getenv(resolved("API_KEY"))),
-		BaseURL:         strings.TrimSpace(os.Getenv(resolved("BASE_URL"))),
-		Model:           strings.TrimSpace(os.Getenv(resolved("MODEL"))),
-		MaxOutputTokens: EnvPositiveInt64(prefix + "MAX_OUTPUT_TOKENS"),
+		APIKey:  strings.TrimSpace(os.Getenv(resolved("API_KEY"))),
+		BaseURL: strings.TrimSpace(os.Getenv(resolved("BASE_URL"))),
+		Model:   strings.TrimSpace(os.Getenv(resolved("MODEL"))),
+		// MaxOutputTokens 见上方 maxOut 说明。
+		MaxOutputTokens: maxOut,
 		VisionEnabled:   !envNoVision(),
 	}
-	// DSC_MAX_OUTPUT_TOKENS 兜底（provider 显式优先）
-	if cfg.MaxOutputTokens == 0 {
+	// DSC_MAX_OUTPUT_TOKENS 兜底（provider 显式配置优先）
+	if !maxOutSet {
 		cfg.MaxOutputTokens = EnvPositiveInt64("DSC_MAX_OUTPUT_TOKENS")
 	}
 	// 推理强度：DSC 统一档位（DSC_REASONING_EFFORT）+ 各接口具体覆盖。
