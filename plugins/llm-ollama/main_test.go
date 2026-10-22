@@ -5,6 +5,37 @@ import (
 	"testing"
 )
 
+// TestOllamaThinkingEnabled 守护思考开关的前缀语义：DSC_OLLAMA_THINKING 优先，
+// 旧名 OLLAMA_THINKING 回退；0/false/off/no 关闭，未设置默认开启。
+func TestOllamaThinkingEnabled(t *testing.T) {
+	os.Unsetenv("DSC_OLLAMA_THINKING")
+	os.Unsetenv("OLLAMA_THINKING")
+	if !ollamaThinkingEnabled() {
+		t.Fatal("未设置时应默认开启思考")
+	}
+
+	for _, off := range []string{"0", "false", "OFF", "no"} {
+		t.Setenv("DSC_OLLAMA_THINKING", off)
+		if ollamaThinkingEnabled() {
+			t.Fatalf("%q 应关闭思考", off)
+		}
+	}
+
+	// DSC_ 前缀优先。
+	t.Setenv("DSC_OLLAMA_THINKING", "1")
+	t.Setenv("OLLAMA_THINKING", "0")
+	if !ollamaThinkingEnabled() {
+		t.Fatal("DSC_OLLAMA_THINKING 应优先于旧名")
+	}
+
+	// 无 DSC_ 时回退旧名。
+	os.Unsetenv("DSC_OLLAMA_THINKING")
+	t.Setenv("OLLAMA_THINKING", "0")
+	if ollamaThinkingEnabled() {
+		t.Fatal("无 DSC_ 时应回退旧名 OLLAMA_THINKING=0 关闭")
+	}
+}
+
 func TestResolveOllamaConfigDSCPrefixGroup(t *testing.T) {
 	// 保存并清理相关环境变量，避免污染其它用例
 	keys := []string{"DSC_OLLAMA_HOST", "DSC_OLLAMA_MODEL", "OLLAMA_HOST", "OLLAMA_MODEL", "OLLAMA_THINKING"}

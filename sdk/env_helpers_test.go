@@ -5,6 +5,37 @@ import (
 	"testing"
 )
 
+// TestEnvWithFallback DSC_ 前缀优先、旧名回退、空白视同未设置。
+func TestEnvWithFallback(t *testing.T) {
+	t.Setenv("DSC_TEST_FB", "dsc-value")
+	t.Setenv("TEST_FB", "legacy-value")
+	if got := EnvWithFallback("DSC_TEST_FB", "TEST_FB", "def"); got != "dsc-value" {
+		t.Fatalf("DSC_ 应优先: %q", got)
+	}
+
+	os.Unsetenv("DSC_TEST_FB")
+	if got := EnvWithFallback("DSC_TEST_FB", "TEST_FB", "def"); got != "legacy-value" {
+		t.Fatalf("应回退旧名: %q", got)
+	}
+
+	os.Unsetenv("TEST_FB")
+	if got := EnvWithFallback("DSC_TEST_FB", "TEST_FB", "def"); got != "def" {
+		t.Fatalf("都缺席应返回默认值: %q", got)
+	}
+
+	// 纯空白视同未设置（与其它 Env helper 一致）。
+	t.Setenv("DSC_TEST_FB", "   ")
+	if got := EnvWithFallback("DSC_TEST_FB", "TEST_FB", "def"); got != "def" {
+		t.Fatalf("空白应视同未设置: %q", got)
+	}
+
+	// 无旧名可用时只看主名。
+	t.Setenv("DSC_TEST_FB", "only-dsc")
+	if got := EnvWithFallback("DSC_TEST_FB", "", "def"); got != "only-dsc" {
+		t.Fatalf("无旧名时读主名: %q", got)
+	}
+}
+
 func TestEnvStr(t *testing.T) {
 	t.Setenv("DSC_TEST_STR", "  hello  ")
 	if got := EnvStr("DSC_TEST_STR", "def"); got != "hello" {

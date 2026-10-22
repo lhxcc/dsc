@@ -654,6 +654,19 @@ func (p *AnthropicProvider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// thinkingEnabled 解析扩展思考开关：DSC_ANTHROPIC_THINKING 优先，旧名
+// ANTHROPIC_THINKING 回退（与 DSC_ 前缀约定一致，旧名保留兼容）。0/false/off/no
+// 关闭，其余（含未设置）开启。DSC_REASONING_EFFORT=none 是并列的关闭入口，
+// 由 main() 单独处理。
+func thinkingEnabled() bool {
+	switch strings.ToLower(dsc.EnvWithFallback("DSC_ANTHROPIC_THINKING", "ANTHROPIC_THINKING", "1")) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
 func main() {
 	cfg := dsc.LoadLLMConfig("anthropic")
 	apiKey := cfg.APIKey
@@ -680,13 +693,13 @@ func main() {
 
 	// 扩展思考默认开启：DeepSeek 的 anthropic 接口支持 thinking 参数并返回 thinking 块，
 	// 其内容经 chat 流式增量转发为 reasoning 帧渲染到 TUI。
-	// ANTHROPIC_THINKING=0 可显式关闭（用于不返回 thinking 的普通模型）；
+	// DSC_ANTHROPIC_THINKING=0 可显式关闭（旧名 ANTHROPIC_THINKING 仍兼容）；
 	// DSC_REASONING_EFFORT=none 同样关闭思考；思考 token 预算由 DSC 统一推理强度控制：
 	// DSC_ANTHROPIC_THINKING_BUDGET 直接指定，否则 DSC_REASONING_EFFORT
 	// （none/minimal/low/medium/high/max）按 DSC 标准档位映射
 	// （0/2048/4096/8192/16384/32768），均未设时默认 4096（DeepSeek 忽略 budget 值，
 	// 故强度改由下方 output_config.effort 表达，二者同时下发互不冲突）。
-	thinking := os.Getenv("ANTHROPIC_THINKING") != "0"
+	thinking := thinkingEnabled()
 	// DSC_REASONING_EFFORT=none 显式关闭扩展思考（对应 OpenAI 路径 reasoning_effort=none）
 	if cfg.ReasoningEffort == "none" {
 		thinking = false

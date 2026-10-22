@@ -19,6 +19,23 @@ func EnvStr(key, def string) string {
 	return def
 }
 
+// EnvWithFallback 读取「DSC_ 前缀优先、旧名回退」的字符串 env；两者都缺席返回 def。
+//
+// 约定：DSC_<P>_* 是正式名（避免与终端同名变量冲突），无前缀旧名保留兼容。
+// 与 LoadLLMConfig 的 API_KEY/BASE_URL/MODEL 三键整组策略不同，开关类变量各自
+// 独立判断——它们不构成一个组，也不存在新旧混搭互相矛盾的问题。
+func EnvWithFallback(primary, legacy, def string) string {
+	if v := strings.TrimSpace(os.Getenv(primary)); v != "" {
+		return v
+	}
+	if legacy != "" {
+		if v := strings.TrimSpace(os.Getenv(legacy)); v != "" {
+			return v
+		}
+	}
+	return def
+}
+
 // EnvInt 读取 int env；缺席/非法返回 def。
 func EnvInt(key string, def int) int {
 	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))

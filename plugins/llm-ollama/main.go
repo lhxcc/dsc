@@ -326,12 +326,25 @@ type toolCallDeltaAccumulatorOllama struct {
 	ArgumentsStr string
 }
 
+// ollamaThinkingEnabled 解析思考开关：DSC_OLLAMA_THINKING 优先，旧名
+// OLLAMA_THINKING 回退（与 DSC_ 前缀约定一致，旧名保留兼容）。0/false/off/no
+// 关闭，其余（含未设置）开启。
+func ollamaThinkingEnabled() bool {
+	switch strings.ToLower(dsc.EnvWithFallback("DSC_OLLAMA_THINKING", "OLLAMA_THINKING", "1")) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
 func main() {
 	model, hostStr := resolveOllamaConfig()
 	hostURL, _ := url.Parse(hostStr)
 
-	// 思考默认开启（与 llm-anthropic 的 ANTHROPIC_THINKING 一致）；OLLAMA_THINKING=0 关闭
-	thinking := os.Getenv("OLLAMA_THINKING") != "0"
+	// 思考默认开启（与 llm-anthropic 的开关语义一致）：DSC_OLLAMA_THINKING 优先，
+	// 旧名 OLLAMA_THINKING 回退；0/false/off/no 关闭。
+	thinking := ollamaThinkingEnabled()
 
 	provider := &OllamaProvider{
 		client:   api.NewClient(hostURL, http.DefaultClient),
