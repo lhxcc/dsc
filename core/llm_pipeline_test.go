@@ -153,3 +153,22 @@ func TestLLMChatStreamNoRetryAfterFrames(t *testing.T) {
 		t.Fatalf("sent %d frames, want 1 (no retry after frames)", len(stream.sent))
 	}
 }
+
+// TestLLMRetryListenerStopsOnContextCancel 回归：退避等待必须感知请求 ctx 取消，
+// 调用方已放弃时立即返回，不再空等完整退避时长后才重试。
+func TestLLMRetryListenerStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	listener := LLMRetryListener(3, time.Second)
+
+	start := time.Now()
+	err := listener(EventContext{Context: ctx}, func(EventContext) error {
+		cancel() // 首次失败后立即取消请求
+		return errors.New("provider failed")
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Fatalf("retry sleep ignored cancellation (elapsed %v)", elapsed)
+	}
+}

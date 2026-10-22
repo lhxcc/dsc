@@ -149,6 +149,14 @@ func (m *Manager) depsSatisfiedLocked(deps []ResolvedDep) bool {
 // providerAvailableLocked 报告名为 name 的插件当前是否已加载并可用作依赖来源
 // （agent / llm / tool / policy / dsc 均计为可提供能力）。需调用方已持有 m.mu。
 func (m *Manager) providerAvailableLocked(name string) bool {
+	// 已失败/卸载中/已释放的插件不得再作为依赖来源（否则 PENDING 条目会被
+	// 错误提升、agent 会被注入一个已死的服务）。
+	if st, ok := m.states[name]; ok {
+		switch st.State {
+		case StateFailed, StateDisposed, StateUnloading:
+			return false
+		}
+	}
 	if _, ok := m.llmServiceIDs[name]; ok {
 		return true
 	}

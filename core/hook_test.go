@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dsc/proto"
+
 	"google.golang.org/grpc"
 )
 
@@ -32,6 +33,8 @@ type fakeHook struct {
 	events   chan *proto.OnEventRequest
 	// eventResult 作为 OnEvent 的 result_json 返回（pre-step 改写测试用）。
 	eventResult string
+	// eventErr 非 nil 时 OnEvent 返回该错误（模拟插件 veto）。
+	eventErr error
 }
 
 func (f *fakeHook) BeforeTool(_ context.Context, req *proto.BeforeToolRequest, _ ...grpc.CallOption) (*proto.BeforeToolResponse, error) {
@@ -49,6 +52,9 @@ func (f *fakeHook) AfterTool(_ context.Context, req *proto.AfterToolRequest, _ .
 }
 
 func (f *fakeHook) OnEvent(_ context.Context, req *proto.OnEventRequest, _ ...grpc.CallOption) (*proto.OnEventResponse, error) {
+	if f.eventErr != nil {
+		return nil, f.eventErr
+	}
 	if f.events != nil {
 		f.events <- req
 	}

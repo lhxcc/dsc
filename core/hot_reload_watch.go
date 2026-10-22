@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -19,7 +20,19 @@ type hotReloadWatcher struct {
 	done     chan struct{}
 	interval time.Duration
 	lastScan time.Time
+	// failures 记录「插件名|二进制路径」的连续失败次数与下次可重试时间：
+	// 坏版本不会每轮扫描都被反复拉起（指数退避，上限 5 分钟）。
+	failures map[string]*reloadBackoff
 }
+
+// reloadBackoff 单个升级候选（插件名 + 版本化二进制路径）的连续失败状态。
+type reloadBackoff struct {
+	fails int
+	next  time.Time
+}
+
+// hotReloadMaxBackoff 单次重试的最长等待时间。
+const hotReloadMaxBackoff = 5 * time.Minute
 
 // upgradeCandidate 收集到的待热重载目标（在未持锁时采集，再由外部调用 HotReload 加锁执行）。
 type upgradeCandidate struct {
@@ -39,6 +52,7 @@ func (m *Manager) StartHotReloadWatcher() error {
 		quit:     make(chan struct{}),
 		done:     make(chan struct{}),
 		interval: 5 * time.Second,
+		failures: make(map[string]*reloadBackoff),
 	}
 	var err error
 	w.watcher, err = fsnotify.NewWatcher()
@@ -111,18 +125,70 @@ func (w *hotReloadWatcher) throttled() bool {
 }
 
 // rescan 扫描全部已加载插件目录，收集版本更高的目标并逐个热重载。
+// 连续失败的候选按指数退避延后重试；成功或出现新版本时重置退避状态。
 func (w *hotReloadWatcher) rescan() {
 	if !w.throttled() {
 		return
 	}
 	for _, u := range w.collectUpgrades() {
-		w.m.logger.Info("hot-reload detected higher version binary", "name", u.name, "version", u.version, "path", u.path)
-		if err := w.m.HotReload(u.name, u.path); err != nil {
-			w.m.logger.Error("hot-reload failed", "name", u.name, "error", err)
+		if !w.shouldAttempt(u) {
 			continue
 		}
+		w.m.logger.Info("hot-reload detected higher version binary", "name", u.name, "version", u.version, "path", u.path)
+		if err := w.m.HotReload(u.name, u.path); err != nil {
+			backoff, attempts := w.recordFailure(u)
+			w.m.logger.Error("hot-reload failed; backing off",
+				"name", u.name, "version", u.version, "attempts", attempts,
+				"retry_in", backoff.String(), "error", err)
+			continue
+		}
+		w.clearFailures(u.name)
 		w.m.logger.Info("hot-reload applied", "name", u.name, "version", u.version)
 	}
+}
+
+// shouldAttempt 判断该候选当前是否允许尝试热重载（处于退避窗口内则跳过）。
+func (w *hotReloadWatcher) shouldAttempt(u upgradeCandidate) bool {
+	b := w.failures[reloadBackoffKey(u)]
+	return b == nil || !time.Now().Before(b.next)
+}
+
+// recordFailure 记录一次失败并返回本次退避时长与累计失败次数。
+// 退避从 interval 起按 2 倍递增，上限 hotReloadMaxBackoff。
+func (w *hotReloadWatcher) recordFailure(u upgradeCandidate) (time.Duration, int) {
+	if w.failures == nil {
+		w.failures = make(map[string]*reloadBackoff)
+	}
+	key := reloadBackoffKey(u)
+	b := w.failures[key]
+	if b == nil {
+		b = &reloadBackoff{}
+		w.failures[key] = b
+	}
+	b.fails++
+	backoff := hotReloadMaxBackoff
+	if b.fails <= 16 { // 防止移位溢出；5s<<16 已远超上限
+		if d := w.interval << (b.fails - 1); d < hotReloadMaxBackoff {
+			backoff = d
+		}
+	}
+	b.next = time.Now().Add(backoff)
+	return backoff, b.fails
+}
+
+// clearFailures 在插件热重载成功后清除该插件的全部退避记录（含旧版本路径）。
+func (w *hotReloadWatcher) clearFailures(name string) {
+	prefix := name + "|"
+	for k := range w.failures {
+		if strings.HasPrefix(k, prefix) {
+			delete(w.failures, k)
+		}
+	}
+}
+
+// reloadBackoffKey 升级候选的退避键：插件名 + 版本化二进制路径（新版本天然获得新键）。
+func reloadBackoffKey(u upgradeCandidate) string {
+	return u.name + "|" + u.path
 }
 
 // collectUpgrades 在持读锁快照下，收集所有「目录内最高版本 > 当前运行版本」的待升级候选。

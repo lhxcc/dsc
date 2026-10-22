@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,6 +155,27 @@ func TestLLMRouteOrderSkipsUnloaded(t *testing.T) {
 	}
 }
 
+// TestApplyPreStepHookVetoAbortsRequest 回归：waterfall 插件返回 error 必须真正
+// 阻断 LLM 请求（此前仅记 warn 后照常放行），且不得调用任何 provider。
+func TestApplyPreStepHookVetoAbortsRequest(t *testing.T) {
+	m := newRouterManager()
+	p := &mockLLMProvider{}
+	m.llms["p"] = p
+	m.llmOrder = []string{"p"}
+	m.agentLLMName = "p"
+	m.toolHookClients["v"] = &fakeHook{eventErr: errors.New("blocked by policy")}
+	m.toolHookOrder = []string{"v"}
+
+	srv := &llmAggregateServer{m: m}
+	_, err := srv.Chat(context.Background(), &proto.ChatRequest{})
+	if err == nil || !strings.Contains(err.Error(), "blocked by policy") {
+		t.Fatalf("veto error = %v", err)
+	}
+	if p.chatCalls != 0 {
+		t.Fatalf("provider must not be called after veto, calls = %d", p.chatCalls)
+	}
+}
+
 // TestApplyPreStepHookCarriesLastUsageTokens 回归「纯启发式低估导致压缩不触发」：
 // 宿主按会话记录最近一次成功请求的上报 prompt 用量，并在 agent/pre-step 事件透传
 // （last_usage_tokens）；压缩插件以该精确底数判定压力，而非仅靠字节启发式估算。
@@ -170,7 +193,10 @@ func TestApplyPreStepHookCarriesLastUsageTokens(t *testing.T) {
 		SessionId: "sess-x",
 		Messages:  []*proto.Message{{Role: "user", Content: "hi"}},
 	}
-	out := srv.applyPreStepHook(context.Background(), req)
+	out, err := srv.applyPreStepHook(context.Background(), req)
+	if err != nil {
+		t.Fatalf("pre-step: %v", err)
+	}
 	if out == nil || len(out.Messages) != 1 || out.Messages[0].Content != "hi" {
 		t.Fatalf("无改写插件时请求必须原样通过, got %+v", out)
 	}

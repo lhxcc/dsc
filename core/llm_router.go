@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dsc/proto"
+
 	plugin "github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 )
@@ -38,12 +39,16 @@ type llmAggregateServer struct {
 func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (*proto.ChatResponse, error) {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req = s.applyPreStepHook(ctx, req)
+		var preErr error
+		req, preErr = s.applyPreStepHook(ctx, req)
+		if preErr != nil {
+			return nil, preErr
+		}
 		var lastErr error
 		for _, np := range s.m.llmRouteSnapshot() {
 			start := time.Now()
 			call := &LLMCall{Provider: np.name, Request: req}
-			err := s.m.events.Waterfall(EventLLMRequest, EventContext{Data: call}, func(EventContext) error {
+			err := s.m.events.Waterfall(EventLLMRequest, EventContext{Data: call, Context: ctx}, func(EventContext) error {
 				resp, err := chatWithProvider(np.p, ctx, req)
 				call.Response, call.Err = resp, err
 				return err
@@ -97,13 +102,17 @@ func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (
 func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer) error {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req = s.applyPreStepHook(stream.Context(), req)
+		var preErr error
+		req, preErr = s.applyPreStepHook(stream.Context(), req)
+		if preErr != nil {
+			return preErr
+		}
 		var lastErr error
 		providerTried := false
 		for _, np := range s.m.llmRouteSnapshot() {
 			start := time.Now()
 			call := &LLMCall{Provider: np.name, Request: req}
-			err := s.m.events.Waterfall(EventLLMRequest, EventContext{Data: call}, func(EventContext) error {
+			err := s.m.events.Waterfall(EventLLMRequest, EventContext{Data: call, Context: stream.Context()}, func(EventContext) error {
 				return chatStreamWithProvider(np.p, req, stream, call)
 			})
 			if err == nil {
@@ -166,9 +175,11 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 //
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
-func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) *proto.ChatRequest {
+//
+// 插件返回 error 即 veto：不再发送 LLM 请求，错误原样回给调用方。
+func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) (*proto.ChatRequest, error) {
 	if len(s.m.hookClientsSnapshot()) == 0 {
-		return req // 无插件监听：直接返回，零开销
+		return req, nil // 无插件监听：直接返回，零开销
 	}
 	msgsJSON, _ := json.Marshal(req.Messages)
 	// 估算当前 token 数（复用 core 公用启发式 EstimateProtoMessagesTokens，
@@ -184,25 +195,25 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		UserInput:       req.GetNewUserInput(),
 	})
 	if err != nil {
-		s.m.logger.Warn("agent/pre-step hook vetoed request", "error", err.Error())
-		return req
+		// waterfall 返回 error 即插件 veto：终止本次请求（不再静默放行）。
+		return nil, fmt.Errorf("agent/pre-step vetoed request: %w", err)
 	}
 	// 解析改写后的消息列表
 	if result == nil {
-		return req
+		return req, nil
 	}
 	resultMap, ok := result.(map[string]any)
 	if !ok {
-		return req
+		return req, nil
 	}
 	msgsRaw, ok := resultMap["messages"]
 	if !ok {
-		return req
+		return req, nil
 	}
 	newMsgsJSON, _ := json.Marshal(msgsRaw)
 	var newMsgs []*proto.Message
 	if err := json.Unmarshal(newMsgsJSON, &newMsgs); err != nil || len(newMsgs) == 0 {
-		return req
+		return req, nil
 	}
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
@@ -213,7 +224,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		SessionId:    req.SessionId,
 		NewUserInput: req.NewUserInput,
 	}
-	return rewritten
+	return rewritten, nil
 }
 
 // recordSessionUsage 按会话记录最近一次成功 LLM 请求的服务端上报 prompt 用量

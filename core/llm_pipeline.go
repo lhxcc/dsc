@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"dsc/proto"
+
 	"google.golang.org/grpc"
 )
 
@@ -37,19 +38,31 @@ type LLMCall struct {
 
 // LLMRetryListener 内建退避重试监听器：next 失败且未开始流式输出时按指数退避重试，
 // 最多 maxAttempts 次。适用于 unary Chat 与流式建立阶段失败；流中途失败不重试。
+// 退避等待感知请求 ctx 取消：调用方已放弃时立即返回，不再空等后重试。
 func LLMRetryListener(maxAttempts int, backoff time.Duration) WaterfallListener {
-	return func(ctx EventContext, next func(EventContext) error) error {
-		call, _ := ctx.Data.(*LLMCall)
+	return func(ec EventContext, next func(EventContext) error) error {
+		call, _ := ec.Data.(*LLMCall)
 		var lastErr error
 		for attempt := 0; ; attempt++ {
-			lastErr = next(ctx)
+			lastErr = next(ec)
 			if lastErr == nil {
 				return nil
 			}
 			if attempt+1 >= maxAttempts || (call != nil && call.StreamStarted) {
 				return lastErr
 			}
-			time.Sleep(backoff * time.Duration(1<<attempt))
+			delay := backoff * time.Duration(1<<attempt)
+			if ec.Context == nil {
+				time.Sleep(delay)
+				continue
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ec.Context.Done():
+				timer.Stop()
+				return ec.Context.Err()
+			}
 		}
 	}
 }
@@ -66,7 +79,7 @@ type llmProviderServer struct {
 
 func (s *llmProviderServer) Chat(ctx context.Context, req *proto.ChatRequest) (*proto.ChatResponse, error) {
 	call := &LLMCall{Provider: s.provider.Name(ctx), Request: req}
-	if err := s.events.Waterfall(EventLLMRequest, EventContext{Data: call}, func(EventContext) error {
+	if err := s.events.Waterfall(EventLLMRequest, EventContext{Data: call, Context: ctx}, func(EventContext) error {
 		resp, err := chatWithProvider(s.provider, ctx, req)
 		call.Response, call.Err = resp, err
 		return err
@@ -80,7 +93,7 @@ func (s *llmProviderServer) Chat(ctx context.Context, req *proto.ChatRequest) (*
 // 经 EventLLMRequest 瀑布（建立阶段失败可重试，已发帧后失败不重试）。
 func (s *llmProviderServer) ChatStream(req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer) error {
 	call := &LLMCall{Provider: s.provider.Name(stream.Context()), Request: req}
-	return s.events.Waterfall(EventLLMRequest, EventContext{Data: call}, func(EventContext) error {
+	return s.events.Waterfall(EventLLMRequest, EventContext{Data: call, Context: stream.Context()}, func(EventContext) error {
 		return chatStreamWithProvider(s.provider, req, stream, call)
 	})
 }

@@ -3,11 +3,14 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"dsc/jobs"
 	"dsc/proto"
+
 	plugin "github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 )
@@ -352,6 +355,35 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 				_ = json.Unmarshal([]byte(r), &result)
 				return result, nil
 			}
+		}
+		return data, nil
+
+	case "parallel":
+		// 并发调用全部插件，等待全部返回后聚合错误（任一失败不影响其余完成）。
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(clients))
+		for _, nc := range clients {
+			wg.Add(1)
+			go func(c proto.PluginHookServiceClient) {
+				defer wg.Done()
+				resp, err := c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if resp.GetError() != "" {
+					errCh <- fmt.Errorf("%s", resp.GetError())
+				}
+			}(nc.client)
+		}
+		wg.Wait()
+		close(errCh)
+		var errs []error
+		for err := range errCh {
+			errs = append(errs, err)
+		}
+		if len(errs) > 0 {
+			return nil, errors.Join(errs...)
 		}
 		return data, nil
 

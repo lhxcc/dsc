@@ -219,7 +219,7 @@ func (m *Manager) repairPendingLocked() error {
 					m.transitionLocked(name, StateFailed, err.Error())
 					return fmt.Errorf("failed to promote core %s: %w", name, err)
 				}
-			case "tool", "policy":
+			case "tool", "policy", "dsc":
 				if m.broker == nil {
 					return fmt.Errorf("broker not available, cannot promote core %s", name)
 				}
@@ -237,8 +237,6 @@ func (m *Manager) repairPendingLocked() error {
 					progressed = true
 				}
 				continue
-			case "dsc":
-				// dsc 类型无服务挂载，依赖就绪即视为已加载完成
 			}
 			delete(m.pendingEntries, name)
 			progressed = true

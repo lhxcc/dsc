@@ -7,11 +7,59 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"dsc/proto"
 	"github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
 )
+
+// TestHotReloadFailureBackoff 回归坏版本热重载的退避：同一候选连续失败时按
+// interval 指数退避（上限 5 分钟），退避窗口内不再尝试；新版本路径获得新键；
+// 成功加载后清除该插件的全部失败记录。
+func TestHotReloadFailureBackoff(t *testing.T) {
+	w := &hotReloadWatcher{interval: 5 * time.Second, failures: make(map[string]*reloadBackoff)}
+	u := upgradeCandidate{name: "tool-x", path: "/p/tool-x-v2"}
+
+	if !w.shouldAttempt(u) {
+		t.Fatal("first attempt should be allowed")
+	}
+	if d, n := w.recordFailure(u); d != 5*time.Second || n != 1 {
+		t.Fatalf("first backoff = %v/%d, want 5s/1", d, n)
+	}
+	if w.shouldAttempt(u) {
+		t.Fatal("candidate should be skipped during backoff window")
+	}
+
+	// 窗口过后再次失败 → 退避翻倍
+	w.failures[reloadBackoffKey(u)].next = time.Now().Add(-time.Millisecond)
+	if !w.shouldAttempt(u) {
+		t.Fatal("candidate should be retried after backoff window")
+	}
+	if d, n := w.recordFailure(u); d != 10*time.Second || n != 2 {
+		t.Fatalf("second backoff = %v/%d, want 10s/2", d, n)
+	}
+
+	// 新版本路径使用独立键，不受旧版本退避影响
+	uNew := upgradeCandidate{name: "tool-x", path: "/p/tool-x-v3"}
+	if !w.shouldAttempt(uNew) {
+		t.Fatal("new version should get a fresh attempt")
+	}
+
+	// 退避上限
+	for i := 0; i < 20; i++ {
+		w.recordFailure(uNew)
+	}
+	if d, _ := w.recordFailure(uNew); d != hotReloadMaxBackoff {
+		t.Fatalf("backoff cap = %v, want %v", d, hotReloadMaxBackoff)
+	}
+
+	// 成功加载后清除该插件的全部记录
+	w.clearFailures("tool-x")
+	if len(w.failures) != 0 {
+		t.Fatalf("failures should be cleared, got %d", len(w.failures))
+	}
+}
 
 // TestHotReloadAgentReconnect 是 agent 热重载后"失联"缺陷的修复验收：
 //
