@@ -535,7 +535,9 @@ func newSkillTools(store *SkillStore, installedDir string) []dsc.Tool {
 			Description: readTool.Description(),
 			Schema:      readTool.ParametersSchema(),
 			Handler:     readTool.Execute,
-			ContextFn:   store.indexBlock, // 技能索引动态注入 system prompt（对齐旧 ListContext 每调用重算）
+			// 只读技能正文：声明只读，供 agent 判定同批调用可并行（对应 core.CapabilityReadOnly）。
+			Capabilities: []string{"read-only"},
+			ContextFn:    store.indexBlock, // 技能索引动态注入 system prompt（对齐旧 ListContext 每调用重算）
 			ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 				return readSkillView(args, result)
 			},

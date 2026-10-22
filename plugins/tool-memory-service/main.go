@@ -13,6 +13,7 @@ import (
 	"time"
 
 	dsc "dsc-sdk"
+
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -645,6 +646,8 @@ func main() {
 		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、工具执行结果等），返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
 		Schema:      searchSchema,
 		Handler:     handleSearch,
+		// 只读查询：声明只读，供 agent 判定同批调用可并行（对应 core.CapabilityReadOnly）。
+		Capabilities: []string{"read-only"},
 		// ContextFn 动态贡献 system prompt（每次 ListContext 求值，对齐 DSH
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
@@ -690,6 +693,8 @@ func main() {
 		Description: "分页列出记忆库中的记忆，按创建时间降序排列。可按来源筛选、查看已归档记忆。",
 		Schema:      listSchema,
 		Handler:     handleList,
+		// 只读查询：声明只读，供 agent 判定同批调用可并行（对应 core.CapabilityReadOnly）。
+		Capabilities: []string{"read-only"},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memoryListView(result)
 		},

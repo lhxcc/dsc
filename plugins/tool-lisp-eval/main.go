@@ -389,6 +389,9 @@ func main() {
 	})
 	sdk.Tool(dsc.Tool{
 		Name: name, Description: description, Schema: schema, Handler: handler,
+		// 纯表达式求值、不写任何外部状态：声明只读，供 agent 判定同批调用可并行
+		//（对应 core.CapabilityReadOnly）。
+		Capabilities: []string{"read-only"},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return lispEvalView(result)
 		},

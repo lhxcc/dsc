@@ -71,6 +71,7 @@ func (m *Manager) AllToolsProto() []*proto.Tool {
 			Name:           name,
 			Description:    desc,
 			ParametersJson: string(paramsJSON),
+			Capabilities:   m.toolCapabilities(name),
 		})
 	}
 	// 稳定排序：工具目录顺序必须确定。底层 ToOpenAITools 遍历共享 map，迭代序随机；
@@ -79,6 +80,21 @@ func (m *Manager) AllToolsProto() []*proto.Tool {
 	// 与 agent 端对工具目录的排序算法一致（顺序不影响功能，但必须确定）。
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// toolCapabilities 返回工具声明的能力标签。能力随工具目录下发给 agent——agent 与
+// 宿主分属不同进程，只能据此判定「本次调用是否只读、可否与其他调用并行」，
+// 不能用宿主注册表。未实现 capabilityEnumerator 的工具返回 nil（调用方 fail-closed）。
+func (m *Manager) toolCapabilities(name string) []string {
+	def, ok := m.toolRegistry.Get(name)
+	if !ok {
+		return nil
+	}
+	l, ok := def.(capabilityEnumerator)
+	if !ok {
+		return nil
+	}
+	return l.Capabilities()
 }
 
 // isPTC 当前是否为 PTC 呈现模式（短读锁）。

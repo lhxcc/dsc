@@ -53,12 +53,18 @@ func ParseSandboxPolicy(s string) SandboxPolicy {
 //	                                      fail-closed）。
 //	"read-only-when:<argName>=<value>"    当参数 <argName> 等于 <value> 时本次调用只读
 //	                                      （如 command=view），read-only 下放行。
+//	CapabilityReadOnly                    工具任何调用都不写：显式声明后本次调用恒为只读。
+//	                                      与 writes-* 互斥声明时以 writes-* 为准（保守）。
 //
 // 一个工具可同时声明多条；空 token、缺 "="、缺参数名/值、未知格式一律忽略。工具未声明
 // 任何上述 token 时回退到按工具名的 legacy 判定（见 legacyWriteCallInfo）。
 const (
 	// CapabilityWritesUnknown 工具可能写任意路径、无法从参数定位（如代码解释器/shell）。
 	CapabilityWritesUnknown = "writes-unknown"
+
+	// CapabilityReadOnly 工具的任何调用都不产生写入：既是沙箱放行依据，也是 agent
+	// 判定「同批调用可并行」的唯一依据（未声明者一律按不可并行处理，fail-closed）。
+	CapabilityReadOnly = "read-only"
 
 	writesPathTokenPrefix   = "writes-path:"
 	readOnlyWhenTokenPrefix = "read-only-when:"
@@ -67,6 +73,7 @@ const (
 // writeCapabilityDecl 从工具能力标签解析出的写语义声明。
 type writeCapabilityDecl struct {
 	writesUnknown bool              // 可能写任意路径
+	readOnly      bool              // 任何调用都不写
 	pathArgs      []string          // 写入目标路径所在的参数名
 	readOnlyWhen  map[string]string // 参数名 -> 该值下本次调用只读
 }
@@ -79,6 +86,9 @@ func parseWriteCapabilityDecl(caps []string) (decl writeCapabilityDecl, declared
 		switch {
 		case token == CapabilityWritesUnknown:
 			decl.writesUnknown = true
+			declared = true
+		case token == CapabilityReadOnly:
+			decl.readOnly = true
 			declared = true
 		case strings.HasPrefix(token, writesPathTokenPrefix):
 			arg := strings.TrimSpace(strings.TrimPrefix(token, writesPathTokenPrefix))
@@ -113,20 +123,20 @@ type writeCallDecision struct {
 // sandboxWriteResolver 按工具自声明的能力解析一次调用的写入语义。
 type sandboxWriteResolver func(toolName, argsJSON string) writeCallDecision
 
-// capabilityLister 可选接口：报告工具声明的完整能力标签列表。写能力 token 携带参数
-// （writes-path:<argName>），CapabilityTool 的精确查询无法枚举，故写能力解析需要本接口。
-type capabilityLister interface {
-	CapabilityTool
+// capabilityEnumerator 可选接口：报告工具声明的完整能力标签列表。写能力 token 携带
+// 参数（writes-path:<argName>），CapabilityTool 的精确查询无法枚举，故写能力解析需要
+// 本接口。仅实现 Capabilities 即可（不必同时实现 HasCapability）。
+type capabilityEnumerator interface {
 	Capabilities() []string
 }
 
-// declaredWriteCapabilityDecl 读取工具自声明的写能力。未实现 CapabilityTool 或未声明任何
-// 可识别的写能力时 declared=false，调用方回退 legacy 判定。
+// declaredWriteCapabilityDecl 读取工具自声明的写能力。未实现 capabilityEnumerator 或
+// 未声明任何可识别的写能力时 declared=false，调用方回退 legacy 判定。
 func declaredWriteCapabilityDecl(tool ToolDefinition) (writeCapabilityDecl, bool) {
 	if tool == nil {
 		return writeCapabilityDecl{}, false
 	}
-	if l, ok := tool.(capabilityLister); ok {
+	if l, ok := tool.(capabilityEnumerator); ok {
 		return parseWriteCapabilityDecl(l.Capabilities())
 	}
 	// 仅实现 CapabilityTool 的工具无法枚举 token：按无参 token 精确查询兜底。
@@ -144,9 +154,18 @@ func resolveWriteCall(tool ToolDefinition, toolName, argsJSON string) writeCallD
 		path, write := legacyWriteCallInfo(toolName, argsJSON)
 		return writeCallDecision{path: path, write: write, unknownWrite: legacyWriteCapableExecutor(toolName)}
 	}
+	return resolveWriteCallFromDecl(decl, argsJSON)
+}
+
+// resolveWriteCallFromDecl 按已解析的能力声明裁决一次调用的写入语义。
+// read-only 声明恒为只读；writes-* 声明优先于 read-only（保守）。
+func resolveWriteCallFromDecl(decl writeCapabilityDecl, argsJSON string) writeCallDecision {
 	if decl.writesUnknown {
 		// 无法定位写路径：read-only 由 unknownWrite 整体拒绝，workspace-write 放行。
 		return writeCallDecision{unknownWrite: true}
+	}
+	if decl.readOnly {
+		return writeCallDecision{}
 	}
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -169,6 +188,21 @@ func resolveWriteCall(tool ToolDefinition, toolName, argsJSON string) writeCallD
 	}
 	// 声明了 writes-path 但参数缺失：按写处理（无路径 → workspace-write 拒绝）。
 	return writeCallDecision{write: true}
+}
+
+// ToolCallReadOnly 按工具声明的能力标签判定一次调用是否只读——agent 侧并行的唯一
+// 准入条件（agent 与宿主分属不同进程，只能依赖 ListTools 随 proto.Tool 下发的
+// capabilities，不能访问宿主的工具注册表）。
+//
+// 未声明任何写能力的工具一律返回 false：能力未知即不可并行（fail-closed）。
+// 与宿主沙箱裁决（resolveWriteCall）共用同一解析逻辑，避免两处口径漂移。
+func ToolCallReadOnly(capabilities []string, argsJSON string) bool {
+	decl, declared := parseWriteCapabilityDecl(capabilities)
+	if !declared {
+		return false
+	}
+	d := resolveWriteCallFromDecl(decl, argsJSON)
+	return !d.write && !d.unknownWrite
 }
 
 // legacyWriteCapableExecutors 是无法从参数路径判断写入目标、却可对文件系统任意写/执行

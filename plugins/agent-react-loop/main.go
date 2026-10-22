@@ -17,6 +17,7 @@ import (
 	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
+
 	"github.com/hashicorp/go-hclog"
 	"google.golang.org/grpc"
 )
@@ -454,7 +455,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 保证「已发送给模型的消息」与「已消费的注入」原子一致，避免注入恰好落在
 		// 两者之间被漏检。
 		a.sessMu.Lock()
-		msgs := sess.DeriveMessagesLimited(a.historyInjection)
+		msgs := a.deriveMessages(sess)
 		iterPendingInjects := a.pendingInjects
 		a.sessMu.Unlock()
 
@@ -518,31 +519,40 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				if keep <= 1 {
 					keep = 2 // 至少保留最后 1 条 + system 不压缩 → keep 最小为 2
 				}
-				summary, err := a.compactHistory(ctx, llmClient, msgs, availableTools)
-				if err != nil {
-					if emit != nil {
-						emit(&core.RunStreamResponse{Status: "error", Error: err.Error()})
-					}
-					return nil, err
+				// 工具对边界：保留区不得以 tool 消息开头（否则请求历史出现孤立
+				// tool 消息）。无法吸附时不压缩，空间压力交给 request-error 兜底。
+				if snapped, ok := core.SnapRetainStart(msgs, keep, 1); ok {
+					keep = snapped
+				} else {
+					keep = 0
 				}
-				// 压缩落地（surface replace）：追加 CompactionSummary 事件遮蔽最旧前缀
-				// [1, keep-1]（跳过 node 0 system），尾部 [keep, len-1] 保持逐字。
-				// 原事件保留在日志（append-only 无损，可回放/恢复）。
-				sess.Append(session.CompactionSummary, &session.CompactionSummaryData{
-					Content: "以下是此前对话的压缩摘要，请基于它继续当前任务：\n" + summary,
-				}, &session.SurfaceOp{Op: session.SurfaceReplace, Start: nodes[1], End: nodes[keep-1]})
-				// 压缩后已用容量无法精确获取，重置为 0（下一轮服务端 usage 会更新为真实值）
-				a.usageMu.Lock()
-				a.lastPromptTokens = 0
-				a.usageMu.Unlock()
-				compacted = true
+				if keep >= 2 {
+					summary, err := a.compactHistory(ctx, llmClient, msgs, availableTools)
+					if err != nil {
+						if emit != nil {
+							emit(&core.RunStreamResponse{Status: "error", Error: err.Error()})
+						}
+						return nil, err
+					}
+					// 压缩落地（surface replace）：追加 CompactionSummary 事件遮蔽最旧前缀
+					// [1, keep-1]（跳过 node 0 system），尾部 [keep, len-1] 保持逐字。
+					// 原事件保留在日志（append-only 无损，可回放/恢复）。
+					sess.Append(session.CompactionSummary, &session.CompactionSummaryData{
+						Content: "以下是此前对话的压缩摘要，请基于它继续当前任务：\n" + summary,
+					}, &session.SurfaceOp{Op: session.SurfaceReplace, Start: nodes[1], End: nodes[keep-1]})
+					// 压缩后已用容量无法精确获取，重置为 0（下一轮服务端 usage 会更新为真实值）
+					a.usageMu.Lock()
+					a.lastPromptTokens = 0
+					a.usageMu.Unlock()
+					compacted = true
+				}
 			}
 		}
 		// 压缩后 surface 已重写，重新派生请求历史（注入计数快照一并刷新，避免已入
 		// 历史的注入在收尾时被误判为新注入而重复发送）
 		if compacted {
 			a.sessMu.Lock()
-			msgs = sess.DeriveMessagesLimited(a.historyInjection)
+			msgs = a.deriveMessages(sess)
 			iterPendingInjects = a.pendingInjects
 			a.sessMu.Unlock()
 		}
@@ -849,11 +859,17 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 
 		// 执行每个工具并追加结果
 		concludeTurn := false // 宿主 goal 工具 complete/blocked 后结束物理轮次（对齐 DSH concludeTurn）
-		for _, tc := range toolCalls {
-			// 检查 ctx.Done()
+		// 只读批并行：整批都是「非本地 + 工具声明只读」时先并发发起 RPC，结果按源序
+		// 落回下面的串行循环（事件顺序、审批与副作用语义不变）。不满足则返回 nil。
+		prefetched := a.prefetchReadOnlyBatch(ctx, toolClient, toolCalls, availableTools, truncated)
+		for i, tc := range toolCalls {
+			// 检查 ctx.Done()：并行批的调用已全部发起，必须继续按序落结果
+			// （保证每个 tool_call 都有 result，会话恢复后历史仍合法）。
 			select {
 			case <-ctx.Done():
-				return cancelResult()
+				if _, done := prefetched[i]; !done {
+					return cancelResult()
+				}
 			default:
 			}
 
@@ -902,7 +918,19 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			// 宿主托管的 plan/goal 工具直接本地执行（状态读写会话事件日志），
 			// 其余工具经聚合 ToolService 转发到工具插件
 			var toolResp *proto.ExecuteToolResponse
-			if isLocalTool(tc.Name) {
+			if pre, ok := prefetched[i]; ok {
+				// 并行预执行结果：RPC 已按源序发起，这里只消费并落结果。
+				toolResp = pre.resp
+				if pre.err != nil {
+					a.logger.Info("tool RPC error", "turn", turnNo, "step", stepNo, "tool", tc.Name, "error", pre.err)
+					sess.Append(session.ToolResult, &session.ToolResultData{
+						Turn: turnNo, Step: stepNo, CallID: tc.Id,
+						Content: fmt.Sprintf("Error executing tool %s: %v", tc.Name, pre.err),
+						Error:   pre.err.Error(),
+					}, &session.SurfaceOp{Op: session.SurfaceAppend})
+					continue
+				}
+			} else if isLocalTool(tc.Name) {
 				var concluded bool
 				toolResp, concluded = a.executeLocalTool(ctx, tc)
 				if concluded {
