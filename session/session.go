@@ -189,6 +189,12 @@ type Session struct {
 	surfaceNodes []int
 	// replaceGen 已提交的 positional replace 次数，供消费方区分尾部增长与重写。
 	replaceGen int
+	// savedPath / savedCount / savedSize 记录上次成功落盘的路径、已写入的事件数
+	// 与文件字节数，供 Save 走增量 append 快路径（事件日志 append-only，只需
+	// 追加 savedCount 之后的新事件）。任一校验不符即回退全量原子重写。
+	savedPath  string
+	savedCount int
+	savedSize  int64
 }
 
 // New 创建空会话。

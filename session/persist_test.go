@@ -321,3 +321,203 @@ func joinLines(lines ...string) string {
 	}
 	return out + "\n"
 }
+
+// requireContiguousSeq 断言恢复出的日志 seq 严格连续（seq == 下标）。
+func requireContiguousSeq(t *testing.T, s *Session) {
+	t.Helper()
+	for i, ev := range s.Events() {
+		if ev.Seq != i {
+			t.Fatalf("event %d has seq %d, want %d", i, ev.Seq, i)
+		}
+	}
+}
+
+// TestSaveAppendsOnlyNewEvents 快路径：首次保存后追加事件再保存，只在新尾部
+// 追加行（原文件未被替换，inode 不变），文件只增长且 Load 得到全部连续事件。
+func TestSaveAppendsOnlyNewEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	s := buildSample(t)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	appendSurface(t, s, UserMessage, &UserMessageData{Content: "u3", Source: "user"})
+	appendSurface(t, s, AssistantMessage, &AssistantMessageData{Turn: 2, Step: 1, Content: "a3"})
+	if err := s.Save(path); err != nil {
+		t.Fatalf("append save: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if !os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("expected in-place append, but file was rewritten")
+	}
+	if afterInfo.Size() <= beforeInfo.Size() {
+		t.Fatalf("file size %d did not grow from %d", afterInfo.Size(), beforeInfo.Size())
+	}
+	if !strings.HasPrefix(string(after), string(before)) {
+		t.Fatal("incremental append altered existing content")
+	}
+
+	restored, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if restored.Len() != s.Len() {
+		t.Fatalf("restored len = %d, want %d", restored.Len(), s.Len())
+	}
+	requireContiguousSeq(t, restored)
+	tail := restored.Events()[restored.Len()-1]
+	if d, ok := tail.Data.(*AssistantMessageData); !ok || d.Content != "a3" {
+		t.Fatalf("last restored event = %+v, want assistant message a3", tail)
+	}
+}
+
+// TestSaveNoopWhenUnchanged 无新事件时重复保存为 no-op：文件不被重写、大小不变。
+func TestSaveNoopWhenUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	s := buildSample(t)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("second save: %v", err)
+	}
+	second, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after second save: %v", err)
+	}
+	if second.Size() != first.Size() {
+		t.Fatalf("size changed on no-op save: %d -> %d", first.Size(), second.Size())
+	}
+	if !os.SameFile(first, second) {
+		t.Fatal("no-op save rewrote the file")
+	}
+	recontent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if string(recontent) != string(content) {
+		t.Fatal("no-op save changed file content")
+	}
+}
+
+// TestSaveFallsBackOnExternalModification 外部改动文件（这里是截短为合法前缀）
+// 后保存：游标校验失败，自动回退全量原子重写，Load 得到当前完整日志。
+func TestSaveFallsBackOnExternalModification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	s := buildSample(t)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// 外部把文件截成只剩首行（仍是合法 JSONL，但已不是本会话的落盘结果）
+	firstLine := strings.SplitN(string(content), "\n", 2)[0] + "\n"
+	if err := os.WriteFile(path, []byte(firstLine), 0644); err != nil {
+		t.Fatalf("external modify: %v", err)
+	}
+
+	appendSurface(t, s, UserMessage, &UserMessageData{Content: "after-external", Source: "user"})
+	if err := s.Save(path); err != nil {
+		t.Fatalf("save after external modification: %v", err)
+	}
+
+	restored, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if restored.Len() != s.Len() {
+		t.Fatalf("restored len = %d, want %d (full rewrite expected)", restored.Len(), s.Len())
+	}
+	requireContiguousSeq(t, restored)
+}
+
+// TestSaveRecoversFromHalfLine 模拟崩溃留下的半行：把文件截断到非换行位置后
+// 保存，尾部校验失败 → 回退全量重写，Load 成功且事件完整。
+func TestSaveRecoversFromHalfLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	s := buildSample(t)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if err := os.Truncate(path, fi.Size()-3); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	if err := s.Save(path); err != nil {
+		t.Fatalf("save after partial line: %v", err)
+	}
+
+	restored, err := Load(path)
+	if err != nil {
+		t.Fatalf("load after recovery: %v", err)
+	}
+	if restored.Len() != s.Len() {
+		t.Fatalf("restored len = %d, want %d", restored.Len(), s.Len())
+	}
+	requireContiguousSeq(t, restored)
+	final, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if !strings.HasSuffix(string(final), "\n") {
+		t.Fatal("rewritten log should end with a newline")
+	}
+}
+
+// TestStoreSaveRepeatedly 经 Store 连续多轮保存：每轮增量追加后 Load 均可完整
+// 恢复（seq 连续、事件数一致）。
+func TestStoreSaveRepeatedly(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	sess, err := st.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		appendSurface(t, sess, UserMessage, &UserMessageData{Content: fmt.Sprintf("u%d", i), Source: "user"})
+		appendSurface(t, sess, AssistantMessage, &AssistantMessageData{Turn: i + 1, Step: 1, Content: fmt.Sprintf("a%d", i)})
+		if err := st.Save(sess); err != nil {
+			t.Fatalf("save round %d: %v", i, err)
+		}
+		loaded, err := st.Load(sess.id)
+		if err != nil {
+			t.Fatalf("load round %d: %v", i, err)
+		}
+		if loaded == nil || loaded.Len() != sess.Len() {
+			t.Fatalf("round %d: loaded len = %v, want %d", i, loaded, sess.Len())
+		}
+		requireContiguousSeq(t, loaded)
+	}
+}
