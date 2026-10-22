@@ -205,20 +205,44 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 				"duration_ms", time.Since(start).Milliseconds(), "panic", fmt.Sprint(r))
 		}
 	}()
-	var result string
-	var err error
-	var viewJSON string
-	var images []string
-	if ev, ok := tool.(ViewImageExecutor); ok {
-		// 图像视图合一接口：单次执行带回全部产物（同时实现 ViewExecutor 时优先）
-		result, viewJSON, images, err = ev.ExecuteWithViewAndImages(execCtx, json.RawMessage(inv.ArgumentsJSON))
-	} else if ev, ok := tool.(ViewExecutor); ok {
-		result, viewJSON, err = ev.ExecuteWithView(execCtx, json.RawMessage(inv.ArgumentsJSON))
-	} else {
-		result, err = tool.Execute(execCtx, json.RawMessage(inv.ArgumentsJSON))
+	args := json.RawMessage(inv.ArgumentsJSON)
+	invoke := func() (string, string, []string, error) {
+		if ev, ok := tool.(ViewImageExecutor); ok {
+			return ev.ExecuteWithViewAndImages(execCtx, args)
+		}
+		if ev, ok := tool.(ViewExecutor); ok {
+			res, view, err := ev.ExecuteWithView(execCtx, args)
+			return res, view, nil, err
+		}
+		res, err := tool.Execute(execCtx, args)
+		return res, "", nil, err
 	}
+	result, viewJSON, images, err := invoke()
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = &ToolTimeoutError{Tool: toolName, Ms: timeoutMs}
+	}
+	// 只读调用的连接级瞬态错误重试：写语义/未知写、取消、超时、panic 一律不重试，
+	// 避免重复副作用或把超时预算翻倍（见 core/tool_retry.go）。
+	if retries := toolRetryAttempts(); retries > 0 && isTransientToolError(err) &&
+		execCtx.Err() == nil && toolCallRetryable(tool, inv.ArgumentsJSON) {
+		for attempt := 1; attempt <= retries; attempt++ {
+			m.logger.Warn("tool transient failure, retrying",
+				"tool", toolName, "attempt", attempt, "retries", retries, "error", err.Error())
+			select {
+			case <-execCtx.Done():
+			case <-time.After(toolRetryBackoff * time.Duration(attempt)):
+			}
+			if execCtx.Err() != nil {
+				break
+			}
+			result, viewJSON, images, err = invoke()
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = &ToolTimeoutError{Tool: toolName, Ms: timeoutMs}
+			}
+			if !isTransientToolError(err) {
+				break
+			}
+		}
 	}
 	// 结果净化：工具输出可能携带非法 UTF-8（如 Windows 原生命令的 OEM 码页输出、
 	// GBK 编码的文件内容），原样进入会话日志/LLM 请求后，proto string 字段会拒绝
