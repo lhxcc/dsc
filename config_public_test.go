@@ -12,15 +12,21 @@ import (
 // TestPublicConfigNoNovelforge 验证公开 config.yaml 不引用内部插件 novelforge，
 // 且替换后的 dsc-notify 正确声明启用：确保开源仓库不带内部插件痕迹。
 func TestPublicConfigNoNovelforge(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("config", "config.yaml"))
+	path := filepath.Join("config", "config.yaml")
+	data, err := os.ReadFile(path)
 	if err != nil {
+		// 仓库自 aee4991 起不再随附默认 config.yaml（使用者由 dsc setup 生成），
+		// 干净 clone 上没有该文件属正常状态，跳过而非失败。
+		if os.IsNotExist(err) {
+			t.Skip("config/config.yaml 不随仓库提供（见 aee4991），跳过公开性校验")
+		}
 		t.Fatalf("read config: %v", err)
 	}
 	if strings.Contains(string(data), "novelforge") {
 		t.Fatal("公开 config.yaml 不应包含内部插件 tool-novelforge")
 	}
 
-	cfg, err := core.LoadConfig(filepath.Join("config", "config.yaml"))
+	cfg, err := core.LoadConfig(path)
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
