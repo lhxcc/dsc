@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	dsc "dsc-sdk"
 	"dsc/core"
@@ -34,6 +39,13 @@ type OpenAIProvider struct {
 	// fileCache 已上传图片的 data URL → file_id 缓存（同一图多轮复用，避免重复上传）。
 	fileMu    sync.Mutex
 	fileCache map[string]string
+	// maxTokensLimit 服务端 max_tokens 合法上限（自适应学习；0=未知）。
+	// 各端点上限不同且随模型变化（DeepSeek 393216、部分端点更低），硬编码不可靠，
+	// 故在服务端以 400 拒绝时从报文区间读出并缓存，后续请求直接按其钳制。
+	maxTokensLimit atomic.Int64
+	// noMaxTokens 服务端只报「max_tokens 非法」但未给出区间时置位：此后一律不携带
+	// 该字段（等模型自然结束），避免每个请求都先吃一次 400。
+	noMaxTokens atomic.Bool
 }
 
 // maxInlineImageBytes 内联 base64 单图大小上限（对齐 DeepSeek 32 MiB 内联限制，
@@ -311,7 +323,17 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []core.Message, tool
 
 	resp, err := p.client.CreateChatCompletion(ctx, req)
 	if err != nil {
-		return nil, err
+		// 服务端因 max_tokens 超范围拒绝时按其上限重试一次：宿主注入的
+		// DSC_MAX_OUTPUT_TOKENS=context_window 可能大于端点上限（例如
+		// context_window=1048576 而 DeepSeek 上限 393216）。
+		if limit, ok := maxTokensRejectionLimit(err); ok {
+			p.learnMaxTokensLimit(limit)
+			req.MaxTokens = limit // limit=0 表示报文未给出区间 → 不携带该字段
+			resp, err = p.client.CreateChatCompletion(ctx, req)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(resp.Choices) == 0 {
@@ -343,11 +365,74 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []core.Message, tool
 
 // resolveMaxTokens 计算本请求实际携带的 max_tokens：请求级参数（压缩等场景的
 // 窗口净余值）优先，其次插件级默认（显式 env > 宿主注入），<=0 表示不携带。
+// 已知服务端上限时提前钳制，避免每个新进程的首个请求都先吃一次 400。
 func (p *OpenAIProvider) resolveMaxTokens(requestMaxTokens int) int {
-	if requestMaxTokens > 0 {
-		return requestMaxTokens
+	if p.noMaxTokens.Load() {
+		return 0
 	}
-	return p.maxTokens
+	mt := requestMaxTokens
+	if mt <= 0 {
+		mt = p.maxTokens
+	}
+	if mt <= 0 {
+		return 0
+	}
+	if limit := int(p.maxTokensLimit.Load()); limit > 0 && mt > limit {
+		mt = limit
+	}
+	return mt
+}
+
+// learnMaxTokensLimit 记录服务端拒绝时给出的上限：limit>0 缓存上限；limit=0 表示
+// 报文只提到 max_tokens 却未给区间，改为此后一律不携带该字段。
+func (p *OpenAIProvider) learnMaxTokensLimit(limit int) {
+	if limit > 0 {
+		p.maxTokensLimit.Store(int64(limit))
+		return
+	}
+	p.noMaxTokens.Store(true)
+}
+
+// maxTokensRangeRE 从服务端 400 报文里提取 max_tokens 合法上限，例如 DeepSeek：
+// "the valid range of max_tokens is [1, 393216]"。
+var maxTokensRangeRE = regexp.MustCompile(`(?i)max_tokens[^0-9]*\[\s*[0-9]+\s*,\s*([0-9]+)\s*\]`)
+
+// apiErrorStatusMessage 取 HTTP 状态码与报文正文，兼容非流式 APIError 与流式
+// RequestError 两种错误载体（go-openai 两条路径返回的类型不同）。
+func apiErrorStatusMessage(err error) (int, string) {
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode, apiErr.Message
+	}
+	var reqErr *openai.RequestError
+	if errors.As(err, &reqErr) {
+		msg := string(reqErr.Body)
+		if reqErr.Err != nil {
+			msg += " " + reqErr.Err.Error()
+		}
+		return reqErr.HTTPStatusCode, msg
+	}
+	return 0, err.Error()
+}
+
+// maxTokensRejectionLimit 判断错误是否为「max_tokens 超出合法范围」，并返回可用上限：
+//   - 报文给出区间 → 区间上限；
+//   - 仅提到 max_tokens 但无区间 → 0（表示改发不带该字段的请求）；
+//   - 其它错误 → ok=false，调用方原样返回错误。
+func maxTokensRejectionLimit(err error) (int, bool) {
+	status, msg := apiErrorStatusMessage(err)
+	if status != http.StatusBadRequest {
+		return 0, false
+	}
+	if !strings.Contains(strings.ToLower(msg), "max_tokens") {
+		return 0, false
+	}
+	if m := maxTokensRangeRE.FindStringSubmatch(msg); len(m) == 2 {
+		if n, convErr := strconv.Atoi(m[1]); convErr == nil && n > 0 {
+			return n, true
+		}
+	}
+	return 0, true
 }
 
 func (p *OpenAIProvider) Name(ctx context.Context) string       { return "openai" }
@@ -396,7 +481,15 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 
 	stream, err := p.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return nil, err
+		// 同 Chat：max_tokens 超范围时按服务端给出的上限重试一次。
+		if limit, ok := maxTokensRejectionLimit(err); ok {
+			p.learnMaxTokensLimit(limit)
+			req.MaxTokens = limit
+			stream, err = p.client.CreateChatCompletionStream(ctx, req)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ch := make(chan *core.ChatStreamResponse)
