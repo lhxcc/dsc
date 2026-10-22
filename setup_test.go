@@ -79,13 +79,13 @@ plugins:
 	if p := byName["llm-ollama"]; p.enabled {
 		t.Fatal("llm-ollama 未在 config 声明，应 enabled=false")
 	}
-	// env 键名语义学习：anthropic 沿用现键
-	if p := byName["llm-anthropic"]; p.baseKey != "ANTHROPIC_BASE_URL" || p.modelKey != "ANTHROPIC_MODEL" || p.apiKey != "ANTHROPIC_API_KEY" {
-		t.Fatalf("anthropic 键学习错误: %+v", p)
+	// env 键名：anthropic 写入一律采用 DSC_ 前缀（即便现有 config 仅旧名）
+	if p := byName["llm-anthropic"]; p.baseKey != "DSC_ANTHROPIC_BASE_URL" || p.modelKey != "DSC_ANTHROPIC_MODEL" || p.apiKey != "DSC_ANTHROPIC_API_KEY" {
+		t.Fatalf("anthropic 键应为 DSC_ 前缀: %+v", p)
 	}
-	// 目录新插件按前缀推导（ollama 有 HOST 语义键时也应识别为 base）
-	if p := byName["llm-ollama"]; p.baseKey != "OLLAMA_BASE_URL" {
-		t.Fatalf("ollama base 键应按前缀推导 OLLAMA_BASE_URL, got %q", p.baseKey)
+	// 目录新插件：ollama 写入一律采用 DSC_ 前缀（基址键为 HOST，与插件读取键一致）
+	if p := byName["llm-ollama"]; p.baseKey != "DSC_OLLAMA_HOST" || p.modelKey != "DSC_OLLAMA_MODEL" || p.apiKey != "DSC_OLLAMA_API_KEY" {
+		t.Fatalf("ollama 键应为 DSC_ 前缀: %+v", p)
 	}
 	// 非 llm 目录不进入
 	if _, ok := byName["tool-filesystem"]; ok {
@@ -94,13 +94,13 @@ plugins:
 }
 
 func TestEnvKeyForProviderSemanticLearning(t *testing.T) {
-	// 已有 OLLAMA_HOST 时 base 键应沿用 HOST，而非推导 BASE_URL
+	// ollama 写入一律采用 DSC_ 前缀（基址键为 HOST，与插件读取键一致）
 	base, model, key := envKeyForProvider("llm-ollama", map[string]string{
 		"OLLAMA_HOST":  "http://localhost:11434",
 		"OLLAMA_MODEL": "qwen",
 	})
-	if base != "OLLAMA_HOST" || model != "OLLAMA_MODEL" || key != "OLLAMA_API_KEY" {
-		t.Fatalf("ollama 语义学习: base=%q model=%q key=%q", base, model, key)
+	if base != "DSC_OLLAMA_HOST" || model != "DSC_OLLAMA_MODEL" || key != "DSC_OLLAMA_API_KEY" {
+		t.Fatalf("ollama 应整组 DSC_ 前缀: base=%q model=%q key=%q", base, model, key)
 	}
 	// 无现有配置时按前缀推导（llm-foo → FOO_*）
 	base, model, key = envKeyForProvider("llm-foo", nil)
@@ -111,6 +111,42 @@ func TestEnvKeyForProviderSemanticLearning(t *testing.T) {
 	_, _, key = envKeyForProvider("llm-bar", map[string]string{"BAR_TOKEN": "x"})
 	if key != "BAR_TOKEN" {
 		t.Fatalf("TOKEN 键识别: key=%q", key)
+	}
+}
+
+// TestEnvKeyForProviderDSCPrefixGroup 验证 anthropic/openai 在现有配置出现任一
+// DSC_ 前缀键时，base/model/api 三者整组采用 DSC_ 前缀推导，不与旧名混用。
+func TestEnvKeyForProviderDSCPrefixGroup(t *testing.T) {
+	// 仅 DSC_ANTHROPIC_BASE_URL 存在，旧 ANTHROPIC_MODEL 也同时存在：
+	// 整组必须走 DSC_ 前缀，不得把 model 回落到旧 ANTHROPIC_MODEL。
+	base, model, key := envKeyForProvider("llm-anthropic", map[string]string{
+		"DSC_ANTHROPIC_BASE_URL": "https://dsc.example.com",
+		"ANTHROPIC_MODEL":        "old-model",
+	})
+	if base != "DSC_ANTHROPIC_BASE_URL" {
+		t.Fatalf("base 应为 DSC_ 前缀: %q", base)
+	}
+	if model != "DSC_ANTHROPIC_MODEL" {
+		t.Fatalf("model 不得混用旧名，应为 DSC_ANTHROPIC_MODEL: %q", model)
+	}
+	if key != "DSC_ANTHROPIC_API_KEY" {
+		t.Fatalf("api 应为 DSC_ 前缀: %q", key)
+	}
+
+	// 现有仅旧名（无 DSC_ 键）：写入仍一律采用 DSC_ 前缀（迁移），不写旧名。
+	// 兼容回退旧名仅发生在读取阶段，不在此处。
+	base, model, key = envKeyForProvider("llm-anthropic", map[string]string{
+		"ANTHROPIC_BASE_URL": "https://old.example.com",
+		"ANTHROPIC_MODEL":    "old-model",
+	})
+	if base != "DSC_ANTHROPIC_BASE_URL" || model != "DSC_ANTHROPIC_MODEL" || key != "DSC_ANTHROPIC_API_KEY" {
+		t.Fatalf("anthropic 写入应一律 DSC_ 前缀（即便现有仅旧名）: base=%q model=%q key=%q", base, model, key)
+	}
+
+	// 非 DSC_ 的 provider 不受影响：llm-foo 仍按前缀推导旧名。
+	base, _, _ = envKeyForProvider("llm-foo", nil)
+	if base != "FOO_BASE_URL" {
+		t.Fatalf("foo 应推导旧名 FOO_BASE_URL: %q", base)
 	}
 }
 

@@ -40,10 +40,26 @@ type LLMConfig struct {
 func LoadLLMConfig(provider string) LLMConfig {
 	p := strings.ToUpper(strings.TrimSpace(provider))
 	prefix := p + "_"
+	// 整组决定前缀：三个键（API_KEY / BASE_URL / MODEL）任一以 DSC_ 前缀存在即整组
+	// 采用 DSC_ 前缀读取，禁止 DSC_ 与非 DSC_ 变量混用（例如 DSC_ANTHROPIC_BASE_URL
+	// 与旧 ANTHROPIC_MODEL 混搭导致半新半旧的不一致配置）。三者必须作为一个整体读取。
+	useDSC := false
+	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
+		if os.Getenv("DSC_"+prefix+suf) != "" {
+			useDSC = true
+			break
+		}
+	}
+	resolved := func(suffix string) string {
+		if useDSC {
+			return "DSC_" + prefix + suffix
+		}
+		return prefix + suffix
+	}
 	cfg := LLMConfig{
-		APIKey:          strings.TrimSpace(os.Getenv(prefix + "API_KEY")),
-		BaseURL:         strings.TrimSpace(os.Getenv(prefix + "BASE_URL")),
-		Model:           strings.TrimSpace(os.Getenv(prefix + "MODEL")),
+		APIKey:          strings.TrimSpace(os.Getenv(resolved("API_KEY"))),
+		BaseURL:         strings.TrimSpace(os.Getenv(resolved("BASE_URL"))),
+		Model:           strings.TrimSpace(os.Getenv(resolved("MODEL"))),
 		MaxOutputTokens: EnvPositiveInt64(prefix + "MAX_OUTPUT_TOKENS"),
 		VisionEnabled:   !envNoVision(),
 	}

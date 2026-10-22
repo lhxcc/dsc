@@ -327,15 +327,7 @@ type toolCallDeltaAccumulatorOllama struct {
 }
 
 func main() {
-	model := os.Getenv("OLLAMA_MODEL")
-	if model == "" {
-		model = "llama3.1:latest"
-	}
-
-	hostStr := os.Getenv("OLLAMA_HOST")
-	if hostStr == "" {
-		hostStr = "http://127.0.0.1:11434"
-	}
+	model, hostStr := resolveOllamaConfig()
 	hostURL, _ := url.Parse(hostStr)
 
 	// 思考默认开启（与 llm-anthropic 的 ANTHROPIC_THINKING 一致）；OLLAMA_THINKING=0 关闭
@@ -352,4 +344,24 @@ func main() {
 	sdk := dsc.New(dsc.Config{Name: "ollama", Version: "1.0.0", Type: dsc.TypeLLM})
 	sdk.LLM(provider)
 	sdk.Serve()
+}
+
+// resolveOllamaConfig 读取 ollama 连接配置：HOST 与 MODEL 作为一个整体决定前缀，
+// 优先 DSC_OLLAMA_HOST / DSC_OLLAMA_MODEL（避免与终端同名 OLLAMA_* 变量冲突），
+// DSC_ 前缀任一存在即整组采用 DSC_，否则回退旧名 OLLAMA_HOST / OLLAMA_MODEL。
+func resolveOllamaConfig() (model, hostStr string) {
+	useDSC := os.Getenv("DSC_OLLAMA_HOST") != "" || os.Getenv("DSC_OLLAMA_MODEL") != ""
+	hostKey, modelKey := "OLLAMA_HOST", "OLLAMA_MODEL"
+	if useDSC {
+		hostKey, modelKey = "DSC_OLLAMA_HOST", "DSC_OLLAMA_MODEL"
+	}
+	model = strings.TrimSpace(os.Getenv(modelKey))
+	if model == "" {
+		model = "llama3.1:latest"
+	}
+	hostStr = strings.TrimSpace(os.Getenv(hostKey))
+	if hostStr == "" {
+		hostStr = "http://127.0.0.1:11434"
+	}
+	return model, hostStr
 }

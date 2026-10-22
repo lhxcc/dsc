@@ -157,3 +157,47 @@ func TestLoadLLMConfig(t *testing.T) {
 		t.Errorf("OpenAI BaseURL = %q, want %q", cfg.BaseURL, "https://api.openai.com/v1")
 	}
 }
+
+// TestLoadLLMConfigDSCPrefixGroup 验证 anthropic/openai 的三个键（API_KEY/BASE_URL/
+// MODEL）作为一个整体决定前缀：任一 DSC_ 前缀键存在即整组采用 DSC_ 前缀，禁止与
+// 旧名混用。
+func TestLoadLLMConfigDSCPrefixGroup(t *testing.T) {
+	t.Setenv("DSC_NO_VISION", "")
+
+	// 仅设置 DSC_ANTHROPIC_BASE_URL，未设 DSC_ANTHROPIC_MODEL（但旧 ANTHROPIC_MODEL 存在）：
+	// 整组走 DSC_ 前缀，Model 必须读 DSC_ANTHROPIC_MODEL（空），不得回落旧 ANTHROPIC_MODEL。
+	t.Setenv("DSC_ANTHROPIC_BASE_URL", "https://dsc.example.com")
+	t.Setenv("ANTHROPIC_MODEL", "should-not-be-used")
+	cfg := LoadLLMConfig("anthropic")
+	if cfg.BaseURL != "https://dsc.example.com" {
+		t.Errorf("BaseURL = %q, want DSC_ value", cfg.BaseURL)
+	}
+	if cfg.Model != "" {
+		t.Errorf("Model = %q, want empty (group uses DSC_ prefix, no mixing)", cfg.Model)
+	}
+	t.Setenv("DSC_ANTHROPIC_MODEL", "dsc-model")
+	if cfg = LoadLLMConfig("anthropic"); cfg.Model != "dsc-model" {
+		t.Errorf("Model = %q, want dsc-model", cfg.Model)
+	}
+
+	// 清空 DSC_ 前缀：整组回退旧名。
+	t.Setenv("DSC_ANTHROPIC_BASE_URL", "")
+	t.Setenv("DSC_ANTHROPIC_MODEL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://old.example.com")
+	t.Setenv("ANTHROPIC_MODEL", "old-model")
+	cfg = LoadLLMConfig("anthropic")
+	if cfg.BaseURL != "https://old.example.com" || cfg.Model != "old-model" {
+		t.Errorf("回退旧名失败: BaseURL=%q Model=%q", cfg.BaseURL, cfg.Model)
+	}
+
+	// OpenAI 组同样适用。
+	t.Setenv("DSC_OPENAI_BASE_URL", "https://dsc.openai.example.com")
+	t.Setenv("OPENAI_MODEL", "old-openai-model")
+	cfg = LoadLLMConfig("openai")
+	if cfg.BaseURL != "https://dsc.openai.example.com" {
+		t.Errorf("OpenAI BaseURL = %q, want DSC_ value", cfg.BaseURL)
+	}
+	if cfg.Model != "" {
+		t.Errorf("OpenAI Model = %q, want empty (no mixing)", cfg.Model)
+	}
+}

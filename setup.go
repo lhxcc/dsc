@@ -82,11 +82,26 @@ func semanticKey(env map[string]string, substrs ...string) string {
 	return ""
 }
 
-// envKeyForProvider 决定提供商的 base/model/api 键名：
-// 优先复用 config 现有条目语义匹配的键（如 OLLAMA_HOST 而非 *_BASE_URL、
-// ANTHROPIC_API_KEY 等），保证旧配置键名不被改写；否则按插件名前缀推导默认。
+// envKeyForProvider 决定提供商的 base/model/api 键名（写入 config 时使用的键名）：
+// 受终端同名变量劫持影响的 provider（anthropic / openai / ollama）写入一律采用 DSC_
+// 前缀，不再写旧名——旧名兼容仅发生在读取阶段（DSC_* 环境变量缺席时回退），且只此
+// 一处。ollama 的基址键约定为 HOST（其余为 BASE_URL）；其余 provider 维持旧前缀语义。
 func envKeyForProvider(pluginName string, existing map[string]string) (baseKey, modelKey, apiKey string) {
 	prefix := strings.ToUpper(strings.TrimPrefix(pluginName, "llm-")) + "_"
+	if prefix == "ANTHROPIC_" || prefix == "OPENAI_" {
+		// 写入一律 DSC_ 前缀，不沿用旧名、不按语义回退旧名。
+		baseKey = "DSC_" + prefix + "BASE_URL"
+		modelKey = "DSC_" + prefix + "MODEL"
+		apiKey = "DSC_" + prefix + "API_KEY"
+		return
+	}
+	if prefix == "OLLAMA_" {
+		// ollama 基址键为 HOST（与插件读取键一致），整组 DSC_ 前缀。
+		baseKey = "DSC_OLLAMA_HOST"
+		modelKey = "DSC_OLLAMA_MODEL"
+		apiKey = "DSC_OLLAMA_API_KEY"
+		return
+	}
 	baseKey = semanticKey(existing, "BASE_URL", "HOST", "BASE")
 	if baseKey == "" {
 		baseKey = prefix + "BASE_URL"

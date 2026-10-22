@@ -24,6 +24,46 @@ import (
 // defaultContextWindow 未配置且探测失败时使用的默认上下文窗口大小：128K（按 1024 计）
 const defaultContextWindow = 128 * 1024
 
+// envGroupPreferDSC 判断某 provider 的一组 LLM env 键（API_KEY/BASE_URL/MODEL）
+// 是否任一以 DSC_ 前缀存在；存在则整组采用 DSC_ 前缀（与 sdk.LoadLLMConfig 一致），
+// 禁止 DSC_ 与非 DSC_ 变量混用。三者必须作为一个整体决定前缀。
+func envGroupPreferDSC(env map[string]string, prefix string) bool {
+	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
+		if v, ok := env["DSC_"+prefix+suf]; ok && v != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// groupEnv 按既定前缀（useDSC）从 env 映射取某 provider 的 suffix 键。
+func groupEnv(env map[string]string, prefix string, useDSC bool, suffix string) string {
+	name := prefix + "_" + suffix
+	if useDSC {
+		name = "DSC_" + name
+	}
+	return env[name]
+}
+
+// osEnvGroupPreferDSC 同 envGroupPreferDSC，但针对进程环境变量。
+func osEnvGroupPreferDSC(prefix string) bool {
+	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
+		if os.Getenv("DSC_"+prefix+suf) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// osGroupEnv 按既定前缀（useDSC）从进程环境取某 provider 的 suffix 键。
+func osGroupEnv(prefix string, useDSC bool, suffix string) string {
+	name := prefix + "_" + suffix
+	if useDSC {
+		name = "DSC_" + name
+	}
+	return strings.TrimSpace(os.Getenv(name))
+}
+
 // probeContextWindow 探测 LLAMACPP（或兼容 OpenAI 的服务）的上下文窗口大小。
 // 通过 GET {baseURL}/models 读取首条模型的 meta.n_ctx（LLAMACPP 提供），
 // 失败或未提供时返回 0，由调用方回退到配置值或默认 128K。
@@ -655,15 +695,17 @@ func main() {
 	}
 
 	// 上下文窗口容量（token 数）：配置 context_window 显式 → 探测 LLAMACPP /v1/models 的
-	// n_ctx → 默认 128K×1024。探测总是执行（OPENAI_BASE_URL 缺席回退 ANTHROPIC_BASE_URL，
+	// n_ctx → 默认 128K×1024。探测总是执行（OPENAI 组 BASE_URL 缺席回退 ANTHROPIC 组，
 	// 同一 llama.cpp 端口 /v1/models 同源）：命中即取探测值（最准），未命中（云端）取配置
 	// 值或默认——窗口来源随端点自然切换，该值同时是注入 LLM 插件的默认输出上限（见后）。
 	probeWindow := 0
-	if baseURL := activeLLMEnv["OPENAI_BASE_URL"]; baseURL != "" {
+	// 上下文窗口探测同样按 provider 整组决定前缀（DSC_ 优先、旧名回退），不与终端
+	// 同名变量混用。
+	if baseURL := groupEnv(activeLLMEnv, "OPENAI", envGroupPreferDSC(activeLLMEnv, "OPENAI"), "BASE_URL"); baseURL != "" {
 		probeWindow = probeContextWindow(baseURL)
-	} else if baseURL := activeLLMEnv["ANTHROPIC_BASE_URL"]; baseURL != "" {
+	} else if baseURL := groupEnv(activeLLMEnv, "ANTHROPIC", envGroupPreferDSC(activeLLMEnv, "ANTHROPIC"), "BASE_URL"); baseURL != "" {
 		// llm-anthropic 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
-		// OPENAI_BASE_URL 缺席时回退探测 anthropic 端点。
+		// OPENAI 组 BASE_URL 缺席时回退探测 anthropic 端点（两组均优先 DSC_ 前缀、旧名回退）。
 		probeWindow = probeContextWindow(baseURL)
 	}
 	if probeWindow > 0 {
@@ -852,29 +894,27 @@ func main() {
 		fail("agent %s not found after loading", agentName)
 	}
 
-	// 从配置提取 LLM 模型名称用于 TUI 展示
+	// 从配置提取 LLM 模型名称用于 TUI 展示；按 provider 整组决定前缀
+	// （DSC_ 优先、旧名回退），不与终端同名变量混用。
 	llmModelName := "Unknown"
 	for _, e := range llmEntries {
 		if e.Name == activeLLMName {
-			if v, ok := e.Env["ANTHROPIC_MODEL"]; ok {
-				llmModelName = v
-			} else if v, ok := e.Env["OPENAI_MODEL"]; ok {
-				llmModelName = v
-			} else if v, ok := e.Env["OLLAMA_MODEL"]; ok {
+			provider := strings.ToUpper(strings.TrimPrefix(e.Name, "llm-"))
+			if v := groupEnv(e.Env, provider, envGroupPreferDSC(e.Env, provider), "MODEL"); v != "" {
 				llmModelName = v
 			}
 			break
 		}
 	}
 	if llmModelName == "Unknown" {
-		// 從環境變量獲取
-		if v := os.Getenv("OPENAI_MODEL"); v != "" {
-			llmModelName = v
-		} else if v := os.Getenv("ANTHROPIC_MODEL"); v != "" {
-			llmModelName = v
-		} else if v := os.Getenv("OLLAMA_MODEL"); v != "" {
-			llmModelName = v
-		} else {
+		// 從環境變量獲取（按 provider 整组决定前缀）
+		for _, provider := range []string{"OPENAI", "ANTHROPIC", "OLLAMA"} {
+			if v := osGroupEnv(provider, osEnvGroupPreferDSC(provider), "MODEL"); v != "" {
+				llmModelName = v
+				break
+			}
+		}
+		if llmModelName == "Unknown" {
 			llmModelName = "Agentic-Model" // 默認值
 		}
 	}

@@ -28,17 +28,19 @@ plugins:
     binary_path: ./plugins/llm-anthropic/llm-anthropic.exe
     enabled: true
     env:
-      ANTHROPIC_BASE_URL: "http://192.168.124.197:8008/"
-      ANTHROPIC_MODEL: "Agentic-Turbo-Coder"
-      ANTHROPIC_API_KEY: "sk-your-real-key"
+      # 优先读取 DSC_ 前缀（避免与终端同名 ANTHROPIC_* 变量冲突）；DSC_ 未设置时回退旧名
+      DSC_ANTHROPIC_BASE_URL: "http://192.168.124.197:8008/"
+      DSC_ANTHROPIC_MODEL: "Agentic-Turbo-Coder"
+      DSC_ANTHROPIC_API_KEY: "sk-your-real-key"
   - name: llm-openai
     type: llm
     binary_path: ./plugins/llm-openai/llm-openai.exe
     enabled: true
     env:
-      OPENAI_BASE_URL: "http://192.168.124.197:8008/v1"
-      OPENAI_MODEL: "Agentic-Turbo-Coder"
-      OPENAI_API_KEY: "sk-your-real-key"
+      # 优先读取 DSC_ 前缀；DSC_ 未设置时回退旧名
+      DSC_OPENAI_BASE_URL: "http://192.168.124.197:8008/v1"
+      DSC_OPENAI_MODEL: "Agentic-Turbo-Coder"
+      DSC_OPENAI_API_KEY: "sk-your-real-key"
   - name: tool-filesystem
     type: tool
     binary_path: ./plugins/tool-filesystem/tool-filesystem.exe
