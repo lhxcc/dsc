@@ -21,6 +21,7 @@ protoc_dir/
 
 *.txt
 *.zip
+*.7z
 
 plugins/tool-pdf/fonts/HarmonyOS-Sans/
 # 测试时 TestMain 自动下载的 CJK TrueType 字体（10MB+），不应提交仓库
