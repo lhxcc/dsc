@@ -36,25 +36,50 @@ func containsEnvKey(env []string, key string) bool {
 	return false
 }
 
-// TestBuildEnvStripsSecretsForNonLLM 验证非 LLM 插件过滤凭据、LLM 插件保留。
+// TestBuildEnvStripsSecretsForNonLLM 验证非 LLM 插件：宿主环境里的凭据（含
+// DSC_<P>_API_KEY 这类 LLM 凭据）一律滤除；插件专属凭据只放行给登记的插件；
+// config.yaml 为该插件显式声明的 env 不受过滤。
 func TestBuildEnvStripsSecretsForNonLLM(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-secret")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "tok-secret")
 	t.Setenv("SOME_PROVIDER_SECRET", "abc")
-	t.Setenv("DSC_ADMIN_TOKEN", "admin-token") // DSC_* 必须保留（webui 代理认证用）
+	t.Setenv("DSC_ANTHROPIC_API_KEY", "sk-llm-secret") // LLM 凭据同样属于凭据，不得外泄
+	t.Setenv("DSC_OLLAMA_API_KEY", "sk-ollama-secret")
+	t.Setenv("DSC_ADMIN_TOKEN", "admin-token")
 	t.Setenv("PLAIN_VAR", "keep")
 
-	env := buildEnv(nil, false)
-	if containsEnvKey(env, "OPENAI_API_KEY") || containsEnvKey(env, "ANTHROPIC_AUTH_TOKEN") ||
-		containsEnvKey(env, "SOME_PROVIDER_SECRET") {
-		t.Fatalf("non-LLM env must strip secrets, got %v", env)
+	env := buildEnv("tool-filesystem", nil, false)
+	for _, k := range []string{
+		"OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "SOME_PROVIDER_SECRET",
+		"DSC_ANTHROPIC_API_KEY", "DSC_OLLAMA_API_KEY", "DSC_ADMIN_TOKEN",
+	} {
+		if containsEnvKey(env, k) {
+			t.Fatalf("非 LLM 插件不得继承宿主凭据 %s，got %v", k, env)
+		}
 	}
-	if !containsEnvKey(env, "DSC_ADMIN_TOKEN") || !containsEnvKey(env, "PLAIN_VAR") {
-		t.Fatalf("non-LLM env must keep DSC_* and non-secret vars, got %v", env)
+	if !containsEnvKey(env, "PLAIN_VAR") {
+		t.Fatalf("非机密宿主变量应保留，got %v", env)
 	}
 
-	envLLM := buildEnv(nil, true)
-	if !containsEnvKey(envLLM, "OPENAI_API_KEY") {
-		t.Fatalf("LLM env must keep API key, got %v", envLLM)
+	// 插件专属放行：仅 tool-harness-webui 能读到 admin token（其 admin 代理转发需要），
+	// 但它同样不应看到 LLM 凭据。
+	webuiEnv := buildEnv("tool-harness-webui", nil, false)
+	if !containsEnvKey(webuiEnv, "DSC_ADMIN_TOKEN") {
+		t.Fatalf("tool-harness-webui 应能读取 DSC_ADMIN_TOKEN，got %v", webuiEnv)
+	}
+	if containsEnvKey(webuiEnv, "DSC_ANTHROPIC_API_KEY") {
+		t.Fatalf("tool-harness-webui 不应读取 LLM 凭据，got %v", webuiEnv)
+	}
+
+	// 显式注入（config.yaml 的 env: 块）不受过滤——那是「给这个插件的配置」。
+	explicit := buildEnv("tool-ssh", map[string]string{"TOOL_SSH_PASSWORD": "pw"}, false)
+	if !containsEnv(explicit, "TOOL_SSH_PASSWORD", "pw") {
+		t.Fatalf("config.yaml 显式注入的插件凭据必须保留，got %v", explicit)
+	}
+
+	// LLM 插件：凭据全保留（含宿主继承的）。
+	envLLM := buildEnv("llm-anthropic", nil, true)
+	if !containsEnvKey(envLLM, "OPENAI_API_KEY") || !containsEnvKey(envLLM, "DSC_ANTHROPIC_API_KEY") {
+		t.Fatalf("LLM 插件应保留凭据，got %v", envLLM)
 	}
 }

@@ -50,13 +50,14 @@ func TestPluginCmdUnifiedEnv(t *testing.T) {
 
 	// 非 LLM 插件：完整宿主环境照给，但凭据类键必须缺席——SkipHostEnv=true 是
 	// 这条过滤真正生效的前提（否则 fork 会把它们原样带回）。
-	// 注：DSC_ 前缀键仍在 isSecretEnvKey 中整体豁免（DSC_ADMIN_TOKEN 供 webui
-	// 代理认证），故 DSC_<P>_API_KEY 不在本条断言内（已知遗留，见 buildEnv 注释）。
 	toolCfg := m.newPluginClientConfig(PluginEntry{Name: "tool-x", Type: "tool"}, "tool-x.exe", "",
 		plugin.HandshakeConfig{}, map[string]plugin.Plugin{}, nil)
 	toolEnv := envToMap(t, toolCfg.Cmd.Env)
 	if _, ok := toolEnv["ANTHROPIC_AUTH_TOKEN"]; ok {
 		t.Fatal("非 LLM 插件不得继承凭据类键")
+	}
+	if _, ok := toolEnv["DSC_ANTHROPIC_API_KEY"]; ok {
+		t.Fatal("非 LLM 插件不得继承 DSC_*_API_KEY（LLM 凭据同样属于凭据）")
 	}
 	if toolEnv["PLAIN_HOST_VAR"] != "host" {
 		t.Fatal("非 LLM 插件仍须继承非机密宿主变量")

@@ -2349,11 +2349,23 @@ var envSecretKeys = map[string]bool{
 	"AWS_SESSION_TOKEN":   true,
 }
 
-// isSecretEnvKey 判断环境变量键是否为不应注入非 LLM 插件的凭据。
-// DSC_* 是宿主自有配置（如 DSC_ADMIN_TOKEN 供 webui 代理认证），一律保留。
-func isSecretEnvKey(k string) bool {
+// envPluginSecretAllowKeys 按插件名放行必需的宿主凭据（最小权限原则）。
+// 只有确实要读该凭据的插件才登记，其余插件一律滤除——避免「一个凭据放行全局」。
+// 目前仅 tool-harness-webui 需要 DSC_ADMIN_TOKEN 做 admin API 代理转发。
+var envPluginSecretAllowKeys = map[string]map[string]bool{
+	"tool-harness-webui": {"DSC_ADMIN_TOKEN": true},
+}
+
+// isSecretEnvKey 判断「从宿主环境继承」的变量键是否为不应注入非 LLM 插件的凭据。
+//
+// 判定顺序：插件专属放行（envPluginSecretAllowKeys）→ 精确键 → 后缀规则。
+// 注意：这里不再对 DSC_ 前缀整体豁免——DSC_<P>_API_KEY 等 LLM 凭据同样属于凭据，
+// 必须拦下（历史问题：整体豁免导致 shell 等 tool 插件能读到模型 API key）。
+// 需要给某个插件凭据时，应写进该插件的 config.yaml `env:` 块（entry.Env 不受本过滤
+// 影响，见 buildEnv），而不是依赖宿主环境继承。
+func isSecretEnvKey(pluginName, k string) bool {
 	u := strings.ToUpper(k)
-	if strings.HasPrefix(u, "DSC_") {
+	if allow := envPluginSecretAllowKeys[strings.ToLower(pluginName)]; allow[u] {
 		return false
 	}
 	if envSecretKeys[u] {
@@ -2368,13 +2380,16 @@ func isSecretEnvKey(k string) bool {
 }
 
 // buildEnv 构建插件进程 env = 宿主环境 + 插件自定义 env。
-// allowSecrets=false 时滤除凭据类键（非 LLM 插件用）；LLM 插件需凭据，传 true。
-func buildEnv(custom map[string]string, allowSecrets bool) []string {
+//
+// allowSecrets=false（非 LLM 插件）时滤除从宿主继承的凭据类键；custom（entry.Env，
+// 即 config.yaml 里为该插件显式声明的 env）始终原样注入——「显式给这个插件的配置」
+// 与「宿主环境里碰巧存在的同名变量」是两回事，后者才是泄漏面。
+func buildEnv(pluginName string, custom map[string]string, allowSecrets bool) []string {
 	envMap := make(map[string]string)
 	for _, kv := range os.Environ() {
 		if i := strings.Index(kv, "="); i > 0 {
 			k := kv[:i]
-			if !allowSecrets && isSecretEnvKey(k) {
+			if !allowSecrets && isSecretEnvKey(pluginName, k) {
 				continue
 			}
 			envMap[k] = kv[i+1:]
@@ -2397,7 +2412,7 @@ func buildEnv(custom map[string]string, allowSecrets bool) []string {
 // 仅 LLM 插件放行凭据类键；tool/policy/agent 等一律滤除，防凭据被
 // shell 等工具进程读出。
 func (m *Manager) coreEnv(entry PluginEntry) []string {
-	env := buildEnv(entry.Env, entry.Type == "llm")
+	env := buildEnv(entry.Name, entry.Env, entry.Type == "llm")
 	if entry.Type == "llm" {
 		// LLM 插件额外把 DSC_ 组回写到无前缀旧名（见函数注释），避免第三方 SDK
 		// 在 NewClient 内部的环境变量凭据链里抢先命中终端遗留的认证变量。
