@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -159,7 +160,34 @@ func inWorkspace(path string) bool {
 	if terr != nil {
 		return false
 	}
-	return containsPath(realRoot, realTarget)
+	if containsPath(realRoot, realTarget) {
+		return true
+	}
+	// 词法/规范路径比较的兜底：大小写不敏感文件系统（macOS 默认 APFS）上，
+	// EvalSymlinks 不还原磁盘真实大小写，大小写变体路径会被误判为越界。
+	// 用文件身份（dev/ino）判定「目标最深已存在祖先确实位于根之下」——
+	// 与大小写、8.3 短名、目录联接等路径别名无关，且不会放行真正越界的路径。
+	return withinByFileIdentity(realRoot, realTarget)
+}
+
+// withinByFileIdentity 判断 target 的最深已存在祖先是否位于 root 之下
+// （按文件身份比较，而非路径字符串）。根或目标不可访问时返回 false（fail-closed）。
+func withinByFileIdentity(root, target string) bool {
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	cur := target
+	for {
+		if info, serr := os.Stat(cur); serr == nil && os.SameFile(info, rootInfo) {
+			return true
+		}
+		parent := PDir(cur)
+		if parent == cur {
+			return false
+		}
+		cur = parent
+	}
 }
 
 // SetSandboxPolicy 运行时切换沙箱策略（TUI /sandbox 命令用；线程安全）。
