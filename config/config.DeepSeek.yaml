@@ -15,7 +15,7 @@ context_window: 1048576
 
 # 压缩后端插件（声明 Provides compaction 能力）：缺省 dsc-system，亦可选
 # dsc-billion-context；删空则 agent 走内联压缩兜底（presets 缺省已启用同款）
-compaction: dsc-billion-context
+compaction: dsc-system
 
 # 历史注入持久化编码（/settings history 写回）：-1 禁止（不注入历史）、0 未定义（默认不限制）、
 
@@ -62,11 +62,11 @@ plugins:
     type: tool
     binary_path: ./plugins/tool-filesystem/tool-filesystem.exe
     enabled: true
-  # # 记忆服务：memory_search / memory_add 工具 + AfterTool 自动记忆钩子
-  # - name: tool-memory-service
-  #   type: tool
-  #   binary_path: ./plugins/tool-memory-service/tool-memory-service.exe
-  #   enabled: true
+  # 记忆服务：memory_search / memory_add 工具 + AfterTool 自动记忆钩子
+  - name: tool-memory-service
+    type: tool
+    binary_path: ./plugins/tool-memory-service/tool-memory-service.exe
+    enabled: true
   # 通知音效：通用(dsc) 类型插件，经 Hook.OnEvent 程序性播放 success/error 完成音效
   - name: dsc-notify
     type: dsc
@@ -91,7 +91,7 @@ plugins:
     type: agent
     binary_path: ./plugins/agent-react-loop/agent-react-loop.exe
     enabled: true
-  - name: dsc-billion-context
-    type: dsc
-    enabled: true
-    binary_path: ./plugins/dsc-billion-context/dsc-billion-context
+  # - name: dsc-billion-context
+  #   type: dsc
+  #   enabled: true
+  #   binary_path: ./plugins/dsc-billion-context/dsc-billion-context
