@@ -222,7 +222,7 @@ func main() {
 			"filesystem": "true",
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "shell", Description: description, Schema: schema, Handler: handler, ViewFn: shellView})
+	sdk.Tool(dsc.Tool{Name: "shell", Description: description, Schema: schema, Handler: handler, ViewFn: shellView, Capabilities: []string{"writes-unknown"}})
 	sdk.Serve()
 }
 

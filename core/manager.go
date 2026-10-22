@@ -324,7 +324,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	m.events.OnWaterfall(EventToolPreExecute, m.approvalEscalation())
 	m.events.OnWaterfall(EventToolPreExecute, m.toolApprovalGate())
 	m.events.OnWaterfall(EventToolPreExecute, m.neverApprovalGate())
-	m.events.OnWaterfall(EventToolPreExecute, sandboxPolicy(m.GetSandboxPolicy))
+	m.events.OnWaterfall(EventToolPreExecute, m.sandboxPolicy(m.GetSandboxPolicy))
 	// LLM 请求默认带退避重试（最多 2 次，300ms 起指数退避）；流中途失败不重试
 	m.events.OnWaterfall(EventLLMRequest, LLMRetryListener(2, 300*time.Millisecond))
 	return m

@@ -294,6 +294,151 @@ func TestSandboxDynamicSwitch(t *testing.T) {
 	}
 }
 
+// declaredWriteTool 测试用工具：模拟插件自声明写能力（实现 CapabilityTool 与
+// Capabilities，供宿主枚举带参数的写能力 token）。
+type declaredWriteTool struct {
+	name string
+	caps []string
+}
+
+func (t *declaredWriteTool) Name() string                      { return t.name }
+func (t *declaredWriteTool) Description() string               { return "declared write tool" }
+func (t *declaredWriteTool) ParametersSchema() json.RawMessage { return json.RawMessage(`{}`) }
+func (t *declaredWriteTool) Execute(_ context.Context, _ json.RawMessage) (string, error) {
+	return "ok", nil
+}
+
+func (t *declaredWriteTool) HasCapability(cap string) bool {
+	for _, c := range t.caps {
+		if c == cap {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *declaredWriteTool) Capabilities() []string { return t.caps }
+
+// TestSandboxToolDeclaredWriteCapabilities 校验沙箱按工具自声明的写能力裁决，
+// 且未声明能力的旧工具仍走 legacy 按名回退。
+func TestSandboxToolDeclaredWriteCapabilities(t *testing.T) {
+	orig := WorkspaceRoot
+	WorkspaceRoot = t.TempDir() + "/ws"
+	defer func() { WorkspaceRoot = orig }()
+	_ = os.MkdirAll(WorkspaceRoot, 0o755)
+
+	inside := jsonPath(WorkspaceRoot) + "/a.txt"
+	editorCaps := []string{"writes-path:path", "read-only-when:command=view"}
+
+	cases := []struct {
+		name string
+		mode SandboxPolicy
+		tool ToolDefinition
+		args string
+		deny string // 期望拒绝信息包含的片段；空表示应放行
+	}{
+		{
+			name: "writes-path 工作区内写放行",
+			mode: SandboxWorkspaceWrite,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":"str_replace","path":"` + inside + `"}`,
+		},
+		{
+			name: "writes-path 工作区外写拒绝",
+			mode: SandboxWorkspaceWrite,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":"str_replace","path":"/etc/hosts"}`,
+			deny: "file access denied under workspace-write mode",
+		},
+		{
+			name: "writes-path 只读策略拒绝",
+			mode: SandboxReadOnly,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":"str_replace","path":"` + inside + `"}`,
+			deny: "file access denied under read-only mode",
+		},
+		{
+			name: "read-only-when 命中时只读放行",
+			mode: SandboxReadOnly,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":"view","path":"` + inside + `"}`,
+		},
+		{
+			name: "空值与未知 token 忽略后仍按 writes-path 裁决",
+			mode: SandboxReadOnly,
+			tool: &declaredWriteTool{name: "declared-editor", caps: []string{"", "bogus", "writes-path:", "read-only-when:command=", "writes-path:path", "read-only-when:command=view"}},
+			args: `{"command":"view","path":"` + inside + `"}`,
+		},
+		{
+			name: "writes-unknown 只读拒绝",
+			mode: SandboxReadOnly,
+			tool: &declaredWriteTool{name: "declared-runner", caps: []string{"writes-unknown"}},
+			args: `{"command":"echo hi"}`,
+			deny: "file access denied under read-only mode",
+		},
+		{
+			name: "writes-unknown 工作区写放行",
+			mode: SandboxWorkspaceWrite,
+			tool: &declaredWriteTool{name: "declared-runner", caps: []string{"writes-unknown"}},
+			args: `{"command":"echo hi"}`,
+		},
+		{
+			name: "writes-path 参数缺失按写处理",
+			mode: SandboxWorkspaceWrite,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":"create"}`,
+			deny: "file access denied under workspace-write mode",
+		},
+		{
+			name: "writes-path 参数无法解析按写处理",
+			mode: SandboxWorkspaceWrite,
+			tool: &declaredWriteTool{name: "declared-editor", caps: editorCaps},
+			args: `{"command":`,
+			deny: "file access denied under workspace-write mode",
+		},
+		{
+			name: "未声明能力旧 shell 只读拒绝",
+			mode: SandboxReadOnly,
+			tool: &mockTool{name: "shell"},
+			args: `{"command":"echo hi"}`,
+			deny: "file access denied under read-only mode",
+		},
+		{
+			name: "未声明能力旧 shell 工作区写放行",
+			mode: SandboxWorkspaceWrite,
+			tool: &mockTool{name: "shell"},
+			args: `{"command":"echo hi"}`,
+		},
+		{
+			name: "未声明能力旧编辑器工作区外拒绝",
+			mode: SandboxWorkspaceWrite,
+			tool: &mockTool{name: "str_replace_editor"},
+			args: `{"command":"str_replace","path":"/etc/hosts"}`,
+			deny: "file access denied under workspace-write mode",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newRouterManager()
+			m.events.OnWaterfall(EventToolPreExecute, m.sandboxPolicy(fixedPolicy(tc.mode)))
+			if err := m.toolRegistry.Register(tc.tool); err != nil {
+				t.Fatalf("register tool: %v", err)
+			}
+			_, err := m.ExecuteTool(context.Background(), tc.tool.Name(), json.RawMessage(tc.args))
+			if tc.deny == "" {
+				if err != nil {
+					t.Fatalf("应放行，却返回错误: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.deny) {
+				t.Fatalf("err = %v, want 包含 %q", err, tc.deny)
+			}
+		})
+	}
+}
+
 func TestParseSandboxPolicy(t *testing.T) {
 	cases := map[string]SandboxPolicy{
 		"full":      SandboxFullAccess,

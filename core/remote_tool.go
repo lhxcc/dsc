@@ -35,6 +35,12 @@ func (r *RemoteTool) HasCapability(cap string) bool {
 	return false
 }
 
+// Capabilities 返回插件声明的完整能力标签列表（proto.Tool.capabilities 原样透传）。
+// 带参数的能力 token（如 writes-path:<argName>）需经本方法枚举才能解析。
+func (r *RemoteTool) Capabilities() []string {
+	return r.capabilities
+}
+
 func (r *RemoteTool) Name() string {
 	return r.name
 }

@@ -42,52 +42,185 @@ func ParseSandboxPolicy(s string) SandboxPolicy {
 	}
 }
 
-// writeCapableExecutors 是无法从参数路径判断写入目标、却可对文件系统任意写/执行
+// 工具写能力 token（wire 语义：随 proto.Tool.capabilities 由工具自声明，宿主只做
+// 统一裁决——新增同类工具无需改宿主；对齐 DSH 按能力而非名称识别工具族的做法）：
+//
+//	CapabilityWritesUnknown               工具可能写任意路径且无法从参数定位（如 shell）。
+//	                                      read-only 下整体拒绝；workspace-write 下放行。
+//	"writes-path:<argName>"               参数 <argName> 是该次调用的写入目标路径；
+//	                                      read-only 一律拒绝，workspace-write 仅放行
+//	                                      workspace 内路径（路径缺失/参数无法解析按写处理，
+//	                                      fail-closed）。
+//	"read-only-when:<argName>=<value>"    当参数 <argName> 等于 <value> 时本次调用只读
+//	                                      （如 command=view），read-only 下放行。
+//
+// 一个工具可同时声明多条；空 token、缺 "="、缺参数名/值、未知格式一律忽略。工具未声明
+// 任何上述 token 时回退到按工具名的 legacy 判定（见 legacyWriteCallInfo）。
+const (
+	// CapabilityWritesUnknown 工具可能写任意路径、无法从参数定位（如代码解释器/shell）。
+	CapabilityWritesUnknown = "writes-unknown"
+
+	writesPathTokenPrefix   = "writes-path:"
+	readOnlyWhenTokenPrefix = "read-only-when:"
+)
+
+// writeCapabilityDecl 从工具能力标签解析出的写语义声明。
+type writeCapabilityDecl struct {
+	writesUnknown bool              // 可能写任意路径
+	pathArgs      []string          // 写入目标路径所在的参数名
+	readOnlyWhen  map[string]string // 参数名 -> 该值下本次调用只读
+}
+
+// parseWriteCapabilityDecl 解析写能力 token；declared 表示是否声明了任何可识别的写能力
+// （未知 token 不算，以免把「声明了无关能力」误判为已迁移）。
+func parseWriteCapabilityDecl(caps []string) (decl writeCapabilityDecl, declared bool) {
+	for _, raw := range caps {
+		token := strings.TrimSpace(raw)
+		switch {
+		case token == CapabilityWritesUnknown:
+			decl.writesUnknown = true
+			declared = true
+		case strings.HasPrefix(token, writesPathTokenPrefix):
+			arg := strings.TrimSpace(strings.TrimPrefix(token, writesPathTokenPrefix))
+			if arg == "" {
+				continue
+			}
+			decl.pathArgs = append(decl.pathArgs, arg)
+			declared = true
+		case strings.HasPrefix(token, readOnlyWhenTokenPrefix):
+			name, value, ok := strings.Cut(strings.TrimPrefix(token, readOnlyWhenTokenPrefix), "=")
+			name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+			if !ok || name == "" || value == "" {
+				continue
+			}
+			if decl.readOnlyWhen == nil {
+				decl.readOnlyWhen = map[string]string{}
+			}
+			decl.readOnlyWhen[name] = value
+			declared = true
+		}
+	}
+	return decl, declared
+}
+
+// writeCallDecision 是一次调用的写入语义裁决输入。
+type writeCallDecision struct {
+	path         string // 可定位的写入目标路径
+	write        bool   // 本次调用是写操作（路径可定位）
+	unknownWrite bool   // 可能写任意路径、无法定位（如 shell）
+}
+
+// sandboxWriteResolver 按工具自声明的能力解析一次调用的写入语义。
+type sandboxWriteResolver func(toolName, argsJSON string) writeCallDecision
+
+// capabilityLister 可选接口：报告工具声明的完整能力标签列表。写能力 token 携带参数
+// （writes-path:<argName>），CapabilityTool 的精确查询无法枚举，故写能力解析需要本接口。
+type capabilityLister interface {
+	CapabilityTool
+	Capabilities() []string
+}
+
+// declaredWriteCapabilityDecl 读取工具自声明的写能力。未实现 CapabilityTool 或未声明任何
+// 可识别的写能力时 declared=false，调用方回退 legacy 判定。
+func declaredWriteCapabilityDecl(tool ToolDefinition) (writeCapabilityDecl, bool) {
+	if tool == nil {
+		return writeCapabilityDecl{}, false
+	}
+	if l, ok := tool.(capabilityLister); ok {
+		return parseWriteCapabilityDecl(l.Capabilities())
+	}
+	// 仅实现 CapabilityTool 的工具无法枚举 token：按无参 token 精确查询兜底。
+	if ct, ok := tool.(CapabilityTool); ok && ct.HasCapability(CapabilityWritesUnknown) {
+		return writeCapabilityDecl{writesUnknown: true}, true
+	}
+	return writeCapabilityDecl{}, false
+}
+
+// resolveWriteCall 优先按工具自声明的写能力解析本次调用；未声明写能力的工具（旧插件）
+// 回退 legacy 按名判定。
+func resolveWriteCall(tool ToolDefinition, toolName, argsJSON string) writeCallDecision {
+	decl, declared := declaredWriteCapabilityDecl(tool)
+	if !declared {
+		path, write := legacyWriteCallInfo(toolName, argsJSON)
+		return writeCallDecision{path: path, write: write, unknownWrite: legacyWriteCapableExecutor(toolName)}
+	}
+	if decl.writesUnknown {
+		// 无法定位写路径：read-only 由 unknownWrite 整体拒绝，workspace-write 放行。
+		return writeCallDecision{unknownWrite: true}
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		// 解析失败且声明了 writes-path：无法判定写意图，fail-closed 按写处理。
+		return writeCallDecision{write: len(decl.pathArgs) > 0}
+	}
+	// read-only-when 先判：命中即本次调用只读，即便工具同时声明了 writes-path。
+	for name, value := range decl.readOnlyWhen {
+		if v, ok := args[name].(string); ok && v == value {
+			return writeCallDecision{}
+		}
+	}
+	if len(decl.pathArgs) == 0 {
+		return writeCallDecision{}
+	}
+	for _, name := range decl.pathArgs {
+		if p, ok := args[name].(string); ok {
+			return writeCallDecision{path: p, write: true}
+		}
+	}
+	// 声明了 writes-path 但参数缺失：按写处理（无路径 → workspace-write 拒绝）。
+	return writeCallDecision{write: true}
+}
+
+// legacyWriteCapableExecutors 是无法从参数路径判断写入目标、却可对文件系统任意写/执行
 // 命令的解释器/执行器工具（如 tool-filesystem 的 shell，内部为 mvdan/sh）。
 // read-only 下必须整体禁用——因为无法从命令文本判定某条命令是否只读，放行即等于
-// 允许「echo x > /anywhere」绕开只读沙箱（P0-1）。workspace-write 下放行（缺省档，
-// 运行 shell 是其主要用途；其工作区写入边界由工具/OS 层约束）。
+// 允许「echo x > /anywhere」绕开只读沙箱。workspace-write 下放行（缺省档，运行 shell
+// 是其主要用途；其工作区写入边界由工具/OS 层约束）。
 //
-// 长期正解：由工具插件自声明「可执行的写能力」（自声明式写入语义），替换此处的
-// 名称枚举。暂以此作为 read-only 缺口的最小封堵。
-var writeCapableExecutors = map[string]bool{
+// 仅为未声明写能力的旧插件保留的 legacy fallback；新工具应声明 CapabilityWritesUnknown。
+var legacyWriteCapableExecutors = map[string]bool{
 	"shell": true,
 }
 
-// isWriteCapableExecutor 判断工具是否为不可定位写入路径的解释器/执行器。
-func isWriteCapableExecutor(name string) bool {
-	return writeCapableExecutors[name]
+// legacyWriteCapableExecutor 判断工具是否为不可定位写入路径的解释器/执行器（legacy）。
+func legacyWriteCapableExecutor(name string) bool {
+	return legacyWriteCapableExecutors[name]
 }
 
-// sandboxCheck 判定一次工具调用是否被当前策略允许。返回允许时的 nil，或拒绝原因。
-func sandboxCheck(policy SandboxPolicy, toolName, argsJSON string) error {
+// sandboxCheck 判定一次工具调用是否被当前策略允许：resolve 非 nil 时按其（工具自声明
+// 能力）解析写入语义，nil 时回退 legacy 按名判定。返回允许时的 nil，或拒绝原因。
+func sandboxCheck(policy SandboxPolicy, toolName, argsJSON string, resolve sandboxWriteResolver) error {
 	if policy == SandboxFullAccess {
 		return nil
 	}
-	path, write := writeCallInfo(toolName, argsJSON)
+	var d writeCallDecision
+	if resolve != nil {
+		d = resolve(toolName, argsJSON)
+	} else {
+		path, write := legacyWriteCallInfo(toolName, argsJSON)
+		d = writeCallDecision{path: path, write: write, unknownWrite: legacyWriteCapableExecutor(toolName)}
+	}
 	switch policy {
 	case SandboxReadOnly:
-		// read-only：任何可写操作一律拒绝；无法定位写路径的解释器/执行器整体禁用。
-		if write || isWriteCapableExecutor(toolName) {
+		// read-only：任何可写操作一律拒绝；无法定位写路径的执行器整体禁用。
+		if d.write || d.unknownWrite {
 			return fmt.Errorf("sandbox: read-only policy blocks write via %s", toolName)
 		}
 	case SandboxWorkspaceWrite:
-		if write {
-			if path == "" || !inWorkspace(path) {
-				return fmt.Errorf("sandbox: workspace-write policy blocks write outside workspace to %q via %s", path, toolName)
-			}
+		if d.write && (d.path == "" || !inWorkspace(d.path)) {
+			return fmt.Errorf("sandbox: workspace-write policy blocks write outside workspace to %q via %s", d.path, toolName)
 		}
-		// 不可定位写路径的执行器在 workspace-write 下放行（缺省档，见 writeCapableExecutors 注释）。
+		// 不可定位写路径的执行器在 workspace-write 下放行（缺省档，见 legacy 注释）。
 	}
 	return nil
 }
 
-// writeCallInfo 提取工具调用的目标路径与写操作判定。
+// legacyWriteCallInfo 是旧插件（未声明写能力）的兼容回退：提取目标路径与写操作判定。
 // 仅对已知写语义的工具生效：str_replace_editor 的 command != view 视为写。
 // 其余工具视为非写（不做额外拦截，避免误伤读操作）。
 // 参数无法解析为合法 JSON 时按「写」处理（fail-closed），避免解析失败被当成
 // 非写放行而与沙箱 fail-closed 声称矛盾。
-func writeCallInfo(toolName, argsJSON string) (path string, write bool) {
+func legacyWriteCallInfo(toolName, argsJSON string) (path string, write bool) {
 	switch toolName {
 	case "str_replace_editor":
 		var m map[string]any
@@ -200,11 +333,32 @@ func (m *Manager) GetSandboxPolicy() SandboxPolicy {
 	return SandboxPolicy(m.sandboxPolicyVal.Load())
 }
 
+// resolveSandboxWrite 从 ToolRegistry 取被调工具，按其自声明的写能力解析本次调用的
+// 写入语义；工具未注册或未声明写能力时回退 legacy 按名判定（旧插件兼容）。
+func (m *Manager) resolveSandboxWrite(toolName, argsJSON string) writeCallDecision {
+	var tool ToolDefinition
+	if m.toolRegistry != nil {
+		tool, _ = m.toolRegistry.Get(toolName)
+	}
+	return resolveWriteCall(tool, toolName, argsJSON)
+}
+
 // sandboxPolicy 工具流水线 pre-execute 瀑布策略：fail-closed 拦截写操作。
 // 策略经 get 动态读取，支持运行时切换（TUI /sandbox 命令）。
 // 审批门（approvalEscalation）已 approved 的升级调用以更宽档 EscalatedMode 复审。
 // 被拒时返回对齐 DSH 的拒绝标记 + 升级提示，模型据此携 sandbox_permissions 升级重试。
+func (m *Manager) sandboxPolicy(get func() SandboxPolicy) WaterfallListener {
+	return sandboxPolicyWith(get, m.resolveSandboxWrite)
+}
+
+// sandboxPolicy 是无 Manager 的包级包装（legacy 判定，不解析工具能力），供既有测试与
+// 独立装配使用；宿主运行时用 m.sandboxPolicy 以按工具自声明的能力裁决。
 func sandboxPolicy(get func() SandboxPolicy) WaterfallListener {
+	return sandboxPolicyWith(get, nil)
+}
+
+// sandboxPolicyWith 是上述两者的共用实现。
+func sandboxPolicyWith(get func() SandboxPolicy, resolve sandboxWriteResolver) WaterfallListener {
 	return func(ctx EventContext, next func(EventContext) error) error {
 		inv, _ := ctx.Data.(*ToolInvocation)
 		if inv == nil {
@@ -214,7 +368,7 @@ func sandboxPolicy(get func() SandboxPolicy) WaterfallListener {
 		if inv.Escalated {
 			mode = inv.EscalatedMode // 本调用已升级获批：以更宽档复审
 		}
-		if err := sandboxCheck(mode, inv.ToolName, inv.ArgumentsJSON); err != nil {
+		if err := sandboxCheck(mode, inv.ToolName, inv.ArgumentsJSON, resolve); err != nil {
 			return fmt.Errorf("%s\n%s",
 				sandboxDenialMarker(sandboxModeString(mode)), escalationHintMarker(escalationSubject(inv.ToolName)))
 		}

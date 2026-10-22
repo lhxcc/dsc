@@ -310,8 +310,8 @@ func (m *Manager) approvalEscalation() WaterfallListener {
 			return next(ev)
 		}
 		// 只有沙箱强制（写语义/执行器）的工具族承载升级；非强制工具忽略升级参数。
-		_, write := writeCallInfo(inv.ToolName, inv.ArgumentsJSON)
-		if !write && !isWriteCapableExecutor(inv.ToolName) {
+		d := m.resolveSandboxWrite(inv.ToolName, inv.ArgumentsJSON)
+		if !d.write && !d.unknownWrite {
 			return next(ev)
 		}
 		perm, just := escalationArgs(inv.ArgumentsJSON)

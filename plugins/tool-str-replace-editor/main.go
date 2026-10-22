@@ -516,6 +516,6 @@ func main() {
 			"editor": "true",
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "str_replace_editor", Description: "Custom editor tool for viewing, creating, and editing files. Supports commands: view, create, str_replace, insert.", Schema: schema, Handler: strReplaceEditor})
+	sdk.Tool(dsc.Tool{Name: "str_replace_editor", Description: "Custom editor tool for viewing, creating, and editing files. Supports commands: view, create, str_replace, insert.", Schema: schema, Handler: strReplaceEditor, Capabilities: []string{"writes-path:path", "read-only-when:command=view"}})
 	sdk.Serve()
 }
