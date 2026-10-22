@@ -43,6 +43,9 @@ type BillionContext struct {
 	// 对齐宿主 session 存储的 SessionKeyForProject——同一项目同名、不同项目隔离）
 	sessionID string
 
+	// logWindowOnce 首次 pre-step 打印生效窗口一次（启动期 stderr 尚未被宿主转发）。
+	logWindowOnce sync.Once
+
 	// lastMessages 缓存最近一次 pre-step 收到的 CoreMessage 列表，供 handleCompress
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
 	// 每次 handlePreStep 更新此缓存；handleCompress 从中读取。
@@ -55,7 +58,9 @@ func main() {
 	stateDir := dsc.PJoin(execDir, "billion-context")
 	store := bcadapter.NewStateStore(stateDir)
 
-	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖）
+	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖——宿主按配置 context_window
+	// 或端点探测值把该键注入所有插件，故云端 1M 窗口下应为 1048576；实际值在首个
+	// pre-step 打印一次，见 handlePreStep）
 	contextWindow := 131072
 	if n := dsc.ContextWindow(); n > 0 {
 		contextWindow = n
@@ -275,6 +280,11 @@ func (bc *BillionContext) handleRequestError(ctx context.Context, dataJSON strin
 // 协议：dataJSON 为 AgentPreStepEvent 的 JSON（含 MessagesJSON 字段）
 // 返回：resultJSON 为 {"messages": [...]} 形式（改写后的 proto.Message 数组 JSON）
 func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (string, error) {
+	// 首个 pre-step 打印实际生效的窗口（此时 gRPC 已握手，stderr 会被宿主转发到日志），
+	// 用于核对云端 1M 窗口是否真的取代了 128K 默认值。
+	bc.logWindowOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "[billion-context] context window=%d\n", bc.config.ModelContextLimit)
+	})
 	var ev core.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("billion-context: parse pre-step event: %w", err)

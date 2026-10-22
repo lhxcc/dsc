@@ -759,6 +759,7 @@ func main() {
 	// 有效上下文窗口下发所有插件（不止 agent）：压缩后端按它算触发阈值，缺省会退回
 	// 128K，云端 1M 窗口下几步就压缩。
 	injectContextWindow(merged, contextWindow)
+	logger.Info("context window injected to all plugins", "window", contextWindow, "plugins", len(merged.Plugins))
 
 	// 输出上限统一语义（不分本地/云端，行为一致）：向 LLM 插件注入 DSC_MAX_OUTPUT_TOKENS
 	// =有效上下文窗口值。探测命中（本地 LLAMACPP）注入探测窗口值；探测不命中（云端）注入
