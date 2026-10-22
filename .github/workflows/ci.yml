@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting of tracked Go files
+        shell: bash
+        run: |
+          # 仅检查受控文件；纯 vendored 第三方源码不强制格式化（见 AGENTS.md）。
+          files="$(git ls-files '*.go' \
+            | grep -vE '^libs/(anthropic-sdk-go|go-openai|go-lua|jig-lisp|toon-go|fasttemplate|bytebufferpool)/' \
+            | grep -vE '^plugins/tool-2fa-master/vendor/')"
+          count="$(printf '%s\n' "$files" | grep -c . || true)"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No tracked Go files found"
+            exit 1
+          fi
+          unformatted="$(printf '%s\n' "$files" | while IFS= read -r f; do
+            [ -n "$f" ] && gofmt -l "$f"
+          done)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "All $count tracked Go files are gofmt-clean."
+
+  test:
+    name: root module build, vet and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  submodules:
+    name: submodule ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 每个子模块独立 go.mod，set up Go 时按各自的 go-version-file 安装版本。
+        #
+        # 未纳入矩阵的模块及原因：
+        # - plugins/tool-computer-use：依赖 robotgo/screenshot，需要 CGO 与原生
+        #   X11/显示库，headless runner 上无法可靠构建；且其截图 API 在较新
+        #   macOS 上已被标记 obsolete。已在本地按平台验证，不在 CI 中构建。
+        # - plugins/tool-harness-webui：main.go 使用 //go:embed all:webui/dist，
+        #   该目录需先用 bun 执行 webui/build.sh 生成，产物被 .gitignore 忽略，
+        #   干净检出时必然构建失败，故跳过。
+        include:
+          - path: sdk
+            test: true
+          - path: plugin
+            test: true
+          - path: builder
+            test: false
+          - path: sdk/examples/hook-tool
+            test: true
+          - path: sdk/examples/llm-proxy
+            test: true
+          - path: sdk/examples/tool-simple
+            test: true
+          - path: plugins/agent-react-loop
+            test: false
+          - path: plugins/dsc-billion-context
+            test: false
+          - path: plugins/dsc-notify
+            test: false
+          - path: plugins/dsc-system
+            test: false
+          - path: plugins/llm-anthropic
+            test: false
+          - path: plugins/llm-ollama
+            test: false
+          - path: plugins/llm-openai
+            test: false
+          - path: plugins/tool-agentic-bench
+            test: false
+          - path: plugins/tool-browser-use
+            test: false
+          - path: plugins/tool-filesystem
+            test: false
+          - path: plugins/tool-lisp-eval
+            test: false
+          - path: plugins/tool-lua-host
+            test: false
+          - path: plugins/tool-memory-service
+            test: false
+          - path: plugins/tool-musicplayer
+            test: false
+          - path: plugins/tool-pdf
+            test: false
+          - path: plugins/tool-sql-host
+            test: false
+          - path: plugins/tool-ssh
+            test: false
+          - path: plugins/tool-str-replace-editor
+            test: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.path }}/go.mod
+          cache: true
+      - name: go build
+        working-directory: ${{ matrix.path }}
+        run: go build ./...
+      - name: go test
+        if: matrix.test
+        working-directory: ${{ matrix.path }}
+        run: go test ./...
+
+  cross:
+    name: cross ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: loong64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: freebsd
+            goarch: amd64
+            # freebsd 上 purego 的 fakecgo 必须显式使用 -std，否则编译失败。
+            gcflags: -gcflags=github.com/ebitengine/purego/internal/fakecgo=-std
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ${{ matrix.gcflags }} ./...
