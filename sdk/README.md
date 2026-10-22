@@ -52,7 +52,7 @@ cd examples/tool-simple && go build -o my-tool.exe .
 | `dsc.TypeTool` | `sdk.Tool(...)` 或 `sdk.ToolProvider(...)` | 註冊工具（可多個）或提供動態工具集；SDK 自動提供 ExecuteTool / ListTools / ListContext / 元數據 / 鈎子服務 |
 | `dsc.TypeLLM` | `sdk.LLM(impl)` | 實現 `plugin.LLMProvider`（Chat / ChatStream / Name / Version / HealthCheck） |
 | `dsc.TypeAgent` | `sdk.Agent(impl)` | 實現 `plugin.Agent`（Run / RunStream / RegisterServices / InjectMessage 等 11 個方法） |
-| `dsc.TypePolicy` | `sdk.Policy(impl)` | 實現 `proto.FsObservationPolicyServiceServer`（宿主橋接到工具流水線） |
+| `dsc.TypePolicy` | `sdk.Policy(impl)` | 實現 `proto.PolicyServiceServer`（宿主橋接到工具流水線三槽位：pre-execute / execute / post-execute） |
 | `dsc.TypeDsc` | `sdk.Tool(...)` / `sdk.ToolProvider(...)` / `sdk.Hook(...)` / `sdk.Context(...)` 等可選 | 通用/純後台插件：不註冊 llm/agent/policy 服務；**可註冊工具**——宿主經 ListTools 探測並登記為 tool provider（工具集為空時跳過登記，零行為變化）；可加鈎子訂閲宿主事件廣播；目錄前綴 `dsc-` |
 
 所有類型的元數據（Type/Name/Version/APIVersion）由 SDK 自動提供，宿主加載時校驗
@@ -160,8 +160,11 @@ sdk.Hook(dsc.Hook{
         AfterTool: func(ctx context.Context, toolName, argumentsJSON, result, toolErr string) (string, string) {
                 return result, toolErr
         },
-        // 宿主事件訂閲（異步廣播：turn/start、tool/result 等）
-        OnEvent: func(ctx context.Context, eventType, dataJSON string) {},
+        // 宿主事件訂閲（同步分發：agent/status、tools/result 等）
+        // waterfall 事件返回改寫後的 resultJSON；err 非空即 veto
+        OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
+                return "", nil
+        },
 })
 ```
 

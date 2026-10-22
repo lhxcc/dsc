@@ -52,9 +52,10 @@ func main() {
 		AfterTool: func(ctx context.Context, toolName, argumentsJSON, result, toolErr string) (string, string) {
 			return result + " [via hook-demo]", toolErr
 		},
-		OnEvent: func(ctx context.Context, eventType, dataJSON string) {
-			// 宿主事件广播（异步）：turn/start、tool/result 等；仅观察，不阻塞。
+		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
+			// 宿主事件广播（同步分发）：agent/status、tools/result 等；仅观察，不阻塞。
 			log.Printf("hook-demo: event %s: %s", eventType, dataJSON)
+			return "", nil
 		},
 	})
 

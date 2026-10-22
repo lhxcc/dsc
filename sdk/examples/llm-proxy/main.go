@@ -23,6 +23,9 @@ func (m *mockLLM) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// VisionEnabled 声明本模型不支持图像输入（供宿主/TUI 提示）。
+func (m *mockLLM) VisionEnabled() bool { return false }
+
 func (m *mockLLM) Chat(ctx context.Context, messages []core.Message, tools []core.Tool, maxTokens int) (*core.ChatResponse, error) {
 	var b strings.Builder
 	for _, msg := range messages {
