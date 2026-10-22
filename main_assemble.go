@@ -233,8 +233,11 @@ func injectRuntimeEnv(merged *core.Config, mode, workspaceRoot, sandboxPolicy st
 // anthropic 兼容口把 max_tokens 视为 required，字段缺席时服务端自填保守默认（laamaafung
 // server-chat.cpp 为 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带
 // 窗口值在 LLAMACPP 侧受上下文自然钳制（生成至 EOS 或窗口满），无害。
-// 插件侧优先级：请求级参数（压缩等场景的窗口净余值）> 显式插件 env（DSC_ANTHROPIC_/
-// DSC_OPENAI_MAX_OUTPUT_TOKENS，旧名兼容，-1=不携带；0 仍表示未设置、走本注入值）> 本注入值 > 不携带（宿主未注入时）。
+// 插件侧优先级：请求级参数（压缩等场景的窗口净余值）> 插件 env 里显式配置的
+// DSC_MAX_OUTPUT_TOKENS（-1=不携带；0 表示未设置）或接口专属
+// DSC_<P>_MAX_OUTPUT_TOKENS（旧名兼容）> 本注入值 > 不携带（宿主未注入时）。
+// 注意：插件 env 已显式给出 DSC_MAX_OUTPUT_TOKENS 时必须尊重，不得覆盖——否则
+// 用户在 config.yaml 里写的 -1（不携带）会被这里静默改回窗口值。
 func injectMaxOutputTokens(merged *core.Config, maxTokens int) {
 	if maxTokens <= 0 {
 		return
@@ -246,6 +249,9 @@ func injectMaxOutputTokens(merged *core.Config, maxTokens int) {
 		}
 		if e.Env == nil {
 			e.Env = map[string]string{}
+		}
+		if _, explicit := e.Env["DSC_MAX_OUTPUT_TOKENS"]; explicit {
+			continue // 用户显式配置优先
 		}
 		e.Env["DSC_MAX_OUTPUT_TOKENS"] = strconv.Itoa(maxTokens)
 	}

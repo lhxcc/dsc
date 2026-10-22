@@ -8,6 +8,27 @@ import (
 
 // TestAssembleMergedConfigToolsDedup 验证 config.yaml 中启用的 tool/dsc 条目
 // 并入合并集（模型安装的插件可跨重启生效），并与 preset 按名去重——同名冲突取 preset。
+// TestInjectMaxOutputTokensRespectsExplicit 验证注入不覆盖插件 env 里显式写的
+// DSC_MAX_OUTPUT_TOKENS（含 -1=不携带）——否则示例配置里的 -1 会被静默改成窗口值。
+func TestInjectMaxOutputTokensRespectsExplicit(t *testing.T) {
+	merged := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "llm-anthropic", Type: "llm", Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "-1"}},
+		{Name: "llm-openai", Type: "llm"},
+		{Name: "tool-x", Type: "tool"},
+	}}
+	injectMaxOutputTokens(merged, 1048576)
+
+	if got := merged.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "-1" {
+		t.Fatalf("显式 -1 不得被覆盖，got %q", got)
+	}
+	if got := merged.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "1048576" {
+		t.Fatalf("未显式配置时应注入窗口值，got %q", got)
+	}
+	if _, ok := merged.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
+		t.Fatal("非 LLM 插件不应被注入 max_tokens")
+	}
+}
+
 func TestAssembleMergedConfigToolsDedup(t *testing.T) {
 	mainCfg := &core.Config{Plugins: []core.PluginEntry{
 		{Name: "agent-react-loop", Type: "agent", Enabled: true, BinaryPath: "./plugins/agent-react-loop/a.exe"},

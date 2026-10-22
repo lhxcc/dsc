@@ -120,6 +120,36 @@ DSC 與 DSH 同源於「一切皆插件」的設計哲學，兩者在概念層�
 - `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`，與 anthropic 口同端口）取探測窗口值，探測不到（雲端）取配置 `context_window` 值（不正確可隨時再設），不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，顯式攜帶窗口值在 llama.cpp 側受上下文自然鉗制、無害，並對抗其對缺席值自填的保守默認（laamaafung 為 4096）；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
 - `llm-ollama`（Ollama 兼容端點：本地 Ollama server。與 `llm-openai`/`llm-anthropic` 同為 LLM provider 插件，經 Ollama Go SDK 直連 `/api/chat`；支持 reasoning/thinking 模型（默認開啓，`DSC_OLLAMA_THINKING=0` 可關閉，舊名 `OLLAMA_THINKING` 仍兼容），從響應 `Message.Thinking` 提取思維鏈幀渲染到 TUI；@文本附件引用（`dsc-txt://`）解析為文本串前綴拼入 user 消息 Content）
 
+#### LLM 相關環境變量
+
+LLM 插件的配置全部走環境變量（寫在 `config.yaml` 插件條目的 `env:` 塊，或由宿主注入）。
+`<PROVIDER>` 取 `ANTHROPIC` / `OPENAI` / `OLLAMA`。所有正式名一律 `DSC_` 前綴——宿主在裝配插件
+子進程環境時用它覆蓋終端同名變量，避免「配置寫新 key、請求卻帶終端舊 key」這類劫持；舊的
+無前綴名僅在 `DSC_` 未設時回退，保留兼容。
+
+| 變量 | 作用 | 取值 / 說明 |
+|---|---|---|
+| `DSC_<P>_API_KEY`<br>`DSC_<P>_BASE_URL`<br>`DSC_<P>_MODEL` | 憑據 / 端點 / 模型名 | 三鍵**整組**決定前綴：任一 `DSC_` 存在即整組讀 `DSC_`，否則整組回退舊名 `<P>_*`；禁止新舊混用 |
+| `DSC_REASONING_EFFORT` | 跨 provider 統一推理強度 | `none`/`minimal`/`low`/`medium`/`high`/`max`（映射見下節） |
+| `DSC_<P>_REASONING_EFFORT` | 接口專屬推理強度覆蓋 | 直接傳端點字面量（如 `xhigh`），優先於統一檔位 |
+| `DSC_<P>_THINKING` | 擴展思考開關 | `0`/`false`/`off`/`no` 關閉；未設默認開啓（舊名 `<P>_THINKING` 回退） |
+| `DSC_ANTHROPIC_THINKING_BUDGET` | anthropic 思考 token 預算 | 正整數；未設時由統一檔位映射（舊名回退） |
+| `DSC_MAX_OUTPUT_TOKENS` | 單輪輸出上限（宿主通用） | `>0` 攜帶該值；`-1` 明確不攜帶 `max_tokens`；`0`/未設 = 由宿主按 `context_window` 注入。寫在插件 `env:` 裡時宿主不再覆蓋（顯式優先） |
+| `DSC_<P>_MAX_OUTPUT_TOKENS` | 接口專屬輸出上限 | 三態同 `DSC_MAX_OUTPUT_TOKENS`，優先於它（舊名回退） |
+| `DSC_NO_VISION` | 強制關閉圖像輸入 | `1`/`true`/`on`/`yes` |
+| `DSC_LLM_DEBUG` | anthropic 思維鏈 stderr 調試打印 | 非空開啓（默認關閉） |
+
+幾點約定：
+
+- **輸出上限的三態語義**：`0`＝未設置（走 `DSC_MAX_OUTPUT_TOKENS` 兜底，即有效上下文窗口值）；
+  `-1`＝明確不攜帶 `max_tokens`；`>0`＝攜帶該值。雲端端點對 `max_tokens` 常有上限
+  （如 DeepSeek 393216），把上下文窗口值原樣當輸出上限會被 400 拒絕，故示例配置默認 `-1`。
+- **憑據不外泄**：非 LLM 插件不繼承任何憑據類鍵（含 `DSC_<P>_API_KEY`）；確實需要宿主憑據的
+  插件走白名單（目前僅 `tool-harness-webui` 可讀 `DSC_ADMIN_TOKEN`）。要給某插件憑據，寫進它
+  自己的 `env:` 塊——顯式注入不受該過濾影響。
+- 排查「插件到底拿到哪份配置」時用 `dsc -log`，啟動日誌會打印 `llm plugin env resolved`
+  （憑據只留後 4 位）。
+
 #### 統一推理強度（DSC_REASONING_EFFORT）
 
 DSC 提供跨 provider 統一的推理強度開關 `DSC_REASONING_EFFORT`（取值 `none` / `minimal` / `low` / `medium` / `high` / `max`，大小寫不敏感），由 SDK 的 `LoadLLMConfig` 按各 LLM 接口語義映射為具體參數，免去逐家記憶不同字段名。各接口映射如下：

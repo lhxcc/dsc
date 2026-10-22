@@ -98,15 +98,7 @@ func LoadLLMConfig(provider string) LLMConfig {
 	// （写 0 仍表示未设置，会被兜底覆盖——这是刻意的：0 保留 Go 零值语义）。
 	maxOut, maxOutSet := int64(0), false
 	if v, ok := EnvLookupSet("DSC_"+prefix+"MAX_OUTPUT_TOKENS", prefix+"MAX_OUTPUT_TOKENS"); ok {
-		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil {
-			switch {
-			case n > 0:
-				maxOut, maxOutSet = n, true
-			case n < 0:
-				maxOut, maxOutSet = -1, true
-			}
-			// n == 0 与非法值都保持「未设置」语义 → 由兜底处理
-		}
+		maxOut, maxOutSet = parseMaxOutputTokens(v)
 	}
 	cfg := LLMConfig{
 		APIKey:  strings.TrimSpace(os.Getenv(resolved("API_KEY"))),
@@ -116,9 +108,11 @@ func LoadLLMConfig(provider string) LLMConfig {
 		MaxOutputTokens: maxOut,
 		VisionEnabled:   !envNoVision(),
 	}
-	// DSC_MAX_OUTPUT_TOKENS 兜底（仅「未设置」时生效；非法值按未设置处理）
+	// DSC_MAX_OUTPUT_TOKENS 兜底（宿主通用；仅未设置时生效，同样支持 -1=不携带）
 	if !maxOutSet {
-		cfg.MaxOutputTokens = EnvPositiveInt64("DSC_MAX_OUTPUT_TOKENS")
+		if v, ok := EnvLookupSet("DSC_MAX_OUTPUT_TOKENS"); ok {
+			cfg.MaxOutputTokens, _ = parseMaxOutputTokens(v)
+		}
 	}
 	// 推理强度：DSC 统一档位（DSC_REASONING_EFFORT）+ 各接口具体覆盖。
 	// 优先级：接口专属变量 > 统一档位映射 > 0/空（插件用自身默认）。
@@ -142,6 +136,26 @@ func LoadLLMConfig(provider string) LLMConfig {
 		cfg.OpenAIReasoningEffort = oai
 	}
 	return cfg
+}
+
+// parseMaxOutputTokens 把 max_tokens 环境变量解析为三态值：
+//
+//	>0  → 该值（携带）
+//	<0  → -1（明确不携带，任意负数归一化）
+//	0/非法 → (0, false)，由调用方按「未设置」处理（走兜底）
+func parseMaxOutputTokens(v string) (int64, bool) {
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	switch {
+	case n > 0:
+		return n, true
+	case n < 0:
+		return -1, true
+	default:
+		return 0, false
+	}
 }
 
 // anthropicThinkingBudgetForLevel 将 DSC 标准档位映射为 anthropic 路径思考 token 预算。

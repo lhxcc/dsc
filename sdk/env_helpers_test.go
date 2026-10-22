@@ -234,6 +234,15 @@ func TestLoadLLMConfigMaxOutputTokensPrefix(t *testing.T) {
 		t.Fatalf("非法值应按未设置处理并兜底，got %d", cfg.MaxOutputTokens)
 	}
 
+	// 宿主通用 DSC_MAX_OUTPUT_TOKENS 同样支持 -1（示例配置就把它写在插件 env 里）。
+	t.Setenv("DSC_MAX_OUTPUT_TOKENS", "-1")
+	os.Unsetenv("DSC_OPENAI_MAX_OUTPUT_TOKENS")
+	os.Unsetenv("OPENAI_MAX_OUTPUT_TOKENS")
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != -1 {
+		t.Fatalf("通用 DSC_MAX_OUTPUT_TOKENS=-1 应表示不携带，got %d", cfg.MaxOutputTokens)
+	}
+	t.Setenv("DSC_MAX_OUTPUT_TOKENS", "131072")
+
 	// anthropic 同规则。
 	t.Setenv("DSC_ANTHROPIC_MAX_OUTPUT_TOKENS", "65536")
 	t.Setenv("ANTHROPIC_MAX_OUTPUT_TOKENS", "8192")
