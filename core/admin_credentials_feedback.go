@@ -40,10 +40,10 @@ func (m *Manager) ensureFeedbackStore() *FeedbackStore {
 //   - POST /credentials/set                设置单条凭据（持久化到文件）
 //   - POST /credentials/delete             删除单条凭据
 func (m *Manager) registerCredentialAdminRoutes(group *vodka.RouteGroup) {
-	group.Get("/credentials/list", m.handleCredentialList)
-	group.Get("/credentials/get", m.handleCredentialGet)
-	group.Post("/credentials/set", m.handleCredentialSet)
-	group.Post("/credentials/delete", m.handleCredentialDelete)
+	group.Get("/list", m.handleCredentialList)
+	group.Get("/get", m.handleCredentialGet)
+	group.Post("/set", m.handleCredentialSet)
+	group.Post("/delete", m.handleCredentialDelete)
 }
 
 // registerFeedbackAdminRoutes 注册 /feedback/* admin 端点。
@@ -52,9 +52,9 @@ func (m *Manager) registerCredentialAdminRoutes(group *vodka.RouteGroup) {
 //   - GET  /feedback/list   列出反馈（按 session 可选过滤）
 //   - GET  /feedback/stats  统计信息
 func (m *Manager) registerFeedbackAdminRoutes(group *vodka.RouteGroup) {
-	group.Post("/feedback/add", m.handleFeedbackAdd)
-	group.Get("/feedback/list", m.handleFeedbackList)
-	group.Get("/feedback/stats", m.handleFeedbackStats)
+	group.Post("/add", m.handleFeedbackAdd)
+	group.Get("/list", m.handleFeedbackList)
+	group.Get("/stats", m.handleFeedbackStats)
 }
 
 // ---- credentials handlers ----

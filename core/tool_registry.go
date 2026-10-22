@@ -19,6 +19,13 @@ func NewToolRegistry() *ToolRegistry {
 	}
 }
 
+// Reset 清空全部已注册工具（宿主 Shutdown 时回收，避免复用 Manager 时残留）。
+func (r *ToolRegistry) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools = make(map[string]ToolDefinition)
+}
+
 // Register 註冊工具（線程安全）
 func (r *ToolRegistry) Register(t ToolDefinition) error {
 	r.mu.Lock()

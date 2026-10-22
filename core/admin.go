@@ -37,6 +37,24 @@ func adminAuth(c *vodka.Context) error {
 // 端口冲突时自动自增重试（如 9999 被占用则尝试 10000、10001…，最多重试 100 次），
 // 并在每次重试时记 warn 日志。最终监听地址经返回值传回调用方。
 func (m *Manager) StartAdmin(addr string) string {
+	e := m.adminEngine()
+
+	// 端口冲突自动自增重试：若指定端口已被占用，逐次自增端口重试，
+	// 最多 100 次。每次冲突记 warn 日志（仅在 -log 开启时输出到日志文件/SSE）。
+	// 多实例同时启动 DSC 时不再因 9999 端口冲突而启动失败。
+	finalAddr := m.listenAdminWithRetry(e, addr)
+	go func() {
+		e.Server.Addr = finalAddr
+		if err := e.Server.ListenAndServe(); err != nil {
+			m.logger.Error("admin api error", "error", err)
+		}
+	}()
+	return finalAddr
+}
+
+// adminEngine 构建管理 API 引擎（超时、认证中间件与全部路由）。
+// 独立于监听，供 StartAdmin 与路由回归测试复用。
+func (m *Manager) adminEngine() *vodka.Vodka {
 	e := vodka.New()
 
 	// 反慢速攻擊：限制讀取請求頭與空閒連接超時。刻意不設 Read/WriteTimeout——
@@ -102,17 +120,7 @@ func (m *Manager) StartAdmin(addr string) string {
 	mcp.Use(adminAuth)
 	m.registerMCPAdminRoutes(mcp)
 
-	// 端口冲突自动自增重试：若指定端口已被占用，逐次自增端口重试，
-	// 最多 100 次。每次冲突记 warn 日志（仅在 -log 开启时输出到日志文件/SSE）。
-	// 多实例同时启动 DSC 时不再因 9999 端口冲突而启动失败。
-	finalAddr := m.listenAdminWithRetry(e, addr)
-	go func() {
-		e.Server.Addr = finalAddr
-		if err := e.Server.ListenAndServe(); err != nil {
-			m.logger.Error("admin api error", "error", err)
-		}
-	}()
-	return finalAddr
+	return e
 }
 
 // listenAdminWithRetry 尝试在指定地址监听，端口被占用时自增端口号重试。
@@ -179,20 +187,14 @@ func (m *Manager) handleUnload(c *vodka.Context) error {
 	return c.JSON(vodka.Map{"status": "success", "message": "core unloaded"})
 }
 
-// handleReload 處理重載插件請求
+// handleReload 處理重載插件請求（失败时回滚到旧条目，不丢配置）
 func (m *Manager) handleReload(c *vodka.Context) error {
 	var entry PluginEntry
 	if err := bindBody(c, &entry); err != nil {
 		return err
 	}
 
-	// 先卸載
-	if err := m.UnloadPlugin(entry.Name); err != nil {
-		return wrapErr("unload", err)
-	}
-
-	// 再加載
-	if err := m.LoadPlugin(entry); err != nil {
+	if err := m.ReloadPlugin(entry); err != nil {
 		return wrapErr("reload", err)
 	}
 
@@ -375,11 +377,13 @@ func (m *Manager) handleMetadata(c *vodka.Context) error {
 
 	return c.JSON(vodka.Map{
 		"status": "success",
-		"metadata": map[string]string{
-			"type":        info.Type,
-			"name":        info.Name,
-			"version":     info.Version,
-			"api_version": info.ApiVersion,
+		"metadata": map[string]any{
+			"type":         info.Type,
+			"name":         info.Name,
+			"version":      info.Version,
+			"api_version":  info.ApiVersion,
+			"services":     info.Services,
+			"capabilities": info.Capabilities,
 		},
 	})
 }

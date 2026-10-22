@@ -211,6 +211,30 @@ func (m *Manager) portableBinaryPath(bin string) string {
 	return normalizeBinaryPath(clean)
 }
 
+// pluginEntryFromConfigLocked 读取 config.yaml 中指定插件的条目（同名首条）。
+// 文件、plugins 序列或条目缺失/无法解码时返回 false。供 reload 失败回滚取旧条目。
+func (m *Manager) pluginEntryFromConfigLocked(name string) (PluginEntry, bool) {
+	doc, err := readConfigDocumentNode(m.persistConfigPath())
+	if err != nil || doc == nil {
+		return PluginEntry{}, false
+	}
+	seq := findPluginsSequence(configMappingNode(doc))
+	if seq == nil {
+		return PluginEntry{}, false
+	}
+	for _, item := range seq.Content {
+		if entryNameFromNode(item) != name {
+			continue
+		}
+		var e PluginEntry
+		if err := item.Decode(&e); err != nil {
+			return PluginEntry{}, false
+		}
+		return e, true
+	}
+	return PluginEntry{}, false
+}
+
 // persistRemovalLocked 从 config.yaml 的 plugins 序列中移除指定插件条目。
 // 文件缺失、无 plugins 序列或条目不存在时视为幂等成功（支持重复卸载）。需已持有 m.mu。
 func (m *Manager) persistRemovalLocked(name string) error {

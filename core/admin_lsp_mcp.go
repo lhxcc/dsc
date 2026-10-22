@@ -19,9 +19,9 @@ import (
 // 诊断信息由外部组件经 SetDiagnostics 推送缓存（完整 LSP 协议握手留待后续）。
 // LSPTool 注册到 ToolRegistry 后模型可调用 lsp_diagnostics 工具查询诊断。
 func (m *Manager) registerLSPAdminRoutes(group *vodka.RouteGroup) {
-	group.Post("/lsp/start", m.handleLSPStart)
-	group.Post("/lsp/stop", m.handleLSPStop)
-	group.Get("/lsp/diagnostics", m.handleLSPDiagnostics)
+	group.Post("/start", m.handleLSPStart)
+	group.Post("/stop", m.handleLSPStop)
+	group.Get("/diagnostics", m.handleLSPDiagnostics)
 }
 
 // registerMCPAdminRoutes 注册 /mcp/* admin 端点。
@@ -33,9 +33,9 @@ func (m *Manager) registerLSPAdminRoutes(group *vodka.RouteGroup) {
 // MCPClient 经 JSON-RPC over HTTP 与外部 MCP 服务器通信，discoverTools 自动把
 // 服务器工具注册到 ToolRegistry，模型可经 mcp__<server>__<rawName> 名调用。
 func (m *Manager) registerMCPAdminRoutes(group *vodka.RouteGroup) {
-	group.Post("/mcp/connect", m.handleMCPConnect)
-	group.Post("/mcp/disconnect", m.handleMCPDisconnect)
-	group.Get("/mcp/list", m.handleMCPList)
+	group.Post("/connect", m.handleMCPConnect)
+	group.Post("/disconnect", m.handleMCPDisconnect)
+	group.Get("/list", m.handleMCPList)
 }
 
 // ---- LSP handlers ----

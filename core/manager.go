@@ -21,6 +21,7 @@ import (
 	"dsc/proto"
 	"dsc/proto/metadata"
 	"dsc/session"
+
 	"github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/go-version"
@@ -1134,6 +1135,17 @@ func (m *Manager) Shutdown() {
 		clients = append(clients, clientInfo{name: name, client: client})
 	}
 
+	// LSP / MCP 客户端是 admin API 拉起的外部子进程，不登记在 m.clients；
+	// 一并收集后停止，避免宿主退出后残留。
+	lspClients := make([]*LSPClient, 0, len(m.lspClients))
+	for _, c := range m.lspClients {
+		lspClients = append(lspClients, c)
+	}
+	mcpClients := make([]*MCPClient, 0, len(m.mcpClients))
+	for _, c := range m.mcpClients {
+		mcpClients = append(mcpClients, c)
+	}
+
 	m.clients = make(map[string]*plugin.Client)
 	m.plugins = make(map[string]DSCPlugin)
 	m.agents = make(map[string]Agent)
@@ -1148,7 +1160,37 @@ func (m *Manager) Shutdown() {
 	m.loadedEntries = make(map[string]PluginEntry)
 	m.pendingEntries = make(map[string]PluginEntry)
 	m.resolvedDeps = make(map[string][]ResolvedDep)
+	// 聚合/工具注册表的运行态同样归零：broker 与 serviceID 在下次启动时重新分配，
+	// 否则复用同一 Manager 会看到残留工具与悬空服务 ID。
+	m.broker = nil
+	m.mainAgentName = ""
+	m.agentToolServiceID = 0
+	m.agentLLMServiceID = 0
+	m.agentLLMName = ""
+	m.userQuestionsServiceID = 0
+	m.coreNotifyServiceID = 0
+	m.llmServiceIDs = make(map[string]uint32)
+	m.llmOrder = nil
+	m.toolServiceIDs = make(map[string]uint32)
+	m.coreToolNames = make(map[string][]string)
+	m.toolClients = make(map[string]proto.ToolServiceClient)
+	m.toolHookClients = make(map[string]proto.PluginHookServiceClient)
+	m.toolHookOrder = nil
+	m.policyOff = make(map[string][]func())
+	m.loadedBinaries = make(map[string]string)
+	m.lspClients = make(map[string]*LSPClient)
+	m.mcpClients = make(map[string]*MCPClient)
+	if m.toolRegistry != nil {
+		m.toolRegistry.Reset()
+	}
 	m.mu.Unlock()
+
+	for _, c := range lspClients {
+		_ = c.Stop()
+	}
+	for _, c := range mcpClients {
+		c.Disconnect()
+	}
 
 	// 等待所有插件子进程确实退出：go-plugin 的 client.Kill() 会阻塞等待进程退出，
 	// 但某些插件可能有自己的清理逻辑导致 Kill 在退出后进程未完全终止。
@@ -1267,27 +1309,18 @@ func (m *Manager) ListContext(ctx context.Context) (string, error) {
 	// 等 dsc 类型插件无法贡献。现改为经 hookClientsSnapshot 聚合所有类型。
 	// 旧插件未实现 PluginHookService.ListContext 时返回 Unimplemented，跳过。
 	m.mu.RLock()
-	clients := make([]proto.PluginHookServiceClient, 0, len(m.toolHookOrder))
-	for _, n := range m.toolHookOrder {
-		if c, ok := m.toolHookClients[n]; ok && c != nil {
-			clients = append(clients, c)
-		}
-	}
-	names := make([]string, len(m.toolHookOrder))
-	copy(names, m.toolHookOrder)
-	m.mu.RUnlock()
-
 	type namedClient struct {
 		name string
 		cl   proto.PluginHookServiceClient
 	}
-	pairs := make([]namedClient, 0, len(clients))
-	for i, c := range clients {
-		if c == nil || i >= len(names) {
-			continue
+	pairs := make([]namedClient, 0, len(m.toolHookOrder))
+	for _, n := range m.toolHookOrder {
+		if c, ok := m.toolHookClients[n]; ok && c != nil {
+			pairs = append(pairs, namedClient{name: n, cl: c})
 		}
-		pairs = append(pairs, namedClient{name: names[i], cl: c})
 	}
+	m.mu.RUnlock()
+
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
 
 	var parts []string
@@ -1490,6 +1523,31 @@ func (m *Manager) LoadPlugin(entry PluginEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.injectionEntryLocked(entry, true)
+}
+
+// ReloadPlugin 以事务方式重载插件：先快照 config.yaml 中的旧条目，卸载后加载新条目；
+// 新条目加载失败则重新加载旧条目（恢复进程与配置），避免“内存与配置双丢”。
+func (m *Manager) ReloadPlugin(entry PluginEntry) error {
+	if entry.Name == "" {
+		return fmt.Errorf("reload: plugin name is required")
+	}
+	m.mu.Lock()
+	prev, hasPrev := m.pluginEntryFromConfigLocked(entry.Name)
+	m.mu.Unlock()
+
+	if err := m.UnloadPlugin(entry.Name); err != nil {
+		return err
+	}
+	if err := m.LoadPlugin(entry); err != nil {
+		if hasPrev {
+			if rerr := m.LoadPlugin(prev); rerr != nil {
+				return fmt.Errorf("%w (rollback to previous entry also failed: %v)", err, rerr)
+			}
+			return fmt.Errorf("%w (previous entry restored)", err)
+		}
+		return err
+	}
+	return nil
 }
 
 // SetConfigPath 设置动态注入/卸载要写回的 config.yaml 路径。

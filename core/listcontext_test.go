@@ -68,6 +68,27 @@ func TestListContextStableOrder(t *testing.T) {
 	}
 }
 
+// TestListContextSkipsMissingClientWithoutMisaligningNames 回归：order 中存在
+// 无客户端的条目（如已失效的钩子插件）时，后续客户端不得错位绑定前一个名字，
+// 否则排序键错误、system prompt 片段顺序漂移。
+func TestListContextSkipsMissingClientWithoutMisaligningNames(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	m.mu.Lock()
+	m.toolHookClients["zzz"] = &hookMockClient{content: "ctx-z"}
+	m.toolHookClients["mmm"] = &hookMockClient{content: "ctx-m"}
+	m.toolHookOrder = []string{"aaa-gone", "zzz", "mmm"}
+	m.mu.Unlock()
+
+	got, err := m.ListContext(context.Background())
+	if err != nil {
+		t.Fatalf("ListContext: %v", err)
+	}
+	const want = "ctx-m\n\nctx-z"
+	if got != want {
+		t.Fatalf("失效条目不应使后续客户端名字错位, got %q want %q", got, want)
+	}
+}
+
 // TestAllToolsProtoSorted 校验 AllToolsProto 产出的工具目录按名升序（供 ListTools、
 // subagent LLM、run_code SDK、PTC 描述内嵌清单复用），使模型输入前缀字节稳定。
 func TestAllToolsProtoSorted(t *testing.T) {

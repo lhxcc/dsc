@@ -61,6 +61,39 @@ func TestSetHistoryInjectionConfigEncoding(t *testing.T) {
 	}
 }
 
+// TestPluginEntryFromConfig 校验 replay 回滚所需的旧条目读取：命中同名条目并保留
+// 字段，缺失条目返回 false（配置中不存在的插件不应产出可回滚条目）。
+func TestPluginEntryFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	content := `plugins:
+  - name: tool-x
+    type: tool
+    enabled: true
+    binary_path: ./plugins/tool-x/tool-x
+  - name: dsc-system
+    type: dsc
+    enabled: false
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := newRouterManager()
+	m.configPath = cfgPath
+
+	entry, ok := m.pluginEntryFromConfigLocked("tool-x")
+	if !ok {
+		t.Fatal("tool-x should be found in config")
+	}
+	if entry.Type != "tool" || !entry.Enabled || entry.BinaryPath != "./plugins/tool-x/tool-x" {
+		t.Fatalf("unexpected entry: %+v", entry)
+	}
+
+	if _, ok := m.pluginEntryFromConfigLocked("missing"); ok {
+		t.Fatal("missing plugin should not be found")
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
