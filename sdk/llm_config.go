@@ -31,9 +31,10 @@ type LLMConfig struct {
 	BaseURL string
 	// Model 来自 <PROVIDER>_MODEL；缺席返回空串。
 	Model string
-	// MaxOutputTokens 来自 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS（旧名
-	// <PROVIDER>_MAX_OUTPUT_TOKENS 回退），再回退 DSC_MAX_OUTPUT_TOKENS；
-	// 均缺席或非法返回 0（请求不携带 max_tokens，由模型自然结束）。
+	// MaxOutputTokens 三态：0=未设置（已由 DSC_MAX_OUTPUT_TOKENS 兜底，仍为 0 表示
+	// 宿主也未注入 → 不携带）；-1=明确不携带 max_tokens；>0=携带该值。
+	// 来源 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS（旧名 <PROVIDER>_MAX_OUTPUT_TOKENS 回退）。
+	// 用 -1 而非 0 表达「明确关闭」，因为 0 是 Go 零值、保留「未设置」语义。
 	MaxOutputTokens int64
 	// VisionEnabled 按 DSC_NO_VISION 强制关闭；否则返回 true（由调用方按模型
 	// 能力进一步判定，见 core.ModelSupportsImages）。
@@ -88,24 +89,34 @@ func LoadLLMConfig(provider string) LLMConfig {
 		return prefix + suffix
 	}
 	// 单轮输出上限：DSC_<P>_MAX_OUTPUT_TOKENS 优先、旧名 <P>_MAX_OUTPUT_TOKENS 回退。
-	// 「显式 0」表示本插件不携带 max_tokens，此时不得再用 DSC_MAX_OUTPUT_TOKENS 兜底
-	// （否则用户无法关闭宿主一律注入的默认上限）。
+	//
+	// 三态语义（用 -1 哨兵把「未设置」与「明确不携带」分开，不依赖 Go 零值判断）：
+	//   0  = 未设置（含显式写 0）→ 继续走 DSC_MAX_OUTPUT_TOKENS 兜底
+	//   -1 = 明确不携带 max_tokens（写 -1 或任意负数均归一化为 -1）
+	//   >0 = 携带该值
+	// 消费者只需 `>0 才携带`，负值天然被忽略。若想关闭宿主注入的默认上限，必须写 -1
+	// （写 0 仍表示未设置，会被兜底覆盖——这是刻意的：0 保留 Go 零值语义）。
 	maxOut, maxOutSet := int64(0), false
 	if v, ok := EnvLookupSet("DSC_"+prefix+"MAX_OUTPUT_TOKENS", prefix+"MAX_OUTPUT_TOKENS"); ok {
-		maxOutSet = true
-		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil && n >= 0 {
-			maxOut = n
+		if n, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil {
+			switch {
+			case n > 0:
+				maxOut, maxOutSet = n, true
+			case n < 0:
+				maxOut, maxOutSet = -1, true
+			}
+			// n == 0 与非法值都保持「未设置」语义 → 由兜底处理
 		}
 	}
 	cfg := LLMConfig{
 		APIKey:  strings.TrimSpace(os.Getenv(resolved("API_KEY"))),
 		BaseURL: strings.TrimSpace(os.Getenv(resolved("BASE_URL"))),
 		Model:   strings.TrimSpace(os.Getenv(resolved("MODEL"))),
-		// MaxOutputTokens 见上方 maxOut 说明。
+		// MaxOutputTokens 见上方三态说明。
 		MaxOutputTokens: maxOut,
 		VisionEnabled:   !envNoVision(),
 	}
-	// DSC_MAX_OUTPUT_TOKENS 兜底（provider 显式配置优先）
+	// DSC_MAX_OUTPUT_TOKENS 兜底（仅「未设置」时生效；非法值按未设置处理）
 	if !maxOutSet {
 		cfg.MaxOutputTokens = EnvPositiveInt64("DSC_MAX_OUTPUT_TOKENS")
 	}

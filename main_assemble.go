@@ -234,7 +234,7 @@ func injectRuntimeEnv(merged *core.Config, mode, workspaceRoot, sandboxPolicy st
 // server-chat.cpp 为 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带
 // 窗口值在 LLAMACPP 侧受上下文自然钳制（生成至 EOS 或窗口满），无害。
 // 插件侧优先级：请求级参数（压缩等场景的窗口净余值）> 显式插件 env（DSC_ANTHROPIC_/
-// DSC_OPENAI_MAX_OUTPUT_TOKENS，旧名兼容，显式 0=不携带）> 本注入值 > 不携带（宿主未注入时）。
+// DSC_OPENAI_MAX_OUTPUT_TOKENS，旧名兼容，-1=不携带；0 仍表示未设置、走本注入值）> 本注入值 > 不携带（宿主未注入时）。
 func injectMaxOutputTokens(merged *core.Config, maxTokens int) {
 	if maxTokens <= 0 {
 		return

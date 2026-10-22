@@ -41,6 +41,18 @@ func TestMaxTokensFromEnvAbsentOrInvalid(t *testing.T) {
 	}
 }
 
+// TestResolveMaxTokensNegativeMeansOmit 验证 -1 哨兵（明确不携带）不会被当成有效值：
+// 插件级 -1 + 请求级 0 → 不携带；请求级 >0 仍优先。
+func TestResolveMaxTokensNegativeMeansOmit(t *testing.T) {
+	p := &OpenAIProvider{maxTokens: -1}
+	if got := p.resolveMaxTokens(0); got != 0 {
+		t.Fatalf("负值应视为不携带（返回 0），got %d", got)
+	}
+	if got := p.resolveMaxTokens(4096); got != 4096 {
+		t.Fatalf("请求级参数仍应优先，got %d", got)
+	}
+}
+
 // TestResolveMaxTokens 请求级参数（压缩等场景的窗口净余值）优先于插件级默认。
 func TestResolveMaxTokens(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 131072}

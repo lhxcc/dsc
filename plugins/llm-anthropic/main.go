@@ -32,11 +32,13 @@ type AnthropicProvider struct {
 	// 忽略 thinking.budget_tokens，改以 output_config.effort 控制思考强度；真实 Anthropic
 	// 则吃 budget_tokens。两者同时下发互不冲突。
 	reasoningEffort string
-	// maxTokens 单轮输出上限（插件级默认）。取值来源：显式 ANTHROPIC_MAX_OUTPUT_TOKENS
-	// > 宿主注入 DSC_MAX_OUTPUT_TOKENS（一律注入=有效上下文窗口值：探测命中 LLAMACPP
-	// 时=探测窗口，云端=配置 context_window）> 0 = 不携带。请求级参数（压缩等场景的
+	// maxTokens 单轮输出上限（插件级默认）。取值来源：显式 DSC_ANTHROPIC_MAX_OUTPUT_TOKENS
+	//（旧名 ANTHROPIC_MAX_OUTPUT_TOKENS 回退）> 宿主注入 DSC_MAX_OUTPUT_TOKENS
+	//（一律注入=有效上下文窗口值：探测命中 LLAMACPP 时=探测窗口，云端=配置 context_window）
+	// > -1 = 明确不携带（必须写 -1；写 0 仍视为「未设置」走兜底）。请求级参数（压缩等场景的
 	// 窗口净余值）经 resolveMaxTokens 优先于本值。零值由 omitZeroMaxTokens 中间件从
-	// 请求体摘除（SDK 无 omitempty，不摘则会上送 "max_tokens":0 被服务端拒绝）。
+	// 请求体摘除（SDK 无 omitempty，不摘则会上送 "max_tokens":0 被服务端拒绝）；
+	// 负值因 `>0 才携带` 的判断天然被忽略。
 	maxTokens int64
 	// vision 是否启用图像输入：默认按模型能力自动判断，DSC_NO_VISION=1 强制关闭。
 	vision bool

@@ -213,11 +213,25 @@ func TestLoadLLMConfigMaxOutputTokensPrefix(t *testing.T) {
 		t.Fatalf("应回退宿主通用 DSC_MAX_OUTPUT_TOKENS，got %d", cfg.MaxOutputTokens)
 	}
 
-	// 显式 0 = 不携带：不能被 DSC_MAX_OUTPUT_TOKENS 兜底覆盖（否则用户无法关闭
-	// 宿主一律注入的默认上限，与文档承诺不符）。
+	// 显式 -1（或任意负数）= 明确不携带，归一化为 -1，且不会被 DSC_MAX_OUTPUT_TOKENS
+	// 兜底覆盖。
+	for _, off := range []string{"-1", "-5"} {
+		t.Setenv("DSC_OPENAI_MAX_OUTPUT_TOKENS", off)
+		if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != -1 {
+			t.Fatalf("显式 %q 应归一化为 -1（不携带），got %d", off, cfg.MaxOutputTokens)
+		}
+	}
+
+	// 显式 0 仍表示「未设置」→ 继续走宿主兜底（0 保留 Go 零值语义）。
 	t.Setenv("DSC_OPENAI_MAX_OUTPUT_TOKENS", "0")
-	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 0 {
-		t.Fatalf("显式 0 应表示不携带，got %d", cfg.MaxOutputTokens)
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 131072 {
+		t.Fatalf("显式 0 应按未设置处理并兜底，got %d", cfg.MaxOutputTokens)
+	}
+
+	// 非法值按「未设置」处理 → 仍走宿主兜底，避免拼写错误静默关闭输出上限。
+	t.Setenv("DSC_OPENAI_MAX_OUTPUT_TOKENS", "abc")
+	if cfg := LoadLLMConfig("openai"); cfg.MaxOutputTokens != 131072 {
+		t.Fatalf("非法值应按未设置处理并兜底，got %d", cfg.MaxOutputTokens)
 	}
 
 	// anthropic 同规则。

@@ -33,6 +33,24 @@ func TestAnthropicEffortForLevel(t *testing.T) {
 // TestBuildMessageParamsEmitsOutputConfigEffort 验证 thinking 开启且设了档位时，
 // 请求同时携带 thinking（budget）与 output_config.effort；DeepSeek 忽略 budget、
 // 吃 effort，二者并存互不冲突。
+// TestBuildMessageParamsNegativeMaxTokensMeansOmit 验证 -1 哨兵（明确不携带）不会以
+// "max_tokens":-1 上送；请求级参数仍优先。
+func TestBuildMessageParamsNegativeMaxTokensMeansOmit(t *testing.T) {
+	msgs := []core.Message{{Role: "user", Content: "hi"}}
+	p := &AnthropicProvider{model: "m", maxTokens: -1}
+	if got := p.resolveMaxTokens(0); got != -1 {
+		t.Fatalf("插件级 -1 应原样返回（表示明确不携带），got %d", got)
+	}
+	params, _ := p.buildMessageParams(msgs, nil, p.resolveMaxTokens(0))
+	if params.MaxTokens != 0 {
+		t.Fatalf("负值不得作为 max_tokens 上送，MaxTokens 应为零值，got %d", params.MaxTokens)
+	}
+	params, _ = p.buildMessageParams(msgs, nil, p.resolveMaxTokens(8192))
+	if params.MaxTokens != 8192 {
+		t.Fatalf("请求级参数仍应优先，got %d", params.MaxTokens)
+	}
+}
+
 func TestBuildMessageParamsEmitsOutputConfigEffort(t *testing.T) {
 	msgs := []core.Message{{Role: "user", Content: "hi"}}
 

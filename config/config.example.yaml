@@ -37,6 +37,10 @@ plugins:
       # 直接指定预算（默认 4096）。DSC_ANTHROPIC_THINKING=0 可整体关闭扩展思考
       #（旧名 ANTHROPIC_THINKING 仍兼容）。
       #DSC_REASONING_EFFORT: "high"
+      # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
+      # 不设置或写 0 都表示「未设置」，走宿主注入的 DSC_MAX_OUTPUT_TOKENS（=有效上下文窗口值）。
+      # 云端端点对 max_tokens 常有上限（如 DeepSeek 393216），超限会被 400 拒绝，故示例默认 -1。
+      DSC_ANTHROPIC_MAX_OUTPUT_TOKENS: "-1"
   - name: llm-openai
     type: llm
     binary_path: ./plugins/llm-openai/llm-openai.exe
@@ -50,6 +54,10 @@ plugins:
       # reasoning_effort 字面量（6 档 1:1 透传）；或用 DSC_OPENAI_REASONING_EFFORT 传
       # 端点支持的字面量（如 xhigh 等文档外档位）绕过统一映射。仅对推理模型有效，非推理模型忽略。
       #DSC_REASONING_EFFORT: "high"
+      # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
+      # 不设置或写 0 都表示「未设置」，走宿主注入的 DSC_MAX_OUTPUT_TOKENS（=有效上下文窗口值）。
+      # 云端端点对 max_tokens 常有上限（如 DeepSeek 393216），超限会被 400 拒绝，故示例默认 -1。
+      DSC_OPENAI_MAX_OUTPUT_TOKENS: "-1"
   - name: tool-filesystem
     type: tool
     binary_path: ./plugins/tool-filesystem/tool-filesystem.exe
