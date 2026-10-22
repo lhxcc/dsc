@@ -84,6 +84,17 @@ sdk.ToolProvider(func() []dsc.Tool {
 （`DSC_APPROVAL=never` 或 TUI `/approval never`），避免無人值守評測在 ask 下逐工具彈窗授權。
 新增同類需要前置審批門控的工具，只需在工具聲明裏加該能力標籤，宿主無需改動（按能力而非插件名識別）。
 
+沙箱寫能力同樣由工具自聲明（宿主只做統一裁決），可用 token：
+
+- `writes-unknown` —— 工具可能寫任意路徑且無法從參數定位（如 shell）：`read-only` 下整體拒絕，
+  `workspace-write` 下放行。
+- `writes-path:<argName>` —— 參數 `<argName>` 是本次調用的寫入目標路徑：`read-only` 拒絕，
+  `workspace-write` 僅放行工作區內路徑；路徑缺失或參數無法解析時按寫處理（fail-closed）。
+- `read-only-when:<argName>=<value>` —— 當該參數等於 `<value>` 時本次調用只讀（如
+  `read-only-when:command=view`），`read-only` 下放行。
+
+可同時聲明多條；空值、未知格式一律忽略。未聲明任何寫能力的舊工具由宿主按工具名回退判定。
+
 ### 聲明式依賴（Config.Requires）——對齊 DSH/Cordis 的 provide + inject 模型
 
 DSC 的能力依賴模型對齊 DSH/Cordis 的 `provide` + `inject` 雙向聲明機制：
@@ -137,16 +148,19 @@ sdk := dsc.New(dsc.Config{
   - 避免自引用：插件自身聲明的 capability 不被解析為自身的依賴來源；
   - `persist=true` 時把插件條目本身寫回 `config.yaml`（**不含 `depends_on` 字段**）。
 - 反應式重算：provider 加載/卸載時，`repairPendingLocked` 重算所有 PENDING 插件的能力
-  依賴（對齊 DSH/Cordis 的 `_refresh + notify`），自動提升依賴已就緒的 PENDING 插件。
+  依賴（對齊 DSH/Cordis 的 `_refresh + notify`），自動提升依賴已就緒的 PENDING 插件
+  （PENDING 主要來自運行期注入或等待 LLM 的 agent；啟動期 provider 不按依賴門控）。
 - agent 的 primary LLM 選擇：從 `m.resolvedDeps[agentName]` 中取首個 `Type=="llm"` 且
   `ProviderName` 非空的項，以其 `ProviderName` 作為 primary LLM（多條 llm 依賴時按
   Capability 名升序取首個，穩定選擇）。
 
 **`SetInterconnect` ≠ `Requires`（重要區分）**：
 `SetInterconnect`（`ic.LLM()` / `ic.Tool()` / `ic.Agent()`）是**運行時可選**訪問宿主聚合服務的
-模式——插件容忍 `nil` 並優雅降級。這與 `Config.Requires`（加載時硬依賴）是**不同**的概念：
-`Requires` 會在依賴未滿足時阻止插件激活（PENDING），而 `SetInterconnect` 僅在調用時檢查
-服務是否可用。不要把運行時可選訪問誤寫成 `Requires`，否則會破壞最小配置場景。
+模式——插件容忍 `nil` 並優雅降級。這與 `Config.Requires` 是**不同**的概念：
+`Requires` 在運行期注入時可把插件置為 `PENDING` 等待依賴，agent 亦靠它選擇 primary LLM；
+但**啟動期 provider（llm/tool/policy）先加載、後解析依賴，不因 `Requires` 未滿足而拒絕拉起**
+（真實加載錯誤才 fail-loud）。因此不要依賴 `Requires` 做啟動順序控制；`SetInterconnect`
+僅在調用時檢查服務是否可用。不要把運行時可選訪問誤寫成 `Requires`，否則會破壞最小配置場景。
 
 ## 鈎子（參與宿主流水線，無需任何插件配合）
 
