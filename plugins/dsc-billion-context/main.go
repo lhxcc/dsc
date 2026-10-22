@@ -53,12 +53,18 @@ type BillionContext struct {
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
 	// 每次 handlePreStep 更新此缓存；handleCompress 从中读取。
 	lastMessages []bcacp.CoreMessage
+
+	// prunedState 启动时清理的孤儿状态文件数（首次 pre-step 时随窗口日志一起打印：
+	// 启动期 stderr 尚未被宿主转发）。
+	prunedState int
 }
 
 func main() {
 	// state 与会话存档同目录，靠 <id>.acp.json 后缀区分，不再单独开 billion-context/。
 	// 目录一律经 SDK 解析（DSC_SESSION_DIR 优先），与宿主 Store 同一来源。
-	store := bcadapter.NewStateStore(dsc.SessionDir())
+	sessionsDir := dsc.SessionDir()
+	pruned := bcadapter.PruneOrphans(sessionsDir)
+	store := bcadapter.NewStateStore(sessionsDir)
 
 	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖——宿主按配置 context_window
 	// 或端点探测值把该键注入所有插件，故云端 1M 窗口下应为 1048576；实际值在首个
@@ -69,8 +75,9 @@ func main() {
 	}
 
 	bc := &BillionContext{
-		store:  store,
-		config: bcacp.DefaultConfig(contextWindow),
+		store:       store,
+		config:      bcacp.DefaultConfig(contextWindow),
+		prunedState: pruned,
 	}
 
 	// 即时工具结果吸收开关（默认关闭，DSC_ACP_ABSORB=1 启用）：
@@ -85,7 +92,7 @@ func main() {
 	}
 
 	sdkInst := dsc.New(dsc.Config{
-		Name:    "dsc-billion-context",
+		Name:    bcadapter.PluginName,
 		Version: "0.3.0",
 		Type:    dsc.TypeDsc,
 		// 声明提供 "compaction" 能力：宿主检测到任何插件 Provides compaction 后，
@@ -286,7 +293,10 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// 用于核对云端 1M 窗口是否真的取代了 128K 默认值。
 	bc.logWindowOnce.Do(func() {
 		fmt.Fprintf(os.Stderr, "[billion-context] context window=%d state=%s/<id>%s\n",
-			bc.config.ModelContextLimit, dsc.SessionDir(), dsc.ACPStateSuffix)
+			bc.config.ModelContextLimit, dsc.SessionDir(), bcadapter.StateFileSuffix)
+		if bc.prunedState > 0 {
+			fmt.Fprintf(os.Stderr, "[billion-context] pruned %d orphan state file(s)\n", bc.prunedState)
+		}
 	})
 	var ev core.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {

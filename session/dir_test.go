@@ -8,7 +8,7 @@ func TestDirIsSingleSource(t *testing.T) {
 	if got, want := Dir("/opt/dsc"), "/opt/dsc/"+DirName; got != want {
 		t.Fatalf("Dir = %q, want %q", got, want)
 	}
-	if FileSuffix != ".jsonl" || ACPSuffix != ".acp.json" {
-		t.Fatalf("后缀约定变更需同步宿主清理逻辑: %q %q", FileSuffix, ACPSuffix)
+	if FileSuffix != ".jsonl" {
+		t.Fatalf("会话日志后缀变更需同步各插件: %q", FileSuffix)
 	}
 }

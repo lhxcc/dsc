@@ -1219,9 +1219,6 @@ func (m *Manager) DeleteSession(id string) error {
 	if err := st.Delete(id); err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}
-	// 会话的压缩状态与会话存档同目录（<id>.acp.json，见 dsc-billion-context）：一并清掉，
-	// 否则 sessions/ 会留下指向已删会话的孤儿状态文件。best-effort：失败不影响删除结果。
-	_ = os.Remove(PJoin(m.sessionDir(), id+session.ACPSuffix))
 	m.logger.Info("session deleted", "id", id)
 	return nil
 }

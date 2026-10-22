@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	bcacp "dsc-billion-context/acp"
@@ -103,9 +104,19 @@ func defaultIDProvider(idx int, _ *proto.Message) string {
 	return fmt.Sprintf("msg-%d", idx)
 }
 
+// PluginName 是本插件名（与 sdk.Config.Name 同源）。
+const PluginName = "dsc-billion-context"
+
+// StateFileSuffix 是压缩状态文件的命名：<会话 id>.<插件名>.json。
+//
+// 用插件名而不是某个跨模块共享的固定后缀（如 ".acp.json"）：插件是**可分离**的，
+// 宿主核心不该知道某个插件的落盘细节——删掉本插件后，core 里不该残留任何只为它
+// 服务的常量或清理代码。文件名自带插件名，同目录多个插件互不冲突、人工也看得懂。
+const StateFileSuffix = "." + PluginName + ".json"
+
 // StateStore 负责 acp state 的持久化（JSON 文件）。
-// 每个 session 一个 state 文件，路径为 dir/<sessionID>.acp.json——后缀取自 SDK 的
-// ACPStateSuffix（与宿主同一份定义），目录由调用方传 dsc.SessionDir()。
+// 每个 session 一个 state 文件，路径为 dir/<sessionID>.<插件名>.json，目录由调用方
+// 传 dsc.SessionDir()（与会话日志同目录，靠文件名区分）。
 type StateStore struct {
 	mu    sync.Mutex
 	dir   string
@@ -219,5 +230,35 @@ func (s *StateStore) path(sessionID string) (string, error) {
 	if !dsc.ValidSessionID(sessionID) {
 		return "", fmt.Errorf("invalid session id %q", sessionID)
 	}
-	return dsc.PJoin(s.dir, sessionID+dsc.ACPStateSuffix), nil
+	return dsc.PJoin(s.dir, sessionID+StateFileSuffix), nil
+}
+
+// PruneOrphans 清理孤儿状态文件：会话已被删除（<id>.jsonl 不存在）时，其 state
+// 没有归属，留着只会在 sessions/ 里越积越多。
+//
+// 之所以由插件自己清理而不是宿主删除：宿主不该知道插件的落盘命名（插件可分离）。
+// 幂等、best-effort：任何错误都跳过，返回删除数量。
+func PruneOrphans(sessionsDir string) int {
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, StateFileSuffix) {
+			continue
+		}
+		id := strings.TrimSuffix(name, StateFileSuffix)
+		if !dsc.ValidSessionID(id) {
+			continue
+		}
+		if _, err := os.Stat(dsc.PJoin(sessionsDir, id+dsc.SessionFileSuffix)); err == nil {
+			continue // 会话仍在
+		}
+		if err := os.Remove(dsc.PJoin(sessionsDir, name)); err == nil {
+			removed++
+		}
+	}
+	return removed
 }

@@ -93,7 +93,7 @@ func TestStateStoreUsesSessionsDirWithSuffix(t *testing.T) {
 	if err := store.Save("session-7", st); err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
-	want := dsc.PJoin(dir, "session-7"+dsc.ACPStateSuffix)
+	want := dsc.PJoin(dir, "session-7"+StateFileSuffix)
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("应写入 %s: %v", want, err)
 	}
@@ -115,7 +115,7 @@ func TestStateStorePathUsesSessionIDVerbatim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q 应可作文件名: %v", id, err)
 		}
-		if want := dsc.PJoin(dir, id+dsc.ACPStateSuffix); p != want {
+		if want := dsc.PJoin(dir, id+StateFileSuffix); p != want {
 			t.Fatalf("path(%q) = %q, want %q", id, p, want)
 		}
 	}
@@ -124,5 +124,57 @@ func TestStateStorePathUsesSessionIDVerbatim(t *testing.T) {
 		if _, err := store.path(bad); err == nil {
 			t.Fatalf("%q 应被拒绝（防路径穿越）", bad)
 		}
+	}
+}
+
+// TestStateFileNamedAfterPlugin 状态文件名必须带插件名（<会话 id>.<插件名>.json）：
+// 宿主核心不该知道任何插件的落盘后缀，同名会话的多种插件状态同目录并存而不冲突。
+func TestStateFileNamedAfterPlugin(t *testing.T) {
+	if !strings.Contains(StateFileSuffix, PluginName) {
+		t.Fatalf("后缀应含插件名: %q（插件名 %q）", StateFileSuffix, PluginName)
+	}
+	p, err := NewStateStore(t.TempDir()).path("session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(p, "session-1."+PluginName+".json") {
+		t.Fatalf("文件名规则不符: %q", p)
+	}
+	if strings.HasSuffix(p, dsc.SessionFileSuffix) {
+		t.Fatalf("不得与会话日志同名: %q", p)
+	}
+}
+
+// TestPruneOrphans 会话已删除时，其状态文件由插件自行清理（宿主不再知道这些文件）。
+func TestPruneOrphans(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStateStore(dir)
+
+	// 两个会话：一个仍有日志，一个已被删除
+	if err := os.WriteFile(dsc.PJoin(dir, "session-1"+dsc.SessionFileSuffix), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"session-1", "session-2"} {
+		if err := store.Save(id, bcacp.CreateInitialState()); err != nil {
+			t.Fatalf("保存 %s 失败: %v", id, err)
+		}
+	}
+	// 无关文件不得被误删
+	other := dsc.PJoin(dir, "session-1.other-plugin.json")
+	if err := os.WriteFile(other, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := PruneOrphans(dir); n != 1 {
+		t.Fatalf("应清理 1 个孤儿状态，got %d", n)
+	}
+	if _, err := os.Stat(dsc.PJoin(dir, "session-1"+StateFileSuffix)); err != nil {
+		t.Fatalf("仍有会话日志的状态不应被删: %v", err)
+	}
+	if _, err := os.Stat(dsc.PJoin(dir, "session-2"+StateFileSuffix)); !os.IsNotExist(err) {
+		t.Fatalf("孤儿状态应被删除: err=%v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("其它插件的文件不得被误删: %v", err)
 	}
 }

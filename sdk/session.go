@@ -18,8 +18,6 @@ const (
 	SessionDirName = session.DirName
 	// SessionFileSuffix 会话事件日志后缀 <id>.jsonl。
 	SessionFileSuffix = session.FileSuffix
-	// ACPStateSuffix 压缩状态后缀 <id>.acp.json（与会话日志同目录）。
-	ACPStateSuffix = session.ACPSuffix
 )
 
 // SessionDir 返回会话数据目录：优先 DSC_SESSION_DIR（宿主注入，可与
