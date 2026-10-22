@@ -151,6 +151,30 @@ func (s *Store) Save(sess *Session) error {
 	return sess.Save(p)
 }
 
+// Fork 从已落盘会话 srcID 复制到 boundary（含）创建新会话：分配新 id 并落盘。
+// 父会话不存在或 boundary 落在开放轮次/步骤内时返回错误。
+func (s *Store) Fork(srcID string, boundary int) (*Session, error) {
+	parent, err := s.Load(srcID)
+	if err != nil {
+		return nil, err
+	}
+	if parent == nil {
+		return nil, fmt.Errorf("session store: session %q not found", srcID)
+	}
+	child, err := parent.Fork(boundary)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	child.id = fmt.Sprintf("session-%d", s.nextID)
+	s.nextID++
+	s.mu.Unlock()
+	if err := s.Save(child); err != nil {
+		return nil, err
+	}
+	return child, nil
+}
+
 // Delete 删除指定会话；不存在视为幂等成功。
 func (s *Store) Delete(id string) error {
 	p, err := s.path(id)

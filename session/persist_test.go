@@ -13,7 +13,12 @@ import (
 // buildSample 构造一个包含全部事件类型、且结束于完整轮次的会话。
 func buildSample(t *testing.T) *Session {
 	t.Helper()
-	s := New()
+	return buildSampleOn(t, New())
+}
+
+// buildSampleOn 在给定会话上构造完整示例事件序列（供需要预绑定 Store id 的用例复用）。
+func buildSampleOn(t *testing.T, s *Session) *Session {
+	t.Helper()
 	appendSystemPrompt(t, s, "sys")
 	s.Append(TurnStart, &TurnData{Turn: 1}, nil)
 	appendSurface(t, s, UserMessage, &UserMessageData{Content: "u1", Source: "user"})
@@ -248,6 +253,46 @@ func TestForkRejectsOutOfRange(t *testing.T) {
 	orig := buildSample(t)
 	if _, err := orig.Fork(orig.Len()); err == nil {
 		t.Fatal("expected error for out-of-range boundary")
+	}
+}
+
+// TestStoreForkAssignsIDAndPersists 回归：Store.Fork 必须给子会话分配新 id 并
+// 立即落盘，使 fork 结果可直接 Load/继续使用（Session.Fork 自身不携带 id）。
+func TestStoreForkAssignsIDAndPersists(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	parent, err := store.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	buildSampleOn(t, parent)
+	if err := store.Save(parent); err != nil {
+		t.Fatalf("save parent: %v", err)
+	}
+
+	child, err := store.Fork(parent.id, parent.Len()-1)
+	if err != nil {
+		t.Fatalf("Store.Fork: %v", err)
+	}
+	if child.id == "" || child.id == parent.id {
+		t.Fatalf("child id = %q, want a fresh non-empty id", child.id)
+	}
+	if child.Len() != parent.Len() {
+		t.Fatalf("child len = %d, want %d", child.Len(), parent.Len())
+	}
+
+	loaded, err := store.Load(child.id)
+	if err != nil {
+		t.Fatalf("Load child: %v", err)
+	}
+	if loaded == nil || loaded.Len() != child.Len() {
+		t.Fatalf("forked session not persisted: %+v", loaded)
+	}
+	infos, err := store.List()
+	if err != nil || len(infos) != 2 {
+		t.Fatalf("List = %v, %v; want 2 sessions", infos, err)
 	}
 }
 
