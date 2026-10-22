@@ -28,6 +28,9 @@ type OpenAIProvider struct {
 	vision bool
 	// filesAPI 是否可把超大图自动上传 DeepSeek Files API（base URL 为 deepseek.com 时启用）。
 	filesAPI bool
+	// reasoningEffort DeepSeek 等端点的推理强度（reasoning_effort）；空=不携带。
+	// 来自 DSC_OPENAI_REASONING_EFFORT，或 DSC_REASONING_EFFORT 档位映射（max→high）。
+	reasoningEffort string
 	// fileCache 已上传图片的 data URL → file_id 缓存（同一图多轮复用，避免重复上传）。
 	fileMu    sync.Mutex
 	fileCache map[string]string
@@ -301,6 +304,10 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []core.Message, tool
 	if mt := p.resolveMaxTokens(maxTokens); mt > 0 {
 		req.MaxTokens = mt
 	}
+	// reasoning_effort：DeepSeek 等推理端点的思考强度；空=不携带（非推理模型忽略）。
+	if p.reasoningEffort != "" {
+		req.ReasoningEffort = p.reasoningEffort
+	}
 
 	resp, err := p.client.CreateChatCompletion(ctx, req)
 	if err != nil {
@@ -381,6 +388,10 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 	// 插件 env 调整）。
 	if mt := p.resolveMaxTokens(0); mt > 0 {
 		req.MaxTokens = mt
+	}
+	// reasoning_effort：DeepSeek 等推理端点的思考强度；空=不携带（非推理模型忽略）。
+	if p.reasoningEffort != "" {
+		req.ReasoningEffort = p.reasoningEffort
 	}
 
 	stream, err := p.client.CreateChatCompletionStream(ctx, req)
@@ -529,19 +540,20 @@ func main() {
 	}
 	model := cfg.Model
 	if model == "" {
-		model = "deepseek-v4-flash"
+		model = "deepseek-flash"
 	}
 
 	config := openai.DefaultConfig(apiKey)
 	config.BaseURL = baseURL
 
 	provider := &OpenAIProvider{
-		client:    openai.NewClientWithConfig(config),
-		model:     model,
-		maxTokens: int(cfg.MaxOutputTokens),
-		vision:    visionEnabled(baseURL, model, !cfg.VisionEnabled),
-		filesAPI:  isDeepSeekEndpoint(baseURL),
-		fileCache: map[string]string{},
+		client:          openai.NewClientWithConfig(config),
+		model:           model,
+		maxTokens:       int(cfg.MaxOutputTokens),
+		vision:          visionEnabled(baseURL, model, !cfg.VisionEnabled),
+		filesAPI:        isDeepSeekEndpoint(baseURL),
+		reasoningEffort: cfg.OpenAIReasoningEffort,
+		fileCache:       map[string]string{},
 	}
 
 	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 core.LLMGRPCPlugin

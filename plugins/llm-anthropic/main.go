@@ -11,7 +11,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -633,7 +632,7 @@ func main() {
 	}
 	model := cfg.Model
 	if model == "" {
-		model = "deepseek-v4-flash"
+		model = "deepseek-flash"
 	}
 
 	opts := []option.RequestOption{
@@ -647,13 +646,13 @@ func main() {
 	// 扩展思考默认开启：DeepSeek 的 anthropic 接口支持 thinking 参数并返回 thinking 块，
 	// 其内容经 chat 流式增量转发为 reasoning 帧渲染到 TUI。
 	// ANTHROPIC_THINKING=0 可显式关闭（用于不返回 thinking 的普通模型）；
-	// ANTHROPIC_THINKING_BUDGET 设定思考 token 预算（默认 4096；DeepSeek 忽略 budget 值）。
+	// 思考 token 预算由 DSC 统一推理强度控制：DSC_ANTHROPIC_THINKING_BUDGET 直接指定，
+	// 否则 DSC_REASONING_EFFORT（low/medium/high/max）按 DSC 标准档位映射，
+	// 均未设时默认 4096（DeepSeek 忽略 budget 值）。
 	thinking := os.Getenv("ANTHROPIC_THINKING") != "0"
-	thinkingBudget := int64(4096)
-	if v := os.Getenv("ANTHROPIC_THINKING_BUDGET"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			thinkingBudget = n
-		}
+	thinkingBudget := cfg.ThinkingBudget
+	if thinkingBudget == 0 {
+		thinkingBudget = 4096
 	}
 	// 单轮输出上限（插件级默认）：宿主注入 DSC_MAX_OUTPUT_TOKENS=有效上下文窗口值
 	// （一律注入，不分本地/云端——探测命中 LLAMACPP 时=探测窗口，云端=配置

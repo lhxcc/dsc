@@ -158,7 +158,7 @@ DSC 與 DSH 同源於「一切皆插件」的設計哲學，兩者在概念層�
 #### 圖像輸入（視覺）
 
 `llm-openai` 與 `llm-anthropic` 支持把本地圖片作為視覺輸入傳給視覺模型（如
-`deepseek-v4-flash-vision-exp`；llamacpp server 的 OpenAI/Anthropic 兼容端點同樣
+`deepseek-flash`；llamacpp server 的 OpenAI/Anthropic 兼容端點同樣
 接受該格式）：
 
 - 圖像以**內容尋址引用**隨會話歷史保存（用户消息 `dsc-img://<sha256>`；工具結果
