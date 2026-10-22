@@ -39,8 +39,11 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
-	// sessionID 当前会话 ID（DSC_SESSION_ID 注入；缺省按工作区派生的项目级键，
-	// 对齐宿主 session 存储的 SessionKeyForProject——同一项目同名、不同项目隔离）
+	// sessionID 当前会话 ID（须持 mu 读写）。
+	// 取值优先级：pre-step 事件里的 Session（宿主真实会话 ID，见 handlePreStep）>
+	// DSC_SESSION_ID env > 工作区派生的项目级键。此前只用后两者，而宿主从不注入
+	// DSC_SESSION_ID，于是永远落在工作区键上——同一工作区开多个会话/fork 时共用
+	// 一份 state（refs、blocks、nudge 基线互相污染，压缩会命中别的会话的消息）。
 	sessionID string
 
 	// logWindowOnce 首次 pre-step 打印生效窗口一次（启动期 stderr 尚未被宿主转发）。
@@ -290,6 +293,10 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 		return "", fmt.Errorf("billion-context: parse pre-step event: %w", err)
 	}
 
+	// 记录宿主真实会话 ID：pre-step 载荷已带 req.GetSessionId()，但宿主从不注入
+	// DSC_SESSION_ID env，故必须以事件为准，否则同工作区多会话共用一份 state。
+	bc.setSessionID(ev.Session)
+
 	// 解析消息列表
 	var protoMsgs []*proto.Message
 	if ev.MessagesJSON != "" {
@@ -373,42 +380,17 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 // handleCompress 处理 compress 工具调用。
 func (bc *BillionContext) handleCompress(ctx context.Context, args json.RawMessage) (string, error) {
-	var req struct {
-		Content []struct {
-			StartRef string `json:"startId"`
-			EndRef   string `json:"endId"`
-			Summary  string `json:"summary"`
-			Topic    string `json:"topic,omitempty"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(args, &req); err != nil {
-		return "", fmt.Errorf("invalid args: %w", err)
-	}
-	if len(req.Content) == 0 {
-		return "", fmt.Errorf("content is required (at least one range)")
+	// 宽松解析（代码围栏 / 尾逗号 / 输出截断救援 / 字段变体）：compress 的 summary
+	// 常是大段自然语言，严格 json.Unmarshal 失败会让整轮压缩作废、上下文继续膨胀。
+	ranges := bcacp.ParseCompressArgs(string(args))
+	if len(ranges) == 0 {
+		return "", fmt.Errorf("content is required: at least one range with startId/endId/summary")
 	}
 
 	sessionID := bc.getSessionID()
 	state, err := bc.store.Load(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("load state: %w", err)
-	}
-
-	// 把请求转为 acp PruneRange 列表
-	ranges := make([]bcacp.PruneRange, 0, len(req.Content))
-	for _, r := range req.Content {
-		if r.StartRef == "" || r.EndRef == "" || r.Summary == "" {
-			continue
-		}
-		ranges = append(ranges, bcacp.PruneRange{
-			StartRef: r.StartRef,
-			EndRef:   r.EndRef,
-			Summary:  r.Summary,
-			Topic:    r.Topic,
-		})
-	}
-	if len(ranges) == 0 {
-		return "", fmt.Errorf("no valid ranges (each requires startId, endId, summary)")
 	}
 
 	// 从缓存获取最近一次 pre-step 的消息列表（解决"compress 工具调用时无消息列表"的致命 bug）
@@ -534,10 +516,26 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 // 存储的 SessionKeyForProject——同一项目同名、不同项目隔离；替代硬编码 default，
 // 避免跨项目压缩状态被混入）。
 func (bc *BillionContext) getSessionID() string {
+	bc.mu.Lock()
+	cur := bc.sessionID
+	bc.mu.Unlock()
+	if cur != "" {
+		return cur
+	}
 	if id := os.Getenv("DSC_SESSION_ID"); id != "" {
 		return id
 	}
 	return session.SessionKeyForProject(dsc.WorkspaceRoot())
+}
+
+// setSessionID 记录当前会话 ID（pre-step 事件携带的宿主真实会话）。
+func (bc *BillionContext) setSessionID(id string) {
+	if id == "" {
+		return
+	}
+	bc.mu.Lock()
+	bc.sessionID = id
+	bc.mu.Unlock()
 }
 
 // estimateTokens 估算 proto.Message 列表的总 token 数。

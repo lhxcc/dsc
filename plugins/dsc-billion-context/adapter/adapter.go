@@ -5,7 +5,6 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"sync"
 
@@ -87,25 +86,21 @@ func FromCoreMessages(coreMsgs []bcacp.CoreMessage) []*proto.Message {
 	return out
 }
 
-// defaultIDProvider 默认 ID 提供者：基于消息内容生成稳定 ID。
-// 不含视图索引：同一条消息（相同 role + content + toolCallId + toolCalls）在
-// 任何视图位置都得到相同 ID，压缩/截断导致索引平移时 ref 映射仍正确。
-// hash 算法：FNV-1a（Go 标准库，无外部依赖）。调用方仍可覆盖以使用 session seq。
-func defaultIDProvider(_ int, msg *proto.Message) string {
-	h := fnv.New64a()
-	h.Write([]byte(msg.Role))
-	h.Write([]byte{0})
-	h.Write([]byte(msg.Content))
-	if msg.ToolCallId != "" {
-		h.Write([]byte{0})
-		h.Write([]byte(msg.ToolCallId))
-	}
-	for _, tc := range msg.ToolCalls {
-		h.Write([]byte{0})
-		h.Write([]byte(tc.Id))
-		h.Write([]byte(tc.Name))
-	}
-	return fmt.Sprintf("msg-%s-%016x", msg.Role, h.Sum64())
+// defaultIDProvider 默认 ID 提供者：**以消息在原始历史中的位置作为身份**。
+//
+// 为什么不是内容 hash：两条内容相同的消息（重复的"继续"、两次相同 compile 输出、
+// 相同工具结果）会得到同一个 ID，于是 MessageRefs.ByRaw 互相覆盖、CoveredMessageIDs
+// 判定错位——压缩会命中错误的消息。acp-kernel 里 ID 由宿主会话日志提供（天然唯一），
+// DSC 的 proto.Message 没有 id/seq 字段，位置就是最接近的等价物。
+//
+// 位置为什么稳定：pre-step 每轮收到的是 agent 的 append-only 原始历史（插件的改写
+// 只影响发给 LLM 的视图，不回写 agent 历史），因此同一消息在跨轮的位置不变；
+// 压缩/prune 造成的"视图平移"发生在渲染之后，不参与下一轮的 ID 分配。
+//
+// 注意：状态里若残留旧版（内容 hash）ID 的块，升级后首轮因 ID 失配会被 sync-blocks
+// 停用，等于一次性重新建立压缩记录；这是从错误 ID 迁移出来的一次性代价。
+func defaultIDProvider(idx int, _ *proto.Message) string {
+	return fmt.Sprintf("msg-%d", idx)
 }
 
 // StateStore 负责 acp state 的持久化（JSON 文件）。
@@ -162,6 +157,10 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 }
 
 // Save 持久化指定 session 的 state。
+//
+// 原子写：先写同目录临时文件并 fsync，再 rename 覆盖目标。直接 WriteFile 在进程崩溃
+// 或断电时可能留下半截 JSON——下次 Load 解析失败虽然会重建，但压缩记录全丢，
+// 上下文随即重新膨胀（压缩是"只增不减"的收益，丢一次等于全部白做）。
 func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,7 +172,36 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 	if err != nil {
 		return fmt.Errorf("marshal acp state: %w", err)
 	}
-	return os.WriteFile(s.path(sessionID), data, 0600)
+
+	tmp, err := os.CreateTemp(s.dir, ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp acp state: %w", err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp acp state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp acp state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp acp state: %w", err)
+	}
+	// os.Rename 在 Windows 上等价于 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，可覆盖目标
+	if err := os.Rename(tmpName, s.path(sessionID)); err != nil {
+		return fmt.Errorf("commit acp state: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // path 返回 session state 文件路径。

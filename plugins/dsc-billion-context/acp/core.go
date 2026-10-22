@@ -130,11 +130,16 @@ type ProcessTurnResult struct {
 }
 
 // ProcessTurn 每轮跑 pipeline（对齐 acp-kernel processTurn）。
-// MVP pipeline：assign-refs → advance-survival → render-messages → decide-nudge
-// （省略 sync-blocks merge / filter / hide-compress-calls / emergency-truncate）
 //
-// 输入：messages（本轮要发给 LLM 的消息列表）+ state + config + tokenCount
-// 输出：改写后的 messages（应用 prune）+ 更新后的 state + nudge 决策
+// 节点顺序（对齐 DESIGN §4 的 canonical order，已接的部分）：
+//
+//	assign-refs → advance-survival → sync-blocks → prune(render)
+//	→ hide-compress-calls → absorb(hide+prompt) → decide-nudge → emergency-truncate
+//
+// 仍未实现：merge-blocks（old-gen 块批合并；acp 包内只有范围合并 mergeBatch，
+// 不是块合并）、filter/ccr-store（acp_retrieve 内容仓库）。缺失 merge 的后果是
+// 块数量随压缩次数线性增长，每个块每轮都渲染 summary——压缩收益会被自身开销
+// 逐步吃掉，属后续待补项。
 //
 // 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
 // 消息文本。原因：tokens 属性每轮估算会变化（消息文本可能改变），导致前缀缓存
@@ -147,11 +152,37 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	// 2. advance-survival：推进块存活计数（驱动 young→old 升级）
 	state.AdvanceSurvival(config.PromotionThreshold)
 
-	// 3. render-messages：应用 prune（renderTags=false 保持前缀缓存稳定）
+	// 3. sync-blocks：按当前视图校正块可见性——视图里已不存在的块停用，避免
+	// 「幽灵摘要」继续注入（宿主裁剪历史、会话 fork、块被消费后都可能出现）。
+	_ = SyncBlocks(messages, state)
+
+	// 4. render-messages：应用 prune（renderTags=false 保持前缀缓存稳定）
 	rendered := RenderMessages(messages, state, config, false)
 
-	// 4. decide-nudge：决策是否注入压缩提示
+	// 5. hide-compress-calls：折叠已消费的 compress 调用对。不折叠时 summary 会在
+	// 「块」与「调用参数」里各存一份，压缩收益被抵消，模型还会反复看到旧压缩调用。
+	if hid := HideConsumedCompressCalls(state, rendered); hid.Hidden > 0 {
+		rendered = hid.Messages
+	}
+
+	// 6. absorb（DSC 扩展，仅 Absorb.Enabled）：先隐藏已吸收的 tool-call/result 对，
+	// 再为达标的大工具结果追加 [ACP absorb] 提示。此前两个节点都没有接线，导致
+	// absorb 工具只写记录、原文照旧发送——等于不生效。
+	if config.Absorb.Enabled {
+		rendered = HideAbsorbedMessages(rendered, state)
+		if ap := AppendAbsorbPrompts(rendered, state, config, tokenCount); ap.PromptedCount > 0 {
+			rendered = ap.Messages
+		}
+	}
+
+	// 7. decide-nudge：决策是否注入压缩提示（注入由 adapter 追加为尾部 user 消息）
 	nudge := DecideNudge(messages, state, config, tokenCount)
+
+	// 8. emergency-truncate：最后安全阀——上下文接近满且模型未主动压缩时，截断
+	// 超大工具输出，避免直接撞窗口（DESIGN 的 LAST safety valve）。
+	if tr := TruncateLargeToolOutputs(rendered, tokenCount, config, false); tr.TruncatedCount > 0 {
+		rendered = tr.Messages
+	}
 
 	return ProcessTurnResult{
 		Messages: rendered,
