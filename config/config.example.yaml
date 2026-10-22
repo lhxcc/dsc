@@ -32,8 +32,8 @@ plugins:
       DSC_ANTHROPIC_BASE_URL: "http://192.168.124.197:8008/"
       DSC_ANTHROPIC_MODEL: "Agentic-Turbo-Coder"
       DSC_ANTHROPIC_API_KEY: "sk-your-real-key"
-      # 推理强度（可选）：统一档位 DSC_REASONING_EFFORT (low/medium/high/max) 自动映射为
-      # 思考 token 预算（4096/8192/16384/64000）；或用 DSC_ANTHROPIC_THINKING_BUDGET
+      # 推理强度（可选）：统一档位 DSC_REASONING_EFFORT (none/minimal/low/medium/high/max) 自动映射为
+      # 思考 token 预算（0/2048/4096/8192/16384/32768；none=关闭思考）；或用 DSC_ANTHROPIC_THINKING_BUDGET
       # 直接指定预算（默认 4096）。ANTHROPIC_THINKING=0 可整体关闭扩展思考。
       #DSC_REASONING_EFFORT: "high"
   - name: llm-openai
@@ -45,9 +45,9 @@ plugins:
       DSC_OPENAI_BASE_URL: "http://192.168.124.197:8008/v1"
       DSC_OPENAI_MODEL: "Agentic-Turbo-Coder"
       DSC_OPENAI_API_KEY: "sk-your-real-key"
-      # 推理强度（可选）：统一档位 DSC_REASONING_EFFORT (low/medium/high/max) 自动映射为
-      # reasoning_effort 字面量（max 钳到 high）；或用 DSC_OPENAI_REASONING_EFFORT 传
-      # 端点支持的字面量（如 max/xhigh）绕过钳制。仅对推理模型有效，非推理模型忽略。
+      # 推理强度（可选）：统一档位 DSC_REASONING_EFFORT (none/minimal/low/medium/high/max) 自动映射为
+      # reasoning_effort 字面量（6 档 1:1 透传）；或用 DSC_OPENAI_REASONING_EFFORT 传
+      # 端点支持的字面量（如 xhigh 等文档外档位）绕过统一映射。仅对推理模型有效，非推理模型忽略。
       #DSC_REASONING_EFFORT: "high"
   - name: tool-filesystem
     type: tool

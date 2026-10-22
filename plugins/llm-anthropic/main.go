@@ -646,10 +646,15 @@ func main() {
 	// 扩展思考默认开启：DeepSeek 的 anthropic 接口支持 thinking 参数并返回 thinking 块，
 	// 其内容经 chat 流式增量转发为 reasoning 帧渲染到 TUI。
 	// ANTHROPIC_THINKING=0 可显式关闭（用于不返回 thinking 的普通模型）；
-	// 思考 token 预算由 DSC 统一推理强度控制：DSC_ANTHROPIC_THINKING_BUDGET 直接指定，
-	// 否则 DSC_REASONING_EFFORT（low/medium/high/max）按 DSC 标准档位映射，
-	// 均未设时默认 4096（DeepSeek 忽略 budget 值）。
+	// DSC_REASONING_EFFORT=none 同样关闭思考；思考 token 预算由 DSC 统一推理强度控制：
+	// DSC_ANTHROPIC_THINKING_BUDGET 直接指定，否则 DSC_REASONING_EFFORT
+	// （none/minimal/low/medium/high/max）按 DSC 标准档位映射
+	// （0/2048/4096/8192/16384/32768），均未设时默认 4096（DeepSeek 忽略 budget 值）。
 	thinking := os.Getenv("ANTHROPIC_THINKING") != "0"
+	// DSC_REASONING_EFFORT=none 显式关闭扩展思考（对应 OpenAI 路径 reasoning_effort=none）
+	if cfg.ReasoningEffort == "none" {
+		thinking = false
+	}
 	thinkingBudget := cfg.ThinkingBudget
 	if thinkingBudget == 0 {
 		thinkingBudget = 4096

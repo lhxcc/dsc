@@ -202,9 +202,10 @@ func TestLoadLLMConfigDSCPrefixGroup(t *testing.T) {
 	}
 }
 
-// TestLoadLLMConfigReasoningEffort 验证 DSC 统一推理强度 DSC_REASONING_EFFORT
-// （low/medium/high/max）按 provider 映射：anthropic→思考 token 预算，
-// openai→reasoning_effort 字面量（max 钳到 high）；接口专属变量优先于统一档位。
+// TestLoadLLMConfigReasoningEffort 验证 DSC 统一推理强度 DSC_REASONING_EFFORT（6 档
+// none/minimal/low/medium/high/max）按 provider 映射：anthropic→思考 token 预算
+// （none=0 关闭/2048/4096/8192/16384/32768），openai→reasoning_effort 字面量 1:1；
+// 接口专属变量优先于统一档位。
 func TestLoadLLMConfigReasoningEffort(t *testing.T) {
 	clearReasoningEnv := func() {
 		for _, k := range []string{
@@ -225,14 +226,34 @@ func TestLoadLLMConfigReasoningEffort(t *testing.T) {
 		t.Errorf("openai high = %q, want high", cfg.OpenAIReasoningEffort)
 	}
 
-	// 2) 统一 max → anthropic 16384（=high）/ openai 钳到 high
+	// 2) 统一 max → anthropic 32768 / openai "max"（1:1 透传，不再钳到 high）
 	clearReasoningEnv()
 	t.Setenv("DSC_REASONING_EFFORT", "max")
-	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 16384 {
-		t.Errorf("anthropic max ThinkingBudget = %d, want 16384 (collapses to high)", cfg.ThinkingBudget)
+	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 32768 {
+		t.Errorf("anthropic max ThinkingBudget = %d, want 32768", cfg.ThinkingBudget)
 	}
-	if cfg := LoadLLMConfig("openai"); cfg.OpenAIReasoningEffort != "high" {
-		t.Errorf("openai max 应钳到 high, got %q", cfg.OpenAIReasoningEffort)
+	if cfg := LoadLLMConfig("openai"); cfg.OpenAIReasoningEffort != "max" {
+		t.Errorf("openai max = %q, want max", cfg.OpenAIReasoningEffort)
+	}
+
+	// 2b) 统一 minimal → anthropic 2048 / openai "minimal"
+	clearReasoningEnv()
+	t.Setenv("DSC_REASONING_EFFORT", "minimal")
+	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 2048 {
+		t.Errorf("anthropic minimal ThinkingBudget = %d, want 2048", cfg.ThinkingBudget)
+	}
+	if cfg := LoadLLMConfig("openai"); cfg.OpenAIReasoningEffort != "minimal" {
+		t.Errorf("openai minimal = %q, want minimal", cfg.OpenAIReasoningEffort)
+	}
+
+	// 2d) 统一 none → anthropic 0（思考关闭）/ openai "none"
+	clearReasoningEnv()
+	t.Setenv("DSC_REASONING_EFFORT", "none")
+	if cfg := LoadLLMConfig("anthropic"); cfg.ThinkingBudget != 0 || cfg.ReasoningEffort != "none" {
+		t.Errorf("anthropic none: ThinkingBudget=%d ReasoningEffort=%q, want 0/none", cfg.ThinkingBudget, cfg.ReasoningEffort)
+	}
+	if cfg := LoadLLMConfig("openai"); cfg.OpenAIReasoningEffort != "none" {
+		t.Errorf("openai none = %q, want none", cfg.OpenAIReasoningEffort)
 	}
 
 	// 3) 统一 low → anthropic 4096 / openai "low"
@@ -267,7 +288,7 @@ func TestLoadLLMConfigReasoningEffort(t *testing.T) {
 		t.Errorf("anthropic 旧名回退, ThinkingBudget = %d, want 2048", cfg.ThinkingBudget)
 	}
 
-	// 7) DSC_OPENAI_REASONING_EFFORT 字面量绕过 max 钳制（端点支持 xhigh 时）
+	// 7) DSC_OPENAI_REASONING_EFFORT 字面量绕过统一映射（端点支持 xhigh 等文档外档位时）
 	clearReasoningEnv()
 	t.Setenv("DSC_REASONING_EFFORT", "high")
 	t.Setenv("DSC_OPENAI_REASONING_EFFORT", "xhigh")

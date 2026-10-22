@@ -12,12 +12,13 @@ import (
 // <PROVIDER>_MAX_OUTPUT_TOKENS env；DSC_MAX_OUTPUT_TOKENS 与 DSC_NO_VISION 是跨
 // provider 的宿主通用 env。
 //
-// 推理强度采用 DSC 统一命名 DSC_REASONING_EFFORT（取值 low/medium/high/max），
-// 由 LoadLLMConfig 按 provider 映射为具体参数：anthropic 路径→思考 token 预算
-// （ThinkingBudget，亦可被 DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖）；openai 路径
-// → reasoning_effort 字面量（OpenAIReasoningEffort，亦可被 DSC_OPENAI_REASONING_EFFORT
-// 直接覆盖）。max 档位在 openai 路径钳到 high（DeepSeek/OpenAI 仅文档化
-// low/medium/high）；若端点支持 max/xhigh 等，用 DSC_OPENAI_REASONING_EFFORT 传字面量。
+// 推理强度采用 DSC 统一命名 DSC_REASONING_EFFORT，取值对齐 OpenAI 官方档位（统一 6 档：
+// none / minimal / low / medium / high / max；xhigh 等文档外档位仍可用
+// DSC_OPENAI_REASONING_EFFORT 直接直传，不经此统一映射）。由 LoadLLMConfig 按 provider
+// 映射为具体参数：anthropic 路径→思考 token 预算（ThinkingBudget，none 关闭思考，
+// 其余 2048/4096/8192/16384/32768，亦可被 DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖）；
+// openai 路径→ reasoning_effort 字面量（OpenAIReasoningEffort，6 档 1:1 透传，亦可被
+// DSC_OPENAI_REASONING_EFFORT 直接覆盖为端点支持的字面量）。
 //
 // 解析顺序（先显式 provider env，后宿主通用 DSC_ env）对齐既有 llm-anthropic
 // 与 llm-openai 的实现（maxTokensFromEnv 先读 ANTHROPIC_MAX_OUTPUT_TOKENS，
@@ -36,14 +37,18 @@ type LLMConfig struct {
 	// 能力进一步判定，见 core.ModelSupportsImages）。
 	VisionEnabled bool
 	// ReasoningEffort 统一推理强度档位（DSC_REASONING_EFFORT），取值
-	// low/medium/high/max；空串=未设，由插件自行决定默认行为。
+	// none/minimal/low/medium/high/max；空串=未设，由插件自行决定默认行为。
+	// 其中 none 表示关闭推理（anthropic 路径据此关闭 thinking；openai 路径下发
+	// reasoning_effort=none）。xhigh 等文档外档位不在统一枚举内，用
+	// DSC_OPENAI_REASONING_EFFORT 直传即可。
 	ReasoningEffort string
 	// ThinkingBudget anthropic 路径思考 token 预算（DSC_ANTHROPIC_THINKING_BUDGET，
 	// 回退旧名 ANTHROPIC_THINKING_BUDGET）；未设且 ReasoningEffort 已设时由档位映射；
 	// 均为 0 时插件用默认 4096。
 	ThinkingBudget int64
 	// OpenAIReasoningEffort openai 路径 reasoning_effort 字面量（DSC_OPENAI_REASONING_EFFORT）；
-	// 未设且 ReasoningEffort 已设时由档位映射（max→high）。非空即原样下发。
+	// 未设且 ReasoningEffort 已设时由档位映射（none/minimal/low/medium/high/max 1:1 透传）。
+	// 非空即原样下发。
 	OpenAIReasoningEffort string
 }
 
@@ -110,11 +115,16 @@ func LoadLLMConfig(provider string) LLMConfig {
 }
 
 // anthropicThinkingBudgetForLevel 将 DSC 标准档位映射为 anthropic 路径思考 token 预算。
-// 未知档位返回 0（交由插件用默认 4096）。max 与 high 同为 16384：统一两路处理，anthropic
-// 思考预算与 openai reasoning_effort 在 max 档均回落 high（通常用 high 已足够，更高强度待
-// 后续按需放开）；若端点支持更高预算，可用 DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖。
+// none 返回 0（思考关闭，由插件据 cfg.ReasoningEffort=="none" 判定）；minimal/low/medium/
+// high/max 对应 2048/4096/8192/16384/32768。未知档位返回 0（交由插件用默认
+// 4096）。max 恢复 32768 以与 openai 路径的 max 档对应；若端点支持更高预算，可用
+// DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖。
 func anthropicThinkingBudgetForLevel(level string) int64 {
 	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "none":
+		return 0
+	case "minimal":
+		return 2048
 	case "low":
 		return 4096
 	case "medium":
@@ -122,25 +132,19 @@ func anthropicThinkingBudgetForLevel(level string) int64 {
 	case "high":
 		return 16384
 	case "max":
-		return 16384
+		return 32768
 	default:
 		return 0
 	}
 }
 
 // openaiReasoningEffortForLevel 将 DSC 标准档位映射为 openai 路径 reasoning_effort 字面量。
-// max 钳到 high（DeepSeek/OpenAI 文档化档位仅 low/medium/high）；若端点支持
-// max/xhigh，由调用方设 DSC_OPENAI_REASONING_EFFORT 传字面量绕过本映射。
+// 统一 6 档（none/minimal/low/medium/high/max）与此处 1:1 透传；xhigh 等文档外档位不在
+// 统一枚举内，由调用方设 DSC_OPENAI_REASONING_EFFORT 直接覆盖。
 func openaiReasoningEffortForLevel(level string) string {
 	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "low":
-		return "low"
-	case "medium":
-		return "medium"
-	case "high":
-		return "high"
-	case "max":
-		return "high"
+	case "none", "minimal", "low", "medium", "high", "max":
+		return strings.ToLower(strings.TrimSpace(level))
 	default:
 		return ""
 	}
