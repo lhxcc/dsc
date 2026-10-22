@@ -23,6 +23,63 @@ func waitJobStatus(t *testing.T, m *Manager, id string, want jobs.JobStatus) {
 	t.Fatalf("job %s did not reach %s", id, want)
 }
 
+// ctxBlockingTool 阻塞到 ctx 取消为止，用于验证后台任务取消真正传导到执行体。
+type ctxBlockingTool struct {
+	started chan struct{}
+}
+
+func (t *ctxBlockingTool) Name() string                      { return "ctx_blocking" }
+func (t *ctxBlockingTool) Description() string               { return "blocks until ctx is cancelled" }
+func (t *ctxBlockingTool) ParametersSchema() json.RawMessage { return json.RawMessage(`{}`) }
+func (t *ctxBlockingTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	close(t.started)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// TestBackgroundJobKillCancelsExecution 回归后台任务取消：job_kill 必须取消
+// 执行体的 ctx 并以 killed 落定；且发起回合的 ctx 取消不应影响后台任务。
+func TestBackgroundJobKillCancelsExecution(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	tool := &ctxBlockingTool{started: make(chan struct{})}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	turnCtx, cancelTurn := context.WithCancel(context.Background())
+	out, _, _, _, err := m.ExecuteToolWithView(turnCtx, "ctx_blocking", json.RawMessage(`{"run_in_background":true}`))
+	if err != nil || !strings.Contains(out, "Background job started") {
+		t.Fatalf("start background = %q, %v", out, err)
+	}
+	select {
+	case <-tool.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background tool did not start")
+	}
+
+	jobsList := m.jobs.ListAll()
+	if len(jobsList) != 1 {
+		t.Fatalf("want 1 job, got %d", len(jobsList))
+	}
+	id := jobsList[0].ID
+
+	// 回合 ctx 取消：后台任务必须继续运行。
+	cancelTurn()
+	time.Sleep(50 * time.Millisecond)
+	if snap, err := m.jobs.Get(id, ""); err != nil || snap.Status != jobs.StatusRunning {
+		t.Fatalf("background job should survive turn ctx cancel, got %+v, %v", snap, err)
+	}
+
+	// job_kill：取消传导到执行体，任务以 killed 落定。
+	if _, err := m.jobs.KillHost(id, "test kill"); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	waitJobStatus(t, m, id, jobs.StatusKilled)
+	if snap, _ := m.jobs.Get(id, ""); snap.Detail != "test kill" {
+		t.Fatalf("kill detail = %q, want reason propagated", snap.Detail)
+	}
+}
+
 func TestJobToolsRegistered(t *testing.T) {
 	m := NewManager(&ManagerConfig{})
 	for _, name := range []string{"job_output", "job_list", "job_kill"} {

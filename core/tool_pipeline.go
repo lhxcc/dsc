@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -434,11 +435,29 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 		Owner: caller,
 		Start: func() (jobs.JobHooks, error) {
 			doneCh := make(chan jobs.JobOutcome, 1)
-			cancelCh := make(chan string, 1)
+			// 后台任务的生命周期独立于发起它的回合：只继承 ctx 中的值
+			// （会话/审批策略），不继承取消——回合结束后任务仍应继续，
+			// 只有 job_kill 才终止它。
+			jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+
+			var mu sync.Mutex
+			cancelReason := ""
 
 			go func() {
+				defer cancel()
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
-				result, _, err := m.executeBackgroundPipeline(ctx, toolName, argsJSON)
+				result, _, err := m.executeBackgroundPipeline(jobCtx, toolName, argsJSON)
+				mu.Lock()
+				reason := cancelReason
+				mu.Unlock()
+				if jobCtx.Err() != nil {
+					detail := "cancelled"
+					if reason != "" {
+						detail = reason
+					}
+					doneCh <- jobs.JobOutcome{Status: jobs.StatusKilled, Detail: detail, Output: result}
+					return
+				}
 				if err != nil {
 					doneCh <- jobs.JobOutcome{Status: jobs.StatusFailed, Detail: err.Error(), Output: result}
 				} else {
@@ -448,10 +467,12 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 
 			return jobs.JobHooks{
 				Cancel: func(reason string) {
-					select {
-					case cancelCh <- reason:
-					default:
+					mu.Lock()
+					if cancelReason == "" {
+						cancelReason = reason
 					}
+					mu.Unlock()
+					cancel()
 				},
 				Done:       doneCh,
 				ReadOutput: nil, // final-output 模式（完成后一次性返回全部输出）
