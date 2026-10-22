@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 
 	"dsc/libs/vodka"
 )
@@ -198,14 +200,20 @@ func (m *Manager) ensureMCPClients() {
 
 func (m *Manager) handleMCPConnect(c *vodka.Context) error {
 	var req struct {
-		ServerName string `json:"server_name"` // [A-Za-z0-9_-]{1,32}
-		Endpoint   string `json:"endpoint"`    // MCP 服务器 HTTP URL
+		ServerName string            `json:"server_name"` // [A-Za-z0-9_-]{1,32}
+		Endpoint   string            `json:"endpoint"`    // HTTP/SSE 传输的 MCP 服务器 URL
+		Transport  string            `json:"transport"`   // "http"（缺省）或 "stdio"
+		Command    string            `json:"command"`     // stdio：服务器可执行文件
+		Args       []string          `json:"args"`        // stdio：启动参数
+		Env        map[string]string `json:"env"`         // stdio：追加环境变量
+		WorkDir    string            `json:"workdir"`     // stdio：子进程工作目录
 	}
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
 		return vodka.NewHTTPError(http.StatusBadRequest, "invalid JSON: "+err.Error())
 	}
-	if req.ServerName == "" || req.Endpoint == "" {
-		return vodka.NewHTTPError(http.StatusBadRequest, "server_name and endpoint are required")
+	stdio := strings.EqualFold(req.Transport, "stdio")
+	if req.ServerName == "" || (!stdio && req.Endpoint == "") || (stdio && req.Command == "") {
+		return vodka.NewHTTPError(http.StatusBadRequest, "server_name and endpoint (or stdio command) are required")
 	}
 	if !isMCPServerNameValid(req.ServerName) {
 		return vodka.NewHTTPError(http.StatusBadRequest, "invalid server_name: use [A-Za-z0-9_-] only, max 32 chars")
@@ -219,7 +227,24 @@ func (m *Manager) handleMCPConnect(c *vodka.Context) error {
 	}
 	m.mu.Unlock()
 
-	client, err := NewMCPClient(m, req.ServerName, req.Endpoint)
+	var (
+		client *MCPClient
+		err    error
+	)
+	if stdio {
+		keys := make([]string, 0, len(req.Env))
+		for k := range req.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		env := make([]string, 0, len(keys))
+		for _, k := range keys {
+			env = append(env, k+"="+req.Env[k])
+		}
+		client, err = NewMCPStdioClient(m, req.ServerName, req.Command, req.Args, env, req.WorkDir)
+	} else {
+		client, err = NewMCPClient(m, req.ServerName, req.Endpoint)
+	}
 	if err != nil {
 		return vodka.NewHTTPError(http.StatusBadRequest, err.Error())
 	}

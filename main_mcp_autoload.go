@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"dsc/core"
 	"github.com/hashicorp/go-hclog"
@@ -24,9 +26,11 @@ import (
 //     # transport: stdio
 //     # command: mcp-server-memory
 //     # args: ["--port", "3000"]
+//     # env: {MEMORY_DB: "/tmp/memory.db"}   # 可选
+//     # workdir: /path/to/server             # 可选
 //
 // 每个条目的 config.mcp 字段含 server_name（必填）与 endpoint（HTTP）或
-// transport: stdio + command + args（stdio，当前仅支持 HTTP，stdio 留待后续）。
+// transport: stdio + command + args/env（stdio）。
 func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.Logger) {
 	if cfg == nil || len(cfg.Plugins) == 0 {
 		return
@@ -46,20 +50,29 @@ func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.
 		}
 		endpoint, _ := mcpCfg["endpoint"].(string)
 		transport, _ := mcpCfg["transport"].(string)
-		if transport == "stdio" {
-			// stdio 传输需要进程管理（spawn 子进程 + JSON-RPC over stdin/stdout）
-			// 当前 MCPClient 仅支持 HTTP/SSE，stdio 留待后续扩展
-			logger.Warn("patch MCP stdio transport not yet supported, skipping",
-				"plugin", entry.Name, "server_name", serverName)
-			continue
+
+		var (
+			client *core.MCPClient
+			err    error
+		)
+		if strings.EqualFold(transport, "stdio") {
+			command, _ := mcpCfg["command"].(string)
+			if command == "" {
+				logger.Warn("patch MCP stdio config missing command, skipping",
+					"plugin", entry.Name, "server_name", serverName)
+				continue
+			}
+			workDir, _ := mcpCfg["workdir"].(string)
+			client, err = core.NewMCPStdioClient(mgr, serverName, command,
+				mcpStringList(mcpCfg["args"]), mcpEnvList(mcpCfg["env"]), workDir)
+		} else {
+			if endpoint == "" {
+				logger.Warn("patch MCP config missing endpoint (HTTP transport), skipping",
+					"plugin", entry.Name, "server_name", serverName)
+				continue
+			}
+			client, err = core.NewMCPClient(mgr, serverName, endpoint)
 		}
-		if endpoint == "" {
-			logger.Warn("patch MCP config missing endpoint (HTTP transport), skipping",
-				"plugin", entry.Name, "server_name", serverName)
-			continue
-		}
-		// 经 admin API 的同一 Manager 路径连接（复用 ensureMCPClients + NewMCPClient + Connect）
-		client, err := core.NewMCPClient(mgr, serverName, endpoint)
 		if err != nil {
 			logger.Error("patch MCP connect failed",
 				"plugin", entry.Name, "server_name", serverName, "error", err)
@@ -67,13 +80,52 @@ func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.
 		}
 		if err := client.Connect(context.Background()); err != nil {
 			logger.Error("patch MCP connect failed",
-				"plugin", entry.Name, "server_name", serverName, "endpoint", endpoint, "error", err)
+				"plugin", entry.Name, "server_name", serverName,
+				"endpoint", endpoint, "transport", transport, "error", err)
 			continue
 		}
 		// 注册到 Manager.mcpClients（与 admin API /mcp/connect 同款路径）
 		mgr.RegisterMCPClient(serverName, client)
 		logger.Info("patch MCP connected",
 			"plugin", entry.Name, "server_name", serverName,
-			"endpoint", endpoint, "tools", fmt.Sprintf("%d", client.ToolCount()))
+			"endpoint", endpoint, "transport", transport,
+			"tools", fmt.Sprintf("%d", client.ToolCount()))
+	}
+}
+
+// mcpStringList 把配置里的数组转成字符串列表（非字符串项忽略）。
+func mcpStringList(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// mcpEnvList 把配置里的 env 转成 KEY=VALUE 列表：支持 map（按键升序，确定性）
+// 或字符串数组两种写法。
+func mcpEnvList(v any) []string {
+	switch e := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(e))
+		for k := range e {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out := make([]string, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, k+"="+fmt.Sprint(e[k]))
+		}
+		return out
+	case []any:
+		return mcpStringList(e)
+	default:
+		return nil
 	}
 }

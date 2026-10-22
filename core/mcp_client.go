@@ -21,8 +21,8 @@ import (
 // stdio 或 HTTP 传输，发现其工具列表，注册到 ToolRegistry。工具命名约定对齐 DSH：
 // mcp__<serverName>__<rawName>。
 //
-// 当前实现支持 HTTP/SSE 传输（MCP 标准传输之一）。stdio 传输需要进程管理，
-// 后续按需扩展。
+// 当前实现支持两种 MCP 标准传输：HTTP/SSE（endpoint）与 stdio（command + args +
+// env，子进程经 stdin/stdout 交换换行分隔的 JSON-RPC）。
 
 // MCPClient 连接一个外部 MCP 服务器，发现并注册其工具。
 type MCPClient struct {
@@ -32,6 +32,9 @@ type MCPClient struct {
 	httpClient *http.Client
 	tools      map[string]*MCPTool // rawName → tool
 	manager    *Manager
+	// stdioSpec 非空时使用 stdio 传输（Connect 拉起子进程）；否则走 endpoint 的 HTTP/SSE。
+	stdioSpec *mcpStdioSpec
+	stdio     *mcpStdioTransport
 }
 
 // MCPTool 一个经 MCP 桥接的工具。
@@ -62,8 +65,34 @@ func NewMCPClient(mgr *Manager, serverName, endpoint string) (*MCPClient, error)
 	}, nil
 }
 
+// NewMCPStdioClient 创建 stdio 传输的 MCP 客户端：Connect 时以 command/args/env
+// 拉起 MCP 服务器子进程，经 stdin/stdout 交换换行分隔的 JSON-RPC。
+func NewMCPStdioClient(mgr *Manager, serverName, command string, args, env []string, workDir string) (*MCPClient, error) {
+	if !isMCPServerNameValid(serverName) {
+		return nil, fmt.Errorf("invalid MCP server name %q: use [A-Za-z0-9_-] only, max 32 chars", serverName)
+	}
+	if strings.TrimSpace(command) == "" {
+		return nil, fmt.Errorf("MCP stdio: command is required")
+	}
+	return &MCPClient{
+		serverName: serverName,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		tools:      make(map[string]*MCPTool),
+		manager:    mgr,
+		stdioSpec:  &mcpStdioSpec{Command: command, Args: args, Env: env, WorkDir: workDir},
+	}, nil
+}
+
 // Connect 连接 MCP 服务器并发现工具。
 func (c *MCPClient) Connect(ctx context.Context) error {
+	if c.stdioSpec != nil && c.stdio == nil {
+		t, err := startMCPStdioTransport(*c.stdioSpec)
+		if err != nil {
+			return err
+		}
+		c.stdio = t
+	}
+
 	// MCP 协议：发送 initialize 请求
 	initReq := map[string]any{
 		"jsonrpc": "2.0",
@@ -81,11 +110,13 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 
 	resp, err := c.doJSON(ctx, initReq)
 	if err != nil {
+		c.closeStdio()
 		return fmt.Errorf("MCP initialize failed: %w", err)
 	}
 	_ = resp
 	// 验证响应中有 capabilities
 	if _, ok := resp["result"]; !ok {
+		c.closeStdio()
 		return fmt.Errorf("MCP initialize: no result in response")
 	}
 
@@ -94,10 +125,14 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 		"jsonrpc": "2.0",
 		"method":  "notifications/initialized",
 	}
-	_, _ = c.doJSON(ctx, notif) // 通知不需响应
+	_ = c.notifyJSON(ctx, notif) // 通知不需响应
 
 	// 发现工具
-	return c.discoverTools(ctx)
+	if err := c.discoverTools(ctx); err != nil {
+		c.closeStdio()
+		return err
+	}
+	return nil
 }
 
 // discoverTools 列出 MCP 服务器的工具并注册到 ToolRegistry。
@@ -224,6 +259,22 @@ func (c *MCPClient) Disconnect() {
 		}
 	}
 	c.tools = make(map[string]*MCPTool)
+	c.closeStdioLocked()
+}
+
+// closeStdio 关闭 stdio 传输（Connect 失败清理用）。
+func (c *MCPClient) closeStdio() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeStdioLocked()
+}
+
+// closeStdioLocked 关闭并清空 stdio 子进程；需已持有 c.mu 或调用方仅独占访问。
+func (c *MCPClient) closeStdioLocked() {
+	if c.stdio != nil {
+		_ = c.stdio.Close()
+		c.stdio = nil
+	}
 }
 
 // ServerName 返回 MCP 服务器名。
@@ -253,6 +304,9 @@ func (c *MCPClient) Tools() []*MCPTool {
 // HTTP 406 "Not Acceptable"。设上两个类型后，旧版服务器忽略 Accept、
 // 新版服务器选择其中一种响应（简单请求通常返回 application/json）。
 func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]any, error) {
+	if c.stdio != nil {
+		return c.stdio.Call(ctx, req)
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -296,6 +350,16 @@ func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]
 	}
 
 	return result, nil
+}
+
+// notifyJSON 发送 JSON-RPC 通知：stdio 不等待响应；HTTP 传输沿用 doJSON（旧服务器
+// 可能返回空体/202，错误由调用方按需忽略）。
+func (c *MCPClient) notifyJSON(ctx context.Context, req map[string]any) error {
+	if c.stdio != nil {
+		return c.stdio.Notify(req)
+	}
+	_, err := c.doJSON(ctx, req)
+	return err
 }
 
 // ParseSSEResponse 从 SSE 响应体提取首个 data: 行的 JSON 负载。
