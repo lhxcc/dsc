@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // LSP 工具（对齐 DSH packages/lsp/lsp + lsp-stdio + tool-lsp）。
@@ -16,11 +19,9 @@ import (
 // hover、定义跳转等暴露给模型。
 //
 // DSC 的适配：LSPClient 管理一个 stdio LSP 子进程，提供：
-//   - Start：启动 LSP 服务器子进程
-//   - Diagnostics：获取文件诊断信息
-//   - Hover：获取符号 hover 信息
-//   - Definition：获取定义位置
-//   - Stop：停止子进程
+//   - Start：启动 LSP 服务器子进程并完成 initialize/initialized 握手
+//   - Diagnostics：同步文档（didOpen/didChange）并获取诊断
+//   - Stop：shutdown/exit 后停止子进程
 //
 // 当前实现支持 stdio 传输（LSP 标准传输之一）。
 
@@ -28,12 +29,23 @@ import (
 type LSPClient struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	stdout   io.ReadCloser
 	serverID string
 	language string
 	rootPath string
 	started  bool
 	// diagnostics 缓存：file path → diagnostics
 	diagCache map[string][]LSPDiagnostic
+
+	// JSON-RPC 运行态（见 lsp_rpc.go）
+	writeMu      sync.Mutex
+	pending      map[int64]chan lspRPCResult
+	nextID       atomic.Int64
+	documents    map[string]int    // uri -> version
+	documentText map[string]string // uri -> 最近一次同步的全文
+	diagWait     map[string]chan struct{}
+	done         chan struct{}
 }
 
 // LSPDiagnostic 一条诊断信息。
@@ -69,26 +81,26 @@ const (
 // rootPath 为工作区根路径，serverID 为 LSP 服务器标识。
 func NewLSPClient(language, rootPath, serverID string) *LSPClient {
 	return &LSPClient{
-		language:  language,
-		rootPath:  rootPath,
-		serverID:  serverID,
-		diagCache: make(map[string][]LSPDiagnostic),
+		language:     language,
+		rootPath:     rootPath,
+		serverID:     serverID,
+		diagCache:    make(map[string][]LSPDiagnostic),
+		pending:      make(map[int64]chan lspRPCResult),
+		documents:    make(map[string]int),
+		documentText: make(map[string]string),
+		diagWait:     make(map[string]chan struct{}),
 	}
 }
 
-// Start 启动 LSP 服务器子进程。
+// Start 启动 LSP 服务器子进程并完成 initialize/initialized 握手。
 // command 为 LSP 服务器可执行文件路径，args 为启动参数。
 //
-// 注意：当前实现仅启动子进程，未与 LSP 服务器进行 initialize 握手。
-// LSP 协议要求客户端发送 initialize 请求，服务器响应后才开始接收
-// textDocument/publishDiagnostics 通知。本客户端把诊断接收解耦——
-// 由外部组件（如 ToolRegistry 钩子）经 SetDiagnostics 主动推送缓存，
-// 本客户端只做缓存查询与工具暴露。完整 LSP 协议实现留待后续扩展。
+// 握手完成后，GetDiagnostics 会按文件内容发送 didOpen/didChange，并等待
+// 服务端 publishDiagnostics 通知更新缓存（见 lsp_rpc.go）。
 func (c *LSPClient) Start(ctx context.Context, command string, args ...string) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.started {
+		c.mu.Unlock()
 		return fmt.Errorf("LSP server already started")
 	}
 
@@ -97,36 +109,104 @@ func (c *LSPClient) Start(ctx context.Context, command string, args ...string) e
 	// Windows 上隐藏 LSP 服务器子进程控制台，避免 TUI 中终端窗口闪烁
 	ConfigureChildProcessAttrs(cmd)
 
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("LSP stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("LSP stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("LSP stderr: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("LSP start failed: %w", err)
 	}
 
 	c.cmd = cmd
+	c.stdin = stdin
+	c.stdout = stdout
 	c.started = true
-	// 后台等待子进程退出，避免僵尸进程（Linux 上不调用 Wait 会留下 defunct）
+	c.pending = make(map[int64]chan lspRPCResult)
+	c.documents = make(map[string]int)
+	c.documentText = make(map[string]string)
+	c.diagWait = make(map[string]chan struct{})
+	c.done = make(chan struct{})
+	done := c.done
+	c.mu.Unlock()
+
+	go c.readLoop(stdout)
+	// stderr 只排空：语言服务器日志不能混入 JSON-RPC 协议流。
+	go func() { _, _ = io.Copy(io.Discard, stderr) }()
 	go func() {
 		_ = cmd.Wait()
+		c.mu.Lock()
+		c.started = false
+		c.failPendingLocked(fmt.Errorf("LSP: server exited"))
+		c.mu.Unlock()
+		close(done)
 	}()
+
+	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if _, err := c.call(initCtx, "initialize", lspInitializeParams(c.rootPath)); err != nil {
+		_ = c.Stop()
+		return fmt.Errorf("LSP initialize failed: %w", err)
+	}
+	if err := c.notify("initialized", map[string]any{}); err != nil {
+		_ = c.Stop()
+		return fmt.Errorf("LSP initialized notification failed: %w", err)
+	}
 	return nil
 }
 
-// Stop 停止 LSP 服务器子进程。
+// Stop 优雅停止 LSP 子进程：shutdown 请求 → exit 通知 → 关闭 stdin → Kill（兜底）。
 // 发送 Kill 后等待最多 5 秒子进程退出，避免遗留僵尸进程。
 func (c *LSPClient) Stop() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if !c.started || c.cmd == nil {
+		c.mu.Unlock()
 		return nil
 	}
+	stdin := c.stdin
+	cmd := c.cmd
+	done := c.done
+	c.mu.Unlock()
 
-	if c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-		// 不阻塞等待——go routine 已在 Start 中调用 Wait
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, _ = c.call(shutdownCtx, "shutdown", nil)
+	cancel()
+	_ = c.notify("exit", nil)
+	if stdin != nil {
+		_ = stdin.Close()
 	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+
+	c.mu.Lock()
 	c.started = false
 	c.cmd = nil
+	c.stdin = nil
+	c.stdout = nil
 	c.diagCache = make(map[string][]LSPDiagnostic)
+	c.pending = make(map[int64]chan lspRPCResult)
+	c.documents = make(map[string]int)
+	c.documentText = make(map[string]string)
+	c.diagWait = make(map[string]chan struct{})
+	c.mu.Unlock()
 	return nil
 }
 
@@ -137,16 +217,31 @@ func (c *LSPClient) SetDiagnostics(filePath string, diags []LSPDiagnostic) {
 	c.diagCache[filePath] = diags
 }
 
-// GetDiagnostics 获取文件的诊断信息。
+// GetDiagnostics 获取文件的诊断信息：已连接 LSP 服务器时先同步文档
+// （didOpen/didChange）并等待 publishDiagnostics 通知，再返回缓存；未启动时
+// 直接返回外部 SetDiagnostics 写入的缓存。
 func (c *LSPClient) GetDiagnostics(ctx context.Context, filePath string) ([]LSPDiagnostic, error) {
+	p := PClean(strings.ReplaceAll(filePath, "\\", "/"))
+
+	c.mu.Lock()
+	started := c.started
+	c.mu.Unlock()
+	if started {
+		uri := lspFileURI(p)
+		wait := c.expectDiagnostics(uri)
+		if err := c.syncDocument(ctx, p, uri); err != nil {
+			c.cancelExpectDiagnostics(uri, wait)
+			return nil, err
+		}
+		lspWaitDiagnostics(ctx, wait, 2*time.Second)
+		// 超时/取消后撤销等待登记，避免迟到的 publishDiagnostics 关闭无人接收的通道。
+		c.cancelExpectDiagnostics(uri, wait)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	diags, ok := c.diagCache[filePath]
-	if !ok {
-		return nil, nil
-	}
-	return diags, nil
+	diags := c.diagCache[p]
+	return append([]LSPDiagnostic(nil), diags...), nil
 }
 
 // GetAllDiagnostics 获取所有文件的诊断信息。
