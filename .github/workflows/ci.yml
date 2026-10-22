@@ -62,6 +62,51 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  race:
+    name: race detector (concurrency core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # 并发面集中在事件总线、工具流水线、会话落盘、后台 job 与热重载；
+      # 只对核心包开 -race，避免 UI 包拖慢反馈（后续按稳定性再纳入）。
+      - run: go test -race -timeout 15m ./core/... ./session/... ./jobs/... ./workflow/... ./cron/... ./coderuntime/...
+
+  bench-compare:
+    name: bench baseline regression check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: plugins/tool-agentic-bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: plugins/tool-agentic-bench/go.mod
+          cache: true
+      - run: go test ./...
+      # 比较逻辑的退出码契约：检出回归 → 1；改进/无回归 → 0。真实模型评测需
+      # 要端点与密钥，不进 PR CI（见插件 README）。
+      - name: benchcmp detects regression (expect exit 1)
+        run: |
+          set +e
+          go run ./cmd/benchcmp --baseline testdata/baseline.json \
+            --current testdata/current_regressed.json --fail-on-regression
+          code=$?
+          if [ "$code" -ne 1 ]; then
+            echo "::error::benchcmp should exit 1 on regression, got $code"
+            exit 1
+          fi
+      - name: benchcmp accepts improvement (expect exit 0)
+        run: >
+          go run ./cmd/benchcmp --baseline testdata/baseline.json
+          --current testdata/current_improved.json --fail-on-regression
+
   submodules:
     name: submodule ${{ matrix.path }}
     runs-on: ubuntu-latest
@@ -92,13 +137,13 @@ jobs:
           - path: sdk/examples/tool-simple
             test: true
           - path: plugins/agent-react-loop
-            test: false
+            test: true
           - path: plugins/dsc-billion-context
             test: false
           - path: plugins/dsc-notify
             test: false
           - path: plugins/dsc-system
-            test: false
+            test: true
           - path: plugins/llm-anthropic
             test: false
           - path: plugins/llm-ollama
