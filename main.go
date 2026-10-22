@@ -514,6 +514,16 @@ func main() {
 
 	logger.Info("starting dsc", "mode", mode)
 
+	// Windows 专属兜底：把宿主纳入带 KILL_ON_JOB_CLOSE 的 Job Object（其余平台
+	// no-op）。插件及其孙进程自动继承该 job；宿主正常退出、panic、os.Exit 或被
+	// 强杀时，内核在句柄回收后一并终止，覆盖 client.Kill()/GracefulKill 来不及
+	// 执行的场景（任务管理器强杀、崩溃）。须在任何插件拉起之前调用。
+	if err := core.EnableProcessJob(); err != nil {
+		logger.Warn("process job object unavailable, relying on graceful plugin shutdown", "error", err)
+	} else if core.ProcessJobActive() {
+		logger.Debug("process job object enabled (kill-on-job-close)")
+	}
+
 	// 加載 preset 配置文件
 	presetPath := core.PJoin(execDir, "config", "presets", fmt.Sprintf("%s.yaml", mode))
 	presetCfg, err := loadConfig(presetPath)

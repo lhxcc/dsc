@@ -1,6 +1,7 @@
 package dsc
 
 import (
+	"os"
 	"testing"
 )
 
@@ -180,14 +181,27 @@ func TestLoadLLMConfigDSCPrefixGroup(t *testing.T) {
 		t.Errorf("Model = %q, want dsc-model", cfg.Model)
 	}
 
-	// 清空 DSC_ 前缀：整组回退旧名。
-	t.Setenv("DSC_ANTHROPIC_BASE_URL", "")
-	t.Setenv("DSC_ANTHROPIC_MODEL", "")
+	// 「键被设置但值为空」也视为已配置 DSC_ 组：不得回退终端旧名——否则配置里
+	// 显式留空的 key 会静默回落到终端历史遗留的 ANTHROPIC_API_KEY（实测事故：
+	// 终端默认 key ****8888 被使用，导致 401）。
+	t.Setenv("DSC_ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "terminal-key-should-not-be-used")
+	if cfg = LoadLLMConfig("anthropic"); cfg.APIKey != "" {
+		t.Errorf("DSC_ 键存在但为空时不得回退旧名，APIKey = %q", cfg.APIKey)
+	}
+
+	// 真正取消设置 DSC_ 前缀（os.Unsetenv，注意「设为空串」≠「未设置」）：整组回退旧名。
+	os.Unsetenv("DSC_ANTHROPIC_BASE_URL")
+	os.Unsetenv("DSC_ANTHROPIC_MODEL")
+	os.Unsetenv("DSC_ANTHROPIC_API_KEY")
 	t.Setenv("ANTHROPIC_BASE_URL", "https://old.example.com")
 	t.Setenv("ANTHROPIC_MODEL", "old-model")
 	cfg = LoadLLMConfig("anthropic")
 	if cfg.BaseURL != "https://old.example.com" || cfg.Model != "old-model" {
 		t.Errorf("回退旧名失败: BaseURL=%q Model=%q", cfg.BaseURL, cfg.Model)
+	}
+	if cfg.APIKey != "terminal-key-should-not-be-used" {
+		t.Errorf("未设 DSC_ 时应回退旧名 APIKey，got %q", cfg.APIKey)
 	}
 
 	// OpenAI 组同样适用。

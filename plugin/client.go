@@ -696,7 +696,13 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		cmd = exec.Command("")
 	}
 	if !c.config.SkipHostEnv {
-		cmd.Env = append(cmd.Env, os.Environ()...)
+		// 宿主环境作为「底料」置于前、调用方 Cmd.Env 置于后：os/exec 对重复键
+		// 取后者（dedupEnv 保留最后一项），因此调用方显式给出的值胜出。
+		// 反序（cmd.Env 在前、os.Environ() 在后）会让宿主/终端里的同名变量
+		// 静默覆盖调用方注入的值——对 DSC 而言即 config.yaml 的
+		// DSC_<P>_API_KEY / BASE_URL / MODEL 被终端同名变量劫持（实测症状：
+		// 配置指向新 key，请求却带着终端旧 key 收到 401）。
+		cmd.Env = append(os.Environ(), cmd.Env...)
 	}
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdin = os.Stdin

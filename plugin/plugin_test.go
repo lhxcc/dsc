@@ -706,6 +706,15 @@ func TestHelperProcess(*testing.T) {
 		}
 
 		os.Exit(1)
+	case "test-env-override":
+		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
+		// 宿主环境里的同名变量为 from_host，调用方 Cmd.Env 给出 from_cmd；
+		// 正确的合并顺序下子进程应看到 from_cmd。
+		if os.Getenv("PLUGIN_TEST_OVERRIDE") == "from_cmd" {
+			os.Exit(0)
+		}
+
+		os.Exit(1)
 	case "mux-grpc-with-old-core":
 		// gRPC broker multiplexing requested, but core has no awareness of the
 		// feature, so just prints 6 segments in the protocol negotiation line.

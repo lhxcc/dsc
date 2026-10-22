@@ -74,8 +74,14 @@ type Manager struct {
 	//               供运行时态查询与反应式重算（对齐 DSH/Cordis 的 _refresh + notify 模型）。
 	//               不区分插件是否经 config.yaml 持久化——孤儿插件（load_dsc_plugin persist=false
 	//               载入）的解析结果也存于此，可在运行时态查询使用。
-	configPath     string
-	agentEntries   map[string]PluginEntry
+	configPath   string
+	agentEntries map[string]PluginEntry
+	// loadedEntries 记录每个插件进程「已生效的声明条目」（含 Env），首次加载时写入、
+	// 卸载时清除。热重载不会重新解析 config.yaml（孤儿插件甚至不在 config 内），
+	// 故必须凭它复现首次加载时的 env 注入；否则重载后的子进程只能继承宿主环境，
+	// config.yaml 里的 DSC_<P>_API_KEY / BASE_URL / MODEL 全部丢失，插件回退读终端
+	// 同名变量（历史症状：热重载后 401 / 模型名回退）。
+	loadedEntries  map[string]PluginEntry
 	pendingEntries map[string]PluginEntry
 	resolvedDeps   map[string][]ResolvedDep
 	// backupSeq 进程内自增计数器，配合毫秒时间戳生成唯一 .bak 文件名，
@@ -250,6 +256,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		subscribers:         make(map[int]chan PluginEvent),
 		stopHooks:           make(map[string][]func() error),
 		agentEntries:        make(map[string]PluginEntry),
+		loadedEntries:       make(map[string]PluginEntry),
 		loadedBinaries:      make(map[string]string),
 		pendingEntries:      make(map[string]PluginEntry),
 		resolvedDeps:        make(map[string][]ResolvedDep),
@@ -436,6 +443,8 @@ func (m *Manager) isPendingLocked(name string) bool {
 // markDisposedLocked 統一卸載終態：Stopping -> Disposed（需已持有 m.mu）。
 func (m *Manager) markDisposedLocked(name string) {
 	m.transitionLocked(name, StateDisposed, "")
+	// 已 dispose 的插件不再参与热重载，条目随之作废（防同名插件换配置后残留旧 env）。
+	delete(m.loadedEntries, name)
 }
 
 // monitorExit 监听子进程退出事件：仅当退出进程仍是当前注册的 client 且非主动卸载时，
@@ -516,6 +525,9 @@ func (m *Manager) GetAgent(name string) (Agent, bool) {
 // loadLLMEntryLocked 加載 LLM 插件並存儲 provider（需已持有 m.mu）。
 // 供 LoadFromConfig 在声明式加载流程中复用，避免重复加锁。
 func (m *Manager) loadLLMEntryLocked(entry PluginEntry) (LLMProvider, error) {
+	// 本函数只服务 LLM 类型；显式钉住类型，确保 coreEnv 按 llm 放行凭据键
+	// （若 Type 意外为空，凭据会被当作非 LLM 机密滤掉，表现为"配置里有 key 但没发出去"）。
+	entry.Type = "llm"
 	binaryPath := entry.BinaryPath
 	if binaryPath == "" {
 		ext := ""
@@ -539,24 +551,15 @@ func (m *Manager) loadLLMEntryLocked(entry PluginEntry) (LLMProvider, error) {
 	}
 	m.trackStateLocked(name, "llm")
 
-	// 創建插件客戶端
-	cmd := exec.Command(binaryPath)
-	if m.config.ExecDir != "" {
-		cmd.Dir = m.config.ExecDir
-	}
-	if len(entry.Env) > 0 {
-		cmd.Env = buildEnv(entry.Env, true)
-	}
-	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: m.config.Handshake,
-		Plugins: map[string]plugin.Plugin{
-			"llm": &LLMGRPCPlugin{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           m.coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// 創建插件客戶端（统一入口：完整 env + SkipHostEnv，见 newPluginClientConfig）
+	clientCfg := m.newPluginClientConfig(
+		entry, binaryPath, m.config.ExecDir, m.config.Handshake,
+		map[string]plugin.Plugin{"llm": &LLMGRPCPlugin{}}, m.coreLogger,
+	)
+	// 启动即打印「插件将实际拿到的 LLM env」摘要（凭据脱敏），使「配置 key vs 终端
+	// 同名变量」这类问题一眼可辨，无需再靠 401 报文里的 ****xxxx 反推。
+	m.logger.Info("llm plugin env resolved", "name", name, "env", summarizeLLMEnv(clientCfg.Cmd.Env))
+	client := plugin.NewClient(clientCfg)
 
 	// 建立 RPC 連接
 	rpcClient, err := client.Client()
@@ -586,6 +589,7 @@ func (m *Manager) loadLLMEntryLocked(entry PluginEntry) (LLMProvider, error) {
 	m.llms[name] = impl
 	m.llmOrder = append(m.llmOrder, name) // 记录加载顺序（去重由加载前 unload 保证）
 	m.typeMap[name] = "llm"
+	m.loadedEntries[name] = entry // 供热重载复现同一份 env 注入
 	// 获取 LLM 的 PluginInfo 并存入 coreMetadata，供能力依赖解析（其他插件经
 	// Requires 声明对 LLM 能力的依赖时，宿主扫描 coreMetadata 找到匹配的 LLM
 	// provider）。LLM 的 llmMetadataServer 默认提供 CapabilityLLM="llm" 能力。
@@ -697,20 +701,12 @@ func (m *Manager) setReloadFailed(name string, err error) {
 // 死后 hook 调用与 tool 调用都会失败。无工具时 ListTools 返回空列表，跳过 tool 登记。
 func (m *Manager) hotReloadPlugin(name, newBinaryPath string, execDir string, handshake plugin.HandshakeConfig, coreLogger hclog.Logger) error {
 	// ---- 准备阶段（不持 m.mu）：拉起并验证新进程 ----
-	cmd := exec.Command(newBinaryPath)
-	if execDir != "" {
-		cmd.Dir = execDir
-	}
-	newClient := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: handshake,
-		Plugins: map[string]plugin.Plugin{
-			"dsc_core": &DSCPluginGRPC{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// entry 取自首次加载时登记的条目，确保重载后 env（含 config.yaml 的 DSC_*）不变。
+	entry := m.reloadEntry(name, "dsc")
+	newClient := plugin.NewClient(m.newPluginClientConfig(
+		entry, newBinaryPath, execDir, handshake,
+		map[string]plugin.Plugin{"dsc_core": &DSCPluginGRPC{}}, coreLogger,
+	))
 
 	rpcClient, err := newClient.Client()
 	if err != nil {
@@ -814,28 +810,15 @@ func (m *Manager) hotReloadAgent(name, newBinaryPath string, execDir string, han
 	}
 
 	// ---- 准备阶段（不持 m.mu）：拉起并验证新进程 ----
-	cmd := exec.Command(newBinaryPath)
-	if execDir != "" {
-		cmd.Dir = execDir
-	}
-	// 新 agent 进程须继承完整宿主环境（含 DSC_* 部署变量）：加载路径用
-	// buildEnv(entry.Env) 构造，这里保持一致。漏设时 cmd.Env 为 nil，go-plugin 仅
-	// 追加握手变量会丢失 os.Environ，导致 Windows 下 CreateProcess 失败
-	//（ERROR_INVALID_PARAMETER）且新进程缺少 DSC_WORKSPACE_ROOT 等部署配置。
-	m.mu.RLock()
-	entry := m.agentEntries[name]
-	m.mu.RUnlock()
-	cmd.Env = m.coreEnv(entry)
-	newClient := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: handshake,
-		Plugins: map[string]plugin.Plugin{
-			"agent": &AgentGRPCPlugin{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// 新 agent 进程须与首次加载完全同源地继承环境：统一经 newPluginClientConfig
+	// 构造（完整宿主环境 + entry.Env，其中含 DSC_WORKSPACE_ROOT 等部署配置与
+	// config.yaml 的 DSC_* 注入）。历史上此处手工拼 cmd.Env 且其余 4 个热重载
+	// 路径干脆漏设，导致重载后插件回退读宿主/终端同名变量。
+	entry := m.reloadEntry(name, "agent")
+	newClient := plugin.NewClient(m.newPluginClientConfig(
+		entry, newBinaryPath, execDir, handshake,
+		map[string]plugin.Plugin{"agent": &AgentGRPCPlugin{}}, coreLogger,
+	))
 
 	rpcClient, err := newClient.Client()
 	if err != nil {
@@ -934,20 +917,15 @@ func (m *Manager) hotReloadAgent(name, newBinaryPath string, execDir string, han
 // 仅最终交换临界区短持 mu；交换时重校验插件在准备期间未被卸载。
 func (m *Manager) hotReloadLLM(name, newBinaryPath string, execDir string, handshake plugin.HandshakeConfig, coreLogger hclog.Logger) error {
 	// ---- 准备阶段（不持 m.mu）：拉起并验证新进程 ----
-	cmd := exec.Command(newBinaryPath)
-	if execDir != "" {
-		cmd.Dir = execDir
-	}
-	newClient := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: handshake,
-		Plugins: map[string]plugin.Plugin{
-			"llm": &LLMGRPCPlugin{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// 与首次加载同一入口，env 复现 config.yaml 注入的 DSC_<P>_API_KEY/BASE_URL/MODEL。
+	entry := m.reloadEntry(name, "llm")
+	clientCfg := m.newPluginClientConfig(
+		entry, newBinaryPath, execDir, handshake,
+		map[string]plugin.Plugin{"llm": &LLMGRPCPlugin{}}, coreLogger,
+	)
+	// 热重载后 env 必须与首次加载一致，同样打印脱敏摘要以便核对。
+	coreLogger.Info("llm plugin env resolved (hot reload)", "name", name, "env", summarizeLLMEnv(clientCfg.Cmd.Env))
+	newClient := plugin.NewClient(clientCfg)
 
 	rpcClient, err := newClient.Client()
 	if err != nil {
@@ -1000,20 +978,11 @@ func (m *Manager) hotReloadLLM(name, newBinaryPath string, execDir string, hands
 // toolHookOrder 由 putToolHookOrderLocked 保持原位，避免重复登记。
 func (m *Manager) hotReloadTool(name, newBinaryPath string, execDir string, handshake plugin.HandshakeConfig, coreLogger hclog.Logger, broker *plugin.GRPCBroker, refs interconnectRefs) error {
 	// ---- 准备阶段（不持 m.mu）：拉起并验证新进程（类型须为 tool）----
-	cmd := exec.Command(newBinaryPath)
-	if execDir != "" {
-		cmd.Dir = execDir
-	}
-	newClient := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: handshake,
-		Plugins: map[string]plugin.Plugin{
-			"dsc_core": &DSCPluginGRPC{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	entry := m.reloadEntry(name, "tool")
+	newClient := plugin.NewClient(m.newPluginClientConfig(
+		entry, newBinaryPath, execDir, handshake,
+		map[string]plugin.Plugin{"dsc_core": &DSCPluginGRPC{}}, coreLogger,
+	))
 
 	rpcClient, err := newClient.Client()
 	if err != nil {
@@ -1077,20 +1046,11 @@ func (m *Manager) hotReloadTool(name, newBinaryPath string, execDir string, hand
 // 仅最终交换临界区短持 mu；交换时重校验插件在准备期间未被卸载。
 func (m *Manager) hotReloadPolicy(name, newBinaryPath string, execDir string, handshake plugin.HandshakeConfig, coreLogger hclog.Logger) error {
 	// ---- 准备阶段（不持 m.mu）：拉起并验证新进程（类型须为 policy）----
-	cmd := exec.Command(newBinaryPath)
-	if execDir != "" {
-		cmd.Dir = execDir
-	}
-	newClient := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: handshake,
-		Plugins: map[string]plugin.Plugin{
-			"dsc_core": &DSCPluginGRPC{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	entry := m.reloadEntry(name, "policy")
+	newClient := plugin.NewClient(m.newPluginClientConfig(
+		entry, newBinaryPath, execDir, handshake,
+		map[string]plugin.Plugin{"dsc_core": &DSCPluginGRPC{}}, coreLogger,
+	))
 
 	rpcClient, err := newClient.Client()
 	if err != nil {
@@ -1180,6 +1140,7 @@ func (m *Manager) Shutdown() {
 	m.states = make(map[string]*RuntimeState)
 	m.stopHooks = make(map[string][]func() error)
 	m.agentEntries = make(map[string]PluginEntry)
+	m.loadedEntries = make(map[string]PluginEntry)
 	m.pendingEntries = make(map[string]PluginEntry)
 	m.resolvedDeps = make(map[string][]ResolvedDep)
 	m.mu.Unlock()
@@ -1907,21 +1868,11 @@ func (m *Manager) loadAgentAndGetBroker(entry PluginEntry) (*plugin.GRPCBroker, 
 		return nil, nil, fmt.Errorf("invalid Agent core directory name '%s': %w", dirName, err)
 	}
 
-	cmd := exec.Command(binaryPath)
-	if m.config.ExecDir != "" {
-		cmd.Dir = m.config.ExecDir
-	}
-	cmd.Env = buildEnv(entry.Env, false)
-	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: m.config.Handshake,
-		Plugins: map[string]plugin.Plugin{
-			"agent": &AgentGRPCPlugin{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           m.coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// 统一入口构造（完整 env，agent 类型不放行凭据键）
+	client := plugin.NewClient(m.newPluginClientConfig(
+		entry, binaryPath, m.config.ExecDir, m.config.Handshake,
+		map[string]plugin.Plugin{"agent": &AgentGRPCPlugin{}}, m.coreLogger,
+	))
 
 	rpcClient, err := client.Client()
 	if err != nil {
@@ -1961,8 +1912,9 @@ func (m *Manager) loadAgentAndGetBroker(entry PluginEntry) (*plugin.GRPCBroker, 
 	m.clients[entry.Name] = client
 	m.agents[entry.Name] = agent
 	m.typeMap[entry.Name] = "agent"
-	m.agentServiceIDs[entry.Name] = 0  // 占位
-	m.agentEntries[entry.Name] = entry // 记录声明条目，供 PENDING agent 再激活时按能力依赖解析 LLM provider
+	m.agentServiceIDs[entry.Name] = 0   // 占位
+	m.agentEntries[entry.Name] = entry  // 记录声明条目，供 PENDING agent 再激活时按能力依赖解析 LLM provider
+	m.loadedEntries[entry.Name] = entry // 供热重载复现同一份 env 注入
 	// 获取 agent 的 PluginInfo 并存入 coreMetadata，供能力依赖解析（agent 的
 	// sdk.Config.Requires 经 PluginInfo.Capabilities 编码为 requires/<type>/<cap> 键）。
 	// 此前 agent 不需要 PluginInfo（用 config.yaml 的 depends_on 按名依赖），现按能力
@@ -2291,22 +2243,11 @@ func (m *Manager) loadPluginWithBroker(entry PluginEntry, broker *plugin.GRPCBro
 	}
 	m.trackStateLocked(entry.Name, entry.Type)
 
-	// 創建客戶端
-	cmd := exec.Command(binaryPath)
-	if m.config.ExecDir != "" {
-		cmd.Dir = m.config.ExecDir
-	}
-	cmd.Env = m.coreEnv(entry)
-	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig: m.config.Handshake,
-		Plugins: map[string]plugin.Plugin{
-			"dsc_core": &DSCPluginGRPC{},
-		},
-		Cmd:              cmd,
-		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Logger:           m.coreLogger,
-		SyncStderr:       m.logFanout,
-	})
+	// 統一入口構造（完整 env；tool/policy/dsc 類型由 coreEnv 濾除憑據鍵）
+	client := plugin.NewClient(m.newPluginClientConfig(
+		entry, binaryPath, m.config.ExecDir, m.config.Handshake,
+		map[string]plugin.Plugin{"dsc_core": &DSCPluginGRPC{}}, m.coreLogger,
+	))
 
 	rpcClient, err := client.Client()
 	if err != nil {
@@ -2387,6 +2328,8 @@ func (m *Manager) loadPluginWithBroker(entry PluginEntry, broker *plugin.GRPCBro
 		m.transitionLocked(entry.Name, StateFailed, fmt.Sprintf("unsupported core type: %s", info.Type))
 		return fmt.Errorf("unsupported core type: %s", info.Type)
 	}
+	// 登记已生效条目（含 Env），供热重载复现同一份 env 注入。
+	m.loadedEntries[entry.Name] = entry
 	return nil
 }
 
@@ -2454,7 +2397,177 @@ func buildEnv(custom map[string]string, allowSecrets bool) []string {
 // 仅 LLM 插件放行凭据类键；tool/policy/agent 等一律滤除，防凭据被
 // shell 等工具进程读出。
 func (m *Manager) coreEnv(entry PluginEntry) []string {
-	return buildEnv(entry.Env, entry.Type == "llm")
+	env := buildEnv(entry.Env, entry.Type == "llm")
+	if entry.Type == "llm" {
+		// LLM 插件额外把 DSC_ 组回写到无前缀旧名（见函数注释），避免第三方 SDK
+		// 在 NewClient 内部的环境变量凭据链里抢先命中终端遗留的认证变量。
+		env = mirrorLLMEnvToLegacyNames(env)
+	}
+	return env
+}
+
+// envLegacyProviders 支持「回写旧名」的 provider 列表（与 DSC_ 命名约定一致）。
+var envLegacyProviders = []string{"ANTHROPIC", "OPENAI", "OLLAMA"}
+
+// mirrorLLMEnvToLegacyNames 把 DSC_<P>_* 的最终值同步到无前缀旧名键，并清掉同组的
+// <P>_AUTH_TOKEN；仅在 DSC_ 组至少有一个键存在时生效（不做任何跨组猜测）。
+//
+// 为什么必须这样做（实测事故）：anthropic-sdk-go 的 DefaultClientOptions 会走
+// 「环境变量凭据链」，优先级是 ANTHROPIC_API_KEY → ANTHROPIC_AUTH_TOKEN。终端
+// .profile 里常只导出 ANTHROPIC_AUTH_TOKEN（给 Claude Code 用），于是 SDK 追加
+// option.WithAuthToken()，请求带上 `Authorization: Bearer <终端 token>`；插件随后
+// 传 option.WithAPIKey(config key) 只会额外设 X-Api-Key，**撤不掉那个 Authorization
+// 头**。服务端（DeepSeek /anthropic）按 Bearer 认证 → 报「api key ****8888 is
+// invalid」，而配置里的 key 从头到尾没被真正使用。
+//
+// 回写后 SDK 在凭据链第一步就命中 <P>_API_KEY 并 return，auth token 分支不执行，
+// 请求只剩 X-Api-Key=配置值。这一处理在宿主侧完成，因此对 anthropic / openai /
+// ollama 以及将来接入的任一第三方 SDK 都成立，不依赖各插件自行规避。
+//
+// 副作用（刻意）：DSC_ 组存在时，旧名 <P>_AUTH_TOKEN 一律删除——DSC 的凭据约定是
+// `<P>_API_KEY`，没有 auth token 概念；要保留 token 通道请显式改用旧名整组配置。
+func mirrorLLMEnvToLegacyNames(env []string) []string {
+	merged := make(map[string]string, len(env))
+	for _, kv := range env {
+		if i := strings.Index(kv, "="); i > 0 {
+			merged[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, p := range envLegacyProviders {
+		suffixes := []string{"API_KEY", "BASE_URL", "MODEL", "HOST"}
+		group := false
+		for _, suf := range suffixes {
+			if _, ok := merged["DSC_"+p+"_"+suf]; ok {
+				group = true
+				break
+			}
+		}
+		if !group {
+			continue
+		}
+		for _, suf := range suffixes {
+			if v, ok := merged["DSC_"+p+"_"+suf]; ok {
+				merged[p+"_"+suf] = v
+			}
+		}
+		delete(merged, p+"_AUTH_TOKEN")
+	}
+	out := make([]string, 0, len(merged))
+	for k, v := range merged {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// pluginCmd 是插件子进程命令的唯一构造入口：首次加载与热重载都必须走这里。
+//
+// env 语义（唯一事实来源，调用点不要另拼 cmd.Env）：
+//   - 恒为「完整列表」= 宿主环境 + entry.Env，且插件值优先（buildEnv 以 map 合并，
+//     天然去重）；
+//   - 仅 LLM 插件放行凭据类键，tool/policy/agent/dsc 一律滤除（防 shell 等工具
+//     进程把 API key 读进模型上下文）；
+//   - 即使 entry.Env 为空也给出完整列表而非 nil：nil 时子进程只剩握手变量
+//     （Windows 下 CreateProcess 报 ERROR_INVALID_PARAMETER），且丢失
+//     DSC_WORKSPACE_ROOT 等部署配置。
+//
+// 配套约定：交给 plugin.NewClient 的 ClientConfig 一律由 newPluginClientConfig
+// 产出（其 SkipHostEnv=true）。若允许 go-plugin 再追加 os.Environ()，会同时
+// 破坏上述两点：① os/exec 对重复键取后者，配置值被宿主/终端同名变量覆盖
+//
+//	（实测症状：config.yaml 指向新 key，请求却带终端旧 key 收到 401）；
+//
+// ② 刚被滤除的凭据键又被原样带进子进程。
+func (m *Manager) pluginCmd(entry PluginEntry, binaryPath, execDir string) *exec.Cmd {
+	if execDir == "" {
+		execDir = m.config.ExecDir
+	}
+	cmd := exec.Command(binaryPath)
+	if execDir != "" {
+		cmd.Dir = execDir
+	}
+	cmd.Env = m.coreEnv(entry)
+	return cmd
+}
+
+// newPluginClientConfig 是插件客户端配置的唯一构造入口（与 pluginCmd 配套）。
+// 集中本仓全站一致的字段，避免 8 个拉起点各抄一份后逐渐漂移（历史上热重载
+// 4 处就漏设了 cmd.Env）。类型相关的 handshake / plugins / logger 由调用点传入。
+func (m *Manager) newPluginClientConfig(entry PluginEntry, binaryPath, execDir string, handshake plugin.HandshakeConfig, plugins map[string]plugin.Plugin, logger hclog.Logger) *plugin.ClientConfig {
+	return &plugin.ClientConfig{
+		HandshakeConfig:  handshake,
+		Plugins:          plugins,
+		Cmd:              m.pluginCmd(entry, binaryPath, execDir),
+		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
+		Logger:           logger,
+		SyncStderr:       m.logFanout,
+		// env 已由 pluginCmd 完整给出，禁止 fork 再追加宿主环境（见 pluginCmd 注释）。
+		SkipHostEnv: true,
+	}
+}
+
+// reloadEntry 取插件热重载时须复用的已生效声明条目（含 Env）。
+// 未登记时退化为最小条目（仅带 name/type），env 即为纯宿主环境——与旧行为一致，
+// 不影响拉起；type 决定 coreEnv 是否放行凭据（llm 才放行）。
+func (m *Manager) reloadEntry(name, typ string) PluginEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if e, ok := m.loadedEntries[name]; ok {
+		return e
+	}
+	return PluginEntry{Name: name, Type: typ, Enabled: true}
+}
+
+// summarizeLLMEnv 从最终注入插件子进程的 env 里筛出 LLM 相关键并脱敏凭据，
+// 返回排序后的 "K=V" 摘要，供启动/热重载日志展示「插件真正拿到的是哪份配置」。
+//
+// 用途：区分「配置注入值」与「宿主/终端同名变量」这两类来源——历史事故里
+// 401 报文只给 ****xxxx，无法判断用的是哪个 key，只能逐层排查；有了这行日志，
+// 一眼即可对账（凭据只暴露后 4 位，与上游的 ****xxxx 掩码口径一致）。
+func summarizeLLMEnv(env []string) []string {
+	var out []string
+	for _, kv := range env {
+		i := strings.Index(kv, "=")
+		if i <= 0 {
+			continue
+		}
+		k, v := kv[:i], kv[i+1:]
+		u := strings.ToUpper(k)
+		// 只认 provider 相关前缀，避免宿主自身业务变量（WORKBUDDY_VLM_*、WECOM_* 等）
+		// 因后缀碰巧是 _MODEL/_AUTH_TOKEN 被误收进摘要（实测出现过）。
+		if !strings.HasPrefix(u, "DSC_") && !strings.HasPrefix(u, "ANTHROPIC_") &&
+			!strings.HasPrefix(u, "OPENAI_") && !strings.HasPrefix(u, "OLLAMA_") {
+			continue
+		}
+		secret := false
+		switch {
+		case strings.HasSuffix(u, "_API_KEY"), strings.HasSuffix(u, "_API_TOKEN"),
+			strings.HasSuffix(u, "_AUTH_TOKEN"), u == "DSC_OLLAMA_API_KEY":
+			secret = true
+		case strings.HasSuffix(u, "_BASE_URL"), strings.HasSuffix(u, "_MODEL"):
+		case u == "DSC_REASONING_EFFORT", u == "DSC_ANTHROPIC_THINKING_BUDGET",
+			u == "DSC_OPENAI_REASONING_EFFORT":
+		default:
+			continue // 与 LLM 无关的键不打印，避免启动日志被宿主环境刷屏
+		}
+		if secret {
+			v = maskCredential(v)
+		}
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// maskCredential 凭据脱敏：仅保留后 4 位（空值显式标出，便于发现「配置写了空 key」）。
+func maskCredential(v string) string {
+	if v == "" {
+		return "(empty)"
+	}
+	if len(v) <= 4 {
+		return "****"
+	}
+	return "****" + v[len(v)-4:]
 }
 
 // LoadToolsAndPoliciesFromConfig 從配置加載 tool 和 policy 插件

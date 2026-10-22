@@ -962,6 +962,33 @@ func TestClient_SkipHostEnv(t *testing.T) {
 	}
 }
 
+// TestClient_CmdEnvOverridesHostEnv 验证 Cmd.Env 中的键在子进程里优先于宿主同名
+// 变量。这是 DSC 的硬性要求：config.yaml 注入的 DSC_<P>_API_KEY / BASE_URL / MODEL
+// 绝不能被宿主或终端里的同名变量劫持（历史症状：配置指向新 key，请求却带终端旧
+// key 收到 401）。os/exec 对重复键取后者，故宿主环境必须作为「底料」置于前。
+func TestClient_CmdEnvOverridesHostEnv(t *testing.T) {
+	t.Setenv("PLUGIN_TEST_OVERRIDE", "from_host")
+
+	process := helperProcess("test-env-override")
+	process.Env = append(process.Env, "PLUGIN_TEST_OVERRIDE=from_cmd")
+	c := NewClient(&ClientConfig{
+		Cmd:             process,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+	})
+	defer c.Kill()
+
+	if _, err := c.Start(); err != nil {
+		t.Fatalf("error: %s", err)
+	}
+	for !c.Exited() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !process.ProcessState.Success() {
+		t.Fatal("Cmd.Env 应优先于宿主同名变量，但子进程读到的是宿主值")
+	}
+}
+
 func TestClient_RequestGRPCMultiplexing_UnsupportedByPlugin(t *testing.T) {
 	for _, name := range []string{
 		"mux-grpc-with-old-core",

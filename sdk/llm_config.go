@@ -65,12 +65,16 @@ type LLMConfig struct {
 func LoadLLMConfig(provider string) LLMConfig {
 	p := strings.ToUpper(strings.TrimSpace(provider))
 	prefix := p + "_"
-	// 整组决定前缀：三个键（API_KEY / BASE_URL / MODEL）任一以 DSC_ 前缀存在即整组
+	// 整组决定前缀：三个键（API_KEY / BASE_URL / MODEL）任一以 DSC_ 前缀「被设置」即整组
 	// 采用 DSC_ 前缀读取，禁止 DSC_ 与非 DSC_ 变量混用（例如 DSC_ANTHROPIC_BASE_URL
 	// 与旧 ANTHROPIC_MODEL 混搭导致半新半旧的不一致配置）。三者必须作为一个整体读取。
+	//
+	// 用 LookupEnv 判断「键存在」而非「值非空」：配置里显式写 `DSC_ANTHROPIC_API_KEY: ""`
+	// 表达的是「用 DSC_ 组、该键留空」，此时绝不能把控制权交回终端的旧名同义变量
+	//（终端里常有历史遗留的 ANTHROPIC_API_KEY 默认值，回退过去会静默用错凭据）。
 	useDSC := false
 	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
-		if os.Getenv("DSC_"+prefix+suf) != "" {
+		if _, ok := os.LookupEnv("DSC_" + prefix + suf); ok {
 			useDSC = true
 			break
 		}

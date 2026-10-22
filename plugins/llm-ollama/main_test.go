@@ -37,6 +37,9 @@ func TestResolveOllamaConfigDSCPrefixGroup(t *testing.T) {
 	os.Setenv("DSC_OLLAMA_MODEL", "qwen2.5:14b")
 	// 同时设置一个旧名，验证不会被混用
 	os.Setenv("OLLAMA_MODEL", "legacy-model-should-be-ignored")
+	// 终端里残留的旧名 HOST 同样不得劫持 config 注入的 DSC_OLLAMA_HOST
+	//（env 投递链修复前，子进程里的同名变量会被宿主值覆盖，连到错误服务）。
+	os.Setenv("OLLAMA_HOST", "http://terminal-legacy:11434")
 	model, host = resolveOllamaConfig()
 	if model != "qwen2.5:14b" {
 		t.Fatalf("DSC_ 组应优先读 DSC_OLLAMA_MODEL: %q", model)
