@@ -222,7 +222,7 @@ TUI 輸入框按 `@` 會彈出當前工作區的文件候選篩選列表（對�
 - `tool-pdf`（PDF 讀取與創建。讀取側：`pdf_read_text` / `pdf_extract_tables`（列對齊表格網格輸出）/ `pdf_info` / `pdf_outline` / `pdf_search` / `pdf_extract_images`，自寫內容流解釋器 + 字體解碼（WinAnsi/MacRoman/Standard + ToUnicode CMap；CID 字體缺 ToUnicode 時回退解析內嵌 TrueType cmap 解碼中文），按 y 聚合行、按橫向間隙識別多欄（以製表符分隔）、依 `Tm` 旋轉角把非橫行單獨分區輸出，盡力還原閲讀順序。創建/整理側：`pdf_create_text` / `pdf_images_to_pdf` / `pdf_append_text` / `pdf_merge_pdfs` / `pdf_split_pdfs` / `pdf_extract_pages`，支持標準 14 字體與自帶 CJK 字體（Type0 嵌入子集、字符級折行與真實行距分頁）。攜帶中文字體體積大不進公開倉庫，需按插件 `fonts/字体下载.txt` 自行下載；go.mod module 名為 `tool-pdf`（與目錄/二進制命名一致，直接 `go build` 產物即合規）。提供 `pdf` 能力）
 - `tool-str-replace-editor`（文件編輯：接受 `/workspace` 虛擬根前綴並剝離映射到工作區根；提供 `editor` 能力）
 - `tool-browser-use`（無頭瀏覽器工具：`web_fetch` / `web_search` / `browser_click` / `browser_type` / `browser_screenshot`；提供 `browser` 能力）
-- `tool-computer-use`（桌面觀察與操作：`computer_use_screen` 截圖隨工具結果回傳視覺模型（經宿主入庫為 `dsc-shot://` 引用，temp 24 小時生命週期，不落用户 workspace） + `computer_use_click/move/drag/scroll/type/key/paste/cursor_position/screen_size/check`；基於 robotgo，座標紀律=截圖即座標系；Linux 需 X11 開發頭文件（libx11-dev/libxtst-dev/libxi-dev）與 DISPLAY，僅本機平台隨發佈包（CGO 插件不交叉編譯）；提供 `computer-use` 能力）
+- `tool-computer-use`（桌面觀察與操作：`computer_use_screen` 截圖隨工具結果回傳視覺模型（經宿主入庫為 `dsc-shot://` 引用，temp 24 小時生命週期，不落用户 workspace） + `computer_use_click/move/drag/scroll/type/key/paste/cursor_position/screen_size/check`；基於 robotgo，座標紀律=截圖即座標系；**macOS 14+** 截屏走 ScreenCaptureKit（macOS 15 SDK 已移除 `CGDisplayCreateImage*`，本倉以 `libs/robotgo`、`libs/screenshot` 最小補丁 fork 適配），需授予「屏幕錄制」與「輔助功能」權限；Linux 需 X11 開發頭文件（libx11-dev/libxtst-dev/libxi-dev）與 DISPLAY，僅本機平台隨發佈包（CGO 插件不交叉編譯）；提供 `computer-use` 能力）
 - `tool-lisp-eval`（Lisp/Scheme 精確有理數求值：`+ - * /` 變參精確運算、`3/4` 分數字面量、任意精度整數；浮點走 `f+ f- f* f/` 逃生艙；提供 `lisp-eval` 能力）
 - `tool-lua-host`（LUA 腳本宿主：腳本註冊工具，宿主互通複用 LLM/Tool/Notify；內置只讀 `list_lua_tools` 枚舉當前已註冊的 LUA 腳本工具；腳本註冊的工具以**腳本名為前綴**暴露（腳本 `example` 的 `ping` → `example_ping`，故模型從工具名即知它出自哪個腳本，`dsc.script.name` 供腳本拼自身工具名）；腳本工具在創造模式下熱加載（約 2s 輪詢掃描 `scripts/`），宿主會節流同步其到模型可直接調用的工具目錄——新腳本工具無需重啓即可被模型直接調用）
 - `tool-sql-host`（.dsp 插件宿主：.dsp 是「dsc's plugin」，實質是一個 SQLite 庫——插件的元數據（`dsp_meta`）、代碼（`dsp_blobs`）、運行期狀態（`dsp_state`）同處一庫，即「程序即數據」；宿主打開後取出其中的 LUA 代碼執行並把註冊的工具以**插件名為前綴**暴露（插件 `hello` 的 `greet` → `hello_greet`，與 `list_dsp_plugins` 列出的插件名逐字對應、歸屬一眼可查；內置只讀 `list_dsp_plugins` 概覽已加載插件），插件經 `dsc.sql.*` 對自己那個庫做 SQL、經 `dsc.store.*` 讀寫自身狀態（宿主重啓後仍在，因為狀態就在它自己的文件裏）；後綴強制校驗 + SQLite 魔數 + `application_id=0x44535031`（"DSP1"）四道門禁自證身份；腳本側 SQL 加保守守衞（禁 ATTACH/DETACH、禁改元數據與代碼表、禁運行期 DDL，自有表由打包期 `schema.sql` 落庫）；創造模式下按**產物哈希**（只覆蓋元數據與代碼，狀態寫入不觸發）熱加載，並可用 `pack_dsp` 把源目錄打包成 .dsp；參考實現來自 SelfDB 的「可執行文件即數據庫」思路，但去掉了內核層——不需要可執行位與 binfmt_misc，執行主體是 Go 宿主進程）
@@ -254,7 +254,7 @@ TUI 輸入框按 `@` 會彈出當前工作區的文件候選篩選列表（對�
 - `session/` — 事件溯源會話（按項目路徑命名存儲，跨項目隔離）
 - `proto/` — gRPC 定義與生成代碼
 - `tui/` — 終端界面（Bubble Tea）
-- `libs/` — vendored 本地依賴 fork（`go-lua`、`jig-lisp` 精確有理數解釋器、`sh`（mvdan.cc/sh/v3 shell 解釋器）等），經各插件 `go.mod` 的 `replace` 指入
+- `libs/` — vendored 本地依賴 fork（`go-lua`、`jig-lisp` 精確有理數解釋器、`sh`（mvdan.cc/sh/v3 shell 解釋器）、`robotgo` / `screenshot`（僅為 macOS 15 SDK 截圖 API 移除打最小補丁，改用 ScreenCaptureKit）等），經各插件 `go.mod` 的 `replace` 指入
 
 ## TUI 斜杆命令
 

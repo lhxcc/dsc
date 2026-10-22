@@ -41,6 +41,9 @@ func TestFilepathBlacklistGuard(t *testing.T) {
 	// 直管（改动会造成与上游无谓分叉，runtime 路径链路亦不涉及）。
 	// libs/fasttemplate、libs/bytebufferpool：仅离线构建 vendored 的第三方模板库，
 	// 无路径处理逻辑。
+	// libs/robotgo、libs/screenshot：vendored 第三方 fork，仅为适配 macOS 15 SDK
+	// 的截图 API 移除而打了最小补丁（ScreenCaptureKit）；其余代码保持上游原样，
+	// 不纳入本仓路径纪律（改动会与上游无谓分叉）。
 	// libs/vodka：属本仓自研（Web 框架），归属上按直管论，登记为**语义例外**——
 	// 其 filepath 用法集中在 HTTP 框架内部（静态文件服务、session 文件存储、模板
 	// 加载），不进入模型可见的路径链路，该语境下原生分隔符本就是正确选择（改造
@@ -65,6 +68,8 @@ func TestFilepathBlacklistGuard(t *testing.T) {
 		filepath.ToSlash("libs/toon-go"):                   true,
 		filepath.ToSlash("libs/fasttemplate"):              true,
 		filepath.ToSlash("libs/bytebufferpool"):            true,
+		filepath.ToSlash("libs/robotgo"):                   true,
+		filepath.ToSlash("libs/screenshot"):                true,
 		filepath.ToSlash("plugins/tool-2fa-master/vendor"): true,
 		filepath.ToSlash("builder"):                        true,
 	}
@@ -184,6 +189,8 @@ func TestSlashTerminologyGuard(t *testing.T) {
 		filepath.ToSlash("libs/toon-go"):                   true,
 		filepath.ToSlash("libs/fasttemplate"):              true,
 		filepath.ToSlash("libs/bytebufferpool"):            true,
+		filepath.ToSlash("libs/robotgo"):                   true,
+		filepath.ToSlash("libs/screenshot"):                true,
 		filepath.ToSlash("plugins/tool-2fa-master/vendor"): true,
 		filepath.ToSlash("builder"):                        true,
 	}

@@ -31,7 +31,7 @@ jobs:
         run: |
           # 仅检查受控文件；纯 vendored 第三方源码不强制格式化（见 AGENTS.md）。
           files="$(git ls-files '*.go' \
-            | grep -vE '^libs/(anthropic-sdk-go|go-openai|go-lua|jig-lisp|toon-go|fasttemplate|bytebufferpool)/' \
+            | grep -vE '^libs/(anthropic-sdk-go|go-openai|go-lua|jig-lisp|toon-go|fasttemplate|bytebufferpool|robotgo|screenshot)/' \
             | grep -vE '^plugins/tool-2fa-master/vendor/')"
           count="$(printf '%s\n' "$files" | grep -c . || true)"
           if [ "$count" -eq 0 ]; then
