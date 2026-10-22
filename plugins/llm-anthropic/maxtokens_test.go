@@ -105,11 +105,22 @@ func TestMaxTokensFromEnvAbsent(t *testing.T) {
 }
 
 func TestMaxTokensFromEnvInvalid(t *testing.T) {
+	// 注意：-1 是合法的「明确不携带」哨兵（见 LLMConfig.MaxOutputTokens 三态），
+	// 非法值请用真正无法解析的字符串。
+	t.Setenv("ANTHROPIC_MAX_OUTPUT_TOKENS", "abc")
+	t.Setenv("DSC_MAX_OUTPUT_TOKENS", "")
+	cfg := dsc.LoadLLMConfig("anthropic")
+	if got := cfg.MaxOutputTokens; got != 0 {
+		t.Fatalf("非法值应按未设置处理（0）: got %d", got)
+	}
+}
+
+func TestMaxTokensFromEnvNegativeOmit(t *testing.T) {
 	t.Setenv("ANTHROPIC_MAX_OUTPUT_TOKENS", "")
 	t.Setenv("DSC_MAX_OUTPUT_TOKENS", "-1")
 	cfg := dsc.LoadLLMConfig("anthropic")
-	if got := cfg.MaxOutputTokens; got != 0 {
-		t.Fatalf("非法值应返回 0: got %d", got)
+	if got := cfg.MaxOutputTokens; got != -1 {
+		t.Fatalf("-1 应表示明确不携带: got %d", got)
 	}
 }
 

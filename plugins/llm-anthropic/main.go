@@ -164,7 +164,12 @@ func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []
 		}
 	}
 
-	// 2. 转换工具定义
+	// 3. 修复 tool_use / tool_result 配对（并行调用的多条结果合并、缺失结果补齐、
+	// 孤儿结果剔除）。不修则 Anthropic 兼容端点会以 400 拒绝：
+	// "messages.N: tool_use ids were found without tool_result blocks immediately after"。
+	userMessages = repairToolPairing(userMessages)
+
+	// 4. 转换工具定义
 	var toolParams []anthropic.ToolUnionParam
 	if len(tools) > 0 {
 		for _, t := range tools {
@@ -185,7 +190,7 @@ func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []
 		}
 	}
 
-	// 3. 构建请求参数
+	// 5. 构建请求参数
 	msgParams := anthropic.MessageNewParams{
 		Model:    anthropic.Model(p.model),
 		Messages: userMessages,
@@ -203,7 +208,7 @@ func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []
 	if len(toolParams) > 0 {
 		msgParams.Tools = toolParams
 	}
-	// 4. 扩展思考（extended thinking）：启用后模型会返回 thinking 块，
+	// 6. 扩展思考（extended thinking）：启用后模型会返回 thinking 块，
 	//    其内容经 chat 流式增量转发为 reasoning 帧最终渲染到 TUI。
 	if p.thinking {
 		msgParams.Thinking = anthropic.ThinkingConfigParamOfEnabled(p.thinkingBudget)
