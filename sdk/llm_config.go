@@ -110,8 +110,9 @@ func LoadLLMConfig(provider string) LLMConfig {
 }
 
 // anthropicThinkingBudgetForLevel 将 DSC 标准档位映射为 anthropic 路径思考 token 预算。
-// 未知档位返回 0（交由插件用默认 4096）。max 取 64000 作为安全上限，可用
-// DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖为端点支持的实际最大值。
+// 未知档位返回 0（交由插件用默认 4096）。max 取 32768 作为通用安全上限（远低于真实
+// Anthropic 端点对 thinking_budget 的硬约束，避免请求被拒）；若端点支持更高预算，可用
+// DSC_ANTHROPIC_THINKING_BUDGET 直接覆盖。
 func anthropicThinkingBudgetForLevel(level string) int64 {
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "low":
@@ -121,7 +122,7 @@ func anthropicThinkingBudgetForLevel(level string) int64 {
 	case "high":
 		return 16384
 	case "max":
-		return 64000
+		return 32768
 	default:
 		return 0
 	}
