@@ -203,6 +203,28 @@ func modelExt() string {
 }
 
 // injectRuntimeEnv 向所有插件进程注入当前模式/工作根/沙箱档/审批策略（主路径与「失败重试」共用）。
+// injectContextWindow 向所有插件注入 DSC_CONTEXT_WINDOW（有效上下文窗口值）。
+//
+// 为什么不能只给 agent：压缩后端（dsc-system 的 compaction-basic、dsc-billion-context）
+// 在各自进程里按窗口算压力阈值，此前拿不到该值只能退回 128K 默认——云端接 1M 窗口时
+// 仍按 128K 判压力，几步就触发压缩（用户实测 TUI 标题已显示 1.0M）。
+// 显式配置优先：插件条目 env 里写了该键（或宿主环境已有）则不覆盖。
+func injectContextWindow(merged *core.Config, contextWindow int) {
+	if contextWindow <= 0 {
+		return
+	}
+	for i := range merged.Plugins {
+		e := &merged.Plugins[i]
+		if e.Env == nil {
+			e.Env = map[string]string{}
+		}
+		if _, ok := e.Env["DSC_CONTEXT_WINDOW"]; ok {
+			continue
+		}
+		e.Env["DSC_CONTEXT_WINDOW"] = strconv.Itoa(contextWindow)
+	}
+}
+
 func injectRuntimeEnv(merged *core.Config, mode, workspaceRoot, sandboxPolicy string) {
 	// 审批策略 env（供 agent 渲染 approval:policy 上下文）：显式 DSC_APPROVAL 尊重之；
 	// 未显式时注入「沙箱预设绑定」默认（对齐 DSH permission-presets：full→never、其餘→ask）。

@@ -98,6 +98,13 @@ func newCompactionBasicServer() *compactionBasicServer {
 		retainRatio: 0.16,
 		retainMin:   1024,
 	}
+	// 窗口来源优先级：DSC_COMPACTION_BASIC_CONTEXT_WINDOW（插件专属）>
+	// DSC_CONTEXT_WINDOW（宿主按配置 context_window / 端点探测下发的有效值）> 128K 默认。
+	// 此前只读专属键，云端 1M 窗口仍按 128K 判压力、几步就触发压缩；宿主现已把通用键
+	// 注入所有插件，这里补回退（显式专属键仍可覆盖）。
+	if n := dsc.ContextWindow(); n > 0 {
+		s.window = n
+	}
 	if v := os.Getenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
 			s.window = n

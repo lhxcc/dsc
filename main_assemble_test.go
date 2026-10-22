@@ -8,6 +8,34 @@ import (
 
 // TestAssembleMergedConfigToolsDedup 验证 config.yaml 中启用的 tool/dsc 条目
 // 并入合并集（模型安装的插件可跨重启生效），并与 preset 按名去重——同名冲突取 preset。
+// TestInjectContextWindow 上下文窗口须下发到所有插件（不只 agent）：压缩后端按它算
+// 触发阈值，缺省会退回 128K，云端 1M 窗口时几步就压缩。显式配置不得被覆盖。
+func TestInjectContextWindow(t *testing.T) {
+	merged := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "agent-x", Type: "agent", Env: map[string]string{"DSC_CONTEXT_WINDOW": "1048576"}},
+		{Name: "dsc-system", Type: "dsc"},
+		{Name: "tool-x", Type: "tool", Env: map[string]string{"DSC_CONTEXT_WINDOW": "65536"}},
+	}}
+	injectContextWindow(merged, 1048576)
+
+	if got := merged.Plugins[1].Env["DSC_CONTEXT_WINDOW"]; got != "1048576" {
+		t.Fatalf("未配置的插件应获得有效窗口值，got %q", got)
+	}
+	if got := merged.Plugins[2].Env["DSC_CONTEXT_WINDOW"]; got != "65536" {
+		t.Fatalf("显式配置不得被覆盖，got %q", got)
+	}
+	if got := merged.Plugins[0].Env["DSC_CONTEXT_WINDOW"]; got != "1048576" {
+		t.Fatalf("agent 已带同值，应保持不变，got %q", got)
+	}
+
+	// window<=0 → 不注入
+	none := &core.Config{Plugins: []core.PluginEntry{{Name: "x", Type: "tool"}}}
+	injectContextWindow(none, 0)
+	if _, ok := none.Plugins[0].Env["DSC_CONTEXT_WINDOW"]; ok {
+		t.Fatal("窗口未知时不应注入")
+	}
+}
+
 // TestInjectMaxOutputTokensRespectsExplicit 验证注入不覆盖插件 env 里显式写的
 // DSC_MAX_OUTPUT_TOKENS（含 -1=不携带）——否则示例配置里的 -1 会被静默改成窗口值。
 func TestInjectMaxOutputTokensRespectsExplicit(t *testing.T) {

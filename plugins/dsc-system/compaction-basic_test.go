@@ -299,3 +299,34 @@ func TestCompactionBasicGrowthSinceReportedUsage(t *testing.T) {
 		t.Fatalf("rewrite 未落地：%d msgs, head=%q", len(got), got[0].GetContent())
 	}
 }
+
+// TestCompactionWindowFromContextWindowEnv 窗口来源优先级回归：宿主把有效窗口
+// （配置 context_window / 端点探测值）以 DSC_CONTEXT_WINDOW 注入所有插件，压缩器
+// 必须采信——此前只认自己的专属键，云端 1M 窗口仍按 128K 判压力，几步就压缩。
+func TestCompactionWindowFromContextWindowEnv(t *testing.T) {
+	t.Setenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW", "")
+	t.Setenv("DSC_CONTEXT_WINDOW", "1048576")
+	if s := newCompactionBasicServer(); s.window != 1048576 {
+		t.Fatalf("应采信 DSC_CONTEXT_WINDOW=1048576，got %d", s.window)
+	}
+
+	// 插件专属键优先于通用键
+	t.Setenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW", "262144")
+	if s := newCompactionBasicServer(); s.window != 262144 {
+		t.Fatalf("专属键应优先，got %d", s.window)
+	}
+
+	// 两者都缺席 → 128K 默认（本地兜底不变）
+	t.Setenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW", "")
+	t.Setenv("DSC_CONTEXT_WINDOW", "")
+	if s := newCompactionBasicServer(); s.window != 131072 {
+		t.Fatalf("无配置时默认 131072，got %d", s.window)
+	}
+
+	// 专属键显式 0 = 驻留禁用（不得被通用键顶回）
+	t.Setenv("DSC_CONTEXT_WINDOW", "1048576")
+	t.Setenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW", "0")
+	if s := newCompactionBasicServer(); s.window != 0 {
+		t.Fatalf("显式 0 应禁用，got %d", s.window)
+	}
+}
