@@ -57,6 +57,37 @@ func TestInjectMaxOutputTokensRespectsExplicit(t *testing.T) {
 	}
 }
 
+// TestAssembleMergedCopiesDefaultLLM 回归：config.yaml 的 default_llm 必须进入
+// 交给 Manager 的合并配置，否则多 LLM 并存时会退化为按名升序选 primary。
+// 同时校验 compaction 的 preset 优先、config 兜底语义。
+func TestAssembleMergedCopiesDefaultLLM(t *testing.T) {
+	mainCfg := &core.Config{
+		DefaultLLM: "llm-openai",
+		Compaction: "cfg-backend",
+		Plugins:    []core.PluginEntry{{Name: "tool-x", Type: "tool", Enabled: true}},
+	}
+	llmEntries := []core.PluginEntry{{Name: "llm-openai", Type: "llm", Enabled: true}}
+	agent := core.PluginEntry{Name: "agent-x", Type: "agent", Enabled: true}
+
+	merged := assembleMerged(llmEntries, &agent, mainCfg,
+		&core.Config{Compaction: "dsc-system"}, 131072, true, "")
+	if merged.DefaultLLM != "llm-openai" {
+		t.Fatalf("default_llm not copied: %q", merged.DefaultLLM)
+	}
+	if merged.Compaction != "dsc-system" {
+		t.Fatalf("preset compaction should win, got %q", merged.Compaction)
+	}
+
+	// preset 未声明 compaction：config 兜底
+	merged = assembleMerged(llmEntries, &agent, mainCfg, &core.Config{}, 131072, true, "")
+	if merged.Compaction != "cfg-backend" {
+		t.Fatalf("config compaction fallback failed: %q", merged.Compaction)
+	}
+	if merged.DefaultLLM != "llm-openai" {
+		t.Fatalf("default_llm not copied in fallback path: %q", merged.DefaultLLM)
+	}
+}
+
 func TestAssembleMergedConfigToolsDedup(t *testing.T) {
 	mainCfg := &core.Config{Plugins: []core.PluginEntry{
 		{Name: "agent-react-loop", Type: "agent", Enabled: true, BinaryPath: "./plugins/agent-react-loop/a.exe"},

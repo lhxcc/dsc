@@ -148,6 +148,12 @@ func assembleMerged(llmEntries []core.PluginEntry, agentEntry *core.PluginEntry,
 	} else if mainCfg != nil {
 		merged.Compaction = mainCfg.Compaction
 	}
+	// default_llm：Manager 在多 LLM provider 并存时用它做显式 primary 选择
+	// （findProviderByCapabilityLocked → m.agentLLMName）。它只存在于 config.yaml，
+	// 不随 preset 合并——漏拷会让 LLM 选择退化为「按名升序取首个」，与用户配置不符。
+	if mainCfg != nil {
+		merged.DefaultLLM = mainCfg.DefaultLLM
+	}
 	return merged
 }
 
