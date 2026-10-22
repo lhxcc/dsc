@@ -28,10 +28,10 @@ func TestDefaultSessionIDFollowsWorkspaceRoot(t *testing.T) {
 	var samplePath, wantKey string
 	if runtime.GOOS == "windows" {
 		samplePath = `C:\Users\Administrator\Desktop\DeepClean`
-		wantKey = "C--Users-Administrator-Desktop-DeepClean"
+		wantKey = "C=--Users--Administrator--Desktop--DeepClean"
 	} else {
 		samplePath = "/home/jor/DeepClean"
-		wantKey = "home-jor-DeepClean"
+		wantKey = "home--jor--DeepClean"
 	}
 	WorkspaceRoot = samplePath
 	if got := m.DefaultSessionID(); got != wantKey {

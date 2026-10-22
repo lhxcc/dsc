@@ -219,14 +219,15 @@ func (s *StateStore) path(sessionID string) string {
 }
 
 // sanitizeSessionID 把 sessionID 限制为安全字符（防止路径遍历）。
-// '+' 与 '=' 必须保留：会话键用它们转义路径里出现的 '-'、'+'、':'（见
-// session.SessionKeyForProject），替换掉会让不同项目的 state 文件名撞在一起。
+// 会话键里的 '+'、'='、'~' 必须保留：它们来自 session.SessionKeyForProject 的
+// 编码（名字里的 '+' 原样保留，盘符冒号编码为 '='，转义引导符为 '~'）；替换掉
+// 会让不同项目的 state 文件名撞在一起。
 func sanitizeSessionID(id string) string {
 	out := make([]byte, 0, len(id))
 	for i := 0; i < len(id); i++ {
 		c := id[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '+' || c == '=' {
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '+' || c == '=' || c == '~' {
 			out = append(out, c)
 		} else {
 			out = append(out, '_')
