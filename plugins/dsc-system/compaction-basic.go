@@ -228,6 +228,16 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		}
 		return "", nil
 	}
+	// 工具对边界：保留区不得以 tool 消息开头，否则请求历史出现孤立 tool 消息
+	// （OpenAI 兼容端点直接拒绝）。无法吸附时放弃本次新增压缩，仅沿用既有记录改写。
+	if snapped, ok := core.SnapRetainStart(msgs, retainIdx, base); ok {
+		retainIdx = snapped
+	} else {
+		if len(records) > 0 {
+			return rewriteJSON(rewritten)
+		}
+		return "", nil
+	}
 
 	summary, id := s.summarize(ctx, msgs[base:retainIdx], false)
 	rec := compactionRecord{
@@ -283,6 +293,13 @@ func (s *compactionBasicServer) handleRequestError(ctx context.Context, dataJSON
 	if end <= base {
 		return "", nil // 无新可压缩段，重试同样的改写无意义
 	}
+	// 工具对边界：保留区（[end, len)）不得以 tool 消息开头。最后一条若是工具结果，
+	// 吸附到其所属 assistant（整对保留）；无法吸附则不压缩——重试同样的坏切分无意义。
+	snapped, ok := core.SnapRetainStart(msgs, end, base)
+	if !ok || snapped <= base {
+		return "", nil
+	}
+	end = snapped
 	summary, id := s.summarize(ctx, msgs[base:end], true)
 	rec := compactionRecord{
 		UpTo:      end,

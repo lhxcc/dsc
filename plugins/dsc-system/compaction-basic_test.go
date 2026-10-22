@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"dsc/core"
 	"dsc/proto"
 )
 
@@ -328,5 +329,89 @@ func TestCompactionWindowFromContextWindowEnv(t *testing.T) {
 	t.Setenv("DSC_COMPACTION_BASIC_CONTEXT_WINDOW", "0")
 	if s := newCompactionBasicServer(); s.window != 0 {
 		t.Fatalf("显式 0 应禁用，got %d", s.window)
+	}
+}
+
+// toolPairMsgs 构造「assistant + 三个工具结果」的消息列表：user 前缀足够大以触发
+// 压力压缩，三个工具结果各约 charsPerTool/4 token，使按 token 累积的保留边界恰好
+// 落在工具块中间（这是必须被吸附的场景）。
+func toolPairMsgs(charsPerTool int) []*proto.Message {
+	return []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: strings.Repeat("x", 40000)},
+		{Role: "assistant", ToolCalls: []*proto.ToolCall{
+			{Id: "a", Name: "t", ArgumentsJson: "{}"},
+			{Id: "b", Name: "t", ArgumentsJson: "{}"},
+			{Id: "c", Name: "t", ArgumentsJson: "{}"},
+		}},
+		{Role: "tool", Content: strings.Repeat("x", charsPerTool), ToolCallId: "a"},
+		{Role: "tool", Content: strings.Repeat("x", charsPerTool), ToolCallId: "b"},
+		{Role: "tool", Content: strings.Repeat("x", charsPerTool), ToolCallId: "c"},
+		{Role: "user", Content: "now"},
+	}
+}
+
+// TestCompactionBasicSnapsToToolPairBoundary 回归：保留边界落在工具块中间时，
+// 必须吸附到拥有这些调用的 assistant，否则改写结果以孤立 tool 消息开头，
+// OpenAI 兼容端点会拒绝整轮请求。
+func TestCompactionBasicSnapsToToolPairBoundary(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000；保留预算 max(1600,1024)=1600
+	s.llm = &fakeCompactionBasicLLM{content: "SUMMARY"}
+
+	res := mustPreStep(t, s, toolPairMsgs(600))
+	if res == "" {
+		t.Fatal("expected rewrite above pressure threshold")
+	}
+	msgs := parseRewrite(t, res)
+	if msgs[2].GetRole() != "assistant" || len(msgs[2].GetToolCalls()) != 3 {
+		t.Fatalf("retain boundary not snapped to owning assistant (index 2 = %q, calls=%d)",
+			msgs[2].GetRole(), len(msgs[2].GetToolCalls()))
+	}
+	if err := core.ValidateToolPairing(msgs); err != nil {
+		t.Fatalf("rewritten history violates tool pairing: %v", err)
+	}
+}
+
+// TestCompactionBasicEmergencySnapsToToolPairBoundary 回归：溢出紧急压缩的保留区
+// 以最后一条为界，若最后一条是工具结果，必须吸附到其所属 assistant——否则尾部
+// 就是一条孤立 tool 消息。
+func TestCompactionBasicEmergencySnapsToToolPairBoundary(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 1_000_000) // 远高于压力阈值：pre-step 只缓存 lastMsgs
+	msgs := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: strings.Repeat("x", 40000)},
+		{Role: "assistant", ToolCalls: []*proto.ToolCall{
+			{Id: "a", Name: "t", ArgumentsJson: "{}"},
+			{Id: "b", Name: "t", ArgumentsJson: "{}"},
+		}},
+		{Role: "tool", Content: strings.Repeat("x", 2400), ToolCallId: "a"},
+		{Role: "tool", Content: strings.Repeat("x", 2400), ToolCallId: "b"},
+	}
+	if res := mustPreStep(t, s, msgs); res != "" {
+		t.Fatalf("low pressure must not rewrite, got %q", res)
+	}
+	res, err := s.handleHostEvent(context.Background(), "agent/request-error",
+		`{"agent":"agent-react-loop","session":"sess-c1","code":"context_window_exceeded"}`)
+	if err != nil {
+		t.Fatalf("request-error: %v", err)
+	}
+	if !strings.Contains(res, `"retry":true`) && !strings.Contains(res, `"retry": true`) {
+		t.Fatalf("emergency compaction should request retry, got %q", res)
+	}
+
+	// 下一次 pre-step 应用已记录：改写结果必须保持工具对完整。
+	rewritten := parseRewrite(t, mustPreStep(t, s, msgs))
+	if err := core.ValidateToolPairing(rewritten); err != nil {
+		t.Fatalf("emergency rewrite violates tool pairing: %v", err)
+	}
+	start := -1
+	for i, m := range rewritten {
+		if m.GetRole() == "assistant" && len(m.GetToolCalls()) == 2 {
+			start = i
+			break
+		}
+	}
+	if start < 0 || start+1 >= len(rewritten) || rewritten[start+1].GetRole() != "tool" {
+		t.Fatalf("emergency retain region does not start at owning assistant: %+v", rewritten)
 	}
 }
