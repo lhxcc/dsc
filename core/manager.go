@@ -1297,8 +1297,11 @@ func (m *Manager) ListContext(ctx context.Context) (string, error) {
 			parts = append(parts, content)
 		}
 	}
-	// compaction 后端状态标记（对齐 DSH ctx.compaction Service 的运行时查询）
-	if m.HasPluginProvidingCapability("compaction") {
+	// compaction 后端状态标记（对齐 DSH ctx.compaction Service 的运行时查询）：
+	// 只认 compaction 字段选定的那一个后端——「有任一插件声明该能力」不足以判定接管，
+	// 否则未选中的插件（如同时启用的 dsc-billion-context）会让 agent 误判为有后端
+	// 而跳过内联压缩，实际却由另一个后端在跑。
+	if m.compactionBackendActive() {
 		parts = append(parts, "[DSC_COMPACTION_BACKEND_ACTIVE]")
 	}
 	return strings.Join(parts, "\n\n"), nil

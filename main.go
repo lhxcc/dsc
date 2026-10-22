@@ -743,6 +743,15 @@ func main() {
 	// 安装的 —— 亦并入，按名去重、preset 优先（同名取 preset），使模型安装的插件能跨重启生效）
 	merged := assembleMerged(llmEntries, agentEntry, mainCfg, presetCfg, contextWindow, headless, inputText)
 
+	// compaction 选择同样 preset 优先（preset 是具体预设、主导行为）；config.yaml 写了
+	// 不同的后端时明确提示，避免「改了 compaction 却不生效」的静默困惑。该字段现在真正
+	// 决定由哪个插件接管 pre-step 压缩（见 Manager.dispatchEventToPlugins）。
+	if mainCfg != nil && mainCfg.Compaction != "" && mainCfg.Compaction != merged.Compaction {
+		logger.Info("compaction backend in config.yaml ignored (preset takes precedence)",
+			"config", mainCfg.Compaction, "effective", merged.Compaction,
+			"hint", "edit the preset's compaction field, or clear it there, to use the config value")
+	}
+
 	// 注入当前模式 + 工作根 + 沙箱档到所有插件进程（DSC_MODE）：tool-lua-host 据此限制
 	// 「插件创造」仅在创造模式（creation）下允许。
 	injectRuntimeEnv(merged, mode, core.WorkspaceRoot, sandboxPolicyEnv())

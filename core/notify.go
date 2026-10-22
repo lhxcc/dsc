@@ -82,6 +82,32 @@ func (m *Manager) hookClientsSnapshot() []proto.PluginHookServiceClient {
 	return out
 }
 
+// compactionBackendName 返回配置选定的压缩后端插件名（空 = 未选，走 agent 内联压缩）。
+func (m *Manager) compactionBackendName() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.compactionBackend
+}
+
+// compactionBackendActive 报告选定的压缩后端是否已加载且声明了 compaction 能力。
+//
+// 只认 compaction 字段指定的那一个：其它插件即使同样声明 Provides compaction 也不
+// 参与接管（否则 dsc-system.compaction-basic 与 dsc-billion-context 的 pre-step 改写
+// 会叠加成双重压缩，且与配置意图不符）。
+func (m *Manager) compactionBackendActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.compactionBackend == "" {
+		return false
+	}
+	info := m.coreMetadata[m.compactionBackend]
+	if info == nil {
+		return false
+	}
+	v, ok := info.Capabilities["compaction"]
+	return ok && v != "false"
+}
+
 // LoadLuaHooks 加载外部脚本钩子配置（-hooks 指定的 hooks.json；路径不存在为
 // 无配置静默）。加载成功后，外部钩子在工具流水线 BeforeTool/AfterTool 阶段
 // 参与裁定（veto/改写），与插件 gRPC 钩子串联（插件先行，外部脚本随后）。
@@ -215,8 +241,27 @@ func errString(err error) string {
 //
 // waterfall 模式下返回 (result, err)：result 为最终改写后的载荷（any 类型，调用方
 // 自行类型断言）；err 非 nil 表示链被 veto（含插件返回的 error 文本）。
+// namedHookClient 带插件名的钩子客户端（派发时需知道来源才能决定是否采纳其改写）。
+type namedHookClient struct {
+	name   string
+	client proto.PluginHookServiceClient
+}
+
+// hookClientsNamedSnapshot 按加载顺序返回（插件名, 客户端）快照，跳过空客户端。
+func (m *Manager) hookClientsNamedSnapshot() []namedHookClient {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]namedHookClient, 0, len(m.toolHookOrder))
+	for _, n := range m.toolHookOrder {
+		if c := m.toolHookClients[n]; c != nil {
+			out = append(out, namedHookClient{name: n, client: c})
+		}
+	}
+	return out
+}
+
 func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) {
-	clients := m.hookClientsSnapshot()
+	clients := m.hookClientsNamedSnapshot()
 	if len(clients) == 0 {
 		return data, nil
 	}
@@ -231,6 +276,17 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		mode = "emit"
 	}
 
+	// agent/pre-step 的「消息改写权」只归 compaction 字段选定的后端：多个插件可能都
+	// 声明 Provides compaction（dsc-system 的 compaction-basic 与 dsc-billion-context），
+	// 若全部采纳就会层层改写、叠加压缩，与配置选择的后端不符。
+	// 注意仍向所有插件派发——pre-step 还承载副作用（dsc-system 重置重复调用链、
+	// 通知型 listener 等），只是它们的 result_json 不参与载荷改写；未选后端时
+	// 一律不采纳改写，由 agent 内联压缩兜底。
+	backend := ""
+	if name == EventAgentPreStep {
+		backend = m.compactionBackendName()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -240,21 +296,19 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		// 初始 result 为原始 dataJSON；每个插件收到的 dataJSON 是上游改写后的
 		next := func() (string, error) { return dataJSON, nil }
 		for i := len(clients) - 1; i >= 0; i-- {
-			c := clients[i]
-			if c == nil {
-				continue
-			}
+			nc := clients[i]
+			adopt := backend != "" && nc.name == backend
 			innerNext := next
 			next = func() (string, error) {
-				resp, err := c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 				if err != nil {
 					return "", err
 				}
 				if resp.GetError() != "" {
 					return "", fmt.Errorf("%s", resp.GetError())
 				}
-				if r := resp.GetResultJson(); r != "" {
-					dataJSON = r // 改写后的载荷透传给下游
+				if r := resp.GetResultJson(); r != "" && adopt {
+					dataJSON = r // 只有选定后端可改写载荷
 				}
 				return innerNext()
 			}
@@ -272,11 +326,8 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 
 	case "serial":
 		// 顺序调用，遇 error 即停
-		for _, c := range clients {
-			if c == nil {
-				continue
-			}
-			resp, err := c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+		for _, nc := range clients {
+			resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 			if err != nil {
 				return nil, err
 			}
@@ -288,11 +339,8 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 
 	case "bail":
 		// 首个非空 result 或 error 短路返回
-		for _, c := range clients {
-			if c == nil {
-				continue
-			}
-			resp, err := c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+		for _, nc := range clients {
+			resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 			if err != nil {
 				return nil, err
 			}
@@ -309,11 +357,8 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 
 	default: // "emit"
 		// 同步顺序调用，忽略返回值（兼容现有通知型 listener）
-		for _, c := range clients {
-			if c == nil {
-				continue
-			}
-			_, _ = c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+		for _, nc := range clients {
+			_, _ = nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 		}
 		return data, nil
 	}

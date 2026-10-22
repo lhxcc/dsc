@@ -30,6 +30,8 @@ type fakeHook struct {
 	beforeFn func(req *proto.BeforeToolRequest) *proto.BeforeToolResponse
 	afterFn  func(req *proto.AfterToolRequest) *proto.AfterToolResponse
 	events   chan *proto.OnEventRequest
+	// eventResult 作为 OnEvent 的 result_json 返回（pre-step 改写测试用）。
+	eventResult string
 }
 
 func (f *fakeHook) BeforeTool(_ context.Context, req *proto.BeforeToolRequest, _ ...grpc.CallOption) (*proto.BeforeToolResponse, error) {
@@ -50,7 +52,7 @@ func (f *fakeHook) OnEvent(_ context.Context, req *proto.OnEventRequest, _ ...gr
 	if f.events != nil {
 		f.events <- req
 	}
-	return &proto.OnEventResponse{}, nil
+	return &proto.OnEventResponse{ResultJson: f.eventResult}, nil
 }
 
 func hookManager() (*Manager, *plainHookTool) {
