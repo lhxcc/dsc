@@ -17,30 +17,80 @@ import (
 // 事件溯源日志（见 persist.go）。
 
 // SessionKeyForProject 把项目根路径转换为默认会话文件名（key）：
-// 统一 / 分隔 → 去掉根斜杆 → 冒号与 / 替换为 -，并清理 Windows 文件名非法字符。
+// 统一 / 分隔 → 去掉根斜杆 → 用 - 连接各级目录，并转义名字里的转义引导符。
 // 保证「同一项目同名、不同项目隔离」——默认会话按当前工作区命名，不再使用
 // 硬编码的 default.jsonl，避免跨项目历史被混入注入上下文。
+//
+// 转义规则（分隔符用 -，因此名字里的 - 必须可区分，否则 a-b 与 a/b 会撞成
+// 同一个 key，两个不同项目共用一份会话存档）：
+//
+//	路径分隔 /（及盘符冒号 X:/） → "-"
+//	名字里的 literal -          → "+-"
+//	名字里的 literal +          → "++"
+//	名字里的 literal :          → "+="
+//	Windows 文件名非法字符 < > " | ? * → "+0" … "+5"
+//
+// 即 "+" 是引导符，其后固定再跟一个字符，故解码无歧义；普通路径（不含上述
+// 字符）的 key 与旧格式一致，保持可读。
 //
 // 例：
 //
 //	C:\Users\Administrator\Desktop\DeepClean → C--Users-Administrator-Desktop-DeepClean
 //	/mnt/c/Users/Administrator/Desktop/DeepClean → mnt-c-Users-Administrator-Desktop-DeepClean
-//	/home/jor/DeepClean → home-jor-DeepClean
+//	/home/jor/my-project → home-jor-my+-project（- 来自名字，与分隔符区分）
 func SessionKeyForProject(projectRoot string) string {
 	// 先统一反斜杆为正斜杆（跨平台：仅靠平台相关转换函数无法处理另一平台的
 	// 反斜杆输入，须显式归一，见 AGENTS.md 路径纪律）
 	p := strings.ReplaceAll(projectRoot, "\\", "/")
 	p = strings.TrimPrefix(p, "/")
-	p = strings.ReplaceAll(p, ":", "-")
-	p = strings.ReplaceAll(p, "/", "-")
-	// 清理 Windows 文件名非法字符（<>:"/\|?*；冒号与斜杆已在上方替换）
-	for _, r := range []rune{'<', '>', '"', '|', '?', '*'} {
-		p = strings.ReplaceAll(p, string(r), "-")
+	var b strings.Builder
+	b.Grow(len(p) + 8)
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch c {
+		case '/':
+			b.WriteByte('-')
+		case '-':
+			b.WriteString("+-")
+		case '+':
+			b.WriteString("++")
+		case ':':
+			// 盘符冒号（X:/）是分隔符的一部分；其余冒号属于名字，须转义
+			if i+1 < len(p) && p[i+1] == '/' {
+				b.WriteByte('-')
+			} else {
+				b.WriteString("+=")
+			}
+		case '<', '>', '"', '|', '?', '*':
+			// 这些字符在 Windows 文件名里非法，按固定码替换（保证仍是单射）
+			b.WriteByte('+')
+			b.WriteByte(illegalCharCode(c))
+		default:
+			b.WriteByte(c)
+		}
 	}
-	if p == "" {
+	if b.Len() == 0 {
 		return "default"
 	}
-	return p
+	return b.String()
+}
+
+// illegalCharCode 返回 Windows 文件名非法字符的固定单字符码（'0'–'5'）。
+func illegalCharCode(c byte) byte {
+	switch c {
+	case '<':
+		return '0'
+	case '>':
+		return '1'
+	case '"':
+		return '2'
+	case '|':
+		return '3'
+	case '?':
+		return '4'
+	default: // '*'
+		return '5'
+	}
 }
 
 // SessionInfo 会话列表条目（轻量元数据，不加载全部事件）。
