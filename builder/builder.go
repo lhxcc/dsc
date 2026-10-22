@@ -205,7 +205,7 @@ func printHelp(progName string) {
 
 每个平台生成 dist/dsc-for-<platform>/ 目录，布局与源码目录层级一致但无 .go 源码：
   dsc[.exe]               宿主主程序
-  config/                 配置文件（config.example.yaml + presets/ 模板）
+  config/                 配置文件（config.example.yaml、config.DeepSeek.yaml + presets/ 模板）
   plugins/<name>/<name>   各插件可执行文件
   plugins/<name>/scripts|dsp|examples/  插件的附带资源目录（示例脚本 / 示例 .dsp 载体 /
                           载体源目录等运行时要读或充当包内说明的文件，见下方「插件附带资源」）
@@ -361,8 +361,11 @@ func buildPlatform(repoRoot string, p platform, includeInternal bool) bool {
 		filepath.Join(releaseDir, "skills", "installed"),
 	)
 
-	// 2. 拷贝运行时资源（config 模板、skills、文档）
+	// 2. 拷贝运行时资源（config 模板与预设、skills、文档）
 	copyFileStrict(filepath.Join(repoRoot, "config", "config.example.yaml"), filepath.Join(releaseDir, "config", "config.example.yaml"))
+	// 可直接改名替换 config.yaml 的成品预设（如 DeepSeek 官方端点）。与 example 同属
+	// 发布必需的配置模板：缺失说明仓库资源不完整，应当 fail loud。
+	copyFileStrict(filepath.Join(repoRoot, "config", "config.DeepSeek.yaml"), filepath.Join(releaseDir, "config", "config.DeepSeek.yaml"))
 	copyDir(filepath.Join(repoRoot, "config", "presets"), filepath.Join(releaseDir, "config", "presets"))
 	copyDir(filepath.Join(repoRoot, "skills", "builtin"), filepath.Join(releaseDir, "skills", "builtin"))
 	copyDir(filepath.Join(repoRoot, "skills", "installed"), filepath.Join(releaseDir, "skills", "installed"))
