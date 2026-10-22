@@ -47,7 +47,11 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 		"examples":                     true,
 		"testdata":                     true,
 		filepath.ToSlash("libs/vodka"): true,
-		filepath.ToSlash("libs/anthropic-sdk-go"):          true,
+		filepath.ToSlash("libs/anthropic-sdk-go"): true,
+		// libs/robotgo、libs/screenshot：vendored 第三方 fork，仅为适配 macOS 15 SDK
+		// 移除 CoreGraphics 截图 API 做了最小补丁，非本仓直管的运行时派生链路。
+		filepath.ToSlash("libs/robotgo"):                   true,
+		filepath.ToSlash("libs/screenshot"):                true,
 		filepath.ToSlash("plugins/tool-2fa-master/vendor"): true,
 		filepath.ToSlash("builder"):                        true,
 	}

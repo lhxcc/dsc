@@ -117,11 +117,15 @@ func (s *llmProviderServer) HealthCheck(ctx context.Context, req *proto.HealthCh
 	return &proto.HealthCheckResponse{Status: status, Message: msg}, nil
 }
 
-// protoMessagesToPlugin 将 proto.ChatRequest 转换为插件侧的消息与工具列表
+// protoMessagesToPlugin 将 proto.ChatRequest 转换为插件侧的消息与工具列表。
+//
+// 字段必须全量保真：tool 消息的 ToolCallID 是 OpenAI/Anthropic 等协议回带
+// tool_call_id 的唯一来源，缺它会被服务端以「missing field tool_call_id」
+// 直接拒绝（422），使整轮会话在最常见的「工具执行完再请求」步骤不可用。
 func protoMessagesToPlugin(req *proto.ChatRequest) ([]Message, []Tool) {
 	messages := make([]Message, len(req.Messages))
 	for i, m := range req.Messages {
-		msg := Message{Role: m.Role, Content: m.Content, Images: m.Images}
+		msg := Message{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallId, Images: m.Images}
 		if len(m.ToolCalls) > 0 {
 			msg.ToolCalls = make([]ToolCall, len(m.ToolCalls))
 			for j, tc := range m.ToolCalls {

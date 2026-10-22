@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dsc/proto"
+
 	"google.golang.org/grpc/metadata"
 )
 
@@ -151,6 +152,58 @@ func TestLLMChatStreamNoRetryAfterFrames(t *testing.T) {
 	// 已发 1 帧后失败：不得重试（避免重复输出），sent 只有 1 帧
 	if len(stream.sent) != 1 {
 		t.Fatalf("sent %d frames, want 1 (no retry after frames)", len(stream.sent))
+	}
+}
+
+// TestProtoMessagesToPluginPreservesToolFields 字段保真往返：宿主聚合层把
+// proto.ChatRequest 交给 LLM 插件时必须逐字段存活，尤其是 tool 消息的
+// ToolCallId——OpenAI 兼容端点靠它回带 tool_call_id，缺失即 422
+// 「missing field tool_call_id」，导致工具执行后的下一步请求整轮失败。
+func TestProtoMessagesToPluginPreservesToolFields(t *testing.T) {
+	req := &proto.ChatRequest{
+		Messages: []*proto.Message{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "看图", Images: []string{"data:image/png;base64,AA"}},
+			{Role: "assistant", ToolCalls: []*proto.ToolCall{
+				{Id: "call_a", Name: "shell", ArgumentsJson: `{"command":"ls"}`},
+				{Id: "call_b", Name: "read", ArgumentsJson: `{"path":"/tmp/a"}`},
+			}},
+			{Role: "tool", Content: "结果", ToolCallId: "call_a", Images: []string{"dsc-img://x"}},
+			{Role: "tool", Content: "另一个结果", ToolCallId: "call_b"},
+		},
+	}
+
+	msgs, _ := protoMessagesToPlugin(req)
+	if len(msgs) != len(req.Messages) {
+		t.Fatalf("messages = %d, want %d", len(msgs), len(req.Messages))
+	}
+	if msgs[1].Images[0] != "data:image/png;base64,AA" {
+		t.Fatalf("user images lost: %+v", msgs[1])
+	}
+	if len(msgs[2].ToolCalls) != 2 ||
+		msgs[2].ToolCalls[0].ID != "call_a" || msgs[2].ToolCalls[1].ID != "call_b" ||
+		msgs[2].ToolCalls[0].Name != "shell" ||
+		msgs[2].ToolCalls[0].Arguments["command"] != "ls" {
+		t.Fatalf("assistant tool calls lost: %+v", msgs[2].ToolCalls)
+	}
+	if msgs[3].ToolCallID != "call_a" || msgs[3].Images[0] != "dsc-img://x" {
+		t.Fatalf("tool message fields lost: %+v", msgs[3])
+	}
+	if msgs[4].ToolCallID != "call_b" {
+		t.Fatalf("tool_call_id lost: %+v", msgs[4])
+	}
+
+	// 回程（插件 → proto）同样须保真，避免仅单程通过。
+	back := convertToProtoMessages(msgs)
+	if back[3].GetToolCallId() != "call_a" || back[4].GetToolCallId() != "call_b" {
+		t.Fatalf("round trip lost tool_call_id: %q / %q",
+			back[3].GetToolCallId(), back[4].GetToolCallId())
+	}
+	if len(back[2].GetToolCalls()) != 2 || back[2].GetToolCalls()[1].GetId() != "call_b" {
+		t.Fatalf("round trip lost tool calls: %+v", back[2].GetToolCalls())
+	}
+	if back[3].GetImages()[0] != "dsc-img://x" {
+		t.Fatalf("round trip lost images: %+v", back[3].GetImages())
 	}
 }
 
