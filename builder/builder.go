@@ -156,7 +156,15 @@ func main() {
 	}
 	printInfo(fmt.Sprintf("当前平台: %s (%s/%s)\n\n", host.Name, host.GOOS, host.GOARCH))
 	// 单平台默认打包只重建当前平台目录，不动其它平台的发布目录（clean 命令可整体清空 dist）
-	buildPlatform(repoRoot, *host, false)
+	//
+	// 返回值必须检查：宿主编译失败（典型原因：目标 dsc.exe 正被运行中的实例占用，
+	// Windows 下文件不可覆盖）时发布目录已被清空重建，只剩插件与残缺内容。早期此处
+	// 忽略返回值并无条件打印「打包完成」，让人误以为构建成功、实际运行的仍是旧二进制
+	//（曾导致修复「看似没生效」的长时间误判），故失败必须显式报错并以非零码退出。
+	if !buildPlatform(repoRoot, *host, false) {
+		printError(fmt.Sprintf("\n=== 打包失败: dist/dsc-for-%s（发布目录可能不完整，请先关闭正在运行的 dsc 后重试）===\n", host.Name))
+		os.Exit(1)
+	}
 	printSuccess(fmt.Sprintf("\n=== 打包完成: dist/dsc-for-%s ===\n", host.Name))
 }
 
@@ -327,6 +335,11 @@ func crossBuild(repoRoot string, args []string) {
 				fmt.Printf("  - %s (%d MB)\n", filepath.Base(d), size/1024/1024)
 			}
 		}
+	}
+	// 有平台失败即非零退出，避免 CI/脚本把残缺发布包当成成功产物。
+	if successCount < len(targets) {
+		printError(fmt.Sprintf("打包失败: %d / %d 个平台未成功\n", len(targets)-successCount, len(targets)))
+		os.Exit(1)
 	}
 }
 
