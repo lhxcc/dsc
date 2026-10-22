@@ -47,8 +47,8 @@ func TestSkillsAndMemoryDirFollowExecDir(t *testing.T) {
 // TestSessionKeyAndValidation 插件侧的键/校验必须与宿主同一实现：
 // 路径规则正常透传，会话 id 校验拒绝路径穿越。
 func TestSessionKeyAndValidation(t *testing.T) {
-	if got := SessionKeyForProject(`/w/my-project`); got != "w--my-project" {
-		t.Fatalf("SessionKeyForProject = %q", got)
+	if got := SessionKeyForProject(`/w/my-project`); !strings.HasPrefix(got, "w--my-project-") {
+		t.Fatalf("SessionKeyForProject = %q，应以编码后的路径前缀开头", got)
 	}
 	for _, ok := range []string{"session-1", "O=--Agents--dsc", "a~db"} {
 		if !ValidSessionID(ok) {
@@ -60,7 +60,7 @@ func TestSessionKeyAndValidation(t *testing.T) {
 			t.Errorf("%q 应被拒绝", bad)
 		}
 	}
-	if !strings.HasSuffix(ACPStateSuffix, ".json") || ACPStateSuffix == SessionFileSuffix {
-		t.Fatalf("状态后缀应与会话日志后缀不同: %q vs %q", ACPStateSuffix, SessionFileSuffix)
+	if SessionFileSuffix != ".jsonl" {
+		t.Fatalf("会话日志后缀变更需同步各插件: %q", SessionFileSuffix)
 	}
 }

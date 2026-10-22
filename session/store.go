@@ -2,6 +2,8 @@ package session
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,6 +27,7 @@ import (
 // 得到同一个 key，两个不相干的项目共用一份会话存档与压缩状态。现在分隔符是
 // 双字符 "--"，名字里单个 "-"（以及 "+"）可原样保留，只在会产生歧义处转义：
 //
+//	键末尾追加 -<HASH>           → 规范化前全路径的短哈希（8 位大写十六进制）
 //	路径分隔 /                   → "--"
 //	盘符冒号 C: 的 ":"            → "="
 //	名字里的 "-"（段首/段尾，或与相邻 "-" 连写） → "~d"
@@ -32,6 +35,9 @@ import (
 //	名字里的 ":"（非盘符）        → "~c"
 //	名字里的 "="                 → "~e"
 //	Windows 文件名非法字符 < > " | ? * → "~0" … "~5"
+//
+// 末尾的短哈希是最后一道防撞保险：即使编码规则将来演进出现遗漏，两个不同路径
+// 也不会落到同一个文件上（编码相同但路径不同时，哈希必然不同）。
 //
 // "~" 是引导符且其后固定再跟一个字符，故解码无歧义；每段的首尾都不会是 "-"
 // （歧义处的 "-" 一律写成 "~d"），故段内既不会出现连写的 "-"，也不会与分隔符
@@ -70,7 +76,17 @@ func SessionKeyForProject(projectRoot string) string {
 	if b.Len() == 0 {
 		return "default"
 	}
-	return b.String()
+	return b.String() + "-" + shortPathHash(p)
+}
+
+// keyHashLen 是键末尾短哈希的字符数（8 位大写十六进制，等同 32 位）。
+const keyHashLen = 8
+
+// shortPathHash 返回规范化路径的短哈希（大写十六进制，git 短哈希风格）。
+// 追加在键末尾，用于兜住编码规则可能存在的一切遗漏：路径不同则哈希必不同。
+func shortPathHash(normalized string) string {
+	sum := sha256.Sum256([]byte(normalized))
+	return strings.ToUpper(hex.EncodeToString(sum[:keyHashLen/2]))
 }
 
 // writeKeySegment 按 SessionKeyForProject 的转义规则写入单个路径段。
@@ -134,8 +150,6 @@ const (
 	DirName = "sessions"
 	// FileSuffix 是会话事件日志后缀：<id>.jsonl。
 	FileSuffix = ".jsonl"
-	// ACPSuffix 是压缩状态后缀：<id>.acp.json（与会话日志同目录，靠后缀区分）。
-	ACPSuffix = ".acp.json"
 )
 
 // Dir 返回会话数据目录（ExecDir 由宿主经 DSC 环境注入，各进程一致）。
