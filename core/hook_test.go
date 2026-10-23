@@ -33,7 +33,9 @@ type fakeHook struct {
 	events   chan *proto.OnEventRequest
 	// eventResult 作为 OnEvent 的 result_json 返回（pre-step 改写测试用）。
 	eventResult string
-	// eventErr 非 nil 时 OnEvent 返回该错误（模拟插件 veto）。
+	// eventError 作为 OnEvent 响应体的 error 返回（语义 veto，插件主动拒绝）。
+	eventError string
+	// eventErr 非 nil 时 OnEvent 返回传输层错误（模拟插件进程退出/连接断开）。
 	eventErr error
 }
 
@@ -54,6 +56,9 @@ func (f *fakeHook) AfterTool(_ context.Context, req *proto.AfterToolRequest, _ .
 func (f *fakeHook) OnEvent(_ context.Context, req *proto.OnEventRequest, _ ...grpc.CallOption) (*proto.OnEventResponse, error) {
 	if f.eventErr != nil {
 		return nil, f.eventErr
+	}
+	if f.eventError != "" {
+		return &proto.OnEventResponse{Error: f.eventError}, nil
 	}
 	if f.events != nil {
 		f.events <- req

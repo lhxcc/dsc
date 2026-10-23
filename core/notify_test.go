@@ -10,6 +10,8 @@ import (
 	"dsc/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // parallelMockHook 并发分发测试用客户端：arrived 用于证明多个客户端同时进入，
@@ -74,6 +76,74 @@ func TestDispatchEventParallel(t *testing.T) {
 	m.mu.Unlock()
 	if _, err := m.dispatchEventToPlugins(errEv, nil); err == nil || !strings.Contains(err.Error(), "plugin-a failed") {
 		t.Fatalf("parallel error aggregation = %v, want plugin error", err)
+	}
+}
+
+// transportFailHook 模拟「插件进程已退出」：OnEvent 返回连接错误（而非插件级
+// error）。这类失败必须按不可用跳过，不能当作语义 veto。
+type transportFailHook struct {
+	hookMockClient
+	calls int
+}
+
+func (c *transportFailHook) OnEvent(context.Context, *proto.OnEventRequest, ...grpc.CallOption) (*proto.OnEventResponse, error) {
+	c.calls++
+	return nil, status.Error(codes.Unavailable, "connection refused")
+}
+
+// TestDispatchEventSkipsDeadHookPlugin 回归：插件进程崩溃后，事件派发不得因
+// 传输层失败而否决整轮请求（历史表现：agent/pre-step 被 veto，会话永久卡死）；
+// 同一插件只拨号一次，之后按不可用跳过。
+func TestDispatchEventSkipsDeadHookPlugin(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	dead := &transportFailHook{}
+	m.mu.Lock()
+	m.toolHookClients["dead"] = dead
+	m.toolHookClients["live"] = &hookMockClient{}
+	m.toolHookOrder = []string{"dead", "live"}
+	m.mu.Unlock()
+
+	const ev EventName = "test/waterfall-dead"
+	eventDispatchMode[ev] = "waterfall"
+	defer delete(eventDispatchMode, ev)
+
+	res, err := m.dispatchEventToPlugins(ev, map[string]string{"k": "v"})
+	if err != nil {
+		t.Fatalf("transport failure must not veto: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected passthrough result from waterfall")
+	}
+	if dead.calls != 1 {
+		t.Fatalf("dead plugin calls = %d, want 1", dead.calls)
+	}
+	// 第二次派发：死插件已被标记，不再拨号。
+	if _, err := m.dispatchEventToPlugins(ev, map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("second dispatch: %v", err)
+	}
+	if dead.calls != 1 {
+		t.Fatalf("dead plugin dialed again: calls = %d", dead.calls)
+	}
+}
+
+// TestDispatchEventStillHonorsPluginVeto 插件显式返回 error 仍是语义 veto。
+func TestDispatchEventStillHonorsPluginVeto(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	m.mu.Lock()
+	m.toolHookClients["vetoer"] = &parallelMockHook{errText: "policy denied"}
+	m.toolHookOrder = []string{"vetoer"}
+	m.mu.Unlock()
+
+	const ev EventName = "test/waterfall-veto"
+	eventDispatchMode[ev] = "waterfall"
+	defer delete(eventDispatchMode, ev)
+
+	if _, err := m.dispatchEventToPlugins(ev, map[string]string{"k": "v"}); err == nil || !strings.Contains(err.Error(), "policy denied") {
+		t.Fatalf("explicit plugin error = %v, want veto", err)
+	}
+	// 显式 veto 不标记插件不可用：下一次仍应派发。
+	if _, err := m.dispatchEventToPlugins(ev, map[string]string{"k": "v"}); err == nil {
+		t.Fatal("second dispatch should still veto")
 	}
 }
 

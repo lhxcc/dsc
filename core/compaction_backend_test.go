@@ -113,3 +113,20 @@ func TestCompactionBackendActiveRequiresConfiguredPlugin(t *testing.T) {
 		t.Fatal("未配置后端时应为 false")
 	}
 }
+
+// TestCompactionBackendActiveFalseWhenPluginDead 后端进程退出后必须视为「无后端」，
+// 让 agent 退回内联压缩，而不是一直等一个再也不会改写载荷的死插件。
+func TestCompactionBackendActiveFalseWhenPluginDead(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.compactionBackend = "dsc-system"
+	m.coreMetadata["dsc-system"] = &metadata.PluginInfo{
+		Capabilities: map[string]string{"compaction": "true"},
+	}
+	m.deadHookClients = map[string]bool{"dsc-system": true}
+	m.mu.Unlock()
+
+	if m.compactionBackendActive() {
+		t.Fatal("压缩后端进程已退出时应视为无后端")
+	}
+}

@@ -65,6 +65,11 @@ type Manager struct {
 	// 使插件 A 无需通知主程序/其他插件即可钩子式改变插件 B 的工具行为。
 	toolHookClients map[string]proto.PluginHookServiceClient
 	toolHookOrder   []string
+	// deadHookClients 记录传输层已断开的钩子客户端（插件进程崩溃/退出）。
+	// 这类插件不再参与事件派发与工具钩子，直到同名插件重新注册——只靠 runtime
+	// state 标记不足以防住「每次请求都向已消失的进程拨号」：连接错误会被当作
+	// 插件 veto，让整轮 LLM 请求永久失败。
+	deadHookClients map[string]bool
 	states          map[string]*RuntimeState // 插件名 -> 运行时状态快照
 
 	// 动态注入插件相关字段：
@@ -1176,6 +1181,7 @@ func (m *Manager) Shutdown() {
 	m.toolClients = make(map[string]proto.ToolServiceClient)
 	m.toolHookClients = make(map[string]proto.PluginHookServiceClient)
 	m.toolHookOrder = nil
+	m.deadHookClients = nil
 	m.policyOff = make(map[string][]func())
 	m.loadedBinaries = make(map[string]string)
 	m.lspClients = make(map[string]*LSPClient)
@@ -1320,6 +1326,9 @@ func (m *Manager) ListContext(ctx context.Context) (string, error) {
 	}
 	pairs := make([]namedClient, 0, len(m.toolHookOrder))
 	for _, n := range m.toolHookOrder {
+		if m.deadHookClients[n] {
+			continue // 进程已退出：跳过，避免每次构建 prompt 都拨号失败
+		}
 		if c, ok := m.toolHookClients[n]; ok && c != nil {
 			pairs = append(pairs, namedClient{name: n, cl: c})
 		}
@@ -2164,6 +2173,7 @@ func (m *Manager) stageToolPlugin(name string, grpcClient *plugin.GRPCClient, to
 func (m *Manager) commitToolPluginLocked(st *stagedTool) {
 	m.toolServiceIDs[st.name] = st.serviceID
 	m.toolClients[st.name] = st.toolClient
+	delete(m.deadHookClients, st.name) // 新进程：重新尝试派发
 	m.toolHookClients[st.name] = proto.NewPluginHookServiceClient(st.grpcClient.Conn)
 	m.putToolHookOrderLocked(st.name)
 	m.coreToolNames[st.name] = st.toolNames
@@ -2293,6 +2303,7 @@ func (m *Manager) commitDscToolPluginLocked(st *stagedTool) {
 // 对齐 DSH cordis 的「事件广播类型无关」——任意插件类型（tool/llm/agent/policy/dsc）
 // 只要声明了 Hook 都能订阅宿主事件，不再局限于 tool。
 func (m *Manager) registerHookClientLocked(name string, grpcClient *plugin.GRPCClient) {
+	delete(m.deadHookClients, name) // 新进程：重新尝试派发
 	m.toolHookClients[name] = proto.NewPluginHookServiceClient(grpcClient.Conn)
 	m.putToolHookOrderLocked(name)
 }

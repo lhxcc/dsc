@@ -3,12 +3,14 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"dsc/proto"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // newRouterManager 构造路由测试用的 Manager：替换事件总线去掉默认 retry，
@@ -155,7 +157,7 @@ func TestLLMRouteOrderSkipsUnloaded(t *testing.T) {
 	}
 }
 
-// TestApplyPreStepHookVetoAbortsRequest 回归：waterfall 插件返回 error 必须真正
+// TestApplyPreStepHookVetoAbortsRequest 回归：waterfall 插件显式返回 error 必须真正
 // 阻断 LLM 请求（此前仅记 warn 后照常放行），且不得调用任何 provider。
 func TestApplyPreStepHookVetoAbortsRequest(t *testing.T) {
 	m := newRouterManager()
@@ -163,7 +165,7 @@ func TestApplyPreStepHookVetoAbortsRequest(t *testing.T) {
 	m.llms["p"] = p
 	m.llmOrder = []string{"p"}
 	m.agentLLMName = "p"
-	m.toolHookClients["v"] = &fakeHook{eventErr: errors.New("blocked by policy")}
+	m.toolHookClients["v"] = &fakeHook{eventError: "blocked by policy"}
 	m.toolHookOrder = []string{"v"}
 
 	srv := &llmAggregateServer{m: m}
@@ -173,6 +175,27 @@ func TestApplyPreStepHookVetoAbortsRequest(t *testing.T) {
 	}
 	if p.chatCalls != 0 {
 		t.Fatalf("provider must not be called after veto, calls = %d", p.chatCalls)
+	}
+}
+
+// TestApplyPreStepHookTransportFailureDoesNotVeto 回归：插件进程已退出（传输层
+// 失败：连接拒绝/EOF）不是语义否决。请求必须照常发出，否则一个崩溃的观察者
+// 会让会话永久卡在 "agent/pre-step vetoed request" 上。
+func TestApplyPreStepHookTransportFailureDoesNotVeto(t *testing.T) {
+	m := newRouterManager()
+	p := &mockLLMProvider{}
+	m.llms["p"] = p
+	m.llmOrder = []string{"p"}
+	m.agentLLMName = "p"
+	m.toolHookClients["dead"] = &fakeHook{eventErr: status.Error(codes.Unavailable, "connection refused")}
+	m.toolHookOrder = []string{"dead"}
+
+	srv := &llmAggregateServer{m: m}
+	if _, err := srv.Chat(context.Background(), &proto.ChatRequest{}); err != nil {
+		t.Fatalf("transport failure must not abort the request: %v", err)
+	}
+	if p.chatCalls != 1 {
+		t.Fatalf("provider calls = %d, want 1", p.chatCalls)
 	}
 }
 

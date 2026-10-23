@@ -75,14 +75,37 @@ func (s *coreNotifyServer) Notify(ctx context.Context, req *proto.NotifyRequest)
 }
 
 // hookClientsSnapshot 返回按加载顺序的插件钩子客户端快照（读锁保护，防热加载竞态）。
+// 已标记不可用（进程退出/连接断开）的插件被跳过。
 func (m *Manager) hookClientsSnapshot() []proto.PluginHookServiceClient {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]proto.PluginHookServiceClient, 0, len(m.toolHookOrder))
 	for _, n := range m.toolHookOrder {
-		out = append(out, m.toolHookClients[n])
+		if m.deadHookClients[n] {
+			continue
+		}
+		if c := m.toolHookClients[n]; c != nil {
+			out = append(out, c)
+		}
 	}
 	return out
+}
+
+// markHookClientDead 把钩子客户端标记为不可用（插件进程退出/连接断开）。
+// 只告警一次；同名插件重新注册时清除标记。原因见 Manager.deadHookClients。
+func (m *Manager) markHookClientDead(name string, err error) {
+	m.mu.Lock()
+	if m.deadHookClients[name] {
+		m.mu.Unlock()
+		return
+	}
+	if m.deadHookClients == nil {
+		m.deadHookClients = make(map[string]bool)
+	}
+	m.deadHookClients[name] = true
+	m.mu.Unlock()
+	m.logger.Warn("hook plugin unavailable; skipping until it is reloaded",
+		"plugin", name, "error", err.Error())
 }
 
 // compactionBackendName 返回配置选定的压缩后端插件名（空 = 未选，走 agent 内联压缩）。
@@ -101,6 +124,11 @@ func (m *Manager) compactionBackendActive() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.compactionBackend == "" {
+		return false
+	}
+	if m.deadHookClients[m.compactionBackend] {
+		// 后端进程已退出：声明「无后端」，让 agent 退回内联压缩，
+		// 而不是一直等一个再也不会改写载荷的死插件。
 		return false
 	}
 	info := m.coreMetadata[m.compactionBackend]
@@ -250,12 +278,16 @@ type namedHookClient struct {
 	client proto.PluginHookServiceClient
 }
 
-// hookClientsNamedSnapshot 按加载顺序返回（插件名, 客户端）快照，跳过空客户端。
+// hookClientsNamedSnapshot 按加载顺序返回（插件名, 客户端）快照，跳过空客户端与
+// 已标记不可用（进程退出/连接断开）的插件。
 func (m *Manager) hookClientsNamedSnapshot() []namedHookClient {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]namedHookClient, 0, len(m.toolHookOrder))
 	for _, n := range m.toolHookOrder {
+		if m.deadHookClients[n] {
+			continue
+		}
 		if c := m.toolHookClients[n]; c != nil {
 			out = append(out, namedHookClient{name: n, client: c})
 		}
@@ -305,7 +337,10 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 			next = func() (string, error) {
 				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 				if err != nil {
-					return "", err
+					// 传输层失败（插件崩溃/连接断开）不是语义否决：跳过该插件继续，
+					// 否则一个退出的观察者/压缩后端会让整轮请求永久失败。
+					m.markHookClientDead(nc.name, err)
+					return innerNext()
 				}
 				if resp.GetError() != "" {
 					return "", fmt.Errorf("%s", resp.GetError())
@@ -328,11 +363,12 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		return result, nil
 
 	case "serial":
-		// 顺序调用，遇 error 即停
+		// 顺序调用，遇 error 即停（传输层失败按不可用跳过，不视为语义 veto）
 		for _, nc := range clients {
 			resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 			if err != nil {
-				return nil, err
+				m.markHookClientDead(nc.name, err)
+				continue
 			}
 			if resp.GetError() != "" {
 				return nil, fmt.Errorf("%s", resp.GetError())
@@ -345,7 +381,8 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		for _, nc := range clients {
 			resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 			if err != nil {
-				return nil, err
+				m.markHookClientDead(nc.name, err)
+				continue
 			}
 			if resp.GetError() != "" {
 				return nil, fmt.Errorf("%s", resp.GetError())
@@ -364,17 +401,18 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		errCh := make(chan error, len(clients))
 		for _, nc := range clients {
 			wg.Add(1)
-			go func(c proto.PluginHookServiceClient) {
+			go func(c proto.PluginHookServiceClient, plugin string) {
 				defer wg.Done()
 				resp, err := c.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 				if err != nil {
-					errCh <- err
+					// 传输层失败：标记不可用并跳过，不计入 veto 聚合。
+					m.markHookClientDead(plugin, err)
 					return
 				}
 				if resp.GetError() != "" {
 					errCh <- fmt.Errorf("%s", resp.GetError())
 				}
-			}(nc.client)
+			}(nc.client, nc.name)
 		}
 		wg.Wait()
 		close(errCh)
@@ -388,9 +426,12 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		return data, nil
 
 	default: // "emit"
-		// 同步顺序调用，忽略返回值（兼容现有通知型 listener）
+		// 同步顺序调用，忽略返回值（兼容现有通知型 listener）；传输层失败只
+		// 标记不可用，不影响其余插件与调用方。
 		for _, nc := range clients {
-			_, _ = nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+			if _, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON}); err != nil {
+				m.markHookClientDead(nc.name, err)
+			}
 		}
 		return data, nil
 	}

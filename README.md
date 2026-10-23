@@ -41,6 +41,7 @@ git clone -b master https://github.com/naamfung/dsc.git
 
 ### 工具並行與瞬態重試
 
+- **插件崩潰隔離**：插件進程退出（連接斷開 / EOF）後會被標記為不可用，事件派發、工具鉤子與上下文聚合一律跳過它，直到同名插件重新加載——不會再因為一個崩潰的觀察者/工具插件把 `agent/pre-step` 變成 veto 而讓整輪請求永久失敗；若退出的是壓縮後端，agent 自動退回內聯壓縮。只有插件**顯式返回 error** 才是語義 veto。
 - **只讀工具並行**：同一條 assistant 消息內的多次工具調用，若全部為只讀且非宿主本地工具，則並發執行——RPC 並發發出，`tool/call`、`tool/result` 事件與 TUI 幀仍按模型給出的順序落盤與呈現（會話可回放、前綴緩存不受影響）。只讀資格只來自工具自聲明的能力標籤 `read-only`（或 `read-only-when:<arg>=<value>` 命中）；未聲明能力的工具一律按不可並行處理（fail-closed），混合批次整批走串行。`DSC_TOOL_PARALLELISM` 控制單批最大併發（默認 4，0/1 關閉）。
 - **工具級瞬態重試**：只讀工具遇到連接級瞬態錯誤（`ECONNRESET`/`ECONNREFUSED`/`EPIPE`/`EOF`/`net.Error` 超時/gRPC `Unavailable`）自動重試，默認 2 次、200ms 線性退避；取消、工具超時、panic、寫語義或寫語義未知的調用一律不重試（避免重複副作用與超時翻倍）。`DSC_TOOL_RETRY` 可調（0 關閉）。
 - **壓縮邊界與工具對完整性**：壓縮保留區的切點會吸附到工具對邊界（保留區不得以 `tool` 消息開頭）；請求前另做一次工具對校驗，發現孤立 `tool` 消息或無結果的 `tool_call` 時做最小修復並留 Warn（只作用於請求副本，事件日誌仍全量保留）。
