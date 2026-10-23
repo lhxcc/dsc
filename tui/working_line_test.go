@@ -23,7 +23,7 @@ func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m.turnTokens = 2048
 
 	// 动画文字随帧变化（第 0 帧中文全是占位下划线），故固定到已揭示若干字的帧
-	m.thinkAnim = thinkAnim{kind: thinkAnimZh, frame: 4 * zhFramesPerRune}
+	m.thinkAnim = thinkAnim{kind: thinkAnimZh, frame: 4 * zhFramesPerStep}
 	content := ansi.Strip(m.View().Content)
 	if !strings.Contains(content, "(5 秒 · Ctrl+C 取消)") {
 		t.Fatalf("工作行应含耗时与取消提示: %q", content)

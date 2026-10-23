@@ -11,47 +11,46 @@ import (
 // 「模型正在工作」行的文字动画。
 //
 // 只有一个 1 列宽的 spinner 时，长回合里很难一眼看出程序是活着还是在等 IO：
-// 一行不动的提示等于噪音。这里在 spinner 后加一段会说话的文字，并能分辨
-// 「正在想」与「正在输出」之外的中间态。
+// 一行不动的提示等于噪音。这里在 spinner 后加一段会说话的文字。
 //
 // 两种动画，每轮随机选一种（随机点选放在 startTurn，一轮之内不切换，避免
 // 文字在一个回合里来回跳）：
 //
-//	中文：逐字用白方块遮住「深度求索中..」，方块从左往右逐字揭开，全亮后
-//	      停留一拍再重新遮住。
-//	英文：「Deep Seeking..」先让字母逐字在大小写间翻动（一道大写波扫过），
-//	      再整串大写闪一下，然后把 SEEKING 逐字擦掉、逐字写出 THINKING，
-//	      最后定格在「Deep Thinking..」。
+//	中文：一道蓝紫扫描光带从左往右推过「深度求索中..」。光带未到之处是被暗紫
+//	      色实心块盖住的，光带扫过即点亮成字，身后留一段紫色余晖；扫到句点后
+//	      停一拍，整行重新盖回。
+//	英文：「Deep Seeking..」整句先被一道大写波扫过，再整句大写闪一下，然后
+//	      整句被逐字擦掉、逐字写回「Deep Thinking..」。
 //
-// 两条动画的显示宽度都是固定的：中文每个字无论遮没遮都用原字符渲染（方块是
-// 白底白字，宽度由字符本身决定），英文各阶段都补到同一宽度。否则行尾会随动画
-// 抖动，比不动还难看。
+// 两条动画的显示宽度都是固定的：中文的遮罩是「原字符 + 同色背景」（宽度由字符
+// 本身决定），英文各阶段都补到同一宽度。否则行尾会随动画抖动，比不动还难看。
 
 // 思考动画的样式。正文用比 dimSty 亮的灰，保证「更明显」这个诉求；
-// 刚揭示或刚变化的字符用强调色，形成注意力焦点。
+// 光带与余晖用蓝紫，形成注意力焦点。
 var (
 	thinkTextSty = lipgloss.NewStyle().Foreground(lipgloss.Color("#CCCCCC"))
 	thinkHotSty  = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	// maskPlaceholderSty 未揭示位置的占位符：暗灰的全角下划线。
-	//
-	// 用「全角下划线占位」而不是白色实心块：一排白块虽然抢眼，但像贴了马赛克，
-	// 与 TUI 的细线风格不搭；下划线是「待填空」的常规符号，逐字被换成字的过程
-	// 就是一行横线被逐个填上，观感轻得多。
-	//
-	// 必须是全角（U+FF3F）：半角 "_" 只有 1 列宽，而它替换的是 2 列宽的汉字，
-	// 逐字揭示时整行会左缩右跳。全角下划线与汉字同宽，行宽才稳。
-	maskPlaceholderSty = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#666666"))
-)
 
-// zhMaskRune 未揭示的中文字用全角下划线占位（与汉字同为 2 列宽）。
-const zhMaskRune = '＿'
+	// 中文扫描光带的四档：未扫到的实心块 → 紧邻光带的前缘 → 光点 → 身后的余晖。
+	//
+	// 遮罩用「原字符 + 同色背景」而不是换成 █ 之类的方块字符：全角块在不同终端
+	// 按 1 或 2 列渲染，逐字推进时整行会抖；同字符渲染则宽度天然不变。
+	// 背景与前景同色 = 字被这块颜色吞掉，看起来就是实心的。
+	zhBlockSty = lipgloss.NewStyle().
+			Background(lipgloss.Color("#2B2455")).
+			Foreground(lipgloss.Color("#2B2455"))
+	zhBlockNearSty = lipgloss.NewStyle().
+			Background(lipgloss.Color("#4A3C9E")).
+			Foreground(lipgloss.Color("#4A3C9E"))
+	zhScanSty  = lipgloss.NewStyle().Foreground(lipgloss.Color("#E6DCFF")).Bold(true)
+	zhTrailSty = lipgloss.NewStyle().Foreground(lipgloss.Color("#A88CFF"))
+)
 
 // thinkAnimKind 是动画语种。
 type thinkAnimKind int
 
 const (
-	thinkAnimZh thinkAnimKind = iota // 「深度求索中..」逐字揭示
+	thinkAnimZh thinkAnimKind = iota // 「深度求索中..」扫描光带
 	thinkAnimEn                      // 「Deep Seeking..」→「Deep Thinking..」
 )
 
@@ -89,19 +88,19 @@ func (a *thinkAnim) text() string {
 	return a.enText()
 }
 
-// ---- 中文：逐字揭示 ----
+// ---- 中文：蓝紫扫描光带 ----
 
 const (
-	// zhFramesPerRune 每个字「被揭开」所占的帧数。2 帧 ≈ 200ms，7 个字
-	// 大约 1.4s 走完，比每帧一字慢一点，看得出是逐字而不是闪一下。
-	zhFramesPerRune = 2
-	// zhHoldFrames 全部揭开后的停留帧数，让人有机会读完这行字，再从头重来。
-	zhHoldFrames = 10
+	// zhFramesPerStep 光带每前进一个字符位所占的帧数（2 帧 ≈ 200ms）。
+	zhFramesPerStep = 2
+	// zhHoldFrames 光带扫到句点后的停留帧数，让人读完整行再从头开始。
+	zhHoldFrames = 6
 )
 
-// 中文动画文案：要被逐字揭示的部分，与始终可见的句点分开。
-// 句点不参与遮罩——把「.」也换成下划线，一行里会混进两条比字宽短的下划线，
-// 看着像排版出错；点本来就只是句读，不需要被「揭示」。
+// 中文动画文案：被光带扫过的正文，与始终可见的句点分开。
+//
+// 句点不参与遮挡：它是「进行中」的句读标记，不是待揭示的内容——盖住它，剩下的
+// 「深度求索中」读起来像已经想完了。它照常显示，但光带扫过时同样被点亮。
 var zhThinkRunes = []rune("深度求索中")
 
 const zhThinkDots = ".."
@@ -111,46 +110,71 @@ func zhThinkText() string {
 	return string(zhThinkRunes) + zhThinkDots
 }
 
+// zhTotalCells 光带要扫过的字符位数（正文 + 句点）。
+func zhTotalCells() int {
+	return len(zhThinkRunes) + len([]rune(zhThinkDots))
+}
+
+// zhCycle 中文动画一个周期的帧数。
+func zhCycle() int {
+	return zhTotalCells()*zhFramesPerStep + zhHoldFrames
+}
+
 func (a *thinkAnim) zhText() string {
-	revealed, hotIdx := a.zhState()
+	head := a.zhHead()
+	n := len(zhThinkRunes)
 
 	var b strings.Builder
 	for i, r := range zhThinkRunes {
+		s := string(r)
 		switch {
-		case i >= revealed:
-			b.WriteString(maskPlaceholderSty.Render(string(zhMaskRune)))
-		case i == hotIdx:
-			b.WriteString(thinkHotSty.Render(string(r)))
-		default:
-			b.WriteString(thinkTextSty.Render(string(r)))
+		case i == head: // 光点
+			b.WriteString(zhScanSty.Render(s))
+		case i == head-1: // 身后的余晖
+			b.WriteString(zhTrailSty.Render(s))
+		case i > head+1: // 尚未扫到：暗紫实心块
+			b.WriteString(zhBlockSty.Render(s))
+		case i > head: // 紧邻光带的前缘，稍亮一档，做出光晕感
+			b.WriteString(zhBlockNearSty.Render(s))
+		default: // 已被扫过
+			b.WriteString(thinkTextSty.Render(s))
 		}
 	}
-	b.WriteString(thinkTextSty.Render(zhThinkDots))
+	// 句点常显；光带扫到哪儿，哪儿亮一下。
+	for j, r := range []rune(zhThinkDots) {
+		s := string(r)
+		switch n + j {
+		case head:
+			b.WriteString(zhScanSty.Render(s))
+		case head - 1:
+			b.WriteString(zhTrailSty.Render(s))
+		default:
+			b.WriteString(thinkTextSty.Render(s))
+		}
+	}
 	return b.String()
 }
 
-// zhRevealed 返回当前帧仍露在外面的字数（0..全部）。
+// zhHead 返回当前帧光点所在的字符位（0..最后一位）。
 //
-// 一个周期是「逐字揭开 → 停留 → 从头重来」：只往前揭示，不做反向遮回。
-// 遮回去等于把刚读到的字再擦掉，读起来像倒放；重来时整行重新被方块盖住，
-// 是 loading 指示器该有的重启感。
-func (a *thinkAnim) zhRevealed() int {
-	revealed, _ := a.zhState()
-	return revealed
+// 光带扫到句点末尾就停在那里停留一拍，然后回到第 0 位重新开始——只往前走，
+// 不做反向扫回：倒着扫等于把刚点亮的字再盖掉，读起来像倒放。
+func (a *thinkAnim) zhHead() int {
+	last := zhTotalCells() - 1
+	h := (a.frame % zhCycle()) / zhFramesPerStep
+	if h > last {
+		h = last
+	}
+	return h
 }
 
-// zhState 返回当前帧的（露出的字数，当前焦点字下标）。
-// 焦点字是刚露出的那个（停留期与重来的第一帧没有焦点，返回 -1）。
-func (a *thinkAnim) zhState() (revealed, hotIdx int) {
+// zhRevealed 返回当前帧已点亮的正文字数（0..全部）。
+func (a *thinkAnim) zhRevealed() int {
 	n := len(zhThinkRunes)
-	reveal := n * zhFramesPerRune
-	f := a.frame % (reveal + zhHoldFrames)
-
-	if f < reveal {
-		r := f / zhFramesPerRune
-		return r, r - 1
+	if h := a.zhHead(); h < n {
+		return h
 	}
-	return n, -1 // 全亮停留，之后回到第 0 帧重新遮住
+	return n
 }
 
 // ---- 英文：大小写翻动 → 擦除 → 改写 ----

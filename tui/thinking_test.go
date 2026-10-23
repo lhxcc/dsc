@@ -14,19 +14,19 @@ import (
 func TestZhAnimationRevealsOneByOne(t *testing.T) {
 	a := &thinkAnim{kind: thinkAnimZh}
 	n := len(zhThinkRunes)
-	reveal := n * zhFramesPerRune
+	reveal := n * zhFramesPerStep
 	cycle := zhCycle()
 
 	if got := a.zhRevealed(); got != 0 {
 		t.Fatalf("第 0 帧应全部被遮，revealed=%d", got)
 	}
 
-	// 揭示段：每 zhFramesPerRune 帧恰好多露出一个字，严格单调不降
+	// 揭示段：每 zhFramesPerStep 帧恰好多露出一个字，严格单调不降
 	prev := -1
 	for f := 0; f < reveal; f++ {
 		a.frame = f
 		got := a.zhRevealed()
-		if want := f / zhFramesPerRune; got != want {
+		if want := f / zhFramesPerStep; got != want {
 			t.Fatalf("frame=%d revealed=%d, want %d", f, got, want)
 		}
 		if got < prev {
@@ -56,46 +56,50 @@ func TestZhAnimationRevealsOneByOne(t *testing.T) {
 	}
 }
 
-// zhCycle 中文动画一个周期的帧数：揭示 + 停留。
-func zhCycle() int {
-	return len(zhThinkRunes)*zhFramesPerRune + zhHoldFrames
-}
+// TestZhAnimationIsScanBeam 中文是一道蓝紫扫描光带：光点之前是字，光点之后是
+// 同字符渲染的暗紫实心块（背景与前景同色），紧邻光带的前缘亮一档形成光晕。
+// 用同字符渲染而不是换成方块字符，宽度才恒定。
+func TestZhAnimationIsScanBeam(t *testing.T) {
+	a := &thinkAnim{kind: thinkAnimZh}
+	n := len(zhThinkRunes)
 
-// TestZhAnimationMasksWithUnderline 未揭示的位置是全角下划线占位，不是白块、
-// 也不是原字符：半角 "_" 只有 1 列宽（会与 2 列宽的汉字错位），故用 U+FF3F；
-// 句点不参与遮罩，始终可见。
-func TestZhAnimationMasksWithUnderline(t *testing.T) {
-	a := &thinkAnim{kind: thinkAnimZh, frame: 0}
+	// 第 0 帧：光点在首字，其后全是实心块，句点常显
+	a.frame = 0
 	raw := a.zhText()
-
-	// 第 0 帧：正文全是下划线，句点照常显示
-	got := ansi.Strip(raw)
-	want := strings.Repeat(string(zhMaskRune), len(zhThinkRunes)) + zhThinkDots
-	if got != want {
-		t.Fatalf("第 0 帧应为全下划线 + 句点，got %q want %q", got, want)
+	if got := ansi.Strip(raw); got != zhThinkText() {
+		t.Fatalf("遮罩不该改变可见字符，got %q want %q", got, zhThinkText())
 	}
-	if strings.Contains(raw, "48;") {
-		// 不该再有背景色（白块时代靠背景遮字）
-		t.Fatalf("占位符不该用背景色: %q", raw)
+	if addr := ansi.Strip(a.zhText()); addr == "" {
+		t.Fatal("不应为空")
 	}
-
-	// 全揭示后是完整文案，一个下划线都不剩
-	a.frame = len(zhThinkRunes) * zhFramesPerRune
-	if got := ansi.Strip(a.zhText()); got != zhThinkText() {
-		t.Fatalf("全揭示后应为完整文案，got %q", got)
+	// 至少一个块带背景色（未扫到的字被吞掉）
+	if !strings.Contains(raw, "48;2;43;36;85") {
+		t.Fatalf("未扫到的字应是暗紫实心块（含背景色）: %q", raw)
 	}
-	if strings.Contains(ansi.Strip(a.zhText()), string(zhMaskRune)) {
-		t.Fatal("全揭示后不应残留占位符")
+	// 句点不参与遮罩：最后一个点始终是正文色而非块
+	if strings.Contains(strings.Split(raw, "..")[0], "48;2;43;36;85") == false {
+		t.Fatalf("期望句点前有块: %q", raw)
 	}
 
-	// 逐字替换：第 k 个位置被揭开后，它不再是下划线
-	a.frame = zhFramesPerRune // 揭开 1 个字
-	r := []rune(ansi.Strip(a.zhText()))
-	if r[0] != zhThinkRunes[0] {
-		t.Fatalf("首字应已揭示，got %q", string(r[0]))
+	// 光点推进：第 k 步时前 k 个正文字都已是普通正文色（不再被块盖住）
+	for step := 0; step < n; step++ {
+		a.frame = step * zhFramesPerStep
+		got := a.zhRevealed()
+		if got != step {
+			t.Fatalf("step=%d zhRevealed=%d", step, got)
+		}
 	}
-	if r[1] != zhMaskRune {
-		t.Fatalf("第二字应仍为占位符，got %q", string(r[1]))
+
+	// 扫描到末尾后停留：光点停在最后一个句点上，全部正文已点亮
+	a.frame = zhCycle() - 1
+	if got := a.zhRevealed(); got != n {
+		t.Fatalf("停留期应全部点亮，got %d", got)
+	}
+
+	// 下一周期从首字重新开始
+	a.frame = zhCycle()
+	if got := a.zhRevealed(); got != 0 {
+		t.Fatalf("新周期应从首字开始，got %d", got)
 	}
 }
 
