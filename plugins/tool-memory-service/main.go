@@ -57,12 +57,12 @@ const (
 	scopeGlobal  = "global"
 )
 
-// globalProject 是全局层在 project 列的存值。
+// globalProject 是全局层在 project 列的存值：直接复用 scope 取值 "global"。
 //
-// 刻意不用空串：空串是「未归属」，而没有 project 列的旧库升级上来的行正是空串。
-// 按 AGENTS「禁止保留兼容分支」，这些行不该被自动当成全局条目自动复活——
-// 要留下就 memory_update 显式认领。
-const globalProject = "*"
+// 不另造哨兵（如 "*"）：库里的值与工具参数用同一套词，看数据就能对上语义。
+// 与项目键不会撞——项目键由 SessionKeyForProject 生成，形如
+// "O=--Agents--dsc-49C81869"，永远带 "-<8位哈希>" 后缀，不可能等于 "global"。
+const globalProject = scopeGlobal
 
 // currentProjectKey 返回当前工作区的项目键（与会话文件名同一套规则）。
 func currentProjectKey() string {
@@ -555,14 +555,6 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 视图 ----
 
-// projectLabel 把归属值渲染为可读标签：全局层显示「全局」，项目键原样展示。
-func projectLabel(project string) string {
-	if project == globalProject {
-		return "全局"
-	}
-	return project
-}
-
 func memorySearchView(result string) (json.RawMessage, error) {
 	var out struct {
 		Results []struct {
@@ -584,7 +576,7 @@ func memorySearchView(result string) (json.RawMessage, error) {
 			"content": r.Content,
 			"score":   strconv.FormatFloat(r.Score, 'f', 2, 64),
 			"source":  r.Source,
-			"project": projectLabel(r.Project),
+			"project": r.Project,
 		})
 	}
 	return dsc.TableView("Memory", &dsc.ViewBadge{Text: fmt.Sprintf("%d hit(s)", out.Total), Tone: "teal"}, []dsc.ViewColumn{
@@ -669,7 +661,7 @@ func memoryListView(result string) (json.RawMessage, error) {
 			"id":      strconv.FormatInt(m.ID, 10),
 			"content": m.Content,
 			"source":  m.Source,
-			"project": projectLabel(m.Project),
+			"project": m.Project,
 		})
 	}
 	return dsc.TableView("Memory", &dsc.ViewBadge{Text: fmt.Sprintf("%d items", out.Total), Tone: "teal"}, []dsc.ViewColumn{

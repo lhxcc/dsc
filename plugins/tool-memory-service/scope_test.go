@@ -164,20 +164,6 @@ func TestDedupPerProject(t *testing.T) {
 	}
 }
 
-// TestProjectLabel 全局哨兵显示「全局」，空值（缺 project 列的旧库）显示「未归属」，
-// 其余原样展示。
-func TestProjectLabel(t *testing.T) {
-	if got := projectLabel(globalProject); got != "全局" {
-		t.Fatalf("全局哨兵应显示全局，got %q", got)
-	}
-	if got := projectLabel("w--proj-1A2B3C4D"); got != "w--proj-1A2B3C4D" {
-		t.Fatalf("项目键应原样展示，got %q", got)
-	}
-	if got := projectLabel("w--proj-a-1234ABCD"); got != "w--proj-a-1234ABCD" {
-		t.Fatalf("项目键应原样展示，got %q", got)
-	}
-}
-
 // TestMemoryProjectColumnStamp 写入时把当前项目键落到 project 列（与会话键同源）。
 func TestMemoryProjectColumnStamp(t *testing.T) {
 	setupMemoryDB(t)
