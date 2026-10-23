@@ -55,13 +55,16 @@ type Config struct {
 	PlanSection string `json:"plan_section" yaml:"plan_section"`
 	// SessionID 會話標識，用於 temp 目錄下的數據分離（如 browser-data/spill）
 	SessionID string `json:"session_id" yaml:"session_id"`
-	// HistoryInjection 历史注入条数（/settings history 写回，启动时经
-	// DSC_HISTORY_INJECTION 下发 agent）。取值与 agent 内部语义**完全一致**：
-	// 未设置(nil) 或 -1 不限制（默认）、0 不注入历史（只带当前轮）、N>0 注入最近 N 条。
+	// HistoryInjection 恢复历史注入的持久化编码（/settings history 写回，启动时经
+	// DSC_HISTORY_INJECTION 下发 agent）：-1 禁止（不注入恢复历史）、0 未定义
+	// （未设置，按默认处理 = 不限制）、>0 只注入恢复历史中最近 N 条。
 	//
-	// 用指针而不是 int：yaml 缺省即 0，而 0 在这里是「不注入历史」这个有意义的
-	// 设置——两者必须能区分，否则「删掉该行」与「显式关闭历史」会得出同一结果。
-	HistoryInjection *int `json:"history_injection" yaml:"history_injection"`
+	// 0 在这套语义里就是「未设置」，因此 yaml 缺行与显式写 0 同义，用 int 即可——
+	// 不存在「分不清未设置与显式 0」的零值陷阱：显式 0 本来也表达「未定义」。
+	//
+	// 它只作用于**从存档恢复的历史**；同一进程内已经发生的轮次属于当前上下文，
+	// 不受此设置影响（见 session.DeriveMessagesLimited）。
+	HistoryInjection int `json:"history_injection" yaml:"history_injection"`
 	// HotReload 是否启用版本化二进制自动热重载 watch：插件目录内出现版本高于当前运行的
 	// <基名>-v<版本><ext> 文件时，自动经 HotReload 换成新进程（默认关闭）。
 	HotReload bool `json:"hot_reload" yaml:"hot_reload"`

@@ -278,15 +278,22 @@ func ptcEnvEnabled() bool {
 
 // historyInjectionCount 返回应下发给 agent 的 DSC_HISTORY_INJECTION 值。
 //
-// config 与 agent 用同一套取值（-1 不限制 / 0 不注入跨轮历史 / N 条），原值透传；
-// 未设置时 ok=false（不下发，agent 默认不限制）。这里**不做任何转码**：曾经两侧
-// 编码相反（config -1=禁止、agent -1=不限），预设里的 -1 被译成「不注入」，
-// 一轮之后模型就看不到之前的会话历史。
+// config 侧编码是「-1 禁止 / 0 未定义 / N>0 注入恢复历史中最近 N 条」，agent 侧
+// 是「-1 不限制 / 0 不注入 / N 条」，两者对 -1 的解释相反，故在此翻译：
+//
+//	config 0（未定义）→ ok=false，不下发，agent 取默认 -1（不限制）
+//	config -1（禁止）  → agent 0
+//	config N>0         → agent N
+//
+// 只翻译 -1，其余原值透传。
 func historyInjectionCount(cfg *core.Config) (int, bool) {
-	if cfg == nil || cfg.HistoryInjection == nil {
-		return 0, false
+	if cfg == nil || cfg.HistoryInjection == 0 {
+		return 0, false // 未定义：不下发，agent 默认不限制
 	}
-	return *cfg.HistoryInjection, true
+	if cfg.HistoryInjection < 0 {
+		return 0, true // config 禁止 → agent off
+	}
+	return cfg.HistoryInjection, true
 }
 
 func main() {

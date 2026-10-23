@@ -17,11 +17,11 @@ context_window: 1048576
 # dsc-billion-context；删空则 agent 走内联压缩兜底（presets 缺省已启用同款）
 compaction: dsc-system
 
-# 跨轮会话历史注入条数（/settings history 写回）：-1 不限制（默认，注入全部历史）、
-# 0 不注入跨轮历史（模型只看得到当前这一轮）、N>0 只注入最近 N 条。
-# 注意它管的是「跨轮历史」——本轮内的对话与工具调用始终保留，不受此设置影响。
+# 恢复历史注入（/settings history 写回）：-1 禁止（不注入从存档恢复的历史）、
+# 0 未定义（未设置，按默认处理 = 不限制）、N>0 只注入恢复历史中最近 N 条。
+# 它只影响「从存档恢复的历史」：同一会话内已经发生的轮次始终完整保留。
 
-history_injection: -1
+history_injection: 0
 plugins:
   - name: llm-anthropic
     type: llm

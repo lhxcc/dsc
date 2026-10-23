@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// TestSetHistoryInjectionConfigRoundTrip 校验 /settings history 持久化原值往返：
-// config 与 agent 用同一套取值（-1 不限制、0 不注入跨轮历史、N 条），不做任何转码。
-// 两侧曾经编码相反，预设里的 -1 被译成「不注入」，于是第二轮就看不到第一轮的历史。
+// TestSetHistoryInjectionConfigEncoding 校验 /settings history 持久化编码往返：
+// agent 值（0=off、-1=unlimited、N=条数）↔ config 三态（-1 禁止、0 未定义、N 启用）。
 func TestSetHistoryInjectionConfigEncoding(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -19,40 +18,37 @@ func TestSetHistoryInjectionConfigEncoding(t *testing.T) {
 	m := newRouterManager()
 	m.configPath = cfgPath
 
-	load := func() (int, bool) {
+	load := func() int {
 		t.Helper()
 		cfg, err := LoadConfig(cfgPath)
 		if err != nil {
 			t.Fatalf("LoadConfig: %v", err)
 		}
-		if cfg.HistoryInjection == nil {
-			return 0, false
-		}
-		return *cfg.HistoryInjection, true
+		return cfg.HistoryInjection
 	}
 
-	// off(0) → config 0（原值）
+	// agent off(0) → config -1（禁止）
 	if err := m.SetHistoryInjectionConfig(0); err != nil {
 		t.Fatalf("SetHistoryInjectionConfig(0): %v", err)
 	}
-	if got, ok := load(); !ok || got != 0 {
-		t.Fatalf("off → config = %d(present=%v), want 0", got, ok)
+	if got := load(); got != -1 {
+		t.Fatalf("off → config = %d, want -1", got)
 	}
 
-	// unlimited(-1) → config -1（原值，不再被译成 0）
+	// agent unlimited(-1) → config 0（未定义 = 回到默认）
 	if err := m.SetHistoryInjectionConfig(-1); err != nil {
 		t.Fatalf("SetHistoryInjectionConfig(-1): %v", err)
 	}
-	if got, ok := load(); !ok || got != -1 {
-		t.Fatalf("unlimited → config = %d(present=%v), want -1", got, ok)
+	if got := load(); got != 0 {
+		t.Fatalf("unlimited → config = %d, want 0", got)
 	}
 
-	// N(5) → config 5
+	// agent N(5) → config 5
 	if err := m.SetHistoryInjectionConfig(5); err != nil {
 		t.Fatalf("SetHistoryInjectionConfig(5): %v", err)
 	}
-	if got, ok := load(); !ok || got != 5 {
-		t.Fatalf("N=5 → config = %d(present=%v), want 5", got, ok)
+	if got := load(); got != 5 {
+		t.Fatalf("N=5 → config = %d, want 5", got)
 	}
 
 	// 文件其余内容保留

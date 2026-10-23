@@ -157,38 +157,34 @@ func keySet(m map[string]bool) []string {
 	return out
 }
 
-// TestHistoryInjectionCountPassesValueThrough 历史注入条数原值透传，不做转码。
+// TestHistoryInjectionCountMapping config 三态 → agent 值的翻译。
 //
-// 回归：config 侧曾用 -1=禁止、0=未定义，agent 侧用 -1=不限制、0=不注入，两侧
-// 语义相反。预设里写 -1 的本意是「不限制」，却被译成「不注入跨轮历史」——
-// 表现就是第二轮开始模型完全不记得上一轮（实测 178K 上下文骤降到 9K）。
-func TestHistoryInjectionCountPassesValueThrough(t *testing.T) {
-	ptr := func(v int) *int { return &v }
-
+// config 用「-1 禁止 / 0 未定义 / N>0」，agent 用「-1 不限制 / 0 不注入 / N」，
+// 两者对 -1 的解释相反，桥接只翻译这一处；0 表示「未设置」，不下发（agent 默认不限制）。
+func TestHistoryInjectionCountMapping(t *testing.T) {
 	if _, ok := historyInjectionCount(nil); ok {
 		t.Fatal("nil config 不应下发")
 	}
-	if _, ok := historyInjectionCount(&core.Config{}); ok {
-		t.Fatal("未设置时不应下发（agent 默认不限制）")
-	}
 	for _, c := range []struct {
-		in   int
-		want int
+		in     int
+		want   int
+		wantOk bool
 	}{
-		{-1, -1}, // 不限制：必须原样下发 -1，绝不能被译成 0
-		{0, 0},   // 显式关闭跨轮历史
-		{5, 5},
+		{0, 0, false},  // 未定义：不下发，agent 取默认 -1（不限制）
+		{-1, 0, true},  // 禁止 → agent off
+		{-5, 0, true},  // 其它负数按禁止处理
+		{5, 5, true},   // 只注入最近 5 条
 	} {
-		got, ok := historyInjectionCount(&core.Config{HistoryInjection: ptr(c.in)})
-		if !ok || got != c.want {
-			t.Fatalf("config %d 应原值下发 %d，got %d(ok=%v)", c.in, c.want, got, ok)
+		got, ok := historyInjectionCount(&core.Config{HistoryInjection: c.in})
+		if ok != c.wantOk || got != c.want {
+			t.Fatalf("config %d → (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.wantOk)
 		}
 	}
 }
 
-// TestDeepSeekPresetKeepsHistoryUnlimited 预设文件不得默认关闭跨轮历史：
-// 这是把「模型失忆」写进出厂配置的坑。
-func TestDeepSeekPresetKeepsHistoryUnlimited(t *testing.T) {
+// TestDeepSeekPresetDoesNotDisableHistory 预设不得把恢复历史注入关掉（-1）：
+// 那是把「接续会话时失忆」写进出厂配置。0（未定义）与 N>0 都可以。
+func TestDeepSeekPresetDoesNotDisableHistory(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("config", "config.DeepSeek.yaml"))
 	if err != nil {
 		t.Skip(err)
@@ -197,10 +193,7 @@ func TestDeepSeekPresetKeepsHistoryUnlimited(t *testing.T) {
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		t.Fatalf("解析预设: %v", err)
 	}
-	if cfg.HistoryInjection == nil {
-		return // 未设置 = 默认不限制
-	}
-	if *cfg.HistoryInjection == 0 {
-		t.Fatal("预设把 history_injection 设为 0：新装的用户第二轮就会丢上下文")
+	if cfg.HistoryInjection < 0 {
+		t.Fatal("预设把 history_injection 设为负数（= 禁止注入恢复历史）：接续旧会话时会看不到任何历史")
 	}
 }
