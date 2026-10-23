@@ -34,9 +34,25 @@ func newTestAgent(t *testing.T) *ReactLoopAgent {
 		blockedAfterConsecutiveRounds: 3,
 		// runner 日志丢弃（测试无需日志；生产 newAgent 会注入本地 hclog）
 		logger: hclog.New(&hclog.LoggerOptions{Output: io.Discard}),
-		// 与 newAgent 缺省一致：-1 = 不限制历史注入（0 会关闭压缩并禁用历史）
-		historyInjection: -1,
+		// 与 newAgent 缺省一致：0 = 未定义（默认不限制历史注入）
+		historyInjection: 0,
 	}
+}
+
+// markSessionRestored 模拟「从存档恢复会话」：把已构造的日志落盘再重新加载。
+// 恢复边界（restoredThrough）由此写入——历史注入上限只作用于这一段，
+// 与真实重启路径完全一致；不这样做的会话会把预置历史当成「本次运行新产生的」，
+// 注入上限对它不生效。
+func markSessionRestored(t *testing.T, a *ReactLoopAgent) {
+	t.Helper()
+	if err := a.store.Save(a.sess); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+	reloaded, err := a.store.Ensure(a.sess.ID())
+	if err != nil || reloaded == nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	a.sess = reloaded
 }
 
 func callTool(t *testing.T, a *ReactLoopAgent, name, args string) (*proto.ExecuteToolResponse, bool) {

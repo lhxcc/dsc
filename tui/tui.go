@@ -3225,19 +3225,28 @@ func (m *Model) capacityTag() string {
 	return shortTokens(m.usedTokens)
 }
 
-// parseHistoryInjection 解析 /settings history 的参数：
-// off/0 → 0（不注入历史）；unlimited/on/-1 → -1（不限制，缺省）；正整数 N → 注入最近 N 条。
+// parseHistoryInjection 解析 /settings history 的参数，沿用 DSC 三值语义：
+//
+//	off / -1 / 任意负数 → -1（不注入恢复历史）
+//	unlimited / on / default / 0 / 缺省 → 0（未定义，按默认处理 = 不限制）
+//	正整数 N → 注入恢复历史中最近 N 条
+//
+// 0 表示「未定义」而不是「关闭」：Go 体系的零值就是未设置，把 0 解释成关闭，
+// 会让漏写/清空配置这类情况意外关掉历史。
 func parseHistoryInjection(arg string) (int, error) {
 	arg = strings.TrimSpace(strings.ToLower(arg))
 	switch arg {
-	case "", "on", "unlimited", "-1":
-		return -1, nil
-	case "off", "0":
+	case "", "on", "unlimited", "default", "0":
 		return 0, nil
+	case "off", "-1":
+		return -1, nil
 	}
 	n, err := strconv.Atoi(arg)
-	if err != nil || n < 0 {
+	if err != nil {
 		return 0, fmt.Errorf("invalid history injection count %q", arg)
+	}
+	if n < 0 {
+		return -1, nil // 任意负值都表示不注入
 	}
 	return n, nil
 }
@@ -3301,13 +3310,14 @@ func (m *Model) runJobsCommand(rest string) {
 	}
 }
 
-// historyInjectionLabel 渲染历史注入设置的可读描述。
+// historyInjectionLabel 渲染历史注入设置的可读描述（DSC 三值语义：
+// 负值=不注入、0=未定义即默认不限制、N 条）。
 func historyInjectionLabel(count int) string {
 	switch {
 	case count < 0:
-		return "不限制（unlimited）"
+		return "不注入恢复历史（off）"
 	case count == 0:
-		return "不注入恢复历史（off，仅带当前轮）"
+		return "不限制（默认）"
 	default:
 		return fmt.Sprintf("最近 %d 条", count)
 	}

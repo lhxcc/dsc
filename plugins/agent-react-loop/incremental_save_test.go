@@ -101,7 +101,7 @@ func TestSessionSavedBeforeBlockingToolExecute(t *testing.T) {
 		defaultMaxGoalRounds:          256,
 		blockedAfterConsecutiveRounds: 3,
 		logger:                        hclog.New(&hclog.LoggerOptions{Output: io.Discard}),
-		historyInjection:              -1,
+		historyInjection:              0,
 		llmServiceID:                  1,
 		toolServiceID:                 1,
 		llmClient:                     &toolUseThenStopLLM{},

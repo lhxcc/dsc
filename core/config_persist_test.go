@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// TestSetHistoryInjectionConfigEncoding 校验 /settings history 持久化编码往返：
-// agent 值（0=off、-1=unlimited、N=条数）↔ config 三态（-1 禁止、0 未定义、N 启用）。
-func TestSetHistoryInjectionConfigEncoding(t *testing.T) {
+// TestSetHistoryInjectionConfigRoundTrip 校验 /settings history 持久化原值写入：
+// config 与 agent 共用 DSC 三值语义（负值=不注入恢复历史、0=未定义、N 条），
+// 不做任何编码换算。
+func TestSetHistoryInjectionConfigRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte("default_llm: x\n"), 0o644); err != nil {
@@ -27,28 +28,13 @@ func TestSetHistoryInjectionConfigEncoding(t *testing.T) {
 		return cfg.HistoryInjection
 	}
 
-	// agent off(0) → config -1（禁止）
-	if err := m.SetHistoryInjectionConfig(0); err != nil {
-		t.Fatalf("SetHistoryInjectionConfig(0): %v", err)
-	}
-	if got := load(); got != -1 {
-		t.Fatalf("off → config = %d, want -1", got)
-	}
-
-	// agent unlimited(-1) → config 0（未定义 = 回到默认）
-	if err := m.SetHistoryInjectionConfig(-1); err != nil {
-		t.Fatalf("SetHistoryInjectionConfig(-1): %v", err)
-	}
-	if got := load(); got != 0 {
-		t.Fatalf("unlimited → config = %d, want 0", got)
-	}
-
-	// agent N(5) → config 5
-	if err := m.SetHistoryInjectionConfig(5); err != nil {
-		t.Fatalf("SetHistoryInjectionConfig(5): %v", err)
-	}
-	if got := load(); got != 5 {
-		t.Fatalf("N=5 → config = %d, want 5", got)
+	for _, want := range []int{-1, 0, 5} {
+		if err := m.SetHistoryInjectionConfig(want); err != nil {
+			t.Fatalf("SetHistoryInjectionConfig(%d): %v", want, err)
+		}
+		if got := load(); got != want {
+			t.Fatalf("config = %d, want %d（原值写入）", got, want)
+		}
 	}
 
 	// 文件其余内容保留

@@ -281,21 +281,9 @@ func isIntegerLiteral(s string) bool {
 // history_injection 字段（保留文件其余内容与注释）；启动时宿主经
 // DSC_HISTORY_INJECTION 下发给 agent，跨会话/重启生效。
 //
-// 编码（config 值）：-1 禁止（不注入恢复历史）、0 未定义（按默认 = 不限制）、>0 注入
-// 恢复历史中最近 N 条。入参 count 为 agent 内部语义（-1 不限制、0 不注入、N 条），
-// 两者对 -1 的解释相反，故此处换算：
-//
-//	agent 0（off）        → config -1（禁止）
-//	agent -1（unlimited） → config 0（未定义，回到默认）
-//	agent N（N 条）       → config N
+// 原值写入：config 与 agent 共用 DSC 的三值语义（负值=不注入恢复历史、0=未定义
+// 即默认不限制、N>0=最近 N 条），中间没有任何编码转换。
 func (m *Manager) SetHistoryInjectionConfig(count int) error {
-	encoded := count
-	switch count {
-	case 0:
-		encoded = -1
-	case -1:
-		encoded = 0
-	}
 	path := m.persistConfigPath()
 	doc, err := readConfigDocumentNode(path)
 	if err != nil {
@@ -305,7 +293,7 @@ func (m *Manager) SetHistoryInjectionConfig(count int) error {
 	if doc == nil {
 		doc = &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
 	}
-	setRootField(root, "history_injection", strconv.Itoa(encoded))
+	setRootField(root, "history_injection", strconv.Itoa(count))
 	if err := saveConfigNode(path, doc); err != nil {
 		return fmt.Errorf("settings: persist config: %w", err)
 	}

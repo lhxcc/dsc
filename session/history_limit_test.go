@@ -6,7 +6,7 @@ import (
 	"dsc/proto"
 )
 
-// TestDeriveMessagesLimitedOff 历史注入关闭（0）：恢复来的历史一条不带，
+// TestDeriveMessagesLimitedOff 历史注入关闭（负值）：恢复来的历史一条不带，
 // 但本次运行内产生的轮次完整保留——否则「注入多少历史」这个设置会删掉
 // 同一会话里刚发生的对话（实测第二轮直接失忆）。
 func TestDeriveMessagesLimitedOff(t *testing.T) {
@@ -23,7 +23,7 @@ func TestDeriveMessagesLimitedOff(t *testing.T) {
 	appendSurface(t, s, UserMessage, &UserMessageData{Content: "q2", Source: "user"})
 	appendSurface(t, s, AssistantMessage, &AssistantMessageData{Content: "a2"})
 
-	msgs := s.DeriveMessagesLimited(0)
+	msgs := s.DeriveMessagesLimited(-1)
 	if len(msgs) != 1+2 {
 		t.Fatalf("off 应保留 system+本次运行的两条, 实际 %d 条: %+v", len(msgs), msgs)
 	}
@@ -44,7 +44,9 @@ func TestDeriveMessagesLimitedIgnoresLimitWithoutHistory(t *testing.T) {
 		appendSurface(t, s, UserMessage, &UserMessageData{Content: q, Source: "user"})
 		appendSurface(t, s, AssistantMessage, &AssistantMessageData{Content: "a-" + q})
 	}
-	for _, limit := range []int{0, 1, 2} {
+	// 0 是「未定义/不限制」，正数只裁恢复历史（此处为空），负数不注入恢复历史
+	// （此处也没有），三者都应全量派生。
+	for _, limit := range []int{0, 1, 2, -1} {
 		msgs := s.DeriveMessagesLimited(limit)
 		if len(msgs) != 1+6 {
 			t.Fatalf("limit=%d 无恢复历史时应全量派生, 实际 %d 条", limit, len(msgs))
@@ -131,12 +133,13 @@ func TestDeriveMessagesLimitedKeepsCurrentTurn(t *testing.T) {
 	}
 }
 
-// TestFoldHistoryLimit 折叠 history/limit 事件：最后一条生效；无记录返回 (-1, false)。
+// TestFoldHistoryLimit 折叠 history/limit 事件：最后一条生效；无记录返回 (0, false)——
+// 0 表示未定义（按默认处理 = 不限制）。
 func TestFoldHistoryLimit(t *testing.T) {
 	s := New()
 	limit, found := FoldHistoryLimit(s.Events())
-	if found || limit != -1 {
-		t.Fatalf("无记录: limit=%d found=%v, 期望 -1/false", limit, found)
+	if found || limit != 0 {
+		t.Fatalf("无记录: limit=%d found=%v, 期望 0/false（0 = 未定义）", limit, found)
 	}
 
 	s.Append(HistoryLimit, &HistoryLimitData{Count: 10}, nil)
@@ -145,5 +148,37 @@ func TestFoldHistoryLimit(t *testing.T) {
 	limit, found = FoldHistoryLimit(s.Events())
 	if !found || limit != 5 {
 		t.Fatalf("最后一条生效: limit=%d found=%v, 期望 5/true", limit, found)
+	}
+}
+
+// TestRestoredBoundarySurvivesSystemPromptReplace 系统提示重建（replace surface
+// node 0 为新事件）之后，恢复边界仍必须算得出来。
+//
+// 回归：边界曾按「第一个 seq >= restoredThrough 的节点」判定，而 node 0 每次重建
+// 都会变成本轮的新事件，于是边界恒为 0——注入上限完全失效（表现为设了 N 条却仍
+// 把全部历史发给模型）。
+func TestRestoredBoundarySurvivesSystemPromptReplace(t *testing.T) {
+	s := New()
+	appendSystemPrompt(t, s, "sys")
+	for i := 0; i < 3; i++ {
+		appendSurface(t, s, UserMessage, &UserMessageData{Content: "q", Source: "user"})
+		appendSurface(t, s, AssistantMessage, &AssistantMessageData{Content: "a"})
+	}
+	s.restoredThrough = s.Len() // 到此为止是恢复的历史
+
+	// 本次运行：system prompt 重建（replace node 0，新事件 seq 在边界之后）+ 当前轮
+	s.Append(SystemMessage, &SystemMessageData{Content: "sys-v2"}, &SurfaceOp{Op: SurfaceReplace, Start: 0, End: 0})
+	appendSurface(t, s, UserMessage, &UserMessageData{Content: "now", Source: "user"})
+
+	// limit=2 只作用于恢复历史：[q2,a2] + 当前消息 + system
+	msgs := s.DeriveMessagesLimited(2)
+	if len(msgs) != 1+3 {
+		t.Fatalf("应保留 system + 2 条历史 + 当前消息，实际 %d 条: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "system" || msgs[0].Content != "sys-v2" {
+		t.Fatalf("首条应为重建后的 system, 实际 (%s, %q)", msgs[0].Role, msgs[0].Content)
+	}
+	if msgs[len(msgs)-1].Content != "now" {
+		t.Fatalf("末条应为当前消息, 实际 %q", msgs[len(msgs)-1].Content)
 	}
 }

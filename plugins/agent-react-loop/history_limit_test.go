@@ -33,6 +33,9 @@ func TestRunLoopLimitedHistoryInjection(t *testing.T) {
 			&session.SurfaceOp{Op: session.SurfaceAppend})
 	}
 
+	// 预置的历史属于「从存档恢复」的部分，注入上限才作用于它
+	markSessionRestored(t, a)
+
 	// 通过 SetHistoryInjection 持久化会话级限制（事件溯源，可折叠还原）
 	if err := a.SetHistoryInjection(context.Background(), 2); err != nil {
 		t.Fatalf("SetHistoryInjection: %v", err)

@@ -154,27 +154,16 @@ func keySet(m map[string]bool) []string {
 	return out
 }
 
-// TestHistoryInjectionCountMapping config 三态 → agent 值的翻译。
-//
-// config 用「-1 禁止 / 0 未定义 / N>0」，agent 用「-1 不限制 / 0 不注入 / N」，
-// 两者对 -1 的解释相反，桥接只翻译这一处；0 表示「未设置」，不下发（agent 默认不限制）。
-func TestHistoryInjectionCountMapping(t *testing.T) {
+// TestHistoryInjectionCountPassThrough config 与 agent 共用 DSC 三值语义，
+// 原值透传、不翻译（负值=不注入恢复历史、0=未定义即默认不限制、N 条）。
+func TestHistoryInjectionCountPassThrough(t *testing.T) {
 	if _, ok := historyInjectionCount(nil); ok {
 		t.Fatal("nil config 不应下发")
 	}
-	for _, c := range []struct {
-		in     int
-		want   int
-		wantOk bool
-	}{
-		{0, 0, false}, // 未定义：不下发，agent 取默认 -1（不限制）
-		{-1, 0, true}, // 禁止 → agent off
-		{-5, 0, true}, // 其它负数按禁止处理
-		{5, 5, true},  // 只注入最近 5 条
-	} {
-		got, ok := historyInjectionCount(&core.Config{HistoryInjection: c.in})
-		if ok != c.wantOk || got != c.want {
-			t.Fatalf("config %d → (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.wantOk)
+	for _, want := range []int{-1, 0, 1, 50} {
+		got, ok := historyInjectionCount(&core.Config{HistoryInjection: want})
+		if !ok || got != want {
+			t.Fatalf("config %d → (%d,%v), want (%d,true)", want, got, ok, want)
 		}
 	}
 }

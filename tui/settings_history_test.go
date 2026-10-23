@@ -15,11 +15,11 @@ func TestSettingsHistoryCommand(t *testing.T) {
 		label string
 	}{
 		{"/settings history 10", 10, "最近 10 条"},
-		{"/settings history off", 0, "不注入恢复历史"},
-		{"/settings history 0", 0, "不注入恢复历史"},
-		{"/settings history unlimited", -1, "不限制"},
-		{"/settings history on", -1, "不限制"},
-		{"/settings history -1", -1, "不限制"},
+		{"/settings history off", -1, "不注入恢复历史"},
+		{"/settings history -1", -1, "不注入恢复历史"},
+		{"/settings history 0", 0, "不限制（默认）"},
+		{"/settings history unlimited", 0, "不限制（默认）"},
+		{"/settings history on", 0, "不限制（默认）"},
 	}
 	for _, c := range cases {
 		ag := &stubAgent{}
@@ -58,11 +58,11 @@ func TestSettingsHistoryInvalid(t *testing.T) {
 	}
 }
 
-// TestParseHistoryInjection 参数解析边界。
+// TestParseHistoryInjection 参数解析边界（DSC 三值：负值=不注入、0=未定义即默认、N 条）。
 func TestParseHistoryInjection(t *testing.T) {
 	ok := map[string]int{
-		"": -1, "on": -1, "unlimited": -1, "-1": -1,
-		"off": 0, "0": 0,
+		"": 0, "on": 0, "unlimited": 0, "default": 0, "0": 0,
+		"off": -1, "-1": -1, "-5": -1, // 任意负值都表示不注入
 		"1": 1, "50": 50,
 	}
 	for in, want := range ok {
@@ -71,7 +71,7 @@ func TestParseHistoryInjection(t *testing.T) {
 			t.Errorf("parseHistoryInjection(%q) = (%d, %v), want (%d, nil)", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"abc", "-5", "1.5"} {
+	for _, in := range []string{"abc", "1.5"} {
 		if _, err := parseHistoryInjection(in); err == nil {
 			t.Errorf("parseHistoryInjection(%q) 应报错", in)
 		}

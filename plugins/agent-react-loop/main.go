@@ -464,8 +464,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		//   "字符数 + 结构开销" 回退），确保重启后第一发请求不会把整段历史直接灌给模型。
 		// - 超过阈值（默认 80% 窗口）时压缩最旧前缀，保留近期尾部（默认 16% 窗口）逐字，
 		//   而非把全部历史折叠成单一摘要。
-		// - 历史注入设置了条数上限（historyInjection >= 0）时跳过压缩：注入条数本身就是
-		//   上下文的硬边界，压缩会与截断重复且其 surface 索引基于全量历史，不再适用。
+		// - 历史注入被显式设置（historyInjection != 0：负数=不注入、N=只带 N 条）时跳过
+		//   压缩：注入条数本身就是上下文的硬边界，压缩会与截断重复且其 surface 索引
+		//   基于全量历史，不再适用。0 = 未定义（默认不限制），此时才走内联压缩。
 		// - 若宿主有 compaction 后端插件，后端在 pre-step 事件中以自身策略阈值
 		//   接管压缩（能力声明驱动，接管与阈值无关；如 billion-context 的 45%
 		//   nudge 提醒 / dsc-system compaction-basic 的 80% 压力改写）。后端卸载后
@@ -474,12 +475,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		//   后端负责日常压缩（model-driven），内联压缩负责兜底（rule-driven）。
 		compacted := false
 		promptTokens := int(a.lastPromptTokens)
-		if a.contextWindow > 0 && a.historyInjection < 0 && promptTokens <= 0 {
+		if a.contextWindow > 0 && a.historyInjection == 0 && promptTokens <= 0 {
 			if est := core.EstimateProtoMessagesTokens(msgs); est > promptTokens {
 				promptTokens = est
 			}
 		}
-		if a.contextWindow > 0 && a.historyInjection < 0 && float64(promptTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
+		if a.contextWindow > 0 && a.historyInjection == 0 && float64(promptTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
 			if emit != nil {
 				emit(&core.RunStreamResponse{
 					Output: fmt.Sprintf("\n[上下文压缩: 已用 %d%% 容量，即将压缩对话历史]\n",
@@ -1484,7 +1485,7 @@ func (a *ReactLoopAgent) SetHistoryInjection(ctx context.Context, count int) err
 	if err := a.store.Save(a.sess); err != nil {
 		return fmt.Errorf("set history injection: %w", err)
 	}
-	a.historyInjection = count // 立即生效（history off/0 后本会话后续消息不再注入历史）
+	a.historyInjection = count // 立即生效（负数 = 不注入恢复历史；0 = 未定义/不限制）
 	fmt.Printf("[Agent Loop] history injection limit set to %d\n", count)
 	return nil
 }
@@ -1713,12 +1714,15 @@ func newAgent() (*ReactLoopAgent, error) {
 	if agent.approvalPolicy == "" {
 		agent.approvalPolicy = "ask"
 	}
-	// 讀取宿主傳入的历史注入条数默认值（DSC_HISTORY_INJECTION）：-1 不限制（缺省），
-	// 0 不注入历史，>0 只注入最近 N 条。会话内可通过 /settings history 以 history/limit
-	// 事件覆盖（事件折叠优先于此默认值）。
-	agent.historyInjection = -1
+	// 讀取宿主傳入的历史注入条数默认值（DSC_HISTORY_INJECTION），沿用 DSC 三值语义：
+	// 负值（-1 等）不注入恢复历史、0 未定义（未设置，按默认 = 不限制）、N>0 只注入
+	// 恢复历史中最近 N 条。会话内可通过 /settings history 以 history/limit 事件覆盖
+	// （事件折叠优先于此默认值）。
+	// 注意与 DSH 相反：DSH 用 -1 表示不限制、0 表示不注入；Go 体系的 0 是零值，
+	// 把它解释成「关闭」会让默认配置意外关掉历史，故 DSC 统一走自己的三值。
+	agent.historyInjection = 0
 	if v := os.Getenv("DSC_HISTORY_INJECTION"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= -1 {
+		if n, err := strconv.Atoi(v); err == nil {
 			agent.historyInjection = n
 		}
 	}

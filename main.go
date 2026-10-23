@@ -278,20 +278,12 @@ func ptcEnvEnabled() bool {
 
 // historyInjectionCount 返回应下发给 agent 的 DSC_HISTORY_INJECTION 值。
 //
-// config 侧编码是「-1 禁止 / 0 未定义 / N>0 注入恢复历史中最近 N 条」，agent 侧
-// 是「-1 不限制 / 0 不注入 / N 条」，两者对 -1 的解释相反，故在此翻译：
-//
-//	config 0（未定义）→ ok=false，不下发，agent 取默认 -1（不限制）
-//	config -1（禁止）  → agent 0
-//	config N>0         → agent N
-//
-// 只翻译 -1，其余原值透传。
+// config 与 agent 共用 DSC 的三值语义，原值透传、不翻译：负值=不注入恢复历史、
+// 0=未定义（按默认 = 不限制）、N>0=只注入恢复历史中最近 N 条。0 也照常下发——
+// 两边对 0 的理解一致，没有需要转换的地方。
 func historyInjectionCount(cfg *core.Config) (int, bool) {
-	if cfg == nil || cfg.HistoryInjection == 0 {
-		return 0, false // 未定义：不下发，agent 默认不限制
-	}
-	if cfg.HistoryInjection < 0 {
-		return 0, true // config 禁止 → agent off
+	if cfg == nil {
+		return 0, false
 	}
 	return cfg.HistoryInjection, true
 }
@@ -593,9 +585,9 @@ func main() {
 	logger.Info("workspace root", "root", filepath.ToSlash(core.WorkspaceRoot))
 
 	// /settings history 持久化的历史注入条数（config.yaml history_injection）在启动时
-	// 原值下发 agent 子进程：-1 不限制、0 不注入、N 注入最近 N 条。config 与 agent
-	// 用同一套取值，不做任何转换——曾经两侧编码相反（config -1=禁止 / agent -1=不限），
-	// 导致预设里的 -1 被译成「不注入历史」，每轮只剩当前消息，表现为模型突然失忆。
+	// 原值下发 agent 子进程：负值=不注入恢复历史、0=未定义（默认不限制）、N=最近 N 条。
+	// config 与 agent 共用同一套 DSC 三值语义，不做转换——与 DSH 的「-1 不限制 /
+	// 0 不注入」刻意不同：Go 的零值是未设置，把 0 当关闭会让漏写配置意外关掉历史。
 	if n, ok := historyInjectionCount(mainCfg); ok {
 		os.Setenv("DSC_HISTORY_INJECTION", strconv.Itoa(n))
 		logger.Info("history injection from config", "count", n)
