@@ -250,5 +250,8 @@ func Load(path string) (*Session, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("session: scan %s: %w", path, err)
 	}
+	// 标记「历史到此为止」：从文件读进来的是历史，之后 append 的是本次运行。
+	// 历史注入上限据此划界（见 DeriveMessagesLimited）。
+	s.restoredThrough = len(s.events)
 	return s, nil
 }

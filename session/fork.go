@@ -40,6 +40,9 @@ func (s *Session) Fork(boundary int) (*Session, error) {
 			child.applySurfaceLocked(ev)
 		}
 	}
+	// fork 出来的内容整体是「继承来的历史」：注入上限应作用在它上面，
+	// 而 fork 之后新发生的轮次完整保留。
+	child.restoredThrough = len(child.events)
 	return child, nil
 }
 

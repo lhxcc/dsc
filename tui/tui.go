@@ -2363,7 +2363,7 @@ var slashGroups = []slashGroup{
 	{
 		entry: compItem{label: "/settings", insert: "/settings ", hint: "设置子命令（history），选中进入后展开", descend: true},
 		subs: []compItem{
-			{label: "/settings history", insert: "/settings history ", hint: "历史注入条数（如 10 / off / unlimited）：控制模型预填充长度"},
+			{label: "/settings history", insert: "/settings history ", hint: "恢复历史注入条数（如 10 / off / unlimited）：只影响从存档恢复的历史"},
 		},
 	},
 }
@@ -2559,7 +2559,7 @@ func (m *Model) buildHelpText() string {
 		"  /cron on|off <id>  启用/停用定时任务",
 		"  /plan       进入 plan 模式（先探索与设计，再经 exit_plan_mode 呈现完整计划）",
 		"  /plan off   退出 plan 模式",
-		"  /settings history <N|off|unlimited>  历史注入条数：控制模型预填充长度",
+		"  /settings history <N|off|unlimited>  恢复历史注入条数：只影响从存档恢复的历史，当前会话内的轮次始终保留",
 		"    （N 为注入最近 N 条；off 不注入历史；unlimited/on 不限制，默认）",
 		"  /settings mouse on|off  切换鼠标捕获（on 恢复应用内捕获；off 释放给终端原生选中/复制）",
 		"  /session <id>  切换到指定会话（如 /session session-3）",
@@ -2821,8 +2821,9 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
-	// /settings history <N|off|unlimited>：控制历史注入条数（模型预填充长度）。
-	// off/0 不注入历史；N 注入最近 N 条；unlimited/on/-1 不限制（默认）。
+	// /settings history <N|off|unlimited>：控制从存档恢复的历史注入条数。
+	// off/0 不注入恢复历史；N 只取恢复历史中最近 N 条；unlimited/on/-1 不限制（默认）。
+	// 无论取值如何，本次运行内已经发生的轮次都完整保留。
 	// 鼠标捕获为自动行为：模型工作期间释放给终端原生选中、空闲恢复应用内捕获，
 	// 不再提供显式开关；需永久释放用环境变量 DSC_DISABLE_MOUSE=1。
 	if strings.HasPrefix(cmd, "/settings") {
@@ -3306,7 +3307,7 @@ func historyInjectionLabel(count int) string {
 	case count < 0:
 		return "不限制（unlimited）"
 	case count == 0:
-		return "不注入历史（off）"
+		return "不注入恢复历史（off，仅带当前轮）"
 	default:
 		return fmt.Sprintf("最近 %d 条", count)
 	}

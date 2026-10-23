@@ -15,8 +15,8 @@ func TestSettingsHistoryCommand(t *testing.T) {
 		label string
 	}{
 		{"/settings history 10", 10, "最近 10 条"},
-		{"/settings history off", 0, "不注入历史"},
-		{"/settings history 0", 0, "不注入历史"},
+		{"/settings history off", 0, "不注入恢复历史"},
+		{"/settings history 0", 0, "不注入恢复历史"},
 		{"/settings history unlimited", -1, "不限制"},
 		{"/settings history on", -1, "不限制"},
 		{"/settings history -1", -1, "不限制"},
