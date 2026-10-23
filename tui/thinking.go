@@ -32,12 +32,20 @@ import (
 var (
 	thinkTextSty = lipgloss.NewStyle().Foreground(lipgloss.Color("#CCCCCC"))
 	thinkHotSty  = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	// maskSty 白底白字：字符位置被「白方块」盖住。不用 █ 之类的方块字符——
-	// 全角块在不同终端按 1 或 2 列渲染，会让整行宽度抖动、行尾跳字。
-	maskSty = lipgloss.NewStyle().
-		Background(lipgloss.Color("#FFFFFF")).
-		Foreground(lipgloss.Color("#FFFFFF"))
+	// maskPlaceholderSty 未揭示位置的占位符：暗灰的全角下划线。
+	//
+	// 用「全角下划线占位」而不是白色实心块：一排白块虽然抢眼，但像贴了马赛克，
+	// 与 TUI 的细线风格不搭；下划线是「待填空」的常规符号，逐字被换成字的过程
+	// 就是一行横线被逐个填上，观感轻得多。
+	//
+	// 必须是全角（U+FF3F）：半角 "_" 只有 1 列宽，而它替换的是 2 列宽的汉字，
+	// 逐字揭示时整行会左缩右跳。全角下划线与汉字同宽，行宽才稳。
+	maskPlaceholderSty = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#666666"))
 )
+
+// zhMaskRune 未揭示的中文字用全角下划线占位（与汉字同为 2 列宽）。
+const zhMaskRune = '＿'
 
 // thinkAnimKind 是动画语种。
 type thinkAnimKind int
@@ -91,24 +99,33 @@ const (
 	zhHoldFrames = 10
 )
 
-// zhThinkText 中文动画文案（5 个汉字 + 2 个点）。
-var zhThinkText = []rune("深度求索中..")
+// 中文动画文案：要被逐字揭示的部分，与始终可见的句点分开。
+// 句点不参与遮罩——把「.」也换成下划线，一行里会混进两条比字宽短的下划线，
+// 看着像排版出错；点本来就只是句读，不需要被「揭示」。
+var zhThinkRunes = []rune("深度求索中")
+
+const zhThinkDots = ".."
+
+// zhThinkText 完整文案（正文 + 句点），仅用于测试与宽度核对。
+func zhThinkText() string {
+	return string(zhThinkRunes) + zhThinkDots
+}
 
 func (a *thinkAnim) zhText() string {
 	revealed, hotIdx := a.zhState()
 
 	var b strings.Builder
-	for i, r := range zhThinkText {
-		if i >= revealed {
-			b.WriteString(maskSty.Render(string(r)))
-			continue
-		}
-		if i == hotIdx {
+	for i, r := range zhThinkRunes {
+		switch {
+		case i >= revealed:
+			b.WriteString(maskPlaceholderSty.Render(string(zhMaskRune)))
+		case i == hotIdx:
 			b.WriteString(thinkHotSty.Render(string(r)))
-			continue
+		default:
+			b.WriteString(thinkTextSty.Render(string(r)))
 		}
-		b.WriteString(thinkTextSty.Render(string(r)))
 	}
+	b.WriteString(thinkTextSty.Render(zhThinkDots))
 	return b.String()
 }
 
@@ -125,7 +142,7 @@ func (a *thinkAnim) zhRevealed() int {
 // zhState 返回当前帧的（露出的字数，当前焦点字下标）。
 // 焦点字是刚露出的那个（停留期与重来的第一帧没有焦点，返回 -1）。
 func (a *thinkAnim) zhState() (revealed, hotIdx int) {
-	n := len(zhThinkText)
+	n := len(zhThinkRunes)
 	reveal := n * zhFramesPerRune
 	f := a.frame % (reveal + zhHoldFrames)
 
@@ -139,22 +156,29 @@ func (a *thinkAnim) zhState() (revealed, hotIdx int) {
 // ---- 英文：大小写翻动 → 擦除 → 改写 ----
 
 const (
-	enWaveFrames  = 12 // 大小写波扫过
-	enUpperFrames = 3  // 整串大写闪一下
-	enEraseFrames = 9  // 逐字擦掉 SEEKING（8 个字母 + 1 拍停留）
-	enWriteFrames = 10 // 逐字写出 THINKING（8 个字母 + 2 拍收尾）
-	enHoldFrames  = 12 // 定格在 Deep Thinking.. 停留
+	enWaveFrames  = 12 // 大小写波扫过整句
+	enUpperFrames = 2  // 整句大写闪一下
+	enEraseFrames = 13 // 逐字擦掉整句（13 个字符位 + 收尾一拍）
+	enWriteFrames = 14 // 逐字写出整句（13 个字符位 + 收尾一拍）
+	enHoldFrames  = 10 // 定格在 Deep Thinking.. 停留
+)
+
+// 英文动画的两个整句（源句 12 字，目的句 13 字）。
+//
+// 不把源句补成 13 宽：那样词与句点之间会多出一个空格（"Deep Seeking .."）。
+// 长度差由渲染末尾的补位吸收，代价是句点在「擦除结束 → 写出开始」时右移一格
+// ——那一刻整行正好只剩一条句点，移一格几乎看不出来。
+const (
+	enSrc = "Deep Seeking"
+	enDst = "Deep Thinking"
 )
 
 const (
-	// enHeadLen 是 "Deep " 的长度：词槽之前的部分也算「动起来的范围」，
-	// 故后面各阶段都以整段 body 为单位处理。
-	enHeadLen = len("Deep ")
-	enSuffix  = ".."
+	enSuffix = ".."
 	// enWidth 整段目标显示宽度：按最长的 "Deep Thinking.."（5+8+2）计。
 	// 每帧都补到该宽度，阶段切换时行尾不右移——否则同一回合里
 	// 「(5 秒 · Ctrl+C 取消)」会左右跳一格。
-	enWidth = enHeadLen + len("THINKING") + len(enSuffix)
+	enWidth = len(enDst) + len(enSuffix)
 )
 
 func (a *thinkAnim) enText() string {
@@ -166,62 +190,53 @@ func (a *thinkAnim) enText() string {
 
 	g := a.frame % cycle
 
-	// body 是句点之前的那一整段（"Deep Seeking" / "DEEP SEEKING" / …）。
+	// body 是句点之前的整句。
 	//
-	// 前面那个词也参与动画：只让 Seeking 翻大小写、把 Deep 定在那里不动，
-	// 整段看起来就像一张静止的标签旁边挂了个跳动的字。所以下面每个阶段都以
-	// 整段 body 为单位，而不是只改后面那个词。
-	//
-	// 各阶段长度不同（Seeking 7 / Thinking 8），末尾再补不可见空格让整段恒定
-	// enWidth 宽。若把短词就地补齐，会渲染出「Deep Seeking ..」——词与句点之间
-	// 凭空多一个空格。
+	// 两个词走完全一样的过程：一起被大小写波扫过、一起闪现大写、一起被逐字擦掉、
+	// 一起被逐字写回。先前只擦后面的词、把 "Deep" 定住不动，同一行里两种节奏并存，
+	// 看着像两段动画拼在一起；整句同进同退才有「一句话被改写」的完整感。
 	var body []rune
 	var hot []bool
 
 	switch {
 	case g < wave:
-		// 大小写波：相位随位置错开，形成一道扫过的大写带，
-		// 从 Deep 一路扫到 Seeking 再扫回来。
-		// 用取模到正数的写法，避免 g-i 为负时 Go 的 % 给出负余数。
-		body = []rune("Deep Seeking")
+		// 大小写波：相位按位置逐列错开、按帧推进，形成一道宽 2 列的大写带
+		// 从行首扫到行尾。取模到正数：g-i 为负时 Go 的 % 会给出负余数。
+		body = []rune(enSrc)
 		hot = make([]bool, len(body))
 		for i := range body {
-			// 相位按位置逐列错开、按帧推进，形成一道宽 2 列的大写带从左扫到右。
-			// 取模到正数：g-i 为负时 Go 的 % 会给出负余数。
 			if ((g-i)%7+7)%7 < 2 {
 				body[i] = unicode.ToUpper(body[i])
 			}
 		}
 	case g < upper:
-		body = []rune("DEEP SEEKING")
+		body = []rune(strings.ToUpper(enSrc))
 		hot = make([]bool, len(body))
 	case g < erase:
-		// 从左到右逐字擦成空格，未擦到的部分保持大写
-		body = []rune("DEEP SEEKING")
+		// 整句从左到右一起消失（擦完后的那一拍正好是空白停顿）
+		erased := g - upper
+		body = []rune(strings.ToUpper(enSrc))
 		hot = make([]bool, len(body))
-		for i := enHeadLen; i < len(body); i++ {
-			if i-enHeadLen < g-upper {
+		for i := range body {
+			if i < erased {
 				body[i] = ' '
 			}
 		}
 	case g < write:
-		// 从左到右逐字写出 THINKING，最新写出的一个字高亮。
-		// 词槽始终保持 8 宽（未写出的部分留空格）：否则 ".." 会紧贴 Deep，
-		// 句点在擦除与写出的交界处突然从行尾跳到行首。
+		// 逐字写出新的整句，写出来就是最终形态（不再做一次大小写收束）
 		written := g - erase
-		if written > len("THINKING") {
-			written = len("THINKING")
+		dst := []rune(enDst)
+		body = []rune(strings.Repeat(" ", len(dst)))
+		if written > len(dst) {
+			written = len(dst)
 		}
-		head := []rune("DEEP ")
-		body = append(head, []rune(strings.Repeat(" ", len("THINKING")))...)
-		copy(body[enHeadLen:], []rune("THINKING")[:written])
+		copy(body, dst[:written])
 		hot = make([]bool, len(body))
 		if written > 0 {
-			hot[enHeadLen+written-1] = true
+			hot[written-1] = true
 		}
 	default:
-		// 定格：回到正常大小写的 Deep Thinking..
-		body = []rune("Deep Thinking")
+		body = []rune(enDst)
 		hot = make([]bool, len(body))
 	}
 

@@ -22,14 +22,21 @@ func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m.elapsed = 5
 	m.turnTokens = 2048
 
+	// 动画文字随帧变化（第 0 帧中文全是占位下划线），故固定到已揭示若干字的帧
+	m.thinkAnim = thinkAnim{kind: thinkAnimZh, frame: 4 * zhFramesPerRune}
 	content := ansi.Strip(m.View().Content)
 	if !strings.Contains(content, "(5 秒 · Ctrl+C 取消)") {
 		t.Fatalf("工作行应含耗时与取消提示: %q", content)
 	}
-	// 英文动画进行中大小写是混的（Deep SeekINg..），故按忽略大小写判断
-	low := strings.ToLower(content)
-	if !strings.Contains(content, "深度求索中") && !strings.Contains(low, "deep seeking") && !strings.Contains(low, "deep thinking") {
-		t.Fatalf("工作行应含动画文字: %q", content)
+	if !strings.Contains(content, "深度求索") {
+		t.Fatalf("中文动画应显示已揭示的文字: %q", content)
+	}
+
+	// 英文语种走同一行：全大写帧应出现整句
+	m.thinkAnim = thinkAnim{kind: thinkAnimEn, frame: enWaveFrames}
+	content = ansi.Strip(m.View().Content)
+	if !strings.Contains(content, "DEEP SEEKING..") {
+		t.Fatalf("英文动画应显示整句: %q", content)
 	}
 	if !strings.Contains(content, "↓2K") {
 		t.Fatalf("工作行应含下行数据: %q", content)
