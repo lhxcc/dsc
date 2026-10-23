@@ -26,13 +26,6 @@ import (
 //
 // 请求文案只描述「记忆能力」，不点名任何插件或工具名——谁提供记忆能力谁承接。
 
-const (
-	// reasoningMinLen 低于此长度的推理视为噪声（"OK"、"继续"之类），不入库。
-	reasoningMinLen = 24
-	// reasoningMaxLen 单条记忆上限，防超长推理撑爆记忆库。
-	reasoningMaxLen = 4000
-)
-
 // seenReasoning 已入库推理的内容哈希（进程内去重：日志补写/重读会再次看到同一段）。
 var seenReasoning = struct {
 	sync.Mutex
@@ -184,14 +177,13 @@ func goalCompleted(data json.RawMessage) bool {
 	return d.Snapshot.Phase == "complete"
 }
 
-// recordReasoning 把模型推理写入记忆库（内容去重、限长、过短丢弃）。
+// recordReasoning 把模型推理完整写入记忆库。
+// 只做内容去重（同一段推理可能因日志重读被再次看到），不截断、不按长度丢弃——
+// 推理的价值正在细节里，砍半条比不记更糟。
 func recordReasoning(text string) {
 	text = strings.TrimSpace(text)
-	if len(text) < reasoningMinLen {
+	if text == "" {
 		return
-	}
-	if len(text) > reasoningMaxLen {
-		text = text[:reasoningMaxLen] + "…"
 	}
 	sum := sha256.Sum256([]byte(text))
 	key := hex.EncodeToString(sum[:8])
@@ -226,11 +218,27 @@ func clearTaskRecord() {
 	taskRecord.Unlock()
 }
 
-// taskRecordContext 返回注入 system prompt 的收尾请求（空 = 无需请求）。
-// 只描述能力，不点名插件或工具：任何提供记忆能力的实现都能承接。
-func taskRecordContext() string {
+// taskNoticePayload 构造 pre-step 的插播载荷：一条 role=system 的消息，由宿主
+// 追加到本轮消息末尾（见 core 的 parsePreStepAppends）。
+func taskNoticePayload(notice string) string {
+	b, err := json.Marshal(map[string]any{
+		"append": []map[string]string{{"role": "system", "content": notice}},
+	})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// takeTaskRecordNotice 取走待发的一次性插播文案（取走即清空）。
+//
+// 为什么走消息而不是 system prompt：系统提示是缓存前缀，改它会让整段前缀失效；
+// 插播只追加在消息末尾，代价小得多，也符合「临时提醒」的性质。取走即清空，
+// 避免每步重复插播把历史塞满。
+func takeTaskRecordNotice() string {
 	taskRecord.Lock()
 	reason := taskRecord.reason
+	taskRecord.reason = ""
 	taskRecord.Unlock()
 	if reason == "" {
 		return ""

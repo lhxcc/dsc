@@ -683,15 +683,21 @@ func main() {
 			}
 			return result, toolErr
 		},
-		// pre-step：跟随会话日志，被动记录模型推理 + 在任务收尾时登记一次写记忆请求
+		// pre-step：跟随会话日志，被动记录模型推理；任务收尾时以「一次性插播消息」
+		// 请求写记忆（详见 capture.go takeTaskRecordNotice）。
 		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
-			if eventType == string(core.EventAgentPreStep) {
-				capturePreStep(dataJSON)
+			if eventType != string(core.EventAgentPreStep) {
+				return "", nil
 			}
-			return "", nil
+			capturePreStep(dataJSON)
+			notice := takeTaskRecordNotice()
+			if notice == "" {
+				return "", nil
+			}
+			// 宿主会把 append 里的消息追加到本轮消息末尾（role=system），
+			// 不改 system prompt，故不会破坏其缓存前缀。
+			return taskNoticePayload(notice), nil
 		},
-		// 收尾请求经 system prompt 下发（每步重建，模型下一步即可看到）
-		ContextFn: taskRecordContext,
 	})
 	sdk.Serve()
 }

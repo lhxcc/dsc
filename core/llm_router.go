@@ -195,25 +195,71 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	if !ok {
 		return req
 	}
-	msgsRaw, ok := resultMap["messages"]
-	if !ok {
-		return req
+	msgs := req.Messages
+	changed := false
+	if msgsRaw, ok := resultMap["messages"]; ok {
+		newMsgsJSON, _ := json.Marshal(msgsRaw)
+		var newMsgs []*proto.Message
+		if err := json.Unmarshal(newMsgsJSON, &newMsgs); err == nil && len(newMsgs) > 0 {
+			msgs = newMsgs
+			changed = true
+		}
 	}
-	newMsgsJSON, _ := json.Marshal(msgsRaw)
-	var newMsgs []*proto.Message
-	if err := json.Unmarshal(newMsgsJSON, &newMsgs); err != nil || len(newMsgs) == 0 {
+	// 一次性插播消息：插件（如记忆）在任务收尾时请求插入一条 system 角色的提示。
+	// 走「追加到消息末尾」而不是改 system prompt——系统提示是缓存前缀，任何改动都会
+	// 让整段前缀缓存失效；插播消息只影响尾部，代价小得多。
+	if ups := parsePreStepAppends(resultMap["append"]); len(ups) > 0 {
+		msgs = append(append([]*proto.Message{}, msgs...), ups...)
+		changed = true
+	}
+	if !changed {
 		return req
 	}
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
-	rewritten := &proto.ChatRequest{
-		Messages:     newMsgs,
+	return &proto.ChatRequest{
+		Messages:     msgs,
 		Tools:        req.Tools,
 		MaxTokens:    req.MaxTokens,
 		SessionId:    req.SessionId,
 		NewUserInput: req.NewUserInput,
 	}
-	return rewritten
+}
+
+// parsePreStepAppends 解析插件经 pre-step 返回的一次性插播消息：
+// {"append":[{"role":"system","content":"…"}]}。role 仅接受 system/user
+// （assistant/tool 需要对应的调用配对，插件无从构造，遇到即丢弃）。
+func parsePreStepAppends(raw any) []*proto.Message {
+	if raw == nil {
+		return nil
+	}
+	norm, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var items []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(norm, &items); err != nil {
+		return nil
+	}
+	out := make([]*proto.Message, 0, len(items))
+	for _, it := range items {
+		content := strings.TrimSpace(it.Content)
+		if content == "" {
+			continue
+		}
+		role := it.Role
+		if role == "" {
+			role = "system"
+		}
+		if role != "system" && role != "user" {
+			continue
+		}
+		out = append(out, &proto.Message{Role: role, Content: content})
+	}
+	return out
 }
 
 // recordSessionUsage 按会话记录最近一次成功 LLM 请求的服务端上报 prompt 用量

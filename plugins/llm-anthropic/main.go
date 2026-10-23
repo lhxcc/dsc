@@ -99,7 +99,23 @@ func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []
 	for _, m := range messages {
 		switch m.Role {
 		case "system":
-			systemMsg = m.Content
+			if systemMsg == "" {
+				systemMsg = m.Content
+				continue
+			}
+			// 后续 system 消息（插件的一次性插播，如「任务已完成，请写记忆」）：
+			// Anthropic 只接受顶层 system，消息列表里没有 system 角色。降级为
+			// user 轮并显式标注，保留「这不是用户发言」的语义；并入上一条 user
+			// 消息以避免同角色相邻（Anthropic 要求 user/assistant 交替）。
+			note := "[system] " + m.Content
+			if n := len(userMessages); n > 0 {
+				last := &userMessages[n-1]
+				if last.Role == anthropic.MessageParamRoleUser {
+					last.Content = append(last.Content, anthropic.NewTextBlock(note))
+					continue
+				}
+			}
+			userMessages = append(userMessages, anthropic.NewUserMessage(anthropic.NewTextBlock(note)))
 		case "user":
 			if len(m.Images) > 0 {
 				// 多模态分支：文本块 + 文件附件块（图像受 p.vision 门控；

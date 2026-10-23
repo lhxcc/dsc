@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,31 +93,38 @@ func TestSessionTailReadsOnlyNewLines(t *testing.T) {
 	}
 }
 
-// TestTaskRecordRequestOnceAndCleared 同一任务只请求一次写记忆
-// （待办完成与目标完成常先后发生），写入记忆后作废。
-func TestTaskRecordRequestOnceAndCleared(t *testing.T) {
+// TestTakeTaskRecordNoticeOnce 同一任务只插播一次（待办完成与目标完成常先后发生）：
+// 通知是「取走即清空」的一次性插播，不随每步重复。
+func TestTakeTaskRecordNoticeOnce(t *testing.T) {
 	clearTaskRecord()
-	if taskRecordContext() != "" {
-		t.Fatal("初始不应有收尾请求")
+	if got := takeTaskRecordNotice(); got != "" {
+		t.Fatalf("初始不应有插播，got %q", got)
 	}
 	requestTaskRecord("待办清单已全部完成")
-	first := taskRecordContext()
+	first := takeTaskRecordNotice()
 	if first == "" {
-		t.Fatal("应产生收尾请求")
+		t.Fatal("应产生插播")
 	}
+	if again := takeTaskRecordNotice(); again != "" {
+		t.Fatalf("插播取走后不应重复，got %q", again)
+	}
+	// 同一任务再次登记：已被取走，不应复活（任务已完成且已提醒过）
 	requestTaskRecord("目标已标记完成")
-	if again := taskRecordContext(); again != first {
-		t.Fatalf("同一任务不应重复请求，got %q", again)
+	second := takeTaskRecordNotice()
+	if second == "" {
+		t.Fatal("新登记应可再次插播")
 	}
-	// 请求文案只提「记忆能力」，不点名任何插件/工具
-	for _, banned := range []string{"memory_add", "memory-service", "tool-memory"} {
-		if strings.Contains(first, banned) {
-			t.Fatalf("请求不应点名具体实现 %q: %s", banned, first)
+	// 文案只提「记忆能力」，不点名任何插件/工具
+	for _, text := range []string{first, second} {
+		for _, banned := range []string{"memory_add", "memory-service", "tool-memory"} {
+			if strings.Contains(text, banned) {
+				t.Fatalf("插播不应点名具体实现 %q: %s", banned, text)
+			}
 		}
 	}
 	clearTaskRecord()
-	if taskRecordContext() != "" {
-		t.Fatal("清除后不应再有请求")
+	if got := takeTaskRecordNotice(); got != "" {
+		t.Fatal("清除后不应再有插播")
 	}
 }
 
@@ -124,17 +132,34 @@ func TestTaskRecordRequestOnceAndCleared(t *testing.T) {
 func TestProcessSessionEventRoutes(t *testing.T) {
 	clearTaskRecord()
 	processSessionEvent([]byte(`{"type":"todo/write","data":{"todos":[{"status":"completed"}]}}`))
-	if taskRecordContext() == "" {
-		t.Fatal("待办全部完成应登记请求")
+	if takeTaskRecordNotice() == "" {
+		t.Fatal("待办全部完成应登记插播")
 	}
 	processSessionEvent([]byte(`{"type":"user/message","data":{"Content":"next"}}`))
-	if taskRecordContext() != "" {
-		t.Fatal("用户新输入应清掉上一任务的请求")
+	if got := takeTaskRecordNotice(); got != "" {
+		t.Fatal("用户新输入应清掉上一任务的插播")
 	}
 	processSessionEvent([]byte(`{"type":"goal/change","data":{"Snapshot":{"Phase":"complete"}}}`))
 	// 用户输入事件已清空，此处应重新登记
-	if taskRecordContext() == "" {
-		t.Fatal("目标完成应登记请求")
+	if takeTaskRecordNotice() == "" {
+		t.Fatal("目标完成应登记插播")
 	}
 	clearTaskRecord()
+}
+
+// TestTaskNoticePayloadShape 插播载荷形状：{"append":[{"role":"system","content":…}]}。
+// 宿主按这个约定把它追加到本轮消息末尾（不改 system prompt）。
+func TestTaskNoticePayloadShape(t *testing.T) {
+	var payload struct {
+		Append []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"append"`
+	}
+	if err := json.Unmarshal([]byte(taskNoticePayload("task done")), &payload); err != nil {
+		t.Fatalf("载荷应可解析: %v", err)
+	}
+	if len(payload.Append) != 1 || payload.Append[0].Role != "system" || payload.Append[0].Content != "task done" {
+		t.Fatalf("载荷不符: %+v", payload)
+	}
 }
