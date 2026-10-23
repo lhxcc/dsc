@@ -243,6 +243,8 @@ func TestInternalFindExecSemicolon(t *testing.T) {
 		// 退出码为谓词真假：仅 dep.js 命中，故只对它执行后续 -print
 		{`find . -type f -exec grep -l '^dep$' {} \; -print`,
 			"./node_modules/dep.js\n./node_modules/dep.js\n"},
+		// -exec + grep -q：静默判据，命中才 -print（模型筛文件最常用的组合）
+		{`find . -name '*.js' -exec grep -q other {} \; -print`, "./src/other.js\n"},
 		// {} 按子串替换（对齐 GNU），不限于独占一个参数
 		{`find . -name 'top.txt' -exec echo 'x{}y' \;`, "x./top.txty\n"},
 	}
