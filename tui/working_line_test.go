@@ -13,7 +13,8 @@ import (
 	"dsc/core"
 )
 
-// TestThinkingLineShowsElapsedHintAndDownstream 思考中行显示耗时、取消快捷键与下行数据。
+// TestThinkingLineShowsElapsedHintAndDownstream 工作行显示动画文字、耗时、取消快捷键与下行数据。
+// 文案随本轮随机选中的动画语种变化，故断言「两者之一 + 尾部提示」，不锁死某一语种。
 func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -22,11 +23,16 @@ func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m.turnTokens = 2048
 
 	content := ansi.Strip(m.View().Content)
-	if !strings.Contains(content, "思考中... (5 秒 · Ctrl+C 取消)") {
-		t.Fatalf("思考中行应含耗时与取消提示: %q", content)
+	if !strings.Contains(content, "(5 秒 · Ctrl+C 取消)") {
+		t.Fatalf("工作行应含耗时与取消提示: %q", content)
+	}
+	// 英文动画进行中大小写是混的（Deep SeekINg..），故按忽略大小写判断
+	low := strings.ToLower(content)
+	if !strings.Contains(content, "深度求索中") && !strings.Contains(low, "deep seeking") && !strings.Contains(low, "deep thinking") {
+		t.Fatalf("工作行应含动画文字: %q", content)
 	}
 	if !strings.Contains(content, "↓2K") {
-		t.Fatalf("思考中行应含下行数据: %q", content)
+		t.Fatalf("工作行应含下行数据: %q", content)
 	}
 }
 

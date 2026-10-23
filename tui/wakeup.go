@@ -44,6 +44,8 @@ func (m *Model) startTurn(text string, images []string, rendered string, warning
 		m.appendMessage(warnSty.Render(warning))
 	}
 	m.thinking = true
+	// 工作行动画每轮重新随机一种（中/英文案），帧号归零重新起播
+	m.thinkAnim.reset()
 	// 新一轮运行指标重置：耗时计时起点、下行数据、缓存命中
 	m.runStart = time.Now()
 	m.elapsed = 0

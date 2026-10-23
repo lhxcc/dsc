@@ -278,6 +278,10 @@ type Model struct {
 	input    textarea.Model
 	spinner  spinner.Model
 
+	// 工作行文字动画（见 thinking.go）：每轮随机中/英文案，帧号随 spinner 的
+	// tick 推进——不另开定时器，spinner 的启停即动画的启停。
+	thinkAnim thinkAnim
+
 	ready     bool // viewport 在收到首个窗口尺寸后初始化
 	thinking  bool // 正在等待 agent 响应
 	streaming bool // 正在流式输出
@@ -408,6 +412,7 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		contextWindow:    contextWindow,
 		input:            input,
 		spinner:          s,
+		thinkAnim:        thinkAnim{kind: randThinkKind()},
 		currentSessionID: defaultSessionID(manager),
 		wakeBudget:       maxConsecutiveWakes,
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
@@ -890,6 +895,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.thinking || m.streaming {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
+			m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
 			return m, cmd
 		}
 		return m, nil
@@ -3511,11 +3517,15 @@ func (m *Model) View() tea.View {
 		parts = append(parts, q)
 	}
 	if m.thinking || m.streaming {
-		line := "  " + m.spinner.View() + fmt.Sprintf(" 思考中... (%d 秒 · Ctrl+C 取消)", m.elapsed)
+		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
+		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
+		// 所以只有尾部提示用 dim。
+		line := "  " + m.spinner.View() + " " + m.thinkAnim.text() +
+			dimSty.Render(fmt.Sprintf(" (%d 秒 · Ctrl+C 取消)", m.elapsed))
 		if m.turnTokens > 0 {
-			line += " · ↓" + shortTokens(m.turnTokens)
+			line += dimSty.Render(" · ↓" + shortTokens(m.turnTokens))
 		}
-		parts = append(parts, dimSty.Render(line))
+		parts = append(parts, line)
 	}
 	if tp := m.renderTodoPanel(); tp != "" {
 		parts = append(parts, tp)
