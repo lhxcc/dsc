@@ -9,9 +9,13 @@ func TestIsVersionCommand(t *testing.T) {
 		want bool
 	}{
 		{"裸 version", []string{"version"}, true},
+		{"-version", []string{"-version"}, true},
+		{"--version", []string{"--version"}, true},
+		{"-v", []string{"-v"}, true},
 		{"无参", nil, false},
 		{"仅无值 flag", []string{"-headless"}, false},
 		{"-input 取值后跟 version（取值不算位置参数）", []string{"-input", "hi", "version"}, true},
+		{"version 作为 -input 的取值不算版本命令", []string{"-input", "version"}, false},
 		{"version 不是首个位置参数", []string{"session", "version"}, false},
 		{"无值 flag 后跟 version", []string{"-debugger", "version"}, true},
 		{"带值 flag 的取值不算位置参数", []string{"-mode", "minimal", "version"}, true},

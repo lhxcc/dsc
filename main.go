@@ -17,6 +17,7 @@ import (
 
 	"dsc/core"
 	"dsc/tui"
+
 	"github.com/hashicorp/go-hclog"
 	"gopkg.in/yaml.v3"
 )
@@ -418,6 +419,13 @@ func main() {
 		}
 	}
 
+	// 未知 flag 响亮失败：此前静默忽略并落入 TUI（`dsc --version` 这类拼写
+	// 错误在管道/嵌套调用下会一直阻塞），现直接给用法并以 2 退出。
+	if err := validateStartupArgs(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "dsc: %v\n\n%s", err, startupUsage)
+		os.Exit(2)
+	}
+
 	// -headless 精简无头模式校验：任务必须来自 -input 且非空白（对齐 harness headless：
 	// 缺失/空白任务为用法错误，任何东西都不执行并退出 1）
 	if headless {
@@ -425,6 +433,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, "headless mode requires -input <task>")
 			os.Exit(1)
 		}
+	}
+
+	// 交互式 TUI 需要终端：无 -input 且 stdin/stdout 任一不是终端时尽早失败。
+	// 放在加载配置/插件之前，避免「先起插件与 cron，再卡死在 TUI」——嵌套调用
+	//（如在 agent 的 shell 工具里再启动 dsc）与管道重定向都会命中这里。
+	if strings.TrimSpace(inputText) == "" && !stdioIsTerminal() {
+		fmt.Fprintln(os.Stderr, "dsc: interactive TUI requires a terminal; use -input \"<task>\" for a one-shot run, or `dsc version`")
+		os.Exit(2)
 	}
 
 	logger := hclog.New(&hclog.LoggerOptions{

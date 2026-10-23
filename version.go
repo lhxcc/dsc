@@ -17,14 +17,18 @@ import (
 //go:embed VERSION
 var versionFile string
 
-// isVersionCommand 判断命令行是否为 `dsc version`：第一个非 flag 参数（不以 -
-// 开头）为 "version" 时输出版本信息；-input 等带值 flag 会被跳过（其值不算位置
-// 参数），判定规则与 `dsc setup` 一致。
+// isVersionCommand 判断命令行是否请求版本信息：`dsc version` 或等价的
+// `-version` / `--version` / `-v`（三种 flag 形式此前被静默忽略，会直接落入
+// 交互式 TUI，在非终端/嵌套调用下表现为「命令永远不返回」）。
+// `-input` 等带值 flag 会被跳过（其值不算位置参数），判定规则与 `dsc setup` 一致。
 func isVersionCommand(args []string) bool {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "-input" || a == "-admin" || a == "-mode" || a == "-log":
+		case a == "-version" || a == "--version" || a == "-v":
+			return true
+		case a == "-input" || a == "-admin" || a == "-mode" || a == "-log" ||
+			a == "-hooks" || a == "-patch":
 			i++ // 跳过 flag 的取值（若存在）
 		case strings.HasPrefix(a, "-"):
 			// 无值 flag（-headless / -debugger 等），跳过
