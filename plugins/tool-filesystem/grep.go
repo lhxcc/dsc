@@ -137,12 +137,12 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if exit != 0 {
 		return interp.NewExitStatus(uint8(exit))
 	}
-	// 无命中退出 1（对齐 GNU grep）。-l 同样如此：它只改变输出形态，不改变「是否有
-	// 命中」这一事实。这一点对 `find ... -exec grep -l ... {} \;` 至关重要——-exec
-	// 正是拿退出码当谓词真假，若 -l 无命中仍退 0，则「列出含 X 的文件」会退化成
-	// 「列出全部文件」。-q 同理（它更是纯粹靠退出码说话）。-c 例外：DSC 约定输出
-	// 计数（含 0）且退 0，供 `grep -c | ...` 之类的管道取数。
-	if (!opts.countOnly || opts.quiet) && matchedTotal == 0 {
+	// 无命中退出 1（对齐 GNU grep）：默认输出、-l、-q、-c 一律如此。-c 并不是例外
+	// ——GNU 同样「打印 0 但退 1」（实测 `grep -c zzz f` → 输出 0、exit 1；`grep -rc`
+	// 全零 → 逐文件打印 0、exit 1）。此前 -c 被排除在外，是加 -c/-l 时的遗留写法，
+	// 取数场景（`n=$(grep -c …)`）不看退出码，故统一后不受影响；而 `grep -c x f && …`
+	// 这类写法必须与 GNU 同结论，否则模型写对也跑错。
+	if matchedTotal == 0 {
 		return interp.NewExitStatus(1)
 	}
 	return nil
