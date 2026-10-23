@@ -194,3 +194,24 @@ func TestJobToolsOwnerIsolation(t *testing.T) {
 		t.Fatalf("foreign list = %q, %v", out, err)
 	}
 }
+
+// TestDetachJobContextSurvivesTurnCancel 后台任务不得随回合 ctx 一起被取消：
+// 现场表现为 LLM 流中断后 job 变 failed、job_output 返回 context canceled。
+func TestDetachJobContextSurvivesTurnCancel(t *testing.T) {
+	parent, cancel := context.WithCancel(WithCaller(WithApprovalPolicy(context.Background(), "ask"), "session-7"))
+	jobCtx := detachJobContext(parent)
+	cancel()
+
+	select {
+	case <-jobCtx.Done():
+		t.Fatal("后台任务 ctx 不应随回合取消")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// 归属信息必须保留（工具流水线据此判定审批策略与会话）
+	if got := CallerFromContext(jobCtx); got != "session-7" {
+		t.Fatalf("caller = %q, want session-7", got)
+	}
+	if got := ApprovalPolicyFromContext(jobCtx); got != "ask" {
+		t.Fatalf("approval policy = %q, want ask", got)
+	}
+}

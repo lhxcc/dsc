@@ -428,6 +428,13 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 		label = fmt.Sprintf("%s: %s", toolName, truncateStr(p.Command, 60))
 	}
 
+	// 后台任务与当前回合解耦：调用方 ctx 在回合被中断（LLM 流错误、用户 Ctrl+C、
+	// 会话切走）时会被取消，若直接沿用它，后台作业会被一起判为 failed
+	// （"rpc error: code = Canceled desc = context canceled"），输出也随之丢失——
+	// 而 `run_in_background` 的语义正是「脱离本轮继续跑」。这里复制归属信息
+	//（会话、审批策略）到独立 ctx，生命周期交给 job 注册表（job_kill/进程退出）。
+	jobCtx := detachJobContext(ctx)
+
 	jobID, err := m.jobs.Start(jobs.StartSpec{
 		Kind:  toolName,
 		Label: label,
@@ -438,7 +445,7 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 
 			go func() {
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
-				result, _, err := m.executeBackgroundPipeline(ctx, toolName, argsJSON)
+				result, _, err := m.executeBackgroundPipeline(jobCtx, toolName, argsJSON)
 				if err != nil {
 					doneCh <- jobs.JobOutcome{Status: jobs.StatusFailed, Detail: err.Error(), Output: result}
 				} else {
@@ -464,6 +471,21 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 
 	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
 	return result, "", nil
+}
+
+// detachJobContext 把后台任务从「回合 ctx」解绑：保留归属信息（会话 id、审批策略），
+// 但不继承取消信号。回合被中断（LLM 流错误 / 用户中断 / 会话切走）时，若后台任务
+// 仍挂在同一 ctx 上，会被判 failed 且输出丢失——而 run_in_background 的语义正是
+// 脱离本轮继续跑，终止只能经 job_kill 或进程退出。
+func detachJobContext(ctx context.Context) context.Context {
+	dctx := context.Background()
+	if c := CallerFromContext(ctx); c != "" {
+		dctx = WithCaller(dctx, c)
+	}
+	if pol := ApprovalPolicyFromContext(ctx); pol != "" {
+		dctx = WithApprovalPolicy(dctx, pol)
+	}
+	return dctx
 }
 
 // executeBackgroundPipeline 在后台执行完整工具流水线（不含 run_in_background 检测，
