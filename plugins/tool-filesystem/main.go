@@ -240,25 +240,79 @@ func mapWorkspacePath(p string) string {
 	return core.MapWorkspacePath(p)
 }
 
-// mapWorkspacePaths 遍历 shell AST，把纯字面量词中的 /workspace 虚拟根前缀重写为真实路径。
-// 只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/命令替换等复杂词不改，
-// 避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b" 等均被覆盖。
+// mapWorkspacePaths 遍历 shell AST，把纯字面量词中的虚拟根前缀重写为真实路径：
+// 工作空间根 /workspace（跨平台，见 core.MapWorkspacePath）与临时目录 /tmp（仅 Windows，
+// 见 mapTempPath）。只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/
+// 命令替换等复杂词不改，避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b"、
+// cd /tmp、ls /tmp/x 等均被覆盖——包括 cd 内建（改 runner.Dir，不经文件操作的 res()），
+// 这正是此前 /tmp 在 cd 下失效而文件操作下正常的根因。
 func mapWorkspacePaths(node syntax.Node) {
+	mapWorkspacePathsFor(node, runtime.GOOS)
+}
+
+// mapWorkspacePathsFor 是 mapWorkspacePaths 的 goos 注入变体（便于跨平台测试）；
+// 生产路径使用真实 runtime.GOOS。
+func mapWorkspacePathsFor(node syntax.Node, goos string) {
 	syntax.Walk(node, func(n syntax.Node) bool {
 		switch v := n.(type) {
 		case *syntax.Lit:
-			v.Value = mapWorkspacePath(v.Value)
+			v.Value = mapShellLitFor(v.Value, goos)
 		case *syntax.SglQuoted:
-			v.Value = mapWorkspacePath(v.Value)
+			// SglQuoted 自身即内容（无独立 Lit 子节点），改写后不再下钻，
+			// 否则 Walk 会继续进入其子节点把已改写的值再映射一次（见 DblQuoted 注释）。
+			v.Value = mapShellLitFor(v.Value, goos)
+			return false
 		case *syntax.DblQuoted:
+			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会再被
+			// 上面的 *syntax.Lit 分支映射第二次。此前的 workspace 映射幂等（已映射值
+			// 不再以 /workspace 开头）而看不出问题，但 /tmp 映射不幂等——已映射的
+			// /tmp/myws/... 会被二次改写为临时目录，导致 cd /workspace 等被误伤。
 			for _, part := range v.Parts {
 				if lit, ok := part.(*syntax.Lit); ok {
-					lit.Value = mapWorkspacePath(lit.Value)
+					lit.Value = mapShellLitFor(lit.Value, goos)
 				}
 			}
+			return false
 		}
 		return true
 	})
+}
+
+// mapShellLitFor 合并两个虚拟根映射（goos 显式注入便于测试）：
+//   - /tmp → DSC 临时目录（仅 Windows；Unix 上 /tmp 是真实挂载点，原样）
+//   - /workspace → 工作空间根（跨平台，见 core.MapWorkspacePath）
+//
+// 次序关键：必须先做 /tmp 映射，再做 /workspace 映射。两者前缀互不相交，正常输入下
+// 次序无所谓；但若工作空间根自身落在 /tmp/... 下（用户从 /tmp 启动 dsc，或
+// DSC_WORKSPACE_ROOT=/tmp/...），先做 /workspace 映射会把根改写成 /tmp/...，再被 /tmp
+// 映射误伤成临时目录——此前 TestMapWorkspaceAST 的假根 /tmp/myws 就踩中此碰撞。
+// Windows 上 /tmp 会被 mvdan/sh 解析成当前盘根（如 E:\tmp），没有真实挂载点，故需在
+// AST 层就把 /tmp 字面量改写成临时目录，使 cd /tmp 与文件操作一致落到 DSC temp
+// （res() 仅对文件操作参数与重定向目标做同名映射，漏了 cd 内建）。
+func mapShellLitFor(p, goos string) string {
+	return mapWorkspacePath(mapTempPathFor(p, dsc.TempDir(), goos))
+}
+
+// mapTempPath 把模型的 /tmp 虚拟根字面量重写为 DSC 临时目录（Windows 专用）。
+func mapTempPath(p string) string {
+	return mapTempPathFor(p, dsc.TempDir(), runtime.GOOS)
+}
+
+// mapTempPathFor 是 mapTempPath 的纯函数本体（goos 显式注入便于测试），语义与 res()
+// 的 /tmp 分支（见 internalcmds.go）保持一致：/tmp 与 /tmp/... 映射到临时目录，
+// Unix 上 /tmp 是真实挂载点，原样不动。
+func mapTempPathFor(p, tempDir, goos string) string {
+	if goos != "windows" {
+		return p
+	}
+	if p == "/tmp" || strings.HasPrefix(p, "/tmp/") {
+		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
+		if rel == "" {
+			return tempDir
+		}
+		return dsc.PJoin(tempDir, rel)
+	}
+	return p
 }
 
 // shellView 为 shell 工具声明结构化视图：标题 Shell + 退出码徽标（0 绿 / 非 0 红）

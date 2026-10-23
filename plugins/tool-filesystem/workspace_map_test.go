@@ -182,3 +182,76 @@ func TestMapWorkspaceASTBareRoot(t *testing.T) {
 		})
 	}
 }
+
+// TestMapTempPathFor 校验 /tmp 虚拟根映射的纯函数本体（goos 显式注入，跨平台全覆盖）：
+//   - Windows：/tmp 与 /tmp/... → 临时目录（与 res() 的 /tmp 分支一致）
+//   - Unix：/tmp 是真实挂载点，原样不动
+//   - 边界：/tmpfoo、/tmpx 不是别名；/workspace 等其它前缀不受影响
+func TestMapTempPathFor(t *testing.T) {
+	cases := []struct {
+		in, tempDir, goos, want string
+	}{
+		{"/tmp", "/tmp/mytemp", "windows", "/tmp/mytemp"},
+		{"/tmp/", "/tmp/mytemp", "windows", "/tmp/mytemp"},
+		{"/tmp/a/b.txt", "/tmp/mytemp", "windows", "/tmp/mytemp/a/b.txt"},
+		{"/tmp/sub", "/tmp/mytemp", "windows", "/tmp/mytemp/sub"},
+		// Unix：/tmp 是真实挂载点，原样
+		{"/tmp", "/tmp/mytemp", "linux", "/tmp"},
+		{"/tmp/a", "/tmp/mytemp", "darwin", "/tmp/a"},
+		// 边界：/tmpfoo 不是别名
+		{"/tmpfoo/x", "/tmp/mytemp", "windows", "/tmpfoo/x"},
+		{"/tmpx", "/tmp/mytemp", "windows", "/tmpx"},
+		// 非 /tmp 路径原样（包括 /workspace）
+		{"/workspace/x", "/tmp/mytemp", "windows", "/workspace/x"},
+	}
+	for _, c := range cases {
+		if got := mapTempPathFor(c.in, c.tempDir, c.goos); got != c.want {
+			t.Fatalf("mapTempPathFor(%q, %q, %q) = %q, want %q", c.in, c.tempDir, c.goos, got, c.want)
+		}
+	}
+}
+
+// TestMapTempAST 校验 AST 层重写同时覆盖 /workspace 与 /tmp：Windows 上 /tmp 字面量
+// 被改写成临时目录（修复 cd /tmp 在 Windows 上落到当前盘根而失败），Unix 上保持原样；
+// /workspace 映射不受 /tmp 处理影响（两前缀互不相交）。
+func TestMapTempAST(t *testing.T) {
+	setRoot(t, "/tmp/myws")
+	t.Setenv("DSC_TEMP_DIR", "/tmp/mytemp")
+
+	cases := []struct {
+		in, wantWindows, wantUnix string
+	}{
+		{`cd /workspace`, `cd /tmp/myws`, `cd /tmp/myws`},
+		{`cd /tmp`, `cd /tmp/mytemp`, `cd /tmp`},
+		{`ls -la /tmp/sub`, `ls -la /tmp/mytemp/sub`, `ls -la /tmp/sub`},
+		{`cat "/tmp/x.txt"`, `cat "/tmp/mytemp/x.txt"`, `cat "/tmp/x.txt"`},
+		{`cd /tmp && echo hi`, `cd /tmp/mytemp && echo hi`, `cd /tmp && echo hi`},
+		// 边界：/tmpfoo 不改
+		{`touch /tmpfoo/x`, `touch /tmpfoo/x`, `touch /tmpfoo/x`},
+		// 共存：一个命令里既有 /workspace 又有 /tmp
+		{`cp /workspace/a /tmp/b`, `cp /tmp/myws/a /tmp/mytemp/b`, `cp /tmp/myws/a /tmp/b`},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			goos := runtime.GOOS
+			want := c.wantUnix
+			if goos == "windows" {
+				want = c.wantWindows
+			}
+			parser := syntax.NewParser()
+			file, err := parser.Parse(strings.NewReader(c.in+"\n"), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mapWorkspacePathsFor(file, goos)
+			var sb strings.Builder
+			if err := syntax.NewPrinter().Print(&sb, file); err != nil {
+				t.Fatal(err)
+			}
+			got := strings.TrimSpace(sb.String())
+			if got != want {
+				t.Fatalf("mapWorkspacePathsFor(%q, %q)\n got: %q\nwant: %q", c.in, goos, got, want)
+			}
+		})
+	}
+}
