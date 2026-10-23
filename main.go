@@ -763,6 +763,13 @@ func main() {
 		contextWindow = defaultContextWindow
 	}
 	logger.Info("context window", "window", contextWindow, "source", windowSource)
+	// 工作区根与默认会话标识：会话存档文件名就是「工作区路径 → 会话键」的编码，
+	// 所以「历史没加载」最常见的两种原因都能在这一行看出来——①工作区根不是你以为的
+	// 那个目录（例如从资源管理器启动 dsc.exe，cwd 变成程序目录）；②会话键与已有存档
+	// 文件名不一致。用 -log 启动即可核对，无需猜。
+	logger.Info("session identity", "workspace_root", core.WorkspaceRoot,
+		"default_session", session.SessionKeyForProject(core.WorkspaceRoot),
+		"session_dir", session.Dir(execDir))
 	// 文本引用注入上限随上下文容量换算（TUI 与 -input 共用；窗口未知保持默认 1 MiB）
 	tui.SetTextRefContextWindow(contextWindow)
 

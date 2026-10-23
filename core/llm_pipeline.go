@@ -108,7 +108,11 @@ func (s *llmProviderServer) HealthCheck(ctx context.Context, req *proto.HealthCh
 func protoMessagesToPlugin(req *proto.ChatRequest) ([]Message, []Tool) {
 	messages := make([]Message, len(req.Messages))
 	for i, m := range req.Messages {
-		msg := Message{Role: m.Role, Content: m.Content, Images: m.Images}
+		// ToolCallID 必须原样透传：tool 消息在 OpenAI 协议里靠 tool_call_id 与前面的
+		// assistant.tool_calls 配对，缺了它 DeepSeek/OpenAI 直接 422
+		// （`missing field tool_call_id`）。此前这里漏抄，而 grpc_llm.go 的同名转换
+		// 是抄了的——两条路径不一致，导致 Anthropic（按顺序配对）能用、OpenAI 不能用。
+		msg := Message{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallId, Images: m.Images}
 		if len(m.ToolCalls) > 0 {
 			msg.ToolCalls = make([]ToolCall, len(m.ToolCalls))
 			for j, tc := range m.ToolCalls {
