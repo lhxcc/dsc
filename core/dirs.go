@@ -15,6 +15,8 @@ import (
 const (
 	// SkillsDirName 技能目录名（相对 ExecDir）。
 	SkillsDirName = "skills"
+	// TempDirName 临时目录名（相对 ExecDir）。
+	TempDirName = "temp"
 	// MemoryDirName 记忆库目录名（相对 ExecDir）。
 	MemoryDirName = "memory"
 )
