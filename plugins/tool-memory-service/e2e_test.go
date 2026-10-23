@@ -124,19 +124,20 @@ func TestE2EWithHostClient(t *testing.T) {
 		}
 		return resp
 	}
-	if resp := run("memory_add", `{"content":"用户偏好：用粤语交流","source":"user"}`); resp.Error != "" {
+	if resp := run("memory_add", `{"content":"用户偏好：用粤语交流","source":"user","scope":"global"}`); resp.Error != "" {
 		t.Fatalf("memory_add = %+v", resp)
 	} else if v := assertView(t, resp); v.Kind != "card" || v.Title != "Memory" || v.Badge == nil || v.Badge.Text != "saved" {
 		t.Fatalf("memory_add view = %+v", v)
 	}
-	if resp := run("memory_search", `{"query":"粤语"}`); resp.Error != "" || !strings.Contains(resp.Content, "粤语") {
+	// 全局层需要显式 scope=global 才检索（默认只查当前项目）
+	if resp := run("memory_search", `{"query":"粤语","scope":"global"}`); resp.Error != "" || !strings.Contains(resp.Content, "粤语") {
 		t.Fatalf("memory_search = %+v", resp)
 	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "Memory" || len(v.Rows) == 0 || v.Rows[0]["content"] == "" {
 		t.Fatalf("memory_search view = %+v", v)
 	}
 	// 回归：带标点的检索词（如文件名 config.yaml、README.md）不应触发 FTS5 语法错误
 	//（裸词中的 '.' 会被 FTS5 当作语法字符）。修复前此类查询报 "fts5: syntax error near '.'"。
-	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user"}`); resp.Error != "" {
+	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user","scope":"project"}`); resp.Error != "" {
 		t.Fatalf("memory_add(punct) = %+v", resp)
 	}
 	if resp := run("memory_search", `{"query":"config.yaml"}`); resp.Error != "" {

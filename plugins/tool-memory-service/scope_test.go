@@ -79,9 +79,9 @@ func TestProjectScopeIsolation(t *testing.T) {
 	if got := searchVia(t, "CMake", ""); len(got) != 0 {
 		t.Fatalf("scope 缺省应按 project 处理: %+v", got)
 	}
-	// 未定义的档位（含此前的 all）回退默认 project，不会变成「全库」
-	if got := searchVia(t, "CMake", "all"); len(got) != 0 {
-		t.Fatalf("未知 scope 应回退 project，got %d 条", len(got))
+	// 未知档位直接报错，不会静默换成「全库」或别的范围
+	if _, err := handleSearch(context.Background(), mustJSON(map[string]string{"keywords": "CMake", "scope": "all"})); err == nil {
+		t.Fatal("未知 scope 应报错")
 	}
 
 	// A 项目自己看得到
@@ -170,8 +170,8 @@ func TestProjectLabel(t *testing.T) {
 	if got := projectLabel(globalProject); got != "全局" {
 		t.Fatalf("全局哨兵应显示全局，got %q", got)
 	}
-	if got := projectLabel(""); got != "未归属" {
-		t.Fatalf("空值应显示未归属，got %q", got)
+	if got := projectLabel("w--proj-1A2B3C4D"); got != "w--proj-1A2B3C4D" {
+		t.Fatalf("项目键应原样展示，got %q", got)
 	}
 	if got := projectLabel("w--proj-a-1234ABCD"); got != "w--proj-a-1234ABCD" {
 		t.Fatalf("项目键应原样展示，got %q", got)
@@ -190,5 +190,81 @@ func TestMemoryProjectColumnStamp(t *testing.T) {
 	}
 	if want := dsc.ProjectSessionKey(); mem.Project != want {
 		t.Fatalf("project = %q, want %q", mem.Project, want)
+	}
+}
+
+// mustJSON 测试辅助：把任意值编码为 json.RawMessage。
+func mustJSON(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// TestAddRequiresScope scope 必填且只接受两档：缺省或乱填都应报错，
+// 不允许写出「没有归属」的记忆（那种数据无法管理）。
+func TestAddRequiresScope(t *testing.T) {
+	setupMemoryDB(t)
+	asProject(t, "/w/proj-a")
+
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "缺归属"})); err == nil {
+		t.Fatal("缺 scope 应报错")
+	}
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "乱填", "scope": "all"})); err == nil {
+		t.Fatal("非法 scope 应报错")
+	}
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "空串", "scope": " "})); err == nil {
+		t.Fatal("空白 scope 应报错")
+	}
+
+	var count int64
+	DB.Model(&Memory{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("报错的写入不应落库，got %d 行", count)
+	}
+
+	// 合法写入仍正常
+	addVia(t, "有归属", "project")
+	DB.Model(&Memory{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("合法写入应落 1 行，got %d", count)
+	}
+}
+
+// TestUpdateScopeValidates 改归属时给非法值要报错；不传 scope 则不动归属。
+func TestUpdateScopeValidates(t *testing.T) {
+	setupMemoryDB(t)
+	asProject(t, "/w/proj-a")
+	res := addVia(t, "条目", "project")
+	id := int64(res["id"].(float64))
+
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "scope": "all"})); err == nil {
+		t.Fatal("非法 scope 应报错")
+	}
+	var mem Memory
+	if err := DB.First(&mem, id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if mem.Project != currentProjectKey() {
+		t.Fatalf("报错不应改归属，got %q", mem.Project)
+	}
+
+	// 不传 scope、只改内容 → 归属不变
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "content": "条目2"})); err != nil {
+		t.Fatalf("改内容应成功: %v", err)
+	}
+	DB.First(&mem, id)
+	if mem.Project != currentProjectKey() {
+		t.Fatalf("未传 scope 时归属应保持，got %q", mem.Project)
+	}
+
+	// 显式改到全局层
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "scope": "global"})); err != nil {
+		t.Fatalf("改到全局应成功: %v", err)
+	}
+	DB.First(&mem, id)
+	if mem.Project != globalProject {
+		t.Fatalf("应改到全局哨兵，got %q", mem.Project)
 	}
 }

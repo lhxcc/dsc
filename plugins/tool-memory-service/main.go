@@ -40,9 +40,10 @@ type Memory struct {
 	AccessCount int    `gorm:"not null;default:0" json:"access_count"`
 	Archived    bool   `gorm:"not null;default:false;index" json:"archived"`
 	Source      string `gorm:"type:text;default:'user'" json:"source"`
-	// Project 记忆归属的项目键（session.SessionKeyForProject 生成，与 sessions/ 同一命名）；
-	// 空串表示全局（跨项目共享，如用户偏好）。
-	Project string `gorm:"type:text;not null;default:'';index" json:"project"`
+	// Project 记忆归属：项目键（session.SessionKeyForProject 生成，与 sessions/ 同一命名）
+	// 或全局层哨兵 globalProject。NOT NULL 且无默认值——写入必须显式给归属，
+	// 库里不存在「未归属」这种中间状态。
+	Project string `gorm:"type:text;not null;index" json:"project"`
 }
 
 // 记忆作用域只有两档，语义严格、互不重叠：
@@ -68,16 +69,36 @@ func currentProjectKey() string {
 	return dsc.ProjectSessionKey()
 }
 
-// normalizeScope 规整 scope 参数：空取默认，未知取值回退默认（不报错，
-// 记忆查询是只读操作，宁可按默认范围返回也不阻断模型）。
-func normalizeScope(raw, def string) string {
+// parseWriteScope 校验写入侧的 scope：必填，且只能是 project / global。
+// 不做「空值回退默认」——那样会留下没有归属的记忆（难以管理），也让调用方
+// 分不清自己到底写进了哪一层。
+func parseWriteScope(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case scopeProject:
-		return scopeProject
+		return scopeProject, nil
 	case scopeGlobal:
-		return scopeGlobal
+		return scopeGlobal, nil
+	case "":
+		return "", fmt.Errorf("scope is required: project (current project) or global (shared across projects)")
 	}
-	return def
+	return "", fmt.Errorf("invalid scope %q: want project or global", raw)
+}
+
+// parseReadScope 校验读取侧的 scope：缺省为 project（只读操作给默认值无害，
+// 不会产生任何数据），但给了非法取值就报错，不静默换成别的范围。
+func parseReadScope(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return scopeProject, nil
+	}
+	return parseWriteScope(raw)
+}
+
+// scopeProjectValue 把 scope 映射为 project 列的存值。
+func scopeProjectValue(scope string) string {
+	if scope == scopeGlobal {
+		return globalProject
+	}
+	return currentProjectKey()
 }
 
 // scopeWhere 给查询加上归属过滤（两档严格互斥，不做隐式合并）。
@@ -301,7 +322,11 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 		kwStr = req.Query
 	}
 	now := time.Now()
-	results, err := searchMemories(kwStr, now, normalizeScope(req.Scope, scopeProject))
+	scope, err := parseReadScope(req.Scope)
+	if err != nil {
+		return "", err
+	}
+	results, err := searchMemories(kwStr, now, scope)
 	if err != nil {
 		return "", err
 	}
@@ -371,10 +396,11 @@ func handleAdd(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Content == "" {
 		return "", fmt.Errorf("content is required")
 	}
-	project := currentProjectKey()
-	if normalizeScope(req.Scope, scopeProject) == scopeGlobal {
-		project = globalProject
+	scope, err := parseWriteScope(req.Scope)
+	if err != nil {
+		return "", err
 	}
+	project := scopeProjectValue(scope)
 	id, dedup, err := addMemory(req.Content, req.Source, project)
 	if err != nil {
 		return "", err
@@ -421,10 +447,10 @@ func handleDelete(ctx context.Context, args json.RawMessage) (string, error) {
 
 func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 	var req struct {
-		ID      int64  `json:"id"`
-		Content string `json:"content"`
-		Source  string `json:"source"`
-		Scope   string `json:"scope"`
+		ID      int64   `json:"id"`
+		Content string  `json:"content"`
+		Source  string  `json:"source"`
+		Scope   *string `json:"scope"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -440,13 +466,13 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Source != "" {
 		updates["source"] = req.Source
 	}
-	if req.Scope != "" {
-		// 允许把条目改归属（例如把历史遗留的全局条目收进当前项目）
-		if normalizeScope(req.Scope, "") == scopeGlobal {
-			updates["project"] = globalProject
-		} else {
-			updates["project"] = currentProjectKey()
+	if req.Scope != nil {
+		// 允许在两档之间改归属（例如把全局条目收进当前项目）
+		scope, err := parseWriteScope(*req.Scope)
+		if err != nil {
+			return "", err
 		}
+		updates["project"] = scopeProjectValue(scope)
 	}
 	if len(updates) == 0 {
 		return "", fmt.Errorf("at least one of content, source or scope must be provided")
@@ -495,7 +521,11 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 		req.PageSize = maxPageSize
 	}
 
-	query := scopeWhere(DB.Model(&Memory{}), normalizeScope(req.Scope, scopeProject))
+	scope, err := parseReadScope(req.Scope)
+	if err != nil {
+		return "", err
+	}
+	query := scopeWhere(DB.Model(&Memory{}), scope)
 	if req.Source != "" {
 		query = query.Where("source = ?", req.Source)
 	}
@@ -525,13 +555,10 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 视图 ----
 
-// projectLabel 把归属值渲染为可读标签：全局层显示「全局」，空值（未归属）显示「未归属」。
+// projectLabel 把归属值渲染为可读标签：全局层显示「全局」，项目键原样展示。
 func projectLabel(project string) string {
-	switch project {
-	case globalProject:
+	if project == globalProject {
 		return "全局"
-	case "":
-		return "未归属"
 	}
 	return project
 }
@@ -664,7 +691,7 @@ func main() {
                 "properties": {
                         "query": {"type": "string", "description": "自然语言查询语句"},
                         "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "检索范围：project=仅当前项目（默认），global=仅全局共享层"}
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "检索范围：project=仅当前项目（缺省），global=仅全局共享层"}
                 },
                 "description": "query 与 keywords 至少提供一个"
         }`)
@@ -673,9 +700,9 @@ func main() {
                 "properties": {
                         "content": {"type": "string", "description": "要保存的记忆内容"},
                         "source": {"type": "string", "description": "记忆来源标记，缺省 user"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "归属：project=当前项目（默认），global=跨项目共享（用户偏好、通用约定）"}
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "必填归属：project=当前项目，global=跨项目共享（用户偏好、通用约定）"}
                 },
-                "required": ["content"]
+                "required": ["content", "scope"]
         }`)
 	deleteSchema := json.RawMessage(`{
                 "type": "object",
@@ -700,7 +727,7 @@ func main() {
                         "page": {"type": "integer", "description": "页码，从 1 开始，默认 1"},
                         "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 100"},
                         "source": {"type": "string", "description": "按来源筛选（可选）"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "范围：project=仅当前项目（默认），global=仅全局共享层"},
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "范围：project=仅当前项目（缺省），global=仅全局共享层"},
                         "archived": {"type": "boolean", "description": "是否只看已归档记忆，默认 false"}
                 }
         }`)
@@ -724,7 +751,7 @@ func main() {
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
 			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。" +
-				"记忆归属分两档（memory_add 的 scope=project/global）：project 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
+				"记忆归属分两档且必填（memory_add 的 scope=project/global）：project 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
 		},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memorySearchView(result)
@@ -733,7 +760,7 @@ func main() {
 	// 增
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_add",
-		Description: "添加一条记忆到记忆库：把值得长期保留的信息（如用户偏好、项目约定、重要结论、本次任务的经验教训）写入记忆库，供后续 memory_search 检索。默认归属当前项目（scope=project）；跨项目通用的事实用 scope=global。",
+		Description: "添加一条记忆到记忆库：把值得长期保留的信息（如用户偏好、项目约定、重要结论、本次任务的经验教训）写入记忆库，供后续 memory_search 检索。必须指定 scope：project 归当前项目，global 供跨项目共享（用户偏好、通用约定）。",
 		Schema:      addSchema,
 		Handler:     handleAdd,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
