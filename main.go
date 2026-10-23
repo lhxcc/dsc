@@ -298,6 +298,20 @@ func main() {
 		}
 	}()
 
+	// dsc help / -h / --help：打印用法后直接退出（不加载插件、不进 TUI）。
+	// 必须放在 version/setup 之前——两者都会扫位置参数，`dsc help` 不该被它们先吃掉。
+	if isHelpCommand(os.Args[1:]) {
+		printHelp()
+		os.Exit(0)
+	}
+
+	// 未知旗标/位置参数 fail-loud：此前一律被静默忽略，`dsc -h`、`dsc hepl` 这类
+	// 拼写错误会直接启动 TUI，用户只看到「命令没按预期做」，比报错难查得多。
+	if err := checkArgs(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
 	// dsc version：输出版本信息后直接退出（不加载插件、不进 TUI）。
 	if isVersionCommand(os.Args[1:]) {
 		printVersion()
