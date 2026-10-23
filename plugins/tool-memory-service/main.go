@@ -357,6 +357,22 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 增 (memory_add) ----
 
+// loadVisibleMemory 取一条「对当前调用方可见」的记忆：归属必须是当前项目或全局层。
+//
+// 别的项目的行一律按「不存在」处理（不泄露存在性）：memory_delete / memory_update
+// 按 ID 操作，而 ID 是自增的、可猜——没有这道校验，模型可以用 id=1..N 遍历删改
+// 其它项目的记忆（甚至用 scope=current 把它「搬」到自己项目）。
+func loadVisibleMemory(id int64) (*Memory, error) {
+	var mem Memory
+	if err := DB.First(&mem, id).Error; err != nil {
+		return nil, fmt.Errorf("memory id %d not found", id)
+	}
+	if mem.Project != currentProjectKey() && mem.Project != globalProject {
+		return nil, fmt.Errorf("memory id %d not found", id)
+	}
+	return &mem, nil
+}
+
 // addMemory 写入一条记忆。project 为项目键（空串 = 全局）。
 // 去重按「同项目 + 同内容」判定：同样的结论出现在两个项目里属两条独立记忆，
 // 全局那条也不该顶掉项目内那条的写入。
@@ -428,6 +444,9 @@ func handleDelete(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.ID == 0 {
 		return "", fmt.Errorf("id is required")
 	}
+	if _, err := loadVisibleMemory(req.ID); err != nil {
+		return "", err
+	}
 	result := DB.Delete(&Memory{}, req.ID)
 	if result.Error != nil {
 		return "", result.Error
@@ -479,6 +498,9 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 	}
 	updates["last_access"] = time.Now().Unix()
 
+	if _, err := loadVisibleMemory(req.ID); err != nil {
+		return "", err
+	}
 	result := DB.Model(&Memory{}).Where("id = ?", req.ID).Updates(updates)
 	if result.Error != nil {
 		return "", result.Error

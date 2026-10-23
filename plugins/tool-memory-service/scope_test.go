@@ -254,3 +254,63 @@ func TestUpdateScopeValidates(t *testing.T) {
 		t.Fatalf("应改到全局哨兵，got %q", mem.Project)
 	}
 }
+
+// TestIDOpsRejectOtherProjects scope 只接受 current/global，无法指定别的项目键；
+// 更要紧的是按 ID 操作也不能越界——ID 自增可猜，若无归属校验，模型能用
+// delete/update 遍历删改其它项目的记忆（甚至把它们「搬」进自己项目）。
+func TestIDOpsRejectOtherProjects(t *testing.T) {
+	setupMemoryDB(t)
+	asProject(t, "/w/proj-a")
+	foreign := addVia(t, "A 项目的私密结论", "current")
+	foreignID := int64(foreign["id"].(float64))
+
+	asProject(t, "/w/proj-b")
+	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": foreignID})); err == nil {
+		t.Fatal("不应能删除其它项目的记忆")
+	}
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "scope": "current"})); err == nil {
+		t.Fatal("不应能把其它项目的记忆改到当前项目")
+	}
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "content": "改写"})); err == nil {
+		t.Fatal("不应能改其它项目的记忆内容")
+	}
+
+	var mem Memory
+	if err := DB.First(&mem, foreignID).Error; err != nil {
+		t.Fatalf("既不应被删: %v", err)
+	}
+	if mem.Project == currentProjectKey() || mem.Project == globalProject {
+		t.Fatalf("归属不应被改到当前项目或全局，got %q", mem.Project)
+	}
+	if mem.Content != "A 项目的私密结论" {
+		t.Fatalf("内容不应被改写，got %q", mem.Content)
+	}
+
+	// 全局条目对任何项目可见，可正常操作
+	asProject(t, "/w/proj-a")
+	g := addVia(t, "通用偏好", "global")
+	gid := int64(g["id"].(float64))
+	asProject(t, "/w/proj-b")
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": gid, "content": "通用偏好2"})); err != nil {
+		t.Fatalf("全局条目应可从任意项目修改: %v", err)
+	}
+	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": gid})); err != nil {
+		t.Fatalf("全局条目应可从任意项目删除: %v", err)
+	}
+}
+
+// TestScopeRejectsForeignProjectKey scope 不接受任意项目键，只认 current/global。
+func TestScopeRejectsForeignProjectKey(t *testing.T) {
+	setupMemoryDB(t)
+	asProject(t, "/w/proj-a")
+	addVia(t, "A 的记忆", "current")
+	foreignKey := currentProjectKey()
+
+	asProject(t, "/w/proj-b")
+	if _, err := handleSearch(context.Background(), mustJSON(map[string]string{"keywords": "A", "scope": foreignKey})); err == nil {
+		t.Fatal("scope 传项目键应报错（不支持指定别的项目）")
+	}
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "x", "scope": foreignKey})); err == nil {
+		t.Fatal("写入时 scope 传项目键应报错")
+	}
+}
