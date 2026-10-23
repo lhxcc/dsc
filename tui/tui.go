@@ -433,6 +433,56 @@ func defaultSessionID(m *core.Manager) string {
 	return "default"
 }
 
+// resolveCurrentSessionID 返回当前应操作的会话 id：
+//  1. currentSessionID 已存在于会话 store（正常情形）；
+//  2. 否则退回最近活动的会话——TUI 启动时按工作区路径推导的 id 与 agent 实际
+//     写入的存档名可能不一致（历史命名、进程早于插件重建等），此时推导值指向
+//     不存在的文件，/export 会误报 not found。
+func (m *Model) resolveCurrentSessionID() string {
+	if m.manager == nil {
+		return m.currentSessionID
+	}
+	list, err := m.manager.ListSessions()
+	if err != nil || len(list) == 0 {
+		return m.currentSessionID
+	}
+	for _, s := range list {
+		if s.ID == m.currentSessionID {
+			return s.ID
+		}
+	}
+	// ListSessions 按最后活动时间倒序：首个即最近写入的会话。
+	m.currentSessionID = list[0].ID
+	return m.currentSessionID
+}
+
+// exportSession 把一个会话导出为 Markdown（id 为空 = agent 当前会话）。
+func (m *Model) exportSession(id string) {
+	defer func() {
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+	}()
+	if m.manager == nil {
+		m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
+		return
+	}
+	if id == "" {
+		id = m.resolveCurrentSessionID()
+	}
+	path, err := m.manager.ExportSession(id)
+	if err != nil {
+		m.appendMessage(errorSty.Render("导出会话失败: ") + err.Error() +
+			"\n可用 /sessions 查看会话 id，或用 /export <id> 指定。")
+		return
+	}
+	// 输出路径统一用正斜杆（ToSlash），与模型所见路径风格一致
+	m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 导出") +
+		fmt.Sprintf("\n已导出会话 %s 到 %s", id, filepath.ToSlash(path)))
+}
+
 // mouseCaptureOffByDefault 允许用户通过 DSC_DISABLE_MOUSE 环境变量在启动时默认
 // 释放鼠标（对齐 REX 的 REX_DISABLE_MOUSE），免去每次会话敲 /settings mouse off。
 func mouseCaptureOffByDefault() bool {
@@ -2305,7 +2355,7 @@ var slashCommands = []compItem{
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
 	{label: "/session default", insert: "/session default", hint: "切换到指定会话（如 /session session-3）"},
 	{label: "/session delete", insert: "/session delete ", hint: "删除指定会话（如 /session delete session-3）"},
-	{label: "/export", insert: "/export", hint: "导出当前会话为 Markdown 文件"},
+	{label: "/export", insert: "/export", hint: "导出当前会话（可加 id）为 Markdown 文件"},
 	{label: "/exit", insert: "/exit", hint: "退出聊天"},
 }
 
@@ -2599,7 +2649,7 @@ func (m *Model) buildHelpText() string {
 		"  /session <id>  切换到指定会话（如 /session session-3）",
 		"  /session new  新建会话并切换",
 		"  /session delete <id>  删除指定会话",
-		"  /export    导出当前会话为 Markdown 文件",
+		"  /export [id]  导出当前会话（或指定 id）为 Markdown 文件",
 		"  /exit        退出聊天",
 	)
 	return strings.Join(lines, "\n")
@@ -2615,6 +2665,13 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 	// 记录经宿主 logger（受 -log 门控，未开 -log 时静默丢弃），不直碰终端 stderr。
 	if m.manager != nil {
 		m.manager.HostLogger().Info("slash command invoked", "cmd", cmd)
+	}
+	// /export 支持可选会话 id：/export [id]（缺省导出 agent 当前实际会话）。
+	// 带参数的命令无法走 switch 的精确匹配（会落到 default 被当作普通消息），
+	// 故在此提前拦截。
+	if cmd == "/export" || strings.HasPrefix(cmd, "/export ") {
+		m.exportSession(strings.TrimSpace(strings.TrimPrefix(cmd, "/export")))
+		return true, nil
 	}
 	switch cmd {
 	case "/help":
@@ -2741,24 +2798,6 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		return true, nil
 	case "/session":
 		m.appendMessage(errorSty.Render("用法: /session <会话 id>，如 /session session-3 或 /session default"))
-		m.input.SetValue("")
-		m.completion = completion{}
-		m.syncInputHeight()
-		m.render()
-		m.virtualGotoBottom()
-		return true, nil
-	case "/export":
-		if m.manager == nil {
-			m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
-		} else {
-			path, err := m.manager.ExportSession(m.currentSessionID)
-			if err != nil {
-				m.appendMessage(errorSty.Render("导出会话失败: ") + err.Error())
-			} else {
-				// 输出路径统一用正斜杆（ToSlash），与模型所见路径风格一致
-				m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 导出") + fmt.Sprintf("\n已导出会话 %s 到 %s", m.currentSessionID, filepath.ToSlash(path)))
-			}
-		}
 		m.input.SetValue("")
 		m.completion = completion{}
 		m.syncInputHeight()
