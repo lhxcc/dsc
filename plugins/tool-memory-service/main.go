@@ -47,13 +47,13 @@ type Memory struct {
 }
 
 // 记忆作用域只有两档，语义严格、互不重叠：
-//   - project：只作用于当前项目
+//   - current：只作用于当前项目
 //   - global ：只作用于跨项目共享层（用户偏好、通用约定）
 //
 // 默认 project。不再提供「全部项目」档：跨项目翻查既难判定意图，也把别的项目
 // 的私有细节带进当前上下文。
 const (
-	scopeProject = "project"
+	scopeCurrent = "current"
 	scopeGlobal  = "global"
 )
 
@@ -74,8 +74,8 @@ func currentProjectKey() string {
 // 分不清自己到底写进了哪一层。
 func parseWriteScope(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case scopeProject:
-		return scopeProject, nil
+	case scopeCurrent:
+		return scopeCurrent, nil
 	case scopeGlobal:
 		return scopeGlobal, nil
 	case "":
@@ -88,7 +88,7 @@ func parseWriteScope(raw string) (string, error) {
 // 不会产生任何数据），但给了非法取值就报错，不静默换成别的范围。
 func parseReadScope(raw string) (string, error) {
 	if strings.TrimSpace(raw) == "" {
-		return scopeProject, nil
+		return scopeCurrent, nil
 	}
 	return parseWriteScope(raw)
 }
@@ -683,7 +683,7 @@ func main() {
                 "properties": {
                         "query": {"type": "string", "description": "自然语言查询语句"},
                         "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "检索范围：project=仅当前项目（缺省），global=仅全局共享层"}
+                        "scope": {"type": "string", "enum": ["current", "global"], "description": "检索范围：current=仅当前项目（缺省），global=仅全局共享层"}
                 },
                 "description": "query 与 keywords 至少提供一个"
         }`)
@@ -692,7 +692,7 @@ func main() {
                 "properties": {
                         "content": {"type": "string", "description": "要保存的记忆内容"},
                         "source": {"type": "string", "description": "记忆来源标记，缺省 user"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "必填归属：project=当前项目，global=跨项目共享（用户偏好、通用约定）"}
+                        "scope": {"type": "string", "enum": ["current", "global"], "description": "必填归属：current=当前项目，global=跨项目共享（用户偏好、通用约定）"}
                 },
                 "required": ["content", "scope"]
         }`)
@@ -709,7 +709,7 @@ func main() {
                         "id": {"type": "integer", "description": "要修改的记忆 ID"},
                         "content": {"type": "string", "description": "新的记忆内容（可选，至少提供 content/source/scope 之一）"},
                         "source": {"type": "string", "description": "新的来源标记（可选）"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "改归属：project=当前项目，global=跨项目共享（可选）"}
+                        "scope": {"type": "string", "enum": ["current", "global"], "description": "改归属：current=当前项目，global=跨项目共享（可选）"}
                 },
                 "required": ["id"]
         }`)
@@ -719,7 +719,7 @@ func main() {
                         "page": {"type": "integer", "description": "页码，从 1 开始，默认 1"},
                         "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 100"},
                         "source": {"type": "string", "description": "按来源筛选（可选）"},
-                        "scope": {"type": "string", "enum": ["project", "global"], "description": "范围：project=仅当前项目（缺省），global=仅全局共享层"},
+                        "scope": {"type": "string", "enum": ["current", "global"], "description": "范围：current=仅当前项目（缺省），global=仅全局共享层"},
                         "archived": {"type": "boolean", "description": "是否只看已归档记忆，默认 false"}
                 }
         }`)
@@ -736,14 +736,14 @@ func main() {
 	// 查（搜索）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_search",
-		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、本次任务的经验教训等），默认只搜当前项目（scope=project）；用户偏好、跨项目约定等全局记忆需显式 scope=global 检索。返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
+		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、本次任务的经验教训等），默认只搜当前项目（scope=current）；用户偏好、跨项目约定等全局记忆需显式 scope=global 检索。返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
 		Schema:      searchSchema,
 		Handler:     handleSearch,
 		// ContextFn 动态贡献 system prompt（每次 ListContext 求值，对齐 DSH
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
 			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。" +
-				"记忆归属分两档且必填（memory_add 的 scope=project/global）：project 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
+				"记忆归属分两档且必填（memory_add 的 scope=current/global）：current 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
 		},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memorySearchView(result)
@@ -772,7 +772,7 @@ func main() {
 	// 改
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_update",
-		Description: "按 ID 修改记忆内容、来源标记或归属（scope=project/global）。至少提供 content、source、scope 之一。修改后 last_access 自动刷新。",
+		Description: "按 ID 修改记忆内容、来源标记或归属（scope=current/global）。至少提供 content、source、scope 之一。修改后 last_access 自动刷新。",
 		Schema:      updateSchema,
 		Handler:     handleUpdate,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
@@ -782,7 +782,7 @@ func main() {
 	// 查列表（分页）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_list",
-		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目（scope=project），可按来源筛选、查看已归档记忆；scope=global 只列全局层。",
+		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目（scope=current），可按来源筛选、查看已归档记忆；scope=global 只列全局层。",
 		Schema:      listSchema,
 		Handler:     handleList,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {

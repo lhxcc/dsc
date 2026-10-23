@@ -70,10 +70,10 @@ func searchVia(t *testing.T, keyword, scope string) []map[string]any {
 func TestProjectScopeIsolation(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	addVia(t, "proj-a 使用 CMake 而非 Make", "project")
+	addVia(t, "proj-a 使用 CMake 而非 Make", "current")
 
 	asProject(t, "/w/proj-b")
-	if got := searchVia(t, "CMake", "project"); len(got) != 0 {
+	if got := searchVia(t, "CMake", "current"); len(got) != 0 {
 		t.Fatalf("B 项目不应看到 A 项目记忆: %+v", got)
 	}
 	if got := searchVia(t, "CMake", ""); len(got) != 0 {
@@ -86,7 +86,7 @@ func TestProjectScopeIsolation(t *testing.T) {
 
 	// A 项目自己看得到
 	asProject(t, "/w/proj-a")
-	if got := searchVia(t, "CMake", "project"); len(got) != 1 {
+	if got := searchVia(t, "CMake", "current"); len(got) != 1 {
 		t.Fatalf("A 项目应看到自己的记忆，got %d 条", len(got))
 	}
 }
@@ -97,13 +97,13 @@ func TestGlobalScopeIsSeparate(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
 	addVia(t, "用户偏好中文回复", "global")
-	addVia(t, "proj-a 私有约定", "project")
+	addVia(t, "proj-a 私有约定", "current")
 
 	asProject(t, "/w/proj-b")
 	if got := searchVia(t, "中文", "global"); len(got) != 1 {
 		t.Fatalf("全局层在任意项目都应可查到，got %d 条", len(got))
 	}
-	if got := searchVia(t, "中文", "project"); len(got) != 0 {
+	if got := searchVia(t, "中文", "current"); len(got) != 0 {
 		t.Fatalf("project 档不应混入全局条目，got %d 条", len(got))
 	}
 	if got := searchVia(t, "私有约定", "global"); len(got) != 0 {
@@ -138,10 +138,10 @@ func TestGlobalScopeIsSeparate(t *testing.T) {
 func TestDedupPerProject(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	first := addVia(t, "构建用 ninja", "project")
+	first := addVia(t, "构建用 ninja", "current")
 
 	asProject(t, "/w/proj-b")
-	second := addVia(t, "构建用 ninja", "project")
+	second := addVia(t, "构建用 ninja", "current")
 	if first["id"] == second["id"] {
 		t.Fatalf("不同项目应各自成条，got 同 id %v", first["id"])
 	}
@@ -155,7 +155,7 @@ func TestDedupPerProject(t *testing.T) {
 	}
 
 	// 同项目重复写入 → 去重
-	again := addVia(t, "构建用 ninja", "project")
+	again := addVia(t, "构建用 ninja", "current")
 	if dedup, _ := again["dedup"].(bool); !dedup {
 		t.Fatal("同项目同内容应去重")
 	}
@@ -168,7 +168,7 @@ func TestDedupPerProject(t *testing.T) {
 func TestMemoryProjectColumnStamp(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	addVia(t, "记录一条", "project")
+	addVia(t, "记录一条", "current")
 
 	var mem Memory
 	if err := DB.Where("content = ?", "记录一条").First(&mem).Error; err != nil {
@@ -211,7 +211,7 @@ func TestAddRequiresScope(t *testing.T) {
 	}
 
 	// 合法写入仍正常
-	addVia(t, "有归属", "project")
+	addVia(t, "有归属", "current")
 	DB.Model(&Memory{}).Count(&count)
 	if count != 1 {
 		t.Fatalf("合法写入应落 1 行，got %d", count)
@@ -222,7 +222,7 @@ func TestAddRequiresScope(t *testing.T) {
 func TestUpdateScopeValidates(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	res := addVia(t, "条目", "project")
+	res := addVia(t, "条目", "current")
 	id := int64(res["id"].(float64))
 
 	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "scope": "all"})); err == nil {

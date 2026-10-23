@@ -137,7 +137,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	}
 	// 回归：带标点的检索词（如文件名 config.yaml、README.md）不应触发 FTS5 语法错误
 	//（裸词中的 '.' 会被 FTS5 当作语法字符）。修复前此类查询报 "fts5: syntax error near '.'"。
-	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user","scope":"project"}`); resp.Error != "" {
+	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user","scope":"current"}`); resp.Error != "" {
 		t.Fatalf("memory_add(punct) = %+v", resp)
 	}
 	if resp := run("memory_search", `{"query":"config.yaml"}`); resp.Error != "" {
