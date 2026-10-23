@@ -14,13 +14,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -137,6 +135,16 @@ func res(hc interp.HandlerContext, p string) string {
 	if runtime.GOOS == "windows" && p == "/dev/null" {
 		return "NUL"
 	}
+	// Windows 上没有真正的 /tmp（会被解析成当前盘根）：把 /tmp 与 /tmp/... 映射到
+	// DSC 自己的临时目录，模型的 Unix 习惯写法（临时脚本、diff 中间产物）都能落地。
+	// Unix 上 /tmp 是真实挂载点，不动。
+	if runtime.GOOS == "windows" && (p == "/tmp" || strings.HasPrefix(p, "/tmp/")) {
+		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
+		if rel == "" {
+			return dsc.TempDir()
+		}
+		return dsc.PJoin(dsc.TempDir(), rel)
+	}
 	if filepath.IsAbs(p) {
 		return p
 	}
@@ -249,17 +257,32 @@ func cmdMkdir(ctx context.Context, hc interp.HandlerContext, args []string) erro
 // ---------- ls ----------
 
 func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	var showAll, long, listSelf, singleCol, classify, byTime, bySize, reverse bool
+	var showAll, showAlmostAll, long, listSelf, singleCol, classify, byTime, bySize, reverse bool
 	var paths []string
+	endOpt := false
 	for _, a := range args {
 		switch {
+		case endOpt:
+			paths = append(paths, a)
 		case a == "--":
+			endOpt = true
+		case strings.HasPrefix(a, "--time-style"):
+			// 仅影响时间列格式：本实现的 -l 已输出稳定可读时间戳，接受该选项即可
+		case strings.HasPrefix(a, "--color"), a == "--group-directories-first":
+			// 输出修饰：接受即忽略
+		case a == "--all":
+			showAll = true
+		case a == "--almost-all":
+			showAlmostAll = true
 		case strings.HasPrefix(a, "-") && len(a) > 1 && a != "-":
 			ok := true
 			for _, f := range a[1:] {
 				switch f {
 				case 'a':
 					showAll = true
+				case 'A':
+					// -A：除 . 与 .. 外的全部。本实现本就不列 . 与 ..，故与 -a 同义
+					showAlmostAll = true
 				case 'l':
 					long = true
 				case 'd':
@@ -314,7 +337,7 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			fmt.Fprintln(hc.Stdout, p0+":")
 		}
 		if fi.IsDir() && !listSelf {
-			if err := lsDir(ctx, hc, p, showAll, long, singleCol, classify, byTime, bySize, reverse); err != nil {
+			if err := lsDir(ctx, hc, p, showAll || showAlmostAll, long, singleCol, classify, byTime, bySize, reverse); err != nil {
 				return err
 			}
 		} else {
@@ -512,15 +535,35 @@ func cmdTouch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 // ---------- rm ----------
 
 func cmdRm(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	recursive, force := false, false
+	recursive, force, endOpt := false, false, false
 	var files []string
 	for _, a := range args {
-		switch a {
-		case "-r", "-R", "--recursive":
+		switch {
+		case endOpt:
+			files = append(files, a)
+		case a == "--":
+			endOpt = true
+		case a == "--recursive":
 			recursive = true
-		case "-f", "--force":
+		case a == "--force":
 			force = true
-		case "--":
+		case len(a) > 1 && a[0] == '-':
+			// 组合短旗标：`rm -rf dir` 是日常写法，此前只认独立的 "-r"/"-f"，
+			// 整串 "-rf" 被当成路径，报 cannot remove '-rf'（现场报告复现 22 次）。
+			for _, f := range a[1:] {
+				switch f {
+				case 'r', 'R':
+					recursive = true
+				case 'f':
+					force = true
+				case 'v', 'i', 'd':
+					// -v 冗长、-i 交互确认（无交互终端等同忽略）、-d 删空目录：
+					// 接受即可，不改变本实现语义
+				default:
+					fmt.Fprintf(hc.Stderr, "rm: unsupported option: -%c（支持：-r/-R -f -d -v）\n", f)
+					return interp.NewExitStatus(2)
+				}
+			}
 		default:
 			files = append(files, a)
 		}
@@ -726,6 +769,9 @@ func copyFile(src, dst string) error {
 }
 
 // ---------- grep ----------
+//
+// 实现见 grep.go（参数解析、BRE→RE2 转换、上下文行、--include 过滤）。
+// 此处仅保留递归遍历共用的噪声目录表，供 grep/find 共用口径。
 
 // grepSkipDirs 递归搜索（-r/-R）时跳过的噪声目录：VCS 元数据与依赖/缓存目录。
 // .git 内多为二进制对象、node_modules/__pycache__ 内是依赖与缓存，模型在真实项目里
@@ -737,235 +783,6 @@ var grepSkipDirs = map[string]bool{
 	"__pycache__":  true,
 	".svn":         true,
 	".hg":          true,
-}
-
-// grepTarget 单个搜索目标：display 为模型可见路径（保留参数的书写形态，递归时为
-// 「参数/相对路径」，按工作区路径纪律统一正斜杆），path 为磁盘路径（"-" 表示 stdin）。
-type grepTarget struct {
-	display string
-	path    string
-}
-
-func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	var ignoreCase, invert, lineNum, countOnly, recursive bool
-	var files []string
-	var pat string
-	patSet := false
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "--":
-		case a == "-e":
-			// -e <pattern>：模式由下一参数给出（含空模式；对齐 POSIX grep -e）
-			if i+1 >= len(args) {
-				fmt.Fprintln(hc.Stderr, "grep: option requires an argument -- e")
-				return interp.NewExitStatus(2)
-			}
-			i++
-			pat, patSet = args[i], true
-		case strings.HasPrefix(a, "-") && len(a) > 1 && a != "-":
-			ok := true
-			for _, f := range a[1:] {
-				switch f {
-				case 'i':
-					ignoreCase = true
-				case 'v':
-					invert = true
-				case 'n':
-					lineNum = true
-				case 'c':
-					countOnly = true
-				case 'r', 'R':
-					// -r/-R 递归搜索目录（对齐 grep -r；R 与 r 同义——遍历中遇到的
-					// 目录/文件符号链接一律不跟随，防环、防挂起，见 grepCollect）
-					recursive = true
-				case 'E':
-					// -E (extended regex) 对齐 POSIX grep -E
-					// 内置实现用 Go regexp（RE2），已支持 extended regex 语法
-				default:
-					ok = false
-				}
-			}
-			if !ok {
-				fmt.Fprintf(hc.Stderr, "grep: unsupported option: %s\n", a)
-				return interp.NewExitStatus(2)
-			}
-		default:
-			// 用 patSet 而非 pat=="" 区分「未提供模式」与「提供了空模式」：空模式在
-			// POSIX grep 里合法（匹配所有行），`grep -c "" file` 就是数行数的常用写法。
-			// 早期实现按 pat=="" 判空，会把空模式吞掉、把紧随的文件名误当模式，进而
-			// 落到「无文件 → 读 stdin」分支，在生产 runner（Stdin 为 nil）上 panic。
-			if !patSet {
-				pat, patSet = a, true
-			} else {
-				files = append(files, a)
-			}
-		}
-	}
-	if !patSet {
-		fmt.Fprintln(hc.Stderr, "grep: missing pattern")
-		return interp.NewExitStatus(2)
-	}
-	if ignoreCase {
-		pat = "(?i)" + pat
-	}
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "grep: %v\n", err)
-		return interp.NewExitStatus(2)
-	}
-	if len(files) == 0 {
-		// -r 未给路径时按 . 搜索（对齐 GNU grep -r）；否则读 stdin
-		if recursive {
-			files = []string{"."}
-		} else {
-			files = []string{"-"}
-		}
-	}
-	// 目标展开：-r 下目录参数递归收集普通文件；未给 -r 时目录按 POSIX 报错（Is a directory）
-	exit := 0
-	targets := make([]grepTarget, 0, len(files))
-	for _, f := range files {
-		if f == "-" {
-			targets = append(targets, grepTarget{display: f, path: "-"})
-			continue
-		}
-		p := res(hc, f)
-		fi, statErr := os.Stat(p)
-		if statErr != nil {
-			fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", f, slashErr(statErr))
-			exit = 2
-			continue
-		}
-		if !fi.IsDir() {
-			targets = append(targets, grepTarget{display: f, path: p})
-			continue
-		}
-		if !recursive {
-			fmt.Fprintf(hc.Stderr, "grep: %s: Is a directory (use -r to search recursively)\n", f)
-			exit = 2
-			continue
-		}
-		grepCollect(ctx, hc, p, dsc.PClean(f), &targets)
-	}
-	// 递归或多目标时每行带文件名前缀（对齐 grep -r 的 path:line:text）
-	showName := recursive || len(targets) > 1
-	matchedTotal := 0
-	for _, tg := range targets {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		count, err := grepOne(hc, tg, re, invert, lineNum, showName, countOnly)
-		if err != nil {
-			fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", tg.display, slashErr(err))
-			exit = 2
-			continue
-		}
-		matchedTotal += count
-		if countOnly {
-			if showName {
-				fmt.Fprintf(hc.Stdout, "%s:%d\n", tg.display, count)
-			} else {
-				fmt.Fprintf(hc.Stdout, "%d\n", count)
-			}
-		}
-	}
-	if exit != 0 {
-		return interp.NewExitStatus(uint8(exit))
-	}
-	if !countOnly && matchedTotal == 0 {
-		return interp.NewExitStatus(1)
-	}
-	return nil
-}
-
-// grepOne 搜索单个目标并回显命中，返回命中行数。磁盘文件先探测是否二进制：
-// 二进制文件不逐行回显（二进制「行」对模型毫无意义，只会把乱码灌进上下文），
-// 命中时按 GNU 口径只报一行 `Binary file <path> matches`。stdin 不做探测（与既有
-// 管道行为保持一致：管道内容按文本处理）。
-func grepOne(hc interp.HandlerContext, tg grepTarget, re *regexp.Regexp, invert, lineNum, showName, countOnly bool) (int, error) {
-	if tg.path == "-" {
-		r := io.Reader(hc.Stdin)
-		if r == nil {
-			// 生产 runner 不提供 stdin（interp.StdIO(nil, ...)）→ 空输入，
-			// 避免 bufio.Scanner(nil) 在 Scan 内 nil 解引用。
-			r = strings.NewReader("")
-		}
-		return grepStream(hc, r, re, invert, lineNum, showName, tg.display, countOnly), nil
-	}
-	f, err := os.Open(tg.path)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = f.Close() }()
-	br := bufio.NewReader(f)
-	if head, _ := br.Peek(8192); bytes.IndexByte(head, 0) >= 0 {
-		n := grepStream(hc, br, re, invert, false, false, tg.display, true)
-		if n > 0 && !countOnly {
-			fmt.Fprintf(hc.Stdout, "Binary file %s matches\n", tg.display)
-		}
-		return n, nil
-	}
-	return grepStream(hc, br, re, invert, lineNum, showName, tg.display, countOnly), nil
-}
-
-// grepCollect 递归收集 dir 下可搜索的普通文件（对齐 grep -r）：目录项按名升序深度
-// 优先——os.ReadDir 已按文件名排序，故同一目录树的命中顺序确定；工具结果会进入模型
-// 上下文，有序产物不得随文件系统返回序漂移（确定性要求）。
-//
-// 遍历中不跟随目录与文件符号链接（防环、防挂起）；跳过 grepSkipDirs 噪声目录；单个
-// 目录不可读（权限等）只报一行并继续，不因单点失败丢弃其余分支的命中。
-func grepCollect(ctx context.Context, hc interp.HandlerContext, dir, display string, out *[]grepTarget) {
-	if err := ctx.Err(); err != nil {
-		return
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", display, slashErr(err))
-		return
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() {
-			if grepSkipDirs[name] {
-				continue
-			}
-			grepCollect(ctx, hc, dsc.PJoin(dir, name), dsc.PJoin(display, name), out)
-			continue
-		}
-		if !e.Type().IsRegular() {
-			continue
-		}
-		*out = append(*out, grepTarget{display: dsc.PJoin(display, name), path: dsc.PJoin(dir, name)})
-	}
-}
-
-// grepStream 把 r 按行匹配；非 countOnly 时输出命中行；返回命中行数。
-func grepStream(hc interp.HandlerContext, r io.Reader, re *regexp.Regexp, invert, lineNum, prefix bool, name string, countOnly bool) int {
-	sc := bufio.NewScanner(r)
-	ln, count := 0, 0
-	for sc.Scan() {
-		ln++
-		hit := re.MatchString(sc.Text())
-		if invert {
-			hit = !hit
-		}
-		if !hit {
-			continue
-		}
-		count++
-		if countOnly {
-			continue
-		}
-		if prefix {
-			fmt.Fprintf(hc.Stdout, "%s:", name)
-		}
-		if lineNum {
-			fmt.Fprintf(hc.Stdout, "%d:", ln)
-		}
-		fmt.Fprintln(hc.Stdout, sc.Text())
-	}
-	return count
 }
 
 // ---------- head / tail ----------
