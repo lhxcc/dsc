@@ -18,15 +18,16 @@ import (
 	"time"
 	"unicode"
 
+	"dsc/core"
+	"dsc/cron"
+	"dsc/jobs"
+
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"dsc/core"
-	"dsc/cron"
-	"dsc/jobs"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/ansi"
 	"gopkg.in/yaml.v3"
@@ -394,6 +395,11 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		key.WithKeys("ctrl+j", "shift+enter", "alt+enter"),
 		key.WithHelp("ctrl+j/shift+enter", "换行"),
 	)
+	// 输入区配色：textarea 默认的 Focused.Text 不带前景色（完全继承终端默认
+	// 前景），在「深色背景 + 深色默认前景」的终端主题上会黑底黑字。先按深色
+	// 主题给默认值，Init 再向终端查询实际底色并据此自适应（见 applyInputPalette
+	// 与 BackgroundColorMsg）。
+	applyInputPalette(&input, true)
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -434,11 +440,38 @@ func mouseCaptureOffByDefault() bool {
 	return v != "" && v != "0"
 }
 
-// Init 返回初始化命令
+// applyInputPalette 按终端明暗设置输入区配色。textarea 的默认 Focused.Text
+// 没有前景色（完全继承终端默认前景），在「深底深字」的主题下会黑底黑字；
+// 这里显式给出高对比前景色，提示符与真实光标沿用主题 accent。
+func applyInputPalette(input *textarea.Model, isDark bool) {
+	textHex, hintHex := inputPaletteFor(isDark)
+	styles := textarea.DefaultStyles(isDark)
+	styles.Focused.Base = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
+	styles.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
+	// 光标行只换前景色：默认样式会铺一层背景色，在非纯黑主题上反而形成色带。
+	styles.Focused.CursorLine = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
+	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(accent)
+	styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color(hintHex))
+	styles.Blurred = styles.Focused
+	styles.Cursor.Color = accent
+	input.SetStyles(styles)
+}
+
+// inputPaletteFor 返回输入区正文（text）与占位提示（hint）的前景色：
+// 深色终端用近白正文，浅色终端用近黑正文；提示色始终比正文暗一档但仍可读。
+func inputPaletteFor(isDark bool) (text, hint string) {
+	if isDark {
+		return "#F2F2F2", "#7C7C7C"
+	}
+	return "#1F1F1F", "#8A8A8A"
+}
+
+// Init 启动输入框焦点、spinner，并请求终端底色（据此选择输入区高对比配色）。
 func (m *Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.input.Focus(),
 		m.spinner.Tick,
+		tea.RequestBackgroundColor,
 	)
 }
 
@@ -592,6 +625,12 @@ func (m *Model) llmSupportsImages() bool {
 // Update 处理消息
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	case tea.BackgroundColorMsg:
+		// 终端底色查询结果：据此选择输入区前景色（深底近白、浅底近黑），
+		// 避免默认「继承终端前景」在深底深字主题上不可读。
+		applyInputPalette(&m.input, msg.IsDark())
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
