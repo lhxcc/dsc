@@ -276,6 +276,19 @@ func ptcEnvEnabled() bool {
 	return false
 }
 
+// historyInjectionCount 返回应下发给 agent 的 DSC_HISTORY_INJECTION 值。
+//
+// config 与 agent 用同一套取值（-1 不限制 / 0 不注入跨轮历史 / N 条），原值透传；
+// 未设置时 ok=false（不下发，agent 默认不限制）。这里**不做任何转码**：曾经两侧
+// 编码相反（config -1=禁止、agent -1=不限），预设里的 -1 被译成「不注入」，
+// 一轮之后模型就看不到之前的会话历史。
+func historyInjectionCount(cfg *core.Config) (int, bool) {
+	if cfg == nil || cfg.HistoryInjection == nil {
+		return 0, false
+	}
+	return *cfg.HistoryInjection, true
+}
+
 func main() {
 	// 捕获 panic：打印完整堆栈而非仅值，并以非零码退出——否则 recover 后 main
 	// 落到 os.Exit(exitCode) 时 exitCode 仍为默认 0，CI 会把崩溃误判为成功。
@@ -572,16 +585,13 @@ func main() {
 	// 避免 Windows 下日志显示反斜杆路径造成人类与模型所见不一致。
 	logger.Info("workspace root", "root", filepath.ToSlash(core.WorkspaceRoot))
 
-	// /settings history 持久化的历史注入编码（config.yaml history_injection）在启动时
-	// 下发 agent 子进程：0 未定义（默认不限制，不设）；-1 禁止（不注入）→ agent 0；
-	// N>0 启用并注入 N 条 → agent N。
-	if mainCfg != nil && mainCfg.HistoryInjection != 0 {
-		agentCount := mainCfg.HistoryInjection
-		if agentCount == -1 {
-			agentCount = 0 // config 禁止 → agent off
-		}
-		os.Setenv("DSC_HISTORY_INJECTION", strconv.Itoa(agentCount))
-		logger.Info("history injection from config", "encoded", mainCfg.HistoryInjection, "agent", agentCount)
+	// /settings history 持久化的历史注入条数（config.yaml history_injection）在启动时
+	// 原值下发 agent 子进程：-1 不限制、0 不注入、N 注入最近 N 条。config 与 agent
+	// 用同一套取值，不做任何转换——曾经两侧编码相反（config -1=禁止 / agent -1=不限），
+	// 导致预设里的 -1 被译成「不注入历史」，每轮只剩当前消息，表现为模型突然失忆。
+	if n, ok := historyInjectionCount(mainCfg); ok {
+		os.Setenv("DSC_HISTORY_INJECTION", strconv.Itoa(n))
+		logger.Info("history injection from config", "count", n)
 	}
 
 	// 放大 go-core GRPCBroker 的连接超时（库默认 5 秒，见 EnvConnTimeout）：

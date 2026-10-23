@@ -1,9 +1,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	core "dsc/core"
+	"gopkg.in/yaml.v3"
 )
 
 // TestAssembleMergedConfigToolsDedup 验证 config.yaml 中启用的 tool/dsc 条目
@@ -152,4 +155,52 @@ func keySet(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestHistoryInjectionCountPassesValueThrough 历史注入条数原值透传，不做转码。
+//
+// 回归：config 侧曾用 -1=禁止、0=未定义，agent 侧用 -1=不限制、0=不注入，两侧
+// 语义相反。预设里写 -1 的本意是「不限制」，却被译成「不注入跨轮历史」——
+// 表现就是第二轮开始模型完全不记得上一轮（实测 178K 上下文骤降到 9K）。
+func TestHistoryInjectionCountPassesValueThrough(t *testing.T) {
+	ptr := func(v int) *int { return &v }
+
+	if _, ok := historyInjectionCount(nil); ok {
+		t.Fatal("nil config 不应下发")
+	}
+	if _, ok := historyInjectionCount(&core.Config{}); ok {
+		t.Fatal("未设置时不应下发（agent 默认不限制）")
+	}
+	for _, c := range []struct {
+		in   int
+		want int
+	}{
+		{-1, -1}, // 不限制：必须原样下发 -1，绝不能被译成 0
+		{0, 0},   // 显式关闭跨轮历史
+		{5, 5},
+	} {
+		got, ok := historyInjectionCount(&core.Config{HistoryInjection: ptr(c.in)})
+		if !ok || got != c.want {
+			t.Fatalf("config %d 应原值下发 %d，got %d(ok=%v)", c.in, c.want, got, ok)
+		}
+	}
+}
+
+// TestDeepSeekPresetKeepsHistoryUnlimited 预设文件不得默认关闭跨轮历史：
+// 这是把「模型失忆」写进出厂配置的坑。
+func TestDeepSeekPresetKeepsHistoryUnlimited(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("config", "config.DeepSeek.yaml"))
+	if err != nil {
+		t.Skip(err)
+	}
+	var cfg core.Config
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("解析预设: %v", err)
+	}
+	if cfg.HistoryInjection == nil {
+		return // 未设置 = 默认不限制
+	}
+	if *cfg.HistoryInjection == 0 {
+		t.Fatal("预设把 history_injection 设为 0：新装的用户第二轮就会丢上下文")
+	}
 }
