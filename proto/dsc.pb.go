@@ -1505,8 +1505,10 @@ func (x *SetPlanModeResponse) GetMessage() string {
 }
 
 type SetHistoryInjectionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Count         int32                  `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"` // 历史注入条数上限：<0 不限制，0 不注入，>0 注入最近 count 条
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 恢复历史注入条数，DSC 三值语义（勿按 DSH 的 -1=不限制实现）：负值=不注入恢复历史、
+	// 0=未定义（默认不限制）、N>0=最近 N 条。只作用于恢复的历史。
+	Count         int32 `protobuf:"varint,1,opt,name=count,proto3" json:"count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

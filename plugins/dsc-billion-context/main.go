@@ -82,7 +82,7 @@ func main() {
 
 	// 即时工具结果吸收开关（默认关闭，DSC_ACP_ABSORB=1 启用）：
 	// 启用后达标大工具结果被追加强制提示，模型经 absorb 蒸馏后消息对被隐藏
-	if os.Getenv("DSC_ACP_ABSORB") == "1" {
+	if dsc.EnvBool("DSC_ACP_ABSORB", false) {
 		bc.config.Absorb.Enabled = true
 		if n := os.Getenv("DSC_ACP_ABSORB_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {

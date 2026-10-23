@@ -1700,7 +1700,7 @@ func newAgent() (*ReactLoopAgent, error) {
 		agent.contextWindow = n
 	}
 	// 讀取宿主傳入的單輪模式標記（DSC_SINGLE_TURN=1，-input 自動化測試入口使用）
-	if v := os.Getenv("DSC_SINGLE_TURN"); v == "1" || strings.EqualFold(v, "true") {
+	if dsc.EnvBool("DSC_SINGLE_TURN", false) {
 		agent.singleTurn = true
 	}
 	// 讀取宿主傳入的沙箱策略（DSC_SANDBOX_POLICY，缺省 workspace-write）
@@ -1756,7 +1756,7 @@ func newAgent() (*ReactLoopAgent, error) {
 		}
 	}
 	// todo 任务清单并行开关（DSC_TODO_ALLOW_PARALLEL，缺省 false：最多一个 in_progress）
-	if v := os.Getenv("DSC_TODO_ALLOW_PARALLEL"); v == "1" || strings.EqualFold(v, "true") {
+	if dsc.EnvBool("DSC_TODO_ALLOW_PARALLEL", false) {
 		agent.todoAllowParallel = true
 	}
 	// 多会话事件日志存储：目录解析统一在 SDK（DSC_SESSION_DIR，缺省 <ExecDir>/sessions），

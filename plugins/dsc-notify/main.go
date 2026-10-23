@@ -414,7 +414,7 @@ func main() {
 	})
 	sdk.OnStart(func(ctx context.Context) error {
 		initSoundCache()
-		if os.Getenv("DSC_NOTIFY_NO_AUDIO") == "1" {
+		if dsc.EnvBool("DSC_NOTIFY_NO_AUDIO", false) {
 			log.Println("⚠️ DSC_NOTIFY_NO_AUDIO=1，跳过音频初始化（静默测试模式）")
 		} else if err := initGlobalAudio(); err != nil {
 			log.Printf("⚠️ 初始化音频失败（后续播放将不可用）: %v", err)
