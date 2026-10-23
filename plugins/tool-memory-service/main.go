@@ -40,6 +40,51 @@ type Memory struct {
 	AccessCount int    `gorm:"not null;default:0" json:"access_count"`
 	Archived    bool   `gorm:"not null;default:false;index" json:"archived"`
 	Source      string `gorm:"type:text;default:'user'" json:"source"`
+	// Project 记忆归属的项目键（session.SessionKeyForProject 生成，与 sessions/ 同一命名）；
+	// 空串表示全局（跨项目共享，如用户偏好）。
+	Project string `gorm:"type:text;not null;default:'';index" json:"project"`
+}
+
+// 记忆作用域：project（当前项目，默认，含全局）/ global（只查全局）/ all（不按项目过滤）。
+const (
+	scopeProject = "project"
+	scopeGlobal  = "global"
+	scopeAll     = "all"
+)
+
+// currentProjectKey 返回当前工作区的项目键（与会话文件名同一套规则）。
+func currentProjectKey() string {
+	return dsc.ProjectSessionKey()
+}
+
+// normalizeScope 规整 scope 参数：空取默认，未知取值回退默认（不报错，
+// 记忆查询是只读操作，宁可按默认范围返回也不阻断模型）。
+func normalizeScope(raw, def string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case scopeProject:
+		return scopeProject
+	case scopeGlobal:
+		return scopeGlobal
+	case scopeAll:
+		return scopeAll
+	case "":
+		return def
+	}
+	return def
+}
+
+// scopeWhere 给查询加上项目过滤。
+// project 作用域含全局条目——真正跨项目的事实（用户偏好、通用约定）不该被项目过滤挡住；
+// 要让记忆只在某项目可见，写的时候用 scope=project，它天然带了项目键。
+func scopeWhere(q *gorm.DB, scope string) *gorm.DB {
+	switch scope {
+	case scopeAll:
+		return q
+	case scopeGlobal:
+		return q.Where("project = ''")
+	default:
+		return q.Where("project = ? OR project = ''", currentProjectKey())
+	}
 }
 
 // CallLog 对应 call_logs 表
@@ -154,7 +199,7 @@ func joinMatchTerms(keywords []string) string {
 }
 
 // searchMemories 执行记忆检索：FTS5 优先，LIKE 兜底；结果按相关度×时间衰减稳定排序。
-func searchMemories(query string, now time.Time) ([]resultItem, error) {
+func searchMemories(query string, now time.Time, scope string) ([]resultItem, error) {
 	keywords := strings.Fields(query)
 	if len(keywords) == 0 {
 		return []resultItem{}, nil
@@ -170,17 +215,29 @@ func searchMemories(query string, now time.Time) ([]resultItem, error) {
 		CreatedAt   int64
 		LastAccess  int64
 		AccessCount int
+		Project     string
 		RelScore    float64
 	}
+	// 项目过滤：project 作用域同时包含全局条目（见 scopeWhere 的说明）
+	extraWhere, extraArgs := "", []any{}
+	switch scope {
+	case scopeAll:
+	case scopeGlobal:
+		extraWhere = " AND m.project = ''"
+	default:
+		extraWhere = " AND (m.project = ? OR m.project = '')"
+		extraArgs = append(extraArgs, currentProjectKey())
+	}
 	var ftsRows []ftsRow
+	args := append([]any{matchQuery}, extraArgs...)
 	err := DB.Raw(`
-        SELECT m.id, m.content, m.created_at, m.last_access, m.access_count,
+        SELECT m.id, m.content, m.created_at, m.last_access, m.access_count, m.project,
                -bm25(memories_fts) AS rel_score
         FROM memories_fts
         JOIN memories m ON m.id = memories_fts.rowid
-        WHERE memories_fts MATCH ? AND m.archived = 0
+        WHERE memories_fts MATCH ? AND m.archived = 0`+extraWhere+`
         ORDER BY rel_score DESC
-        LIMIT 50`, matchQuery).Scan(&ftsRows).Error
+        LIMIT 50`, args...).Scan(&ftsRows).Error
 	if err != nil {
 		ftsRows = nil
 	}
@@ -194,6 +251,7 @@ func searchMemories(query string, now time.Time) ([]resultItem, error) {
 				LastAccess:  row.LastAccess,
 				AccessCount: row.AccessCount,
 				Archived:    false,
+				Project:     row.Project,
 			}
 			score := row.RelScore * timeFactor(row.LastAccess, now)
 			results = append(results, resultItem{Memory: mem, Score: score})
@@ -208,11 +266,10 @@ func searchMemories(query string, now time.Time) ([]resultItem, error) {
 		likeWhere := strings.Join(likeConditions, " OR ")
 
 		var memories []Memory
-		err := DB.Model(&Memory{}).
+		q := DB.Model(&Memory{}).
 			Where("archived = ?", false).
-			Where(likeWhere, likeArgs...).
-			Limit(50).
-			Find(&memories).Error
+			Where(likeWhere, likeArgs...)
+		err := scopeWhere(q, scope).Limit(50).Find(&memories).Error
 		if err != nil {
 			return nil, err
 		}
@@ -238,6 +295,7 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 	var req struct {
 		Query    string `json:"query"`
 		Keywords string `json:"keywords"`
+		Scope    string `json:"scope"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -247,7 +305,7 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 		kwStr = req.Query
 	}
 	now := time.Now()
-	results, err := searchMemories(kwStr, now)
+	results, err := searchMemories(kwStr, now, normalizeScope(req.Scope, scopeProject))
 	if err != nil {
 		return "", err
 	}
@@ -278,12 +336,15 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 增 (memory_add) ----
 
-func addMemory(content, source string) (id int64, dedup bool, err error) {
+// addMemory 写入一条记忆。project 为项目键（空串 = 全局）。
+// 去重按「同项目 + 同内容」判定：同样的结论出现在两个项目里属两条独立记忆，
+// 全局那条也不该顶掉项目内那条的写入。
+func addMemory(content, source, project string) (id int64, dedup bool, err error) {
 	if source == "" {
 		source = "user"
 	}
 	var existing Memory
-	if err := DB.Where("content = ?", content).First(&existing).Error; err == nil {
+	if err := DB.Where("content = ? AND project = ?", content, project).First(&existing).Error; err == nil {
 		return existing.ID, true, nil
 	}
 	now := time.Now().Unix()
@@ -294,6 +355,7 @@ func addMemory(content, source string) (id int64, dedup bool, err error) {
 		AccessCount: 0,
 		Archived:    false,
 		Source:      source,
+		Project:     project,
 	}
 	if err := DB.Create(&mem).Error; err != nil {
 		return 0, false, err
@@ -305,6 +367,7 @@ func handleAdd(ctx context.Context, args json.RawMessage) (string, error) {
 	var req struct {
 		Content string `json:"content"`
 		Source  string `json:"source"`
+		Scope   string `json:"scope"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -312,13 +375,18 @@ func handleAdd(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Content == "" {
 		return "", fmt.Errorf("content is required")
 	}
-	id, dedup, err := addMemory(req.Content, req.Source)
+	project := currentProjectKey()
+	if normalizeScope(req.Scope, scopeProject) == scopeGlobal {
+		project = ""
+	}
+	id, dedup, err := addMemory(req.Content, req.Source, project)
 	if err != nil {
 		return "", err
 	}
 	out, err := json.Marshal(map[string]interface{}{
-		"id":    id,
-		"dedup": dedup,
+		"id":      id,
+		"dedup":   dedup,
+		"project": project,
 	})
 	if err != nil {
 		return "", err
@@ -360,6 +428,7 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 		ID      int64  `json:"id"`
 		Content string `json:"content"`
 		Source  string `json:"source"`
+		Scope   string `json:"scope"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -375,8 +444,16 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Source != "" {
 		updates["source"] = req.Source
 	}
+	if req.Scope != "" {
+		// 允许把条目改归属（例如把历史遗留的全局条目收进当前项目）
+		if normalizeScope(req.Scope, "") == scopeGlobal {
+			updates["project"] = ""
+		} else {
+			updates["project"] = currentProjectKey()
+		}
+	}
 	if len(updates) == 0 {
-		return "", fmt.Errorf("at least one of content or source must be provided")
+		return "", fmt.Errorf("at least one of content, source or scope must be provided")
 	}
 	updates["last_access"] = time.Now().Unix()
 
@@ -406,6 +483,7 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 		Page     int    `json:"page"`
 		PageSize int    `json:"page_size"`
 		Source   string `json:"source"`
+		Scope    string `json:"scope"`
 		Archived *bool  `json:"archived"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
@@ -421,7 +499,7 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 		req.PageSize = maxPageSize
 	}
 
-	query := DB.Model(&Memory{})
+	query := scopeWhere(DB.Model(&Memory{}), normalizeScope(req.Scope, scopeProject))
 	if req.Source != "" {
 		query = query.Where("source = ?", req.Source)
 	}
@@ -451,12 +529,21 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 视图 ----
 
+// projectLabel 把项目键渲染为可读标签：空串代表全局条目。
+func projectLabel(project string) string {
+	if project == "" {
+		return "全局"
+	}
+	return project
+}
+
 func memorySearchView(result string) (json.RawMessage, error) {
 	var out struct {
 		Results []struct {
 			ID      int64   `json:"id"`
 			Content string  `json:"content"`
 			Source  string  `json:"source"`
+			Project string  `json:"project"`
 			Score   float64 `json:"score"`
 		} `json:"results"`
 		Total int `json:"total"`
@@ -471,6 +558,7 @@ func memorySearchView(result string) (json.RawMessage, error) {
 			"content": r.Content,
 			"score":   strconv.FormatFloat(r.Score, 'f', 2, 64),
 			"source":  r.Source,
+			"project": projectLabel(r.Project),
 		})
 	}
 	return dsc.TableView("Memory", &dsc.ViewBadge{Text: fmt.Sprintf("%d hit(s)", out.Total), Tone: "teal"}, []dsc.ViewColumn{
@@ -478,6 +566,7 @@ func memorySearchView(result string) (json.RawMessage, error) {
 		{Key: "content", Title: "content"},
 		{Key: "score", Title: "score", Tone: "green"},
 		{Key: "source", Title: "source"},
+		{Key: "project", Title: "project"},
 	}, rows), nil
 }
 
@@ -541,6 +630,7 @@ func memoryListView(result string) (json.RawMessage, error) {
 			ID      int64  `json:"id"`
 			Content string `json:"content"`
 			Source  string `json:"source"`
+			Project string `json:"project"`
 		} `json:"memories"`
 		Total int64 `json:"total"`
 	}
@@ -553,12 +643,14 @@ func memoryListView(result string) (json.RawMessage, error) {
 			"id":      strconv.FormatInt(m.ID, 10),
 			"content": m.Content,
 			"source":  m.Source,
+			"project": projectLabel(m.Project),
 		})
 	}
 	return dsc.TableView("Memory", &dsc.ViewBadge{Text: fmt.Sprintf("%d items", out.Total), Tone: "teal"}, []dsc.ViewColumn{
 		{Key: "id", Title: "id"},
 		{Key: "content", Title: "content"},
 		{Key: "source", Title: "source"},
+		{Key: "project", Title: "project"},
 	}, rows), nil
 }
 
@@ -572,7 +664,8 @@ func main() {
                 "type": "object",
                 "properties": {
                         "query": {"type": "string", "description": "自然语言查询语句"},
-                        "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"}
+                        "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"},
+                        "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "检索范围：project=当前项目+全局（默认），global=仅全局，all=全部项目"}
                 },
                 "description": "query 与 keywords 至少提供一个"
         }`)
@@ -580,7 +673,8 @@ func main() {
                 "type": "object",
                 "properties": {
                         "content": {"type": "string", "description": "要保存的记忆内容"},
-                        "source": {"type": "string", "description": "记忆来源标记，缺省 user"}
+                        "source": {"type": "string", "description": "记忆来源标记，缺省 user"},
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "归属：project=当前项目（默认），global=跨项目共享（用户偏好、通用约定）"}
                 },
                 "required": ["content"]
         }`)
@@ -595,8 +689,9 @@ func main() {
                 "type": "object",
                 "properties": {
                         "id": {"type": "integer", "description": "要修改的记忆 ID"},
-                        "content": {"type": "string", "description": "新的记忆内容（可选，至少提供 content 或 source 之一）"},
-                        "source": {"type": "string", "description": "新的来源标记（可选）"}
+                        "content": {"type": "string", "description": "新的记忆内容（可选，至少提供 content/source/scope 之一）"},
+                        "source": {"type": "string", "description": "新的来源标记（可选）"},
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "改归属：project=当前项目，global=跨项目共享（可选）"}
                 },
                 "required": ["id"]
         }`)
@@ -606,6 +701,7 @@ func main() {
                         "page": {"type": "integer", "description": "页码，从 1 开始，默认 1"},
                         "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 100"},
                         "source": {"type": "string", "description": "按来源筛选（可选）"},
+                        "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "范围：project=当前项目+全局（默认），global=仅全局，all=全部"},
                         "archived": {"type": "boolean", "description": "是否只看已归档记忆，默认 false"}
                 }
         }`)
@@ -622,13 +718,14 @@ func main() {
 	// 查（搜索）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_search",
-		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、工具执行结果等），返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
+		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、本次任务的经验教训等），默认只搜当前项目与全局记忆（scope=project），返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
 		Schema:      searchSchema,
 		Handler:     handleSearch,
 		// ContextFn 动态贡献 system prompt（每次 ListContext 求值，对齐 DSH
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
-			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。其他工具的执行结果会自动写入记忆库。"
+			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。" +
+				"记忆按项目归属（memory_add 的 scope=project/global），检索默认只覆盖当前项目与全局；模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
 		},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memorySearchView(result)
@@ -637,7 +734,7 @@ func main() {
 	// 增
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_add",
-		Description: "添加一条记忆到记忆库：把值得长期保留的信息（如用户偏好、项目约定、重要结论）写入记忆库，供后续 memory_search 检索。",
+		Description: "添加一条记忆到记忆库：把值得长期保留的信息（如用户偏好、项目约定、重要结论、本次任务的经验教训）写入记忆库，供后续 memory_search 检索。默认归属当前项目（scope=project）；跨项目通用的事实用 scope=global。",
 		Schema:      addSchema,
 		Handler:     handleAdd,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
@@ -657,7 +754,7 @@ func main() {
 	// 改
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_update",
-		Description: "按 ID 修改记忆内容或来源标记。至少提供 content 或 source 之一。修改后 last_access 自动刷新。",
+		Description: "按 ID 修改记忆内容、来源标记或归属（scope=project/global）。至少提供 content、source、scope 之一。修改后 last_access 自动刷新。",
 		Schema:      updateSchema,
 		Handler:     handleUpdate,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
@@ -667,7 +764,7 @@ func main() {
 	// 查列表（分页）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_list",
-		Description: "分页列出记忆库中的记忆，按创建时间降序排列。可按来源筛选、查看已归档记忆。",
+		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目与全局记忆（scope=project），可按来源筛选、查看已归档记忆。",
 		Schema:      listSchema,
 		Handler:     handleList,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {

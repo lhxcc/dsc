@@ -24,8 +24,12 @@ func TestMemorySearchView(t *testing.T) {
 	if v.Kind != "table" || v.Title != "Memory" || v.Badge == nil || v.Badge.Text != "2 hit(s)" || v.Badge.Tone != "teal" {
 		t.Fatalf("view 头 = %+v", v)
 	}
-	if len(v.Columns) != 4 || len(v.Rows) != 2 {
+	if len(v.Columns) != 5 || len(v.Rows) != 2 {
 		t.Fatalf("columns/rows = %d/%d", len(v.Columns), len(v.Rows))
+	}
+	// 归属列：project 为空表示全局，视图显示「全局」
+	if v.Columns[4].Key != "project" || v.Rows[0]["project"] != "全局" {
+		t.Fatalf("project 列应展示全局: cols=%+v row0=%+v", v.Columns, v.Rows[0])
 	}
 	if v.Columns[2].Key != "score" || v.Columns[2].Tone != "green" {
 		t.Fatalf("score 列应带绿色 tone: %+v", v.Columns)

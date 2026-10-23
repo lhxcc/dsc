@@ -195,7 +195,8 @@ func recordReasoning(text string) {
 	seenReasoning.m[key] = true
 	seenReasoning.Unlock()
 
-	if _, _, err := addMemory(text, "reasoning"); err != nil {
+	// 推理按当前项目归属：换项目后不该在另一个项目的记忆里翻到这些细节
+	if _, _, err := addMemory(text, "reasoning", currentProjectKey()); err != nil {
 		fmt.Fprintf(os.Stderr, "memory-service: record reasoning failed: %v\n", err)
 	}
 }
