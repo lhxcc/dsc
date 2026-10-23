@@ -2,11 +2,14 @@ package tui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"charm.land/bubbletea/v2"
 	"dsc/userquestions"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 // TestQuestionFlow 校验问题覆盖层的渲染与键盘选择/放弃。
@@ -492,5 +495,30 @@ func TestComposerPasteWorksWhileRunning(t *testing.T) {
 	m.Update(tea.PasteMsg{Content: "粘贴内容"})
 	if got := m.input.Value(); got != "粘贴内容" {
 		t.Fatalf("input = %q, want pasted text while running", got)
+	}
+}
+
+// TestQuestionCustomInputAtCompletion 回答框内输入 "@" 应弹出文件补全菜单，
+// 且 Tab 可选中候选——此前自定义回答框完全没有补全。
+func TestQuestionCustomInputAtCompletion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "shot.png"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DSC_WORKSPACE_ROOT", dir)
+
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID: "q", Question: "pick", Options: []userquestions.Option{{Label: "A"}},
+	}}}, answer: make(chan *userquestions.Answer, 1)})
+	m.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
+
+	m.Update(tea.KeyPressMsg{Code: '@', Text: "@"})
+	if !m.completion.active || len(m.completion.items) == 0 {
+		t.Fatalf("输入 @ 后应有文件候选，completion=%+v", m.completion)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	if got := m.input.Value(); !strings.HasPrefix(got, "@") || !strings.Contains(got, "shot.png") {
+		t.Fatalf("Tab 应把候选写入回答框，got %q", got)
 	}
 }

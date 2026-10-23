@@ -295,6 +295,18 @@ func (m *Manager) hookClientsNamedSnapshot() []namedHookClient {
 	return out
 }
 
+// collectPreStepAppends 从插件返回的 result_json 中取出一次性插播消息。
+// 约定形状：{"append":[{"role":"system","content":"…"}]}；无该字段返回 nil。
+func collectPreStepAppends(resultJSON string) []any {
+	var payload struct {
+		Append []any `json:"append"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &payload); err != nil {
+		return nil
+	}
+	return payload.Append
+}
+
 func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) {
 	clients := m.hookClientsNamedSnapshot()
 	if len(clients) == 0 {
@@ -329,6 +341,7 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 	case "waterfall":
 		// 洋葱模型：从尾向前包装，每个插件可改写 result_json
 		// 初始 result 为原始 dataJSON；每个插件收到的 dataJSON 是上游改写后的
+		var appends []any // 所有插件请求的一次性插播消息（与改写权无关）
 		next := func() (string, error) { return dataJSON, nil }
 		for i := len(clients) - 1; i >= 0; i-- {
 			nc := clients[i]
@@ -345,8 +358,15 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 				if resp.GetError() != "" {
 					return "", fmt.Errorf("%s", resp.GetError())
 				}
-				if r := resp.GetResultJson(); r != "" && adopt {
-					dataJSON = r // 只有选定后端可改写载荷
+				if r := resp.GetResultJson(); r != "" {
+					// 插播消息：任何插件都可请求（只影响消息尾部，不改写既有内容），
+					// 与「载荷改写只归压缩后端」互不冲突。
+					if name == EventAgentPreStep {
+						appends = append(appends, collectPreStepAppends(r)...)
+					}
+					if adopt {
+						dataJSON = r // 只有选定后端可改写载荷
+					}
 				}
 				return innerNext()
 			}
@@ -359,6 +379,16 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		var result any
 		if finalResult != "" {
 			_ = json.Unmarshal([]byte(finalResult), &result)
+		}
+		if len(appends) > 0 {
+			// 合并进返回载荷的 append 字段，交由调用方追加到消息末尾
+			m, _ := result.(map[string]any)
+			if m == nil {
+				m = map[string]any{}
+			}
+			merged, _ := m["append"].([]any)
+			m["append"] = append(merged, appends...)
+			result = m
 		}
 		return result, nil
 

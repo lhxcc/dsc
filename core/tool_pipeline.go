@@ -453,16 +453,22 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 		label = fmt.Sprintf("%s: %s", toolName, truncateStr(p.Command, 60))
 	}
 
+	// 后台任务与当前回合解耦：调用方 ctx 在回合被中断（LLM 流错误、用户 Ctrl+C、
+	// 会话切走）时会被取消，若直接沿用它，后台作业会被一起判为 failed
+	// （"rpc error: code = Canceled desc = context canceled"），输出也随之丢失——
+	// 而 `run_in_background` 的语义正是「脱离本轮继续跑」。这里复制归属信息
+	//（会话、审批策略）到独立 ctx，生命周期交给 job 注册表（job_kill/进程退出）。
+	jobCtx := detachJobContext(ctx)
+
 	jobID, err := m.jobs.Start(jobs.StartSpec{
 		Kind:  toolName,
 		Label: label,
 		Owner: caller,
 		Start: func() (jobs.JobHooks, error) {
 			doneCh := make(chan jobs.JobOutcome, 1)
-			// 后台任务的生命周期独立于发起它的回合：只继承 ctx 中的值
-			// （会话/审批策略），不继承取消——回合结束后任务仍应继续，
-			// 只有 job_kill 才终止它。
-			jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+			// job_kill 需要能终止流水线；jobCtx 已脱离回合取消（detachJobContext），
+			// 这里只叠加一层可取消性，终止来源仅限 job_kill。
+			runCtx, cancel := context.WithCancel(jobCtx)
 
 			var mu sync.Mutex
 			cancelReason := ""
@@ -470,11 +476,11 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 			go func() {
 				defer cancel()
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
-				result, _, err := m.executeBackgroundPipeline(jobCtx, toolName, argsJSON)
+				result, _, err := m.executeBackgroundPipeline(runCtx, toolName, argsJSON)
 				mu.Lock()
 				reason := cancelReason
 				mu.Unlock()
-				if jobCtx.Err() != nil {
+				if runCtx.Err() != nil {
 					detail := "cancelled"
 					if reason != "" {
 						detail = reason
@@ -509,6 +515,21 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 
 	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
 	return result, "", nil
+}
+
+// detachJobContext 把后台任务从「回合 ctx」解绑：保留归属信息（会话 id、审批策略），
+// 但不继承取消信号。回合被中断（LLM 流错误 / 用户中断 / 会话切走）时，若后台任务
+// 仍挂在同一 ctx 上，会被判 failed 且输出丢失——而 run_in_background 的语义正是
+// 脱离本轮继续跑，终止只能经 job_kill 或进程退出。
+func detachJobContext(ctx context.Context) context.Context {
+	dctx := context.Background()
+	if c := CallerFromContext(ctx); c != "" {
+		dctx = WithCaller(dctx, c)
+	}
+	if pol := ApprovalPolicyFromContext(ctx); pol != "" {
+		dctx = WithApprovalPolicy(dctx, pol)
+	}
+	return dctx
 }
 
 // executeBackgroundPipeline 在后台执行完整工具流水线（不含 run_in_background 检测，

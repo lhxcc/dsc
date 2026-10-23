@@ -700,6 +700,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.PasteMsg:
 		// 问题待答期间：粘贴的文本即自定义回答（无需先选兜底项），且不受
 		// thinking/streaming 门控——模型正阻塞等待回答时粘贴不应被静默丢弃。
+		// 插入后刷新 @ 文件补全：回答框里的截图路径往往就是粘贴进来的。
 		if m.question != nil {
 			if !m.question.customMode {
 				m.question.customMode = true
@@ -707,6 +708,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
 			m.syncInputHeight()
+			m.updateCompletion()
 			m.render()
 			return m, nil
 		}

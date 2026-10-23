@@ -297,6 +297,24 @@ func formatShellResult(output string, exitCode int32) string {
 	return output
 }
 
+// shellHandlers 返回与路径归一相关的基础 handler（生产 runner 与测试 runner 共用）：
+//   - ExecHandler：内建式常用 POSIX 工具（mkdir/ls/cat/touch/rm/cp/mv/grep/head/tail/wc）
+//     进程内实现，不依赖外部 PATH；未命中的命令仍回退默认 PATH 外部执行。
+//   - OpenHandler：重定向/输入输出也走同一套路径归一（res）。默认 handler 只按 Dir
+//     拼相对路径，于是 `echo x > /tmp/a`、`2>/dev/null` 会绕过内建命令的路径映射
+//     （Windows 上 /tmp 落到当前盘根）。
+func shellHandlers() []interp.RunnerOption {
+	return []interp.RunnerOption{
+		interp.ExecHandler(shellExecHandler),
+		interp.OpenHandler(func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+			if path == "" {
+				return os.OpenFile(path, flag, perm)
+			}
+			return os.OpenFile(res(interp.HandlerCtx(ctx), path), flag, perm)
+		}),
+	}
+}
+
 // getOrCreateSession 獲取或創建 session
 func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 	globalSessionManager.mu.RLock()
@@ -335,10 +353,8 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 		interp.Env(initialEnv),
 		interp.Dir(cwd),
 		interp.StdIO(nil, stdoutSignal, stderrSignal),
-		// 内建式常用 POSIX 工具（mkdir/ls/cat/touch/rm/cp/mv/grep/head/tail/wc）进程内
-		// 实现，不依赖外部 PATH；未命中的命令仍回退默认 PATH 外部执行（见 internalcmds.go）。
-		interp.ExecHandler(shellExecHandler),
 	}
+	runnerOpts = append(runnerOpts, shellHandlers()...)
 
 	runner, err := interp.New(runnerOpts...)
 	if err != nil {

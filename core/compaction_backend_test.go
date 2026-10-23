@@ -1,6 +1,7 @@
 package core
 
 import (
+	"strings"
 	"testing"
 
 	"dsc/proto"
@@ -128,5 +129,64 @@ func TestCompactionBackendActiveFalseWhenPluginDead(t *testing.T) {
 
 	if m.compactionBackendActive() {
 		t.Fatal("压缩后端进程已退出时应视为无后端")
+	}
+}
+
+// TestPreStepCollectsAppendsFromAnyPlugin 插播消息（append）与改写权无关：
+// 任何插件都可请求，只有 compaction 后端能改写 messages。记忆插件正靠这条通道
+// 在任务收尾时插入一条 system 消息，而不去改（会破坏缓存前缀的）system prompt。
+func TestPreStepCollectsAppendsFromAnyPlugin(t *testing.T) {
+	m, _ := hookManager()
+	backend := &fakeHook{events: make(chan *proto.OnEventRequest, 4)}
+	notifier := &fakeHook{events: make(chan *proto.OnEventRequest, 4)}
+	notifier.eventResult = `{"append":[{"role":"system","content":"task done, write memory"}]}`
+
+	m.mu.Lock()
+	m.toolHookClients["dsc-system"] = backend
+	m.toolHookClients["tool-memory-service"] = notifier
+	m.toolHookOrder = []string{"tool-memory-service", "dsc-system"}
+	m.compactionBackend = "dsc-system"
+	m.mu.Unlock()
+
+	out, err := m.dispatchEventToPlugins(EventAgentPreStep, map[string]string{"messages": "[]"})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	payload, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("返回载荷类型 %T", out)
+	}
+	appends, _ := payload["append"].([]any)
+	if len(appends) != 1 {
+		t.Fatalf("应收集 1 条插播，got %+v", payload["append"])
+	}
+
+	// 解析为消息，并核对角色/内容
+	msgs := parsePreStepAppends(appends)
+	if len(msgs) != 1 || msgs[0].GetRole() != "system" || !strings.Contains(msgs[0].GetContent(), "write memory") {
+		t.Fatalf("插播消息解析不符: %+v", msgs)
+	}
+}
+
+// TestParsePreStepAppendsFilters 只接受 system/user 且丢弃空内容：
+// assistant/tool 需要配对的调用信息，插件无从构造。
+func TestParsePreStepAppendsFilters(t *testing.T) {
+	raw := []any{
+		map[string]any{"role": "system", "content": "note"},
+		map[string]any{"content": "default role"},
+		map[string]any{"role": "user", "content": "u"},
+		map[string]any{"role": "assistant", "content": "drop"},
+		map[string]any{"role": "tool", "content": "drop"},
+		map[string]any{"role": "system", "content": "   "},
+	}
+	msgs := parsePreStepAppends(raw)
+	if len(msgs) != 3 {
+		t.Fatalf("应保留 3 条，got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].GetRole() != "system" || msgs[1].GetRole() != "system" || msgs[2].GetRole() != "user" {
+		t.Fatalf("角色映射不符: %+v", msgs)
+	}
+	if parsePreStepAppends(nil) != nil {
+		t.Fatal("nil 应返回 nil")
 	}
 }

@@ -14,6 +14,8 @@ import (
 
 	dsc "dsc-sdk"
 
+	"dsc/core"
+
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -25,8 +27,6 @@ const (
 	decayLambda  = 0.05
 	archiveDays  = 30
 	timeNodeDays = 30
-	// maxAutoMemoryLen 钩子自动记录单条记忆的最大长度（防长输出撑爆记忆库）
-	maxAutoMemoryLen = 2000
 	// defaultPageSize 列表查询的默认每页条数
 	defaultPageSize = 20
 	// maxPageSize 列表查询的最大每页条数
@@ -564,23 +564,6 @@ func memoryListView(result string) (json.RawMessage, error) {
 	}, rows), nil
 }
 
-// recordToolResult 是 AfterTool 钩子：把其他工具的成功执行结果自动写入记忆库
-func recordToolResult(toolName, result, toolErr string) {
-	if toolErr != "" || result == "" {
-		return
-	}
-	if strings.HasPrefix(toolName, "memory_") {
-		return
-	}
-	content := toolName + ": " + result
-	if len(content) > maxAutoMemoryLen {
-		content = content[:maxAutoMemoryLen]
-	}
-	if _, _, err := addMemory(content, "tool"); err != nil {
-		fmt.Fprintf(os.Stderr, "memory-service: record tool result failed: %v\n", err)
-	}
-}
-
 func main() {
 	if err := initDB(dbPath()); err != nil {
 		fmt.Fprintf(os.Stderr, "memory-service: init db failed: %v\n", err)
@@ -699,9 +682,27 @@ func main() {
 	})
 
 	sdk.Hook(dsc.Hook{
+		// 记忆写入成功后作废收尾请求（本轮任务已留下记录）
 		AfterTool: func(ctx context.Context, toolName, argumentsJSON, result, toolErr string) (string, string) {
-			recordToolResult(toolName, result, toolErr)
+			if toolErr == "" && strings.HasPrefix(toolName, "memory_") {
+				clearTaskRecord()
+			}
 			return result, toolErr
+		},
+		// pre-step：跟随会话日志，被动记录模型推理；任务收尾时以「一次性插播消息」
+		// 请求写记忆（详见 capture.go takeTaskRecordNotice）。
+		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
+			if eventType != string(core.EventAgentPreStep) {
+				return "", nil
+			}
+			capturePreStep(dataJSON)
+			notice := takeTaskRecordNotice()
+			if notice == "" {
+				return "", nil
+			}
+			// 宿主会把 append 里的消息追加到本轮消息末尾（role=system），
+			// 不改 system prompt，故不会破坏其缓存前缀。
+			return taskNoticePayload(notice), nil
 		},
 	})
 	sdk.Serve()

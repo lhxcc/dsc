@@ -51,6 +51,15 @@ func ValidSessionID(id string) bool {
 	return session.ValidID(id)
 }
 
+// TempDir 返回临时目录：优先 DSC_TEMP_DIR（宿主注入），缺省 <ExecDir>/temp。
+// 用于工具产物（截图、spill、脚本临时档）：按进程 cwd 落盘会在不同启动方式下漂移。
+func TempDir() string {
+	if dir := EnvStr("DSC_TEMP_DIR", ""); dir != "" {
+		return dir
+	}
+	return PJoin(ExecDir(), core.TempDirName)
+}
+
 // SkillsDir 返回技能目录：优先 DSC_SKILLS_DIR（宿主注入，可与 ExecDir 分离），
 // 缺省 <ExecDir>/skills。
 //

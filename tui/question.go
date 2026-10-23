@@ -231,6 +231,38 @@ func (m *Model) enterCustomInputMode(q *pendingQuestion) tea.Cmd {
 // Enter 从主输入框取值提交、Esc 返回选项、Ctrl+C 放弃整个问题。
 func (m *Model) handleCustomInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	q := m.question
+	// @ 文件引用补全菜单打开时，导航/补全键先由菜单接管（与主输入框行为一致）。
+	// 之前自定义回答框完全没有补全：输入 "@" 后无候选，也无法 Tab 选中——用户
+	// 想引用一张截图只能手打完整路径。
+	if m.completion.active && len(m.completion.items) > 0 {
+		switch msg.String() {
+		case "up", "ctrl+p":
+			m.moveCompletion(-1)
+			m.render()
+			return m, nil
+		case "down", "ctrl+n":
+			m.moveCompletion(1)
+			m.render()
+			return m, nil
+		case "tab":
+			m.acceptCompletion()
+			m.syncInputHeight()
+			m.updateCompletion()
+			m.render()
+			return m, nil
+		case "enter":
+			// 仍在过滤（未精确命中）时 Enter 是「选中候选」，不是「提交回答」。
+			if !m.completionExactLabel() {
+				m.acceptCompletion()
+				m.syncInputHeight()
+				m.updateCompletion()
+				m.render()
+				return m, nil
+			}
+		}
+	}
+	// Enter 判定提到 switch 之前：终端可能以 KeyEnter 之外的形态上报 Enter，
+	// 且必须在 default 之前拦截，否则会被当成编辑键交给 textarea。
 	if isEnterKey(msg) {
 		text := strings.TrimSpace(m.input.Value())
 		m.input.SetValue("")
@@ -246,6 +278,7 @@ func (m *Model) handleCustomInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.syncInputHeight() // 输入框高度变化（已清空），同步 viewport
+		m.completion = completion{}
 		q.answers = append(q.answers, m.buildCustomAnswer(q, q.request.Questions[q.current].MultiSelect, text))
 		return m, m.advanceOrSubmit(q)
 	}
@@ -258,24 +291,30 @@ func (m *Model) handleCustomInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			q.err <- &userquestions.Error{Code: userquestions.ErrCanceled, Err: fmt.Errorf("user dismissed the question")}
 		}
 		m.input.SetValue("")
+		m.completion = completion{}
 		m.syncViewportHeight()
 		m.render()
 		return m, nil
+	case "ctrl+v":
+		// 部分终端不把 Ctrl+V 当括号粘贴，交回应用处理：手动读系统剪贴板
+		// （回答框里同样需要，用于粘贴截图路径等）。
+		return m, readClipboardPaste()
 	case "esc":
 		// 返回选项选择，清空输入框
 		q.customMode = false
 		m.input.SetValue("")
+		m.completion = completion{}
 		m.syncInputHeight()
 		m.render()
 		return m, nil
-	case "ctrl+v":
-		// 同选项模式的说明：手动读剪贴板，结果作为 PasteMsg 追加到自定义回答。
-		return m, readClipboardPaste()
 	default:
-		// 其余按键交给主输入框编辑（Shift+Enter/Ctrl+J 换行、IME 等由 textarea 处理）
+		// 其余按键交给主输入框编辑（Shift+Enter/Ctrl+J 换行、IME 等由 textarea 处理）。
+		// 编辑后刷新补全：输入 "@" 或继续打字都要驱动 @ 文件候选与斜杆菜单，
+		// 否则回答框里永远看不到候选列表。
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.syncInputHeight()
+		m.updateCompletion()
 		m.render()
 		return m, cmd
 	}

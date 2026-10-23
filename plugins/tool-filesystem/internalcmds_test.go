@@ -19,12 +19,13 @@ import (
 func runShellIO(t *testing.T, dir, script string) (string, string, error) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	r, err := interp.New(
+	opts := []interp.RunnerOption{
 		interp.Env(expand.ListEnviron()), // 空环境：无 PATH
 		interp.Dir(dir),
 		interp.StdIO(strings.NewReader(""), &out, &errb),
-		interp.ExecHandler(shellExecHandler),
-	)
+	}
+	opts = append(opts, shellHandlers()...)
+	r, err := interp.New(opts...)
 	if err != nil {
 		t.Fatalf("new runner: %v", err)
 	}
@@ -42,12 +43,13 @@ func runShellIO(t *testing.T, dir, script string) (string, string, error) {
 func runShellNilStdin(t *testing.T, dir, script string) (string, string, error) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	r, err := interp.New(
+	opts := []interp.RunnerOption{
 		interp.Env(expand.ListEnviron()), // 空环境：无 PATH
 		interp.Dir(dir),
 		interp.StdIO(nil, &out, &errb),
-		interp.ExecHandler(shellExecHandler),
-	)
+	}
+	opts = append(opts, shellHandlers()...)
+	r, err := interp.New(opts...)
 	if err != nil {
 		t.Fatalf("new runner: %v", err)
 	}
