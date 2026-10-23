@@ -79,9 +79,17 @@ func TestProjectScopeIsolation(t *testing.T) {
 	if got := searchVia(t, "CMake", ""); len(got) != 0 {
 		t.Fatalf("scope 缺省应按 project 处理: %+v", got)
 	}
-	// 未知档位直接报错，不会静默换成「全库」或别的范围
-	if _, err := handleSearch(context.Background(), mustJSON(map[string]string{"keywords": "CMake", "scope": "all"})); err == nil {
-		t.Fatal("未知 scope 应报错")
+	// 显式跨项目是允许的（模型是唯一用户，要能管理自己的数据）：
+	// all = 全库盘点，project:<key> = 点名某个项目
+	if got := searchVia(t, "CMake", "all"); len(got) != 1 {
+		t.Fatalf("scope=all 应可跨项目检索，got %d 条", len(got))
+	}
+	if got := searchVia(t, "CMake", "project:"+keyOf(t, "/w/proj-a")); len(got) != 1 {
+		t.Fatalf("scope=project:<A 键> 应能检索 A 项目，got %d 条", len(got))
+	}
+	// 明显写错的取值仍然报错，不静默换范围
+	if _, err := handleSearch(context.Background(), mustJSON(map[string]string{"keywords": "CMake", "scope": "projct:typo"})); err == nil {
+		t.Fatal("非法 scope 应报错")
 	}
 
 	// A 项目自己看得到
@@ -255,62 +263,84 @@ func TestUpdateScopeValidates(t *testing.T) {
 	}
 }
 
-// TestIDOpsRejectOtherProjects scope 只接受 current/global，无法指定别的项目键；
-// 更要紧的是按 ID 操作也不能越界——ID 自增可猜，若无归属校验，模型能用
-// delete/update 遍历删改其它项目的记忆（甚至把它们「搬」进自己项目）。
-func TestIDOpsRejectOtherProjects(t *testing.T) {
+// TestModelCanManageOtherProjects 记忆插件的用户只有模型自己：隔离是默认检索范围，
+// 不是权限。模型应当能按 id 修改/删除/迁移任意项目的记忆（先 scope=all 盘点拿 id）。
+func TestModelCanManageOtherProjects(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	foreign := addVia(t, "A 项目的私密结论", "current")
+	foreign := addVia(t, "A 项目的结论", "current")
 	foreignID := int64(foreign["id"].(float64))
 
 	asProject(t, "/w/proj-b")
-	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": foreignID})); err == nil {
-		t.Fatal("不应能删除其它项目的记忆")
+	// B 项目里用 all 才能看到（默认 current 看不到）
+	if got := searchVia(t, "A 项目的结论", "current"); len(got) != 0 {
+		t.Fatalf("默认不应看到别的项目，got %d 条", len(got))
 	}
-	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "scope": "current"})); err == nil {
-		t.Fatal("不应能把其它项目的记忆改到当前项目")
-	}
-	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "content": "改写"})); err == nil {
-		t.Fatal("不应能改其它项目的记忆内容")
+	if got := searchVia(t, "A 项目的结论", "all"); len(got) != 1 {
+		t.Fatalf("scope=all 应能看到，got %d 条", len(got))
 	}
 
+	// 允许改内容
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "content": "A 项目的结论（已整理）"})); err != nil {
+		t.Fatalf("应允许跨项目整理内容: %v", err)
+	}
+	// 允许迁移到全局层（整理动作）
+	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": foreignID, "scope": "global"})); err != nil {
+		t.Fatalf("应允许把条目改到全局层: %v", err)
+	}
 	var mem Memory
-	if err := DB.First(&mem, foreignID).Error; err != nil {
-		t.Fatalf("既不应被删: %v", err)
+	DB.First(&mem, foreignID)
+	if mem.Project != globalProject {
+		t.Fatalf("归属应已改为全局，got %q", mem.Project)
 	}
-	if mem.Project == currentProjectKey() || mem.Project == globalProject {
-		t.Fatalf("归属不应被改到当前项目或全局，got %q", mem.Project)
+	// 允许删除
+	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": foreignID})); err != nil {
+		t.Fatalf("应允许跨项目删除: %v", err)
 	}
-	if mem.Content != "A 项目的私密结论" {
-		t.Fatalf("内容不应被改写，got %q", mem.Content)
-	}
-
-	// 全局条目对任何项目可见，可正常操作
-	asProject(t, "/w/proj-a")
-	g := addVia(t, "通用偏好", "global")
-	gid := int64(g["id"].(float64))
-	asProject(t, "/w/proj-b")
-	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": gid, "content": "通用偏好2"})); err != nil {
-		t.Fatalf("全局条目应可从任意项目修改: %v", err)
-	}
-	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": gid})); err != nil {
-		t.Fatalf("全局条目应可从任意项目删除: %v", err)
+	if err := DB.First(&Memory{}, foreignID).Error; err == nil {
+		t.Fatal("删除后不应再存在")
 	}
 }
 
-// TestScopeRejectsForeignProjectKey scope 不接受任意项目键，只认 current/global。
-func TestScopeRejectsForeignProjectKey(t *testing.T) {
+// TestScopeAcceptsProjectKey scope=project:<键> 可点名任意项目（读与写都支持），
+// 写入后可被该项目的默认检索看到。
+func TestScopeAcceptsProjectKey(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
-	addVia(t, "A 的记忆", "current")
-	foreignKey := currentProjectKey()
+	keyA := currentProjectKey()
 
 	asProject(t, "/w/proj-b")
-	if _, err := handleSearch(context.Background(), mustJSON(map[string]string{"keywords": "A", "scope": foreignKey})); err == nil {
-		t.Fatal("scope 传项目键应报错（不支持指定别的项目）")
+	// 在 B 会话里往 A 项目写一条
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "写给 A 项目的备注", "scope": "project:" + keyA})); err != nil {
+		t.Fatalf("应允许写入指定项目: %v", err)
 	}
-	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "x", "scope": foreignKey})); err == nil {
-		t.Fatal("写入时 scope 传项目键应报错")
+	// B 的默认检索看不到
+	if got := searchVia(t, "写给 A 项目", "current"); len(got) != 0 {
+		t.Fatalf("B 默认不应看到写给 A 的备注，got %d 条", len(got))
 	}
+	// A 的默认检索能看到
+	asProject(t, "/w/proj-a")
+	if got := searchVia(t, "写给 A 项目", "current"); len(got) != 1 {
+		t.Fatalf("A 应看到写给自己项目的备注，got %d 条", len(got))
+	}
+
+	// 非法形态仍报错
+	for _, bad := range []string{"project:", "project:global", "projct:x"} {
+		if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "x", "scope": bad})); err == nil {
+			t.Fatalf("%q 应报错", bad)
+		}
+	}
+	// all 不能用于写入
+	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "x", "scope": "all"})); err == nil {
+		t.Fatal("scope=all 不能用于写入")
+	}
+}
+
+// keyOf 返回某个工作区根对应的项目键（不改当前上下文）。
+func keyOf(t *testing.T, root string) string {
+	t.Helper()
+	old := core.WorkspaceRoot
+	core.WorkspaceRoot = root
+	defer func() { core.WorkspaceRoot = old }()
+	return dsc.ProjectSessionKey()
 }

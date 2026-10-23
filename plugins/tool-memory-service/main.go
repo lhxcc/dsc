@@ -46,15 +46,19 @@ type Memory struct {
 	Project string `gorm:"type:text;not null;index" json:"project"`
 }
 
-// 记忆作用域只有两档，语义严格、互不重叠：
-//   - current：只作用于当前项目
-//   - global ：只作用于跨项目共享层（用户偏好、通用约定）
+// 记忆作用域（scope）——注意这是**检索/写入范围**，不是权限。
+// 记忆插件的用户只有模型自己，隔离的目的是「默认别把别的项目的细节灌进当前上下文」，
+// 而不是禁止模型管理自己的数据。因此除两档常用范围外，还能显式点名某个项目。
 //
-// 默认 project。不再提供「全部项目」档：跨项目翻查既难判定意图，也把别的项目
-// 的私有细节带进当前上下文。
+//	current            当前项目（默认）
+//	global             跨项目共享层（用户偏好、通用约定）
+//	project:<项目键>    指定某个项目（用于跨项目管理/整理）
+//	all                全库（仅检索与列表；用于盘点有哪些项目、查看某条 id 属于谁）
 const (
 	scopeCurrent = "current"
 	scopeGlobal  = "global"
+	scopeAll     = "all"
+	scopePrefix  = "project:"
 )
 
 // globalProject 是全局层在 project 列的存值：直接复用 scope 取值 "global"。
@@ -69,44 +73,82 @@ func currentProjectKey() string {
 	return dsc.ProjectSessionKey()
 }
 
-// parseWriteScope 校验写入侧的 scope：必填，且只能是 project / global。
-// 不做「空值回退默认」——那样会留下没有归属的记忆（难以管理），也让调用方
-// 分不清自己到底写进了哪一层。
-func parseWriteScope(raw string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
+// scopeFilter 是解析后的检索/写入范围。
+type scopeFilter struct {
+	kind string // current | global | all | project
+	key  string // kind==project 时的项目键
+}
+
+// parseScope 解析 scope 参数。def 为空值时使用的默认档（写入侧传 ""，
+// 即「必填」；读取侧传 scopeCurrent）。
+func parseScope(raw, def string) (scopeFilter, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		if def == "" {
+			return scopeFilter{}, fmt.Errorf("scope is required: current, global, or project:<key>")
+		}
+		return scopeFilter{kind: def}, nil
+	}
+	switch strings.ToLower(s) {
 	case scopeCurrent:
-		return scopeCurrent, nil
+		return scopeFilter{kind: scopeCurrent}, nil
 	case scopeGlobal:
-		return scopeGlobal, nil
-	case "":
-		return "", fmt.Errorf("scope is required: project (current project) or global (shared across projects)")
+		return scopeFilter{kind: scopeGlobal}, nil
+	case scopeAll:
+		return scopeFilter{kind: scopeAll}, nil
 	}
-	return "", fmt.Errorf("invalid scope %q: want project or global", raw)
+	if len(s) > len(scopePrefix) && strings.EqualFold(s[:len(scopePrefix)], scopePrefix) {
+		key := strings.TrimSpace(s[len(scopePrefix):])
+		if key == "" {
+			return scopeFilter{}, fmt.Errorf("scope %q is missing the project key", s)
+		}
+		if key == globalProject {
+			return scopeFilter{}, fmt.Errorf("use scope=global for the shared layer, not project:%s", key)
+		}
+		return scopeFilter{kind: "project", key: key}, nil
+	}
+	return scopeFilter{}, fmt.Errorf("invalid scope %q: want current, global, all, or project:<key>", raw)
 }
 
-// parseReadScope 校验读取侧的 scope：缺省为 project（只读操作给默认值无害，
-// 不会产生任何数据），但给了非法取值就报错，不静默换成别的范围。
-func parseReadScope(raw string) (string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return scopeCurrent, nil
+// projectValue 把范围映射为写入 project 列的值（all 不能用于写入）。
+func (f scopeFilter) projectValue() (string, error) {
+	switch f.kind {
+	case scopeCurrent:
+		return currentProjectKey(), nil
+	case scopeGlobal:
+		return globalProject, nil
+	case "project":
+		return f.key, nil
 	}
-	return parseWriteScope(raw)
+	return "", fmt.Errorf("scope=all cannot be used for writing: choose current, global, or project:<key>")
 }
 
-// scopeProjectValue 把 scope 映射为 project 列的存值。
-func scopeProjectValue(scope string) string {
-	if scope == scopeGlobal {
-		return globalProject
-	}
-	return currentProjectKey()
-}
-
-// scopeWhere 给查询加上归属过滤（两档严格互斥，不做隐式合并）。
-func scopeWhere(q *gorm.DB, scope string) *gorm.DB {
-	if scope == scopeGlobal {
+// where 给查询加上归属过滤。
+func (f scopeFilter) where(q *gorm.DB) *gorm.DB {
+	switch f.kind {
+	case scopeAll:
+		return q
+	case scopeGlobal:
 		return q.Where("project = ?", globalProject)
+	case "project":
+		return q.Where("project = ?", f.key)
+	default:
+		return q.Where("project = ?", currentProjectKey())
 	}
-	return q.Where("project = ?", currentProjectKey())
+}
+
+// sqlClause 返回拼进原生查询的过滤片段（FTS 分支用）。
+func (f scopeFilter) sqlClause() (string, []any) {
+	switch f.kind {
+	case scopeAll:
+		return "", nil
+	case scopeGlobal:
+		return " AND m.project = ?", []any{globalProject}
+	case "project":
+		return " AND m.project = ?", []any{f.key}
+	default:
+		return " AND m.project = ?", []any{currentProjectKey()}
+	}
 }
 
 // CallLog 对应 call_logs 表
@@ -221,7 +263,7 @@ func joinMatchTerms(keywords []string) string {
 }
 
 // searchMemories 执行记忆检索：FTS5 优先，LIKE 兜底；结果按相关度×时间衰减稳定排序。
-func searchMemories(query string, now time.Time, scope string) ([]resultItem, error) {
+func searchMemories(query string, now time.Time, scope scopeFilter) ([]resultItem, error) {
 	keywords := strings.Fields(query)
 	if len(keywords) == 0 {
 		return []resultItem{}, nil
@@ -240,11 +282,8 @@ func searchMemories(query string, now time.Time, scope string) ([]resultItem, er
 		Project     string
 		RelScore    float64
 	}
-	// 归属过滤：两档严格互斥（见 scopeWhere）
-	extraWhere, extraArgs := " AND m.project = ?", []any{currentProjectKey()}
-	if scope == scopeGlobal {
-		extraArgs = []any{globalProject}
-	}
+	// 归属过滤（scope 是检索范围，不是权限：all 表示全库）
+	extraWhere, extraArgs := scope.sqlClause()
 	var ftsRows []ftsRow
 	args := append([]any{matchQuery}, extraArgs...)
 	err := DB.Raw(`
@@ -286,7 +325,7 @@ func searchMemories(query string, now time.Time, scope string) ([]resultItem, er
 		q := DB.Model(&Memory{}).
 			Where("archived = ?", false).
 			Where(likeWhere, likeArgs...)
-		err := scopeWhere(q, scope).Limit(50).Find(&memories).Error
+		err := scope.where(q).Limit(50).Find(&memories).Error
 		if err != nil {
 			return nil, err
 		}
@@ -322,7 +361,7 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 		kwStr = req.Query
 	}
 	now := time.Now()
-	scope, err := parseReadScope(req.Scope)
+	scope, err := parseScope(req.Scope, scopeCurrent)
 	if err != nil {
 		return "", err
 	}
@@ -357,17 +396,12 @@ func handleSearch(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 增 (memory_add) ----
 
-// loadVisibleMemory 取一条「对当前调用方可见」的记忆：归属必须是当前项目或全局层。
-//
-// 别的项目的行一律按「不存在」处理（不泄露存在性）：memory_delete / memory_update
-// 按 ID 操作，而 ID 是自增的、可猜——没有这道校验，模型可以用 id=1..N 遍历删改
-// 其它项目的记忆（甚至用 scope=current 把它「搬」到自己项目）。
-func loadVisibleMemory(id int64) (*Memory, error) {
+// loadMemory 取一条记忆（按 id）。不做归属限制：记忆插件的用户只有模型自己，
+// 隔离是「默认检索范围」，不是权限——模型要整理哪个项目的记忆都应允许，
+// 用 memory_list(scope=all) 就能看到 id 与归属。
+func loadMemory(id int64) (*Memory, error) {
 	var mem Memory
 	if err := DB.First(&mem, id).Error; err != nil {
-		return nil, fmt.Errorf("memory id %d not found", id)
-	}
-	if mem.Project != currentProjectKey() && mem.Project != globalProject {
 		return nil, fmt.Errorf("memory id %d not found", id)
 	}
 	return &mem, nil
@@ -412,11 +446,14 @@ func handleAdd(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Content == "" {
 		return "", fmt.Errorf("content is required")
 	}
-	scope, err := parseWriteScope(req.Scope)
+	scope, err := parseScope(req.Scope, "")
 	if err != nil {
 		return "", err
 	}
-	project := scopeProjectValue(scope)
+	project, err := scope.projectValue()
+	if err != nil {
+		return "", err
+	}
 	id, dedup, err := addMemory(req.Content, req.Source, project)
 	if err != nil {
 		return "", err
@@ -444,7 +481,7 @@ func handleDelete(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.ID == 0 {
 		return "", fmt.Errorf("id is required")
 	}
-	if _, err := loadVisibleMemory(req.ID); err != nil {
+	if _, err := loadMemory(req.ID); err != nil {
 		return "", err
 	}
 	result := DB.Delete(&Memory{}, req.ID)
@@ -486,19 +523,23 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 		updates["source"] = req.Source
 	}
 	if req.Scope != nil {
-		// 允许在两档之间改归属（例如把全局条目收进当前项目）
-		scope, err := parseWriteScope(*req.Scope)
+		// 允许改归属（current / global / project:<key>）
+		scope, err := parseScope(*req.Scope, "")
 		if err != nil {
 			return "", err
 		}
-		updates["project"] = scopeProjectValue(scope)
+		project, err := scope.projectValue()
+		if err != nil {
+			return "", err
+		}
+		updates["project"] = project
 	}
 	if len(updates) == 0 {
 		return "", fmt.Errorf("at least one of content, source or scope must be provided")
 	}
 	updates["last_access"] = time.Now().Unix()
 
-	if _, err := loadVisibleMemory(req.ID); err != nil {
+	if _, err := loadMemory(req.ID); err != nil {
 		return "", err
 	}
 	result := DB.Model(&Memory{}).Where("id = ?", req.ID).Updates(updates)
@@ -543,11 +584,11 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 		req.PageSize = maxPageSize
 	}
 
-	scope, err := parseReadScope(req.Scope)
+	scope, err := parseScope(req.Scope, scopeCurrent)
 	if err != nil {
 		return "", err
 	}
-	query := scopeWhere(DB.Model(&Memory{}), scope)
+	query := scope.where(DB.Model(&Memory{}))
 	if req.Source != "" {
 		query = query.Where("source = ?", req.Source)
 	}
@@ -705,7 +746,7 @@ func main() {
                 "properties": {
                         "query": {"type": "string", "description": "自然语言查询语句"},
                         "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"},
-                        "scope": {"type": "string", "enum": ["current", "global"], "description": "检索范围：current=仅当前项目（缺省），global=仅全局共享层"}
+                        "scope": {"type": "string", "description": "检索范围（缺省 current）：current=当前项目；global=全局共享层；project:<项目键>=指定项目；all=全库（跨项目盘点/整理时用）"}
                 },
                 "description": "query 与 keywords 至少提供一个"
         }`)
@@ -714,7 +755,7 @@ func main() {
                 "properties": {
                         "content": {"type": "string", "description": "要保存的记忆内容"},
                         "source": {"type": "string", "description": "记忆来源标记，缺省 user"},
-                        "scope": {"type": "string", "enum": ["current", "global"], "description": "必填归属：current=当前项目，global=跨项目共享（用户偏好、通用约定）"}
+                        "scope": {"type": "string", "description": "必填归属：current=当前项目；global=跨项目共享（用户偏好、通用约定）；project:<项目键>=指定某个项目（如 project:O=--Agents--dsc-49C81869）"}
                 },
                 "required": ["content", "scope"]
         }`)
@@ -731,7 +772,7 @@ func main() {
                         "id": {"type": "integer", "description": "要修改的记忆 ID"},
                         "content": {"type": "string", "description": "新的记忆内容（可选，至少提供 content/source/scope 之一）"},
                         "source": {"type": "string", "description": "新的来源标记（可选）"},
-                        "scope": {"type": "string", "enum": ["current", "global"], "description": "改归属：current=当前项目，global=跨项目共享（可选）"}
+                        "scope": {"type": "string", "description": "改归属（可选）：current=当前项目；global=跨项目共享；project:<项目键>=指定项目"}
                 },
                 "required": ["id"]
         }`)
@@ -741,7 +782,7 @@ func main() {
                         "page": {"type": "integer", "description": "页码，从 1 开始，默认 1"},
                         "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 100"},
                         "source": {"type": "string", "description": "按来源筛选（可选）"},
-                        "scope": {"type": "string", "enum": ["current", "global"], "description": "范围：current=仅当前项目（缺省），global=仅全局共享层"},
+                        "scope": {"type": "string", "description": "范围（缺省 current）：current=当前项目；global=全局共享层；project:<项目键>=指定项目；all=全库（含各项目，用于盘点）"},
                         "archived": {"type": "boolean", "description": "是否只看已归档记忆，默认 false"}
                 }
         }`)
@@ -765,7 +806,7 @@ func main() {
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
 			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。" +
-				"记忆归属分两档且必填（memory_add 的 scope=current/global）：current 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
+				"记忆归属必填（memory_add 的 scope）：current=当前项目，global=跨项目共享层，project:<项目键>=指定项目；检索默认只查当前项目，查全局用 scope=global，整理其它项目用 scope=all 盘点后再按 id 增删改（隔离只作用于默认检索范围，不限制你管理这些数据）。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
 		},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memorySearchView(result)
@@ -804,7 +845,7 @@ func main() {
 	// 查列表（分页）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_list",
-		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目（scope=current），可按来源筛选、查看已归档记忆；scope=global 只列全局层。",
+		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目（scope=current）；scope=global 列全局层，scope=all 列全库（含 project 归属列，便于按 id 整理）。",
 		Schema:      listSchema,
 		Handler:     handleList,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
