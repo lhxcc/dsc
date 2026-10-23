@@ -33,6 +33,7 @@ package robotgo
 #cgo darwin CFLAGS: -x objective-c -Wno-deprecated-declarations
 #cgo darwin LDFLAGS: -framework Cocoa -framework OpenGL -framework IOKit
 #cgo darwin LDFLAGS: -framework Carbon -framework CoreFoundation
+#cgo darwin LDFLAGS: -framework ScreenCaptureKit
 
 #cgo linux CFLAGS: -I/usr/src
 #cgo linux LDFLAGS: -L/usr/src -lm -lX11 -lXtst
