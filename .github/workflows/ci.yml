@@ -154,6 +154,8 @@ jobs:
             test: false
           - path: plugins/tool-browser-use
             test: false
+          - path: plugins/tool-code-review
+            test: true
           - path: plugins/tool-filesystem
             test: false
           - path: plugins/tool-lisp-eval

@@ -69,6 +69,7 @@ var publicPlugins = []string{
 	"tool-ssh",
 	"tool-musicplayer",
 	"tool-harness-webui",
+	"tool-code-review",
 }
 
 // cgoPlugins 依赖 CGO 的插件（robotgo 链接 X11）：只能在「与运行时平台一致」的
