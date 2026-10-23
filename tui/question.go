@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode"
 
-	"charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"dsc/userquestions"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // questionBoxSty 问题覆盖层边框样式。
@@ -76,10 +78,35 @@ func (m *Model) askProvider(ctx context.Context, req *userquestions.Request) (*u
 	}
 }
 
+// isEnterKey 判断是否 Enter：优先按物理键码判断（不同终端的 String() 文本可能
+// 是 "enter" / "\r" 等），避免选择项确认在所有终端上都可靠触发。
+func isEnterKey(msg tea.KeyPressMsg) bool {
+	return msg.Code == tea.KeyEnter || msg.String() == "enter" || msg.String() == "\r"
+}
+
+// printableInput 返回本次按键可插入的可见文本（含 IME 提交的多字符文本）；
+// 控制键、纯空白返回空串（不触发「输入即自定义回答」）。
+func printableInput(msg tea.KeyPressMsg) string {
+	text := msg.Text
+	if text == "" && msg.Code >= 32 {
+		text = string(msg.Code)
+	}
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	for _, r := range text {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return text
+}
+
 // handleQuestionKey 问题覆盖层激活时的按键处理：方向选择、Space 勾选（多选）、
 // Enter 确认（队列中回答完当前问题后推进下一个）、Esc 放弃；
 // 选中末尾"✎ 其他（手动输入）"项触发自定义文字输入（覆盖层消失、焦点落到主输入框）。
-// c/o 同样可进入自定义输入（键盘快捷通道）。
+// c/o 同样可进入自定义输入（键盘快捷通道）；直接键入其它可见字符也会立即进入
+// 自定义输入并保留该字符（不必先按 Enter 选中兜底项）。
 //
 // 任何改变 m.question 或 q.customMode 的分支都必须经 syncViewportHeight 同步
 // viewport 实际高度——否则 vpHeight() 计算正确但 m.viewport.Height() 仍为旧值，
@@ -96,6 +123,20 @@ func (m *Model) handleQuestionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	opts := m.questionOptions(q)
 	multi := q.request.Questions[q.current].MultiSelect
+	if isEnterKey(msg) {
+		if q.answer == nil {
+			m.question = nil
+			m.syncViewportHeight()
+			m.render()
+			return m, nil
+		}
+		// 选中末尾的"✎ 其他（手动输入）"项 → 进入自定义输入模式（覆盖层消失）
+		if m.isCustomOption(q, q.cursor) {
+			return m, m.enterCustomInputMode(q)
+		}
+		q.answers = append(q.answers, m.buildAnswerItem(q, multi))
+		return m, m.advanceOrSubmit(q)
+	}
 	switch msg.String() {
 	case "ctrl+q":
 		return m, tea.Quit
@@ -145,19 +186,21 @@ func (m *Model) handleQuestionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "c", "o":
 		// 键盘快捷通道：直接进入自定义文字输入（与选中末尾项等价）
 		return m, m.enterCustomInputMode(q)
-	case "enter":
-		if q.answer == nil {
-			m.question = nil
-			m.syncViewportHeight()
+	case "ctrl+v":
+		// 部分终端不把 Cmd+V/Ctrl+V 转成括号粘贴，而是交回应用；此处手动读
+		// 剪贴板（结果以 PasteMsg 回到 Update，由粘贴分支填入自定义回答）。
+		// 不拦截的话该键会落到 textarea 的 Paste 绑定并插入其内部空剪贴板。
+		return m, readClipboardPaste()
+	default:
+		// 直接键入可见字符 = 想自己写答案：进入自定义输入并保留该字符，
+		// 不必先按 Enter 选中兜底项（修复「选中其他后打字没反应」）。
+		if text := printableInput(msg); text != "" {
+			cmd := m.enterCustomInputMode(q)
+			m.input.InsertString(text)
+			m.syncInputHeight()
 			m.render()
-			return m, nil
+			return m, cmd
 		}
-		// 选中末尾的"✎ 其他（手动输入）"项 → 进入自定义输入模式（覆盖层消失）
-		if m.isCustomOption(q, q.cursor) {
-			return m, m.enterCustomInputMode(q)
-		}
-		q.answers = append(q.answers, m.buildAnswerItem(q, multi))
-		return m, m.advanceOrSubmit(q)
 	}
 	return m, nil
 }
@@ -188,6 +231,24 @@ func (m *Model) enterCustomInputMode(q *pendingQuestion) tea.Cmd {
 // Enter 从主输入框取值提交、Esc 返回选项、Ctrl+C 放弃整个问题。
 func (m *Model) handleCustomInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	q := m.question
+	if isEnterKey(msg) {
+		text := strings.TrimSpace(m.input.Value())
+		m.input.SetValue("")
+		if q.answer == nil || text == "" {
+			// 无通道或空文本：回到选项选择
+			// 注意：customMode 由 true→false，覆盖层从隐藏变可见，
+			// vpHeight 收缩，必须重新 syncViewportHeight——若先调
+			// syncInputHeight（此时 customMode 仍 true）再改 customMode，
+			// viewport 会保留旧高度把覆盖层挤出可视区。
+			q.customMode = false
+			m.syncViewportHeight()
+			m.render()
+			return m, nil
+		}
+		m.syncInputHeight() // 输入框高度变化（已清空），同步 viewport
+		q.answers = append(q.answers, m.buildCustomAnswer(q, q.request.Questions[q.current].MultiSelect, text))
+		return m, m.advanceOrSubmit(q)
+	}
 	switch msg.String() {
 	case "ctrl+q":
 		return m, tea.Quit
@@ -207,23 +268,9 @@ func (m *Model) handleCustomInputKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.syncInputHeight()
 		m.render()
 		return m, nil
-	case "enter":
-		text := strings.TrimSpace(m.input.Value())
-		m.input.SetValue("")
-		if q.answer == nil || text == "" {
-			// 无通道或空文本：回到选项选择
-			// 注意：customMode 由 true→false，覆盖层从隐藏变可见，
-			// vpHeight 收缩，必须重新 syncViewportHeight——若先调
-			// syncInputHeight（此时 customMode 仍 true）再改 customMode，
-			// viewport 会保留旧高度把覆盖层挤出可视区。
-			q.customMode = false
-			m.syncViewportHeight()
-			m.render()
-			return m, nil
-		}
-		m.syncInputHeight() // 输入框高度变化（已清空），同步 viewport
-		q.answers = append(q.answers, m.buildCustomAnswer(q, q.request.Questions[q.current].MultiSelect, text))
-		return m, m.advanceOrSubmit(q)
+	case "ctrl+v":
+		// 同选项模式的说明：手动读剪贴板，结果作为 PasteMsg 追加到自定义回答。
+		return m, readClipboardPaste()
 	default:
 		// 其余按键交给主输入框编辑（Shift+Enter/Ctrl+J 换行、IME 等由 textarea 处理）
 		var cmd tea.Cmd

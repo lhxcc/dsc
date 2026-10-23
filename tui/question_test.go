@@ -371,3 +371,126 @@ func TestQuestionCustomModeOverlayHides(t *testing.T) {
 		t.Fatalf("customMode should show a one-line hint, got %q", after)
 	}
 }
+
+// TestQuestionTypingStartsCustomInput 回归「选中/停在其他项后打字没反应」：
+// 问题待答时直接键入可见字符应进入自定义输入并保留该字符，不必先按 Enter。
+func TestQuestionTypingStartsCustomInput(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	ansCh := make(chan *userquestions.Answer, 1)
+	errCh := make(chan error, 1)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID:       "q",
+		Question: "how?",
+		Options:  []userquestions.Option{{Label: "A"}, {Label: "B"}},
+	}}}, answer: ansCh, err: errCh})
+
+	m.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
+	if m.question == nil || !m.question.customMode {
+		t.Fatal("typing a printable character should enter custom input mode")
+	}
+	if got := m.input.Value(); got != "z" {
+		t.Fatalf("input = %q, want the typed character", got)
+	}
+	m.Update(tea.KeyPressMsg{Code: 'i', Text: "i"})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	select {
+	case ans := <-ansCh:
+		if len(ans.Answers) != 1 || ans.Answers[0].Custom != "zi" {
+			t.Fatalf("custom answer = %+v", ans)
+		}
+	default:
+		t.Fatal("answer should be delivered")
+	}
+}
+
+// TestQuestionPasteBecomesCustomAnswer 回归：模型等待回答（thinking）期间粘贴
+// 不得被运行态门控丢弃，应直接作为自定义回答填入。
+func TestQuestionPasteBecomesCustomAnswer(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.thinking = true
+	ansCh := make(chan *userquestions.Answer, 1)
+	errCh := make(chan error, 1)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID:       "q",
+		Question: "how?",
+		Options:  []userquestions.Option{{Label: "A"}, {Label: "B"}},
+	}}}, answer: ansCh, err: errCh})
+
+	m.Update(tea.PasteMsg{Content: "你好"})
+	if m.question == nil || !m.question.customMode {
+		t.Fatal("pasting while a question is pending should enter custom input mode")
+	}
+	if got := m.input.Value(); got != "你好" {
+		t.Fatalf("input = %q, want pasted text", got)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	select {
+	case ans := <-ansCh:
+		if len(ans.Answers) != 1 || ans.Answers[0].Custom != "你好" {
+			t.Fatalf("custom answer = %+v", ans)
+		}
+	default:
+		t.Fatal("answer should be delivered")
+	}
+}
+
+// TestQuestionEnterByKeyCode 不同终端的 Enter 文本可能不同：必须按物理键码也能确认。
+func TestQuestionEnterByKeyCode(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	ansCh := make(chan *userquestions.Answer, 1)
+	errCh := make(chan error, 1)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID:       "q",
+		Question: "pick",
+		Options:  []userquestions.Option{{Label: "A"}, {Label: "B"}},
+	}}}, answer: ansCh, err: errCh})
+
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Text: "\r"})
+	select {
+	case ans := <-ansCh:
+		if len(ans.Answers) != 1 || len(ans.Answers[0].Selected) != 1 || ans.Answers[0].Selected[0] != "A" {
+			t.Fatalf("answer = %+v, want option A", ans)
+		}
+	default:
+		t.Fatal("Enter by key code should confirm the selected option")
+	}
+}
+
+// TestQuestionCtrlVIntercepted 回归「打字可以、粘贴没反应」：问题待答时 Ctrl+V
+// 必须被拦截走剪贴板读取（结果以 PasteMsg 进入自定义回答），而不是落到
+// textarea 的 Paste 绑定（其内部剪贴板为空，等于静默丢弃）。
+func TestQuestionCtrlVIntercepted(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.thinking = true
+	ansCh := make(chan *userquestions.Answer, 1)
+	errCh := make(chan error, 1)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID:       "q",
+		Question: "how?",
+		Options:  []userquestions.Option{{Label: "A"}, {Label: "B"}},
+	}}}, answer: ansCh, err: errCh})
+
+	// 选项模式：Ctrl+V 应触发剪贴板读取
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModCtrl}); cmd == nil {
+		t.Fatal("ctrl+v in option mode should read the clipboard")
+	}
+	// 自定义输入模式：同样应触发
+	m.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
+	if m.question == nil || !m.question.customMode {
+		t.Fatal("expected custom input mode")
+	}
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModCtrl}); cmd == nil {
+		t.Fatal("ctrl+v in custom mode should read the clipboard")
+	}
+}
+
+// TestComposerPasteWorksWhileRunning 运行/流式期间键盘输入可实时注入，粘贴不应
+// 被单独丢弃（历史表现：打字可以、粘贴没反应）。
+func TestComposerPasteWorksWhileRunning(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.thinking = true
+	m.Update(tea.PasteMsg{Content: "粘贴内容"})
+	if got := m.input.Value(); got != "粘贴内容" {
+		t.Fatalf("input = %q, want pasted text while running", got)
+	}
+}

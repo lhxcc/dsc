@@ -648,10 +648,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.virtualGotoBottom()
 
 	case tea.PasteMsg:
-		// 终端括号粘贴（如 Windows Terminal 的 Ctrl+V）插入到输入框。
-		if m.thinking || m.streaming {
+		// 问题待答期间：粘贴的文本即自定义回答（无需先选兜底项），且不受
+		// thinking/streaming 门控——模型正阻塞等待回答时粘贴不应被静默丢弃。
+		if m.question != nil {
+			if !m.question.customMode {
+				m.question.customMode = true
+				m.input.SetValue("")
+			}
+			m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
+			m.syncInputHeight()
+			m.render()
 			return m, nil
 		}
+		// 终端括号粘贴（如 Windows Terminal 的 Ctrl+V）插入到输入框。
+		// 运行/流式期间同样允许——键盘输入已支持「实时注入」，粘贴不应被
+		// 单独丢弃（否则表现为「打字可以、粘贴没反应」）。
 		m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
 		m.syncInputHeight()
 		m.updateCompletion()
