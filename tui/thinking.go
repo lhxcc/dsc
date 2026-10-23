@@ -87,11 +87,8 @@ const (
 	// zhFramesPerRune 每个字「被揭开」所占的帧数。2 帧 ≈ 200ms，7 个字
 	// 大约 1.4s 走完，比每帧一字慢一点，看得出是逐字而不是闪一下。
 	zhFramesPerRune = 2
-	// zhHoldFrames 全部揭开后的停留帧数，让人有机会读完这行字。
-	zhHoldFrames = 6
-	// zhGapFrames 全部遮回去后停顿一拍再开始下一轮：连着重遮会让这行字看起来
-	// 像在闪，留一拍空档才有节奏。
-	zhGapFrames = 2
+	// zhHoldFrames 全部揭开后的停留帧数，让人有机会读完这行字，再从头重来。
+	zhHoldFrames = 10
 )
 
 // zhThinkText 中文动画文案（5 个汉字 + 2 个点）。
@@ -117,35 +114,26 @@ func (a *thinkAnim) zhText() string {
 
 // zhRevealed 返回当前帧仍露在外面的字数（0..全部）。
 //
-// 一个周期是「逐字揭开 → 停留 → 逐字遮回去 → 停顿」：单向揭示后瞬间整体重遮
-// 会像闪一下；反向着遮回去，读起来才是同一段动画在往复。
+// 一个周期是「逐字揭开 → 停留 → 从头重来」：只往前揭示，不做反向遮回。
+// 遮回去等于把刚读到的字再擦掉，读起来像倒放；重来时整行重新被方块盖住，
+// 是 loading 指示器该有的重启感。
 func (a *thinkAnim) zhRevealed() int {
 	revealed, _ := a.zhState()
 	return revealed
 }
 
 // zhState 返回当前帧的（露出的字数，当前焦点字下标）。
-// 焦点字：揭示阶段是刚露出的那个，遮回阶段是即将被遮的那个（-1 表示无）。
+// 焦点字是刚露出的那个（停留期与重来的第一帧没有焦点，返回 -1）。
 func (a *thinkAnim) zhState() (revealed, hotIdx int) {
 	n := len(zhThinkText)
 	reveal := n * zhFramesPerRune
-	cover := reveal
-	f := a.frame % (reveal + zhHoldFrames + cover + zhGapFrames)
+	f := a.frame % (reveal + zhHoldFrames)
 
-	switch {
-	case f < reveal: // 逐字揭开
+	if f < reveal {
 		r := f / zhFramesPerRune
 		return r, r - 1
-	case f < reveal+zhHoldFrames: // 全亮停留
-		return n, -1
-	case f < reveal+zhHoldFrames+cover: // 逐字遮回
-		left := n - (f-reveal-zhHoldFrames)/zhFramesPerRune
-		if left < 0 {
-			left = 0
-		}
-		return left, left
 	}
-	return 0, -1 // 全遮停顿
+	return n, -1 // 全亮停留，之后回到第 0 帧重新遮住
 }
 
 // ---- 英文：大小写翻动 → 擦除 → 改写 ----
@@ -159,12 +147,14 @@ const (
 )
 
 const (
-	enPrefix = "Deep "
-	enSuffix = ".."
+	// enHeadLen 是 "Deep " 的长度：词槽之前的部分也算「动起来的范围」，
+	// 故后面各阶段都以整段 body 为单位处理。
+	enHeadLen = len("Deep ")
+	enSuffix  = ".."
 	// enWidth 整段目标显示宽度：按最长的 "Deep Thinking.."（5+8+2）计。
 	// 每帧都补到该宽度，阶段切换时行尾不右移——否则同一回合里
 	// 「(5 秒 · Ctrl+C 取消)」会左右跳一格。
-	enWidth = len(enPrefix) + len("THINKING") + len(enSuffix)
+	enWidth = enHeadLen + len("THINKING") + len(enSuffix)
 )
 
 func (a *thinkAnim) enText() string {
@@ -176,38 +166,42 @@ func (a *thinkAnim) enText() string {
 
 	g := a.frame % cycle
 
-	// 各阶段的词长度不同（Seeking 7 / Thinking 8），故词槽按阶段给尺寸，
-	// 末尾再补不可见空格让整段恒定 enWidth 宽。若把短词就地补齐，会渲染出
-	// 「Deep Seeking ..」——词与句点之间凭空多一个空格。
-	var word []rune
+	// body 是句点之前的那一整段（"Deep Seeking" / "DEEP SEEKING" / …）。
+	//
+	// 前面那个词也参与动画：只让 Seeking 翻大小写、把 Deep 定在那里不动，
+	// 整段看起来就像一张静止的标签旁边挂了个跳动的字。所以下面每个阶段都以
+	// 整段 body 为单位，而不是只改后面那个词。
+	//
+	// 各阶段长度不同（Seeking 7 / Thinking 8），末尾再补不可见空格让整段恒定
+	// enWidth 宽。若把短词就地补齐，会渲染出「Deep Seeking ..」——词与句点之间
+	// 凭空多一个空格。
+	var body []rune
 	var hot []bool
 
 	switch {
 	case g < wave:
-		// 大小写波：相位随位置错开，形成一道扫过的大写带。
+		// 大小写波：相位随位置错开，形成一道扫过的大写带，
+		// 从 Deep 一路扫到 Seeking 再扫回来。
 		// 用取模到正数的写法，避免 g-i 为负时 Go 的 % 给出负余数。
-		word = []rune("Seeking")
-		hot = make([]bool, len(word))
-		for i := range word {
-			// 周期 7 而不是 5：波阶段共 12 帧，周期若整除帧数就会原样重复一遍，
-			// 看着像卡住；7 与 12 互质，每帧的形态都不同。
+		body = []rune("Deep Seeking")
+		hot = make([]bool, len(body))
+		for i := range body {
+			// 相位按位置逐列错开、按帧推进，形成一道宽 2 列的大写带从左扫到右。
+			// 取模到正数：g-i 为负时 Go 的 % 会给出负余数。
 			if ((g-i)%7+7)%7 < 2 {
-				word[i] = unicode.ToUpper(word[i])
+				body[i] = unicode.ToUpper(body[i])
 			}
 		}
 	case g < upper:
-		word = []rune("SEEKING")
-		hot = make([]bool, len(word))
-		for i := range hot {
-			hot[i] = true
-		}
+		body = []rune("DEEP SEEKING")
+		hot = make([]bool, len(body))
 	case g < erase:
 		// 从左到右逐字擦成空格，未擦到的部分保持大写
-		word = []rune("SEEKING")
-		hot = make([]bool, len(word))
-		for i := range word {
-			if i < g-upper {
-				word[i] = ' '
+		body = []rune("DEEP SEEKING")
+		hot = make([]bool, len(body))
+		for i := enHeadLen; i < len(body); i++ {
+			if i-enHeadLen < g-upper {
+				body[i] = ' '
 			}
 		}
 	case g < write:
@@ -218,21 +212,21 @@ func (a *thinkAnim) enText() string {
 		if written > len("THINKING") {
 			written = len("THINKING")
 		}
-		word = []rune(strings.Repeat(" ", len("THINKING")))
-		copy(word, []rune("THINKING")[:written])
-		hot = make([]bool, len(word))
+		head := []rune("DEEP ")
+		body = append(head, []rune(strings.Repeat(" ", len("THINKING")))...)
+		copy(body[enHeadLen:], []rune("THINKING")[:written])
+		hot = make([]bool, len(body))
 		if written > 0 {
-			hot[written-1] = true
+			hot[enHeadLen+written-1] = true
 		}
 	default:
 		// 定格：回到正常大小写的 Deep Thinking..
-		word = []rune("Thinking")
-		hot = make([]bool, len(word))
+		body = []rune("Deep Thinking")
+		hot = make([]bool, len(body))
 	}
 
 	var b strings.Builder
-	b.WriteString(thinkTextSty.Render(enPrefix))
-	for i, r := range word {
+	for i, r := range body {
 		s := string(r)
 		if hot[i] && r != ' ' {
 			b.WriteString(thinkHotSty.Render(s))
@@ -241,7 +235,7 @@ func (a *thinkAnim) enText() string {
 		b.WriteString(thinkTextSty.Render(s))
 	}
 	b.WriteString(thinkTextSty.Render(enSuffix))
-	if pad := enWidth - len(enPrefix) - len(word) - len(enSuffix); pad > 0 {
+	if pad := enWidth - len(body) - len(enSuffix); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
 	}
 	return b.String()

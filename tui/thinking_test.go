@@ -9,60 +9,56 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// TestZhAnimationRevealsOneByOne 中文动画是「逐字揭开白方块、停留、再逐字遮回去」：
-// 一个周期内露出字数从 0 单调升到满，再单调降回 0，且 0..满 每个值都出现过。
+// TestZhAnimationRevealsOneByOne 中文动画只往前走：逐字揭开、停留、然后整行
+// 重新被盖住再来一遍——不做反向遮回（把刚读到的字再擦掉，读起来像倒放）。
 func TestZhAnimationRevealsOneByOne(t *testing.T) {
 	a := &thinkAnim{kind: thinkAnimZh}
 	n := len(zhThinkText)
+	reveal := n * zhFramesPerRune
 	cycle := zhCycle()
 
 	if got := a.zhRevealed(); got != 0 {
 		t.Fatalf("第 0 帧应全部被遮，revealed=%d", got)
 	}
 
-	var seq []int
-	for f := 0; f < cycle; f++ {
+	// 揭示段：每 zhFramesPerRune 帧恰好多露出一个字，严格单调不降
+	prev := -1
+	for f := 0; f < reveal; f++ {
 		a.frame = f
-		seq = append(seq, a.zhRevealed())
-	}
-	// 前半段逐字增长（每 zhFramesPerRune 帧 +1），后半段逐字减少
-	for f := 0; f < n*zhFramesPerRune; f++ {
-		if want := f / zhFramesPerRune; seq[f] != want {
-			t.Fatalf("frame=%d revealed=%d, want %d", f, seq[f], want)
+		got := a.zhRevealed()
+		if want := f / zhFramesPerRune; got != want {
+			t.Fatalf("frame=%d revealed=%d, want %d", f, got, want)
 		}
-	}
-	if seq[n*zhFramesPerRune] != n {
-		t.Fatalf("揭示结束时应满格，got %d", seq[n*zhFramesPerRune])
-	}
-	for f := n*zhFramesPerRune + zhHoldFrames; f < cycle; f++ {
-		if seq[f] > n {
-			t.Fatalf("frame=%d revealed 越界: %d", f, seq[f])
+		if got < prev {
+			t.Fatalf("frame=%d 露出字数回退（%d → %d）：不应有反向遮回", f, prev, got)
 		}
+		prev = got
 	}
-	if seq[cycle-1] != 0 {
-		t.Fatalf("周期末尾应回到全遮，got %d", seq[cycle-1])
-	}
-	seen := make([]bool, n+1)
-	for _, v := range seq {
-		seen[v] = true
-	}
-	for i := 0; i <= n; i++ {
-		if !seen[i] {
-			t.Fatalf("一个周期内应出现「露出 %d 字」的帧", i)
+
+	// 停留段：全亮不动
+	for f := reveal; f < cycle; f++ {
+		a.frame = f
+		if got := a.zhRevealed(); got != n {
+			t.Fatalf("停留期 frame=%d 应保持全亮，got %d", f, got)
 		}
 	}
 
-	// 满格那一帧，可见文字就是完整文案
-	a.frame = n * zhFramesPerRune
+	// 下一轮从头重来：整行重新被方块盖住
+	a.frame = cycle
+	if got := a.zhRevealed(); got != 0 {
+		t.Fatalf("新周期应从全遮开始，got %d", got)
+	}
+
+	// 满格时可见文字就是完整文案
+	a.frame = reveal
 	if got := ansi.Strip(a.zhText()); got != string(zhThinkText) {
 		t.Fatalf("满格后应为完整文案，got %q", got)
 	}
 }
 
-// zhCycle 中文动画一个周期的帧数。
+// zhCycle 中文动画一个周期的帧数：揭示 + 停留。
 func zhCycle() int {
-	n := len(zhThinkText)
-	return 2*n*zhFramesPerRune + zhHoldFrames + zhGapFrames
+	return len(zhThinkText)*zhFramesPerRune + zhHoldFrames
 }
 
 // TestZhAnimationMasksWithWhiteBlock 被遮的字用白底白字盖住（不是换成别的
@@ -93,7 +89,9 @@ func TestEnAnimationMorphsToThinking(t *testing.T) {
 			sawUpper = true
 		}
 		// 擦除阶段：词槽被清空，只剩 Deep、一段空白与 ..
-		if strings.Contains(text, "Deep"+strings.Repeat(" ", 1+len("SEEKING"))+"..") {
+		// （此刻前缀已是全大写 DEEP，故按忽略大小写比）
+		low := strings.ToLower(text)
+		if strings.Contains(low, "deep"+strings.Repeat(" ", 1+len("SEEKING"))+"..") {
 			sawEmptyWord = true
 		}
 		if strings.Contains(text, "Deep Thinking..") {
@@ -209,5 +207,50 @@ func TestThinkAnimFrameAdvancesWithSpinnerTick(t *testing.T) {
 	model2, _ := idle.Update(idle.spinner.Tick())
 	if got := model2.(*Model).thinkAnim.frame; got != f {
 		t.Fatalf("空闲时不应推进动画帧: %d → %d", f, got)
+	}
+}
+
+// TestEnAnimationMovesTheFirstWord 除了 Seeking，「Deep」也必须跟着动：
+// 只让后面那个词翻大小写、前面定住不动，整段看起来像静止标签旁边挂了个跳动的字。
+func TestEnAnimationMovesTheFirstWord(t *testing.T) {
+	a := &thinkAnim{kind: thinkAnimEn}
+
+	// 波阶段：前面的词的大小写形态必须逐帧变化（波带宽度只有 2 个字，
+	// 不会出现整个 DEEP 同时大写，故按「前缀形态有几种」判断是否在动）
+	heads := map[string]bool{}
+	for f := 0; f < enWaveFrames; f++ {
+		a.frame = f
+		heads[ansi.Strip(a.enText())[:len("Deep")]] = true
+	}
+	if len(heads) < 2 {
+		t.Fatalf("前面的 Deep 应随波改变大小写，实际只有 %d 种形态: %v", len(heads), heads)
+	}
+
+	// 全大写闪帧：整段（含前缀）都是大写
+	a.frame = enWaveFrames
+	if got := ansi.Strip(a.enText()); !strings.HasPrefix(got, "DEEP SEEKING") {
+		t.Fatalf("全大写帧前缀应为 DEEP，got %q", got)
+	}
+
+	// 擦除与写出阶段：前缀保持大写，直到定格才回到词首大写
+	a.frame = enWaveFrames + enUpperFrames + 2
+	if got := ansi.Strip(a.enText()); !strings.HasPrefix(got, "DEEP") {
+		t.Fatalf("擦除阶段前缀应保持 DEEP，got %q", got)
+	}
+	a.frame = enWaveFrames + enUpperFrames + enEraseFrames + 2
+	if got := ansi.Strip(a.enText()); !strings.HasPrefix(got, "DEEP") {
+		t.Fatalf("写出阶段前缀应保持 DEEP，got %q", got)
+	}
+
+	// 定格：回到 Deep Thinking..
+	a.frame = enWaveFrames + enUpperFrames + enEraseFrames + enWriteFrames
+	got := ansi.Strip(a.enText())
+	if !strings.HasPrefix(got, "Deep Thinking..") {
+		t.Fatalf("定格应为 Deep Thinking..，got %q", got)
+	}
+	// 且此时不再有大写波造成的抖动：连续帧完全相同
+	a.frame++
+	if next := ansi.Strip(a.enText()); next != got {
+		t.Fatalf("定格期应静止: %q vs %q", got, next)
 	}
 }
