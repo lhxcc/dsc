@@ -7,6 +7,7 @@ import (
 
 	"dsc/core"
 	"dsc/cron"
+	"dsc/session"
 )
 
 // TestSessionCommandSwitch 校验 /session <id> 命令触发 agent 会话切换。
@@ -264,5 +265,54 @@ func TestApprovalCommandWithoutManager(t *testing.T) {
 	full := strings.Join(m.lines, "\n")
 	if !strings.Contains(full, "插件管理器不可用") {
 		t.Fatalf("should show manager-unavailable error, got: %q", full)
+	}
+}
+
+// TestSessionsCommandShowsTurnsTimeAndCurrent 会话列表应展示真实语义：
+// 轮次（turn 计数）、最后活动时间、最近一条用户消息，并标记当前会话；
+// 切换示例必须是真实 id（不再是虚构的 session-3）。
+func TestSessionsCommandShowsTurnsTimeAndCurrent(t *testing.T) {
+	dir := t.TempDir()
+	mgr := core.NewManager(&core.ManagerConfig{ExecDir: dir})
+	st, err := session.NewStore(session.Dir(dir))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	s1, _ := st.Create()
+	s1.Append(session.TurnStart, &session.TurnData{Turn: 1}, nil)
+	s1.Append(session.UserMessage, &session.UserMessageData{Content: "first topic", Source: "user"}, &session.SurfaceOp{Op: session.SurfaceAppend})
+	s1.Append(session.TurnStart, &session.TurnData{Turn: 2}, nil)
+	s1.Append(session.UserMessage, &session.UserMessageData{Content: "latest question", Source: "user"}, &session.SurfaceOp{Op: session.SurfaceAppend})
+	if err := st.Save(s1); err != nil {
+		t.Fatalf("save s1: %v", err)
+	}
+	s2, _ := st.Create()
+	s2.Append(session.TurnStart, &session.TurnData{Turn: 1}, nil)
+	s2.Append(session.UserMessage, &session.UserMessageData{Content: "other", Source: "user"}, &session.SurfaceOp{Op: session.SurfaceAppend})
+	if err := st.Save(s2); err != nil {
+		t.Fatalf("save s2: %v", err)
+	}
+
+	m := New(&stubAgent{}, mgr, context.Background(), "m", "minimal", 131072)
+	m.currentSessionID = s1.ID()
+	if handled, _ := m.runSlashCommand("/sessions"); !handled {
+		t.Fatal("/sessions should be handled")
+	}
+	full := strings.Join(m.lines, "\n")
+	for _, want := range []string{
+		"● " + s1.ID(),
+		"2 轮",
+		"latest question",
+	} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("sessions output missing %q:\n%s", want, full)
+		}
+	}
+	// 切换示例必须是列表里真实存在的 id（顺序按最后活动时间，故两条都接受）。
+	if !strings.Contains(full, "/session "+s1.ID()) && !strings.Contains(full, "/session "+s2.ID()) {
+		t.Fatalf("hint should reference a real session id:\n%s", full)
+	}
+	if strings.Contains(full, "session-3") {
+		t.Fatalf("hint must not reference a fabricated id:\n%s", full)
 	}
 }

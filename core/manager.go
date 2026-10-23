@@ -1221,9 +1221,11 @@ func (m *Manager) GetToolRegistry() *ToolRegistry {
 
 // SessionSummary 会话列表的宿主侧摘要（TUI 展示用）。
 type SessionSummary struct {
-	ID      string `json:"id"`
-	Events  int    `json:"events"`
-	Preview string `json:"preview"`
+	ID       string    `json:"id"`
+	Events   int       `json:"events"`
+	Turns    int       `json:"turns"`
+	LastTime time.Time `json:"last_time"`
+	Preview  string    `json:"preview"`
 }
 
 // ListSessions 列出多会话 store 中的会话（读 ExecDir/sessions 目录）。
@@ -1238,7 +1240,13 @@ func (m *Manager) ListSessions() ([]SessionSummary, error) {
 	}
 	out := make([]SessionSummary, len(infos))
 	for i, info := range infos {
-		out[i] = SessionSummary{ID: info.ID, Events: info.Events, Preview: info.Preview}
+		out[i] = SessionSummary{
+			ID:       info.ID,
+			Events:   info.Events,
+			Turns:    info.Turns,
+			LastTime: info.LastTime,
+			Preview:  info.Preview,
+		}
 	}
 	return out, nil
 }

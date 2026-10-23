@@ -208,3 +208,39 @@ func TestStoreRejectsTraversal(t *testing.T) {
 		t.Fatal("Save with traversal id should be rejected")
 	}
 }
+
+// TestStoreListCountsTurnsAndLatestPreview 会话列表摘要语义：轮次取 turn/start
+// 计数，预览取「最近一条真实用户消息」（不让 goal/guard 等合成消息覆盖），
+// 而不是首条消息——长会话里首条往往只是早期的探索命令。
+func TestStoreListCountsTurnsAndLatestPreview(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	sess, err := st.Create()
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sess.Append(TurnStart, &TurnData{Turn: 1}, nil)
+	appendSurface(t, sess, UserMessage, &UserMessageData{Content: "first topic", Source: "user"})
+	sess.Append(TurnStart, &TurnData{Turn: 2}, nil)
+	appendSurface(t, sess, UserMessage, &UserMessageData{Content: "latest real question", Source: "user"})
+	appendSurface(t, sess, UserMessage, &UserMessageData{Content: "synthetic goal round", Source: "goal_round"})
+	if err := st.Save(sess); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	infos, err := st.List()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("listed %d sessions, want 1", len(infos))
+	}
+	if infos[0].Turns != 2 {
+		t.Fatalf("turns = %d, want 2", infos[0].Turns)
+	}
+	if infos[0].Preview != "latest real question" {
+		t.Fatalf("preview = %q, want latest real user message", infos[0].Preview)
+	}
+}

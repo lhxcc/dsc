@@ -2682,13 +2682,28 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 				var b strings.Builder
 				b.WriteString(assistantNameSty.Render(assistantMark + " DSC · 会话列表\n"))
 				for _, s := range summaries {
-					fmt.Fprintf(&b, "  %s · %d 事件", s.ID, s.Events)
+					marker := "  "
+					if s.ID == m.currentSessionID {
+						marker = "● " // 当前会话
+					}
+					fmt.Fprintf(&b, "  %s%s", marker, s.ID)
+					if s.Turns > 0 {
+						fmt.Fprintf(&b, " · %d 轮", s.Turns)
+					} else {
+						// 旧会话没有 turn/start 事件：退回事件数，避免显示 0 轮
+						fmt.Fprintf(&b, " · %d 事件", s.Events)
+					}
+					if !s.LastTime.IsZero() {
+						b.WriteString(" · " + s.LastTime.Local().Format("01-02 15:04"))
+					}
 					if s.Preview != "" {
 						b.WriteString(" · " + s.Preview)
 					}
 					b.WriteString("\n")
 				}
-				b.WriteString("切换: /session <id>（如 /session session-3）")
+				// 切换示例使用列表里真实存在的 id（此前的 /session session-3 并非
+				// 现行的会话命名规则——id 由项目路径派生）。
+				b.WriteString("切换: /session <id>（如 /session " + summaries[0].ID + "）")
 				m.appendMessage(b.String())
 			}
 		} else {

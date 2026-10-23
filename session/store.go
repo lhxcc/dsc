@@ -139,8 +139,12 @@ func illegalCharCode(c byte) byte {
 type SessionInfo struct {
 	ID       string    `json:"id"`
 	Events   int       `json:"events"`
+	Turns    int       `json:"turns"`
 	LastTime time.Time `json:"last_time"`
-	Preview  string    `json:"preview"` // 首条 user 消息截断预览
+	// Preview 是最近一条真实用户消息（Source 为 user/空）的截断预览。
+	// 不取首条：长会话里首条往往只是早期的探索命令（如 "ls -l"），
+	// 无法说明当前在做什么。
+	Preview string `json:"preview"`
 }
 
 // 会话存储的文件命名与目录约定（全仓唯一实现，宿主与各插件一律引用，
@@ -320,7 +324,8 @@ func (s *Store) List() ([]SessionInfo, error) {
 	return infos, nil
 }
 
-// scanInfo 轻量扫描单个 JSONL：事件数（行数）、最后事件时间、首条 user 消息预览。
+// scanInfo 轻量扫描单个 JSONL：事件数（行数）、轮次数、最后事件时间、
+// 最近一条真实用户消息预览。
 func scanInfo(path string) (SessionInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -343,10 +348,21 @@ func scanInfo(path string) (SessionInfo, error) {
 		if ej.Time > 0 {
 			info.LastTime = time.UnixMilli(ej.Time)
 		}
-		if info.Preview == "" && ej.Type == UserMessage {
+		switch ej.Type {
+		case TurnStart:
+			info.Turns++
+		case UserMessage:
+			// 最近一条真实用户消息作为预览；goal/guard/截断续行等合成消息
+			// 不代表用户意图，忽略（Source 为空视为旧格式的真实用户消息）。
 			var d UserMessageData
-			if err := json.Unmarshal(ej.Data, &d); err == nil && d.Source == "user" {
-				info.Preview = truncate(d.Content, 40)
+			if err := json.Unmarshal(ej.Data, &d); err != nil {
+				continue
+			}
+			if src := strings.TrimSpace(d.Source); src != "" && src != "user" {
+				continue
+			}
+			if content := strings.Join(strings.Fields(d.Content), " "); content != "" {
+				info.Preview = truncate(content, 40)
 			}
 		}
 	}
