@@ -110,7 +110,9 @@ type ReactLoopAgent struct {
 	// /approval → 宿主广播 → 本 agent 落会话日志保持同步。
 	approvalPolicy string
 
-	// 历史注入条数上限（-1 = 不限制，缺省；0 = 不注入历史；>0 = 只注入最近 N 条）。
+	// 历史注入条数上限，遵循 DSC 三值语义（与 DSH 相反，勿按 DSH 读）：
+	// 负值 = 不注入从存档恢复的历史；0 = 未定义（未设置，缺省，按默认 = 不限制，
+	// 恢复历史全部注入）；N>0 = 只注入恢复历史中最近 N 条。
 	// 会话级设置以 log-only history/limit 事件持久化（每次 Run 折叠还原），
 	// 无事件时退回 DSC_HISTORY_INJECTION 环境变量默认。用于控制本地模型预填充长度。
 	historyInjection int
@@ -346,7 +348,8 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		a.approvalPolicy = p
 	}
 	// 历史注入条数每次 Run 从事件日志折叠（/settings history 已提交的变更即时生效）；
-	// 无记录时保留 newAgent 读入的 DSC_HISTORY_INJECTION 部署默认（缺省 -1 = 不限制）。
+	// 无记录时保留 newAgent 读入的 DSC_HISTORY_INJECTION 部署默认（缺省 0 = 未定义
+	// → 不限制，即恢复历史全部注入）。
 	if limit, found := session.FoldHistoryLimit(a.sess.Events()); found {
 		a.historyInjection = limit
 	}

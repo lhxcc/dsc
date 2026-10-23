@@ -51,8 +51,10 @@ type Agent interface {
 	// 供模型先探索与设计，再通过 exit_plan_mode 工具呈现完整计划并退出。
 	SetPlanMode(ctx context.Context, active bool) error
 	// SetHistoryInjection 设置当前会话的历史注入条数上限（log-only history/limit
-	// 事件，fold 恢复）：count < 0 不限制（缺省）；0 不注入历史；> 0 只注入最近
-	// count 条派生消息。用于 TUI /settings history 命令控制本地模型预填充长度。
+	// 事件，fold 恢复），遵循 DSC 三值语义：负值不注入恢复历史；0 未定义（未设置，
+	// 按默认 = 不限制，注入全部恢复历史）；N>0 只注入恢复历史中最近 N 条。只作用于
+	// 从存档恢复的历史——本次运行已发生的轮次永远完整保留。用于 TUI
+	// /settings history 命令控制本地模型预填充长度。
 	SetHistoryInjection(ctx context.Context, count int) error
 	// SetUserQuestionsService 注入宿主挂载在 broker 上的 UserQuestionsService ID
 	// （0 = 无通道）。agent 的工具（如 exit_plan_mode）据此向用户提问并等待回答。

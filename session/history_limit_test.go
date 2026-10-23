@@ -6,6 +6,42 @@ import (
 	"dsc/proto"
 )
 
+// TestDeriveMessagesLimitedZeroInjectsAll 0 = 未定义（未设置）→ 按默认「不限制」：
+// 恢复来的历史**全部**注入，不是 0 条。
+//
+// 这条与 Off 用例互为反例，锁住 DSC 与 DSH 相反的编码（DSH：-1 不限制 / 0 不注入）。
+// 若哪天有人按 DSH 的读法把 0 当「关闭」，恢复历史会在默认配置下整段消失，而配置里
+// 根本没写这一项——正是 AGENTS.md §12 要防的零值陷阱。
+func TestDeriveMessagesLimitedZeroInjectsAll(t *testing.T) {
+	s := New()
+	appendSystemPrompt(t, s, "sys")
+	const rounds = 5
+	for i := 0; i < rounds; i++ {
+		appendSurface(t, s, UserMessage, &UserMessageData{Content: "q", Source: "user"})
+		appendSurface(t, s, AssistantMessage, &AssistantMessageData{Content: "a"})
+	}
+	s.restoredThrough = s.Len() // 全部属于「从存档恢复」的历史
+
+	msgs := s.DeriveMessagesLimited(0)
+	if want := 1 + 2*rounds; len(msgs) != want {
+		t.Fatalf("0 应注入全部恢复历史（system + %d 条），实际 %d 条", 2*rounds, len(msgs))
+	}
+	if msgs[0].Role != "system" {
+		t.Fatalf("首条应为 system，实际 %q", msgs[0].Role)
+	}
+	if msgs[len(msgs)-1].Content != "a" {
+		t.Fatalf("末条应为最后一条历史，实际 %q", msgs[len(msgs)-1].Content)
+	}
+
+	// 对照：同一个会话设成 N>0 才裁，设成负值则一条历史都不带
+	if got := len(s.DeriveMessagesLimited(3)); got != 1+4 {
+		t.Fatalf("limit=3 应保留 system + 回退到 user 边界的 4 条，实际 %d 条", got)
+	}
+	if got := len(s.DeriveMessagesLimited(-1)); got != 1 {
+		t.Fatalf("负值应只带 system（不注入恢复历史），实际 %d 条", got)
+	}
+}
+
 // TestDeriveMessagesLimitedOff 历史注入关闭（负值）：恢复来的历史一条不带，
 // 但本次运行内产生的轮次完整保留——否则「注入多少历史」这个设置会删掉
 // 同一会话里刚发生的对话（实测第二轮直接失忆）。

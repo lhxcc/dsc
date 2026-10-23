@@ -2822,8 +2822,9 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		return true, nil
 	}
 	// /settings history <N|off|unlimited>：控制从存档恢复的历史注入条数。
-	// off/0 不注入恢复历史；N 只取恢复历史中最近 N 条；unlimited/on/-1 不限制（默认）。
-	// 无论取值如何，本次运行内已经发生的轮次都完整保留。
+	// off / -1（任意负值）不注入恢复历史；unlimited / on / 0（缺省）不限制，即全部
+	// 注入；N>0 只取恢复历史中最近 N 条。无论取值如何，本次运行内已经发生的轮次
+	// 都完整保留。
 	// 鼠标捕获为自动行为：模型工作期间释放给终端原生选中、空闲恢复应用内捕获，
 	// 不再提供显式开关；需永久释放用环境变量 DSC_DISABLE_MOUSE=1。
 	if strings.HasPrefix(cmd, "/settings") {
