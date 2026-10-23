@@ -461,6 +461,43 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		iterPendingInjects := a.pendingInjects
 		a.sessMu.Unlock()
 
+		// 超窗裁剪（请求级兜底，不改会话日志）：内联压缩是把「整段历史」交给同一个模型
+		// 做摘要，只能处理「历史本身还塞得进窗口」的情形；1M 云端攒下 700K 历史再切回
+		// 128K 本地时，压缩请求自己就超限，整轮直接失败——既没压缩也没发请求。故先把
+		// 派生历史裁进窗口（丢弃最旧的完整轮次，允许接近上限但不允许超过），再走后面的
+		// 压缩判断。裁剪只作用于本次请求，surface/事件日志一字不改，切回大窗口时全量历史原样恢复。
+		msgs, droppedMsgs := fitMessagesToWindow(msgs, a.contextWindow)
+		if droppedMsgs > 0 {
+			if len(msgs) > 0 && msgs[0].Role == "system" {
+				// 重新构造而非复制：proto.Message 内含 protobuf 的内部状态（含 mutex），
+				// 值拷贝会触发 vet 的 copylocks 告警；system 消息只用到 role+content。
+				msgs[0] = &proto.Message{
+					Role: msgs[0].Role,
+					Content: strings.TrimRight(msgs[0].Content, "\n") + fmt.Sprintf(
+						"\n\n（注意：因当前上下文窗口仅 %d tokens，本次请求已省略较早的 %d 条对话记录；"+
+							"如需那些内容请重新读取相关文件或改用更大窗口的模型。）\n", a.contextWindow, droppedMsgs),
+				}
+			}
+			if emit != nil {
+				emit(&core.RunStreamResponse{
+					Output: fmt.Sprintf("\n[上下文裁剪: 历史超出 %d tokens 窗口，已省略最早 %d 条消息（会话记录未删除）]\n",
+						a.contextWindow, droppedMsgs),
+					Status: "tool",
+				})
+			}
+		}
+		// 裁完仍超窗口：只可能是「单轮内容本身超窗」（例如一次粘贴 200K tokens），
+		// 无论怎么丢历史都塞不进。此时明确报错，而不是把注定被 provider 拒绝的请求发出去。
+		if a.contextWindow > 0 {
+			if est := core.EstimateProtoMessagesTokens(msgs); est > a.contextWindow {
+				err := fmt.Errorf("单轮内容超出上下文窗口（约 %d > %d tokens）：请拆分输入、减少一次性粘贴的内容，或改用更大窗口的模型", est, a.contextWindow)
+				if emit != nil {
+					emit(&core.RunStreamResponse{Status: "error", Error: err.Error()})
+				}
+				return nil, err
+			}
+		}
+
 		// 上下文自动压缩（对齐 DSH compaction-basic 的 pre-step 压力检查）：
 		// - 已用容量优先取上次请求服务端报告的 prompt token（精确）；首次请求（含重启
 		//   恢复历史会话）无该值，退回字符启发式估算（对齐 DSH tokenMeter 的
@@ -476,6 +513,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		//   内联压缩自动恢复为唯一压缩路径——不依赖 env 或动态状态同步，
 		//   避免了"动态加载/卸载与 env 快照不同步"的问题。两者作为双重安全网：
 		//   后端负责日常压缩（model-driven），内联压缩负责兜底（rule-driven）。
+		//   - 本步已做过超窗裁剪（droppedMsgs > 0）时跳过内联压缩，两个原因：
+		//     ① 裁剪后的 msgs 与 surface nodes 不再一一对应，压缩落点按 node 索引取
+		//        msgs 会错位；
+		//     ② 更重要——裁剪是非破坏性的（历史仍在会话里，切回大窗口模型可原样恢复），
+		//        而压缩会把它摘要化、永久改写会话。既然本次请求已在窗口内（≤90%），
+		//        没理由为省这点余量把「留给大窗口的那部分历史」销毁掉。
 		compacted := false
 		promptTokens := int(a.lastPromptTokens)
 		if a.contextWindow > 0 && a.historyInjection == 0 && promptTokens <= 0 {
@@ -483,7 +526,8 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				promptTokens = est
 			}
 		}
-		if a.contextWindow > 0 && a.historyInjection == 0 && float64(promptTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
+		if droppedMsgs == 0 && a.contextWindow > 0 && a.historyInjection == 0 &&
+			float64(promptTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
 			if emit != nil {
 				emit(&core.RunStreamResponse{
 					Output: fmt.Sprintf("\n[上下文压缩: 已用 %d%% 容量，即将压缩对话历史]\n",
@@ -549,6 +593,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			msgs = sess.DeriveMessagesLimited(a.historyInjection)
 			iterPendingInjects = a.pendingInjects
 			a.sessMu.Unlock()
+			// 压缩后若注入计数把历史又拉回超窗（historyInjection>0 时压缩不被跳过，
+			// 但尾部逐字保留区仍可能很大），再裁一次兜底，保证发出去的一定在窗口内。
+			msgs, _ = fitMessagesToWindow(msgs, a.contextWindow)
 		}
 
 		// 稳定排序工具目录（按名称），消除无关的顺序差异导致请求前缀字节变化、
@@ -1332,6 +1379,74 @@ const compactSystemPrompt = "You are a conversation compactor. Condense the conv
 // max(bytes/4, runes) + 角色开销 + 图像 + 工具参数），与压缩后端
 // （dsc-system compaction-basic）及宿主 pre-step 同一估算口径，
 // 不再各持一份私有字节/4 粗略实现。
+
+// oversizeTrimRatio 超窗裁剪的目标比例（默认 0.90）。裁到窗口内侧但仍在压缩触发线
+// （0.80）之上：这样「裁完立刻压缩」——能塞进窗口的那部分被摘要化（信息保留），只有
+// 确实塞不进的最旧部分被丢弃，而不是因为总量超窗就干脆不压缩。
+var oversizeTrimRatio = 0.90
+
+// oversizeTrimTriggerRatio 进入裁剪的门槛（占窗口比例，默认 0.95）。窗口内的历史交给
+// 内联压缩处理（留尾部逐字、旧前缀摘要化，比直接丢弃更保信息）；只有超过这条线
+// ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
+var oversizeTrimTriggerRatio = 0.95
+
+// fitMessagesToWindow 把待发历史裁进上下文窗口：允许接近上限，但不允许超过。
+//
+// 存在理由：内联压缩是把「整段历史」交给同一个模型做摘要，因此它只能处理「历史本身还
+// 塞得进窗口」的情形。1M 云端攒下 700K 历史后切回 128K 本地，压缩请求自身就超限，
+// 整轮直接失败（`compact history failed: context length exceeded`）——既没压缩也没发出
+// 请求。压缩后端（billion-context）也只能一段一段救，救不动就放弃。
+//
+// 这里的兜底最小侵入：从最旧的**完整轮次**开始丢弃，直到估算落进 budget。丢弃只发生在
+// 本次请求的派生消息上，surface/事件日志一字不改——所以切回大窗口模型时全量历史原样
+// 回来（压缩是不可逆的，裁剪不是）。
+//
+// 返回裁剪后的消息与被丢弃的条数。边界：
+//   - 首条 system 永不丢（丢掉基础指令模型会乱答）
+//   - 起点必须落在 user 消息上：保证 tool_use 与 tool_result 配对不被切断，且 Anthropic
+//     要求首条非 system 消息是 user
+//   - 连最后一条 user 起的后缀都超窗（单轮本身超窗，如一次粘贴 200K tokens）时原样返回，
+//     由调用方报错——这种情况没有正确的自动解
+func fitMessagesToWindow(msgs []*proto.Message, window int) (out []*proto.Message, dropped int) {
+	if window <= 0 || len(msgs) == 0 {
+		return msgs, 0
+	}
+	budget := int(float64(window) * oversizeTrimRatio)
+	if core.EstimateProtoMessagesTokens(msgs) <= int(float64(window)*oversizeTrimTriggerRatio) {
+		return msgs, 0 // 窗口内（含稍超压缩线）：交给压缩路径，不在这里丢历史
+	}
+	head := 0
+	if msgs[0].Role == "system" {
+		head = 1
+	}
+	// 逐条 token 与后缀累计，避免对每个候选起点重算整段
+	toks := make([]int, len(msgs))
+	for i, m := range msgs {
+		toks[i] = core.EstimateProtoMessageTokens(m)
+	}
+	headTokens := 0
+	for _, t := range toks[:head] {
+		headTokens += t
+	}
+	suffix := make([]int, len(msgs)+1) // suffix[i] = toks[i:] 之和
+	for i := len(msgs) - 1; i >= 0; i-- {
+		suffix[i] = suffix[i+1] + toks[i]
+	}
+	// 最旧的「整段塞得进」的 user 边界即起点（越旧保留越多）
+	for i := head; i < len(msgs); i++ {
+		if msgs[i].Role != "user" {
+			continue
+		}
+		if headTokens+suffix[i] > budget {
+			continue
+		}
+		out = make([]*proto.Message, 0, head+len(msgs)-i)
+		out = append(out, msgs[:head]...)
+		out = append(out, msgs[i:]...)
+		return out, i - head
+	}
+	return msgs, 0
+}
 
 // compactHistory 當上下文已用容量超過 80% 時觸發：讓模型把派生歷史壓縮成摘要。
 // 返回摘要文本（不含 system 消息，避免把基礎指令與技能索引壓進摘要），
