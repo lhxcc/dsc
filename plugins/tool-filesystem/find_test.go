@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,9 +93,14 @@ func TestInternalFindInamePathDepth(t *testing.T) {
 }
 
 // TestInternalFindLogicAndPrune 逻辑组合（-o、!、括号）与 -prune 惯用式：
-// `-path ./node_modules -prune -o -name '*.js' -print` 必须打印 node_modules 自身
-// 但不进入其内部（故 dep.js 不出现）——这正是 -path 需按书写形态（"./..."）匹配、
-// 且 -prune 需在求值命中后阻止下探的原因。
+// `-path ./node_modules -prune -o -name '*.js' -print` 命中 node_modules 时只剪枝、
+// 不进入其内部（故 dep.js 不出现），且因表达式含显式 -print（动作）而不补隐式输出，
+// node_modules 自身也不打印——与 GNU find 实测一致：
+//
+//	$ find . -path ./node_modules -prune -o -name '*.js' -print
+//	./src/a.js
+//
+// 这也正是 -path 需按书写形态（"./..."）匹配、-prune 需在求值命中后阻止下探的原因。
 func TestInternalFindLogicAndPrune(t *testing.T) {
 	dir := setupFindTree(t)
 
@@ -102,7 +108,9 @@ func TestInternalFindLogicAndPrune(t *testing.T) {
 		{`find . -name '*.txt' -o -name '*.md'`, "./docs/guide.md\n./src/nested/b.txt\n./top.txt\n"},
 		{`find . -type f ! -name '*.js'`, "./.git/config\n./docs/guide.md\n./src/nested/b.txt\n./top.txt\n"},
 		{`find . \( -name '*.md' -o -name '*.txt' \) -type f`, "./docs/guide.md\n./src/nested/b.txt\n./top.txt\n"},
-		{`find . -path ./node_modules -prune -o -name '*.js' -print`, "./node_modules\n./src/a.js\n./src/other.js\n"},
+		{`find . -path ./node_modules -prune -o -name '*.js' -print`, "./src/a.js\n./src/other.js\n"},
+		// -prune 单独出现（无显式动作）时仍补隐式 -print，剪枝对象自身照常输出
+		{`find . -path ./node_modules -prune -o -name '*.js'`, "./node_modules\n./src/a.js\n./src/other.js\n"},
 	}
 	for _, c := range cases {
 		out, err := runShell(t, dir, c.script)
@@ -137,14 +145,14 @@ func TestInternalFindNoMatchAndMissingPath(t *testing.T) {
 	}
 }
 
-// TestInternalFindUnsupportedPredicate 未支持谓词（-exec/-delete/-print0 等）必须响亮
+// TestInternalFindUnsupportedPredicate 未支持谓词（-execdir/-delete/-print0 等）必须响亮
 // 报错并列出支持清单——find 被 ExecHandler 无条件拦截，不存在回落到真实 find 的路径，
 // 静默失败会让模型空转。
 func TestInternalFindUnsupportedPredicate(t *testing.T) {
 	dir := setupFindTree(t)
 
 	for _, script := range []string{
-		`find . -name '*.js' -exec rm {} \;`,
+		`find . -name '*.js' -execdir rm {} \;`,
 		`find . -name '*.pyc' -delete`,
 		`find . -size +1M`,
 	} {
@@ -219,5 +227,115 @@ func TestInternalFindDoesNotFollowLinks(t *testing.T) {
 		if out != "./link\n" {
 			t.Fatalf("符号链接应作为链接本身列出（junction 不匹配 -type l）: %q", out)
 		}
+	}
+}
+
+// TestInternalFindExecSemicolon `-exec ... \;`：每个条目执行一次，退出码即谓词真假。
+// 子命令必须走与 shell 相同的分派（echo 是 shell 内建、grep 是内部命令），否则测试
+// 环境 PATH 为空时必然 127；同时验证出现显式动作后不再补隐式 -print（否则
+// `-exec rm {} \;` 会额外吐一串路径污染输出）。
+func TestInternalFindExecSemicolon(t *testing.T) {
+	dir := setupFindTree(t)
+
+	cases := []struct{ script, want string }{
+		// 静默执行：只输出 echo 的内容，路径不再被隐式打印
+		{`find . -name '*.js' -exec echo {} \;`, "./node_modules/dep.js\n./src/a.js\n./src/other.js\n"},
+		// 退出码为谓词真假：仅 dep.js 命中，故只对它执行后续 -print
+		{`find . -type f -exec grep -l '^dep$' {} \; -print`,
+			"./node_modules/dep.js\n./node_modules/dep.js\n"},
+		// {} 按子串替换（对齐 GNU），不限于独占一个参数
+		{`find . -name 'top.txt' -exec echo 'x{}y' \;`, "x./top.txty\n"},
+	}
+	for _, c := range cases {
+		out, err := runShell(t, dir, c.script)
+		if got := exitCode(t, err); got != 0 {
+			t.Fatalf("%s 应成功: exit=%d out=%q", c.script, got, out)
+		}
+		if out != c.want {
+			t.Fatalf("%s 输出不符:\n got %q\nwant %q", c.script, out, c.want)
+		}
+	}
+}
+
+// TestInternalFindExecBatch `-exec ... {} +`：收集路径后批量执行一次，恒为真；
+// 无命中时一次也不执行（对齐 GNU）。
+func TestInternalFindExecBatch(t *testing.T) {
+	dir := setupFindTree(t)
+
+	// 命中两个文件，批量命令只起一次、按遍历顺序接收路径
+	out, err := runShell(t, dir, `find . -type f -exec grep -lE 'other|top' {} +`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("批量 -exec 应成功: exit=%d out=%q", got, out)
+	}
+	if want := "./src/other.js\n./top.txt\n"; out != want {
+		t.Fatalf("批量 -exec 输出不符:\n got %q\nwant %q", out, want)
+	}
+
+	// 无命中：命令一次都不执行，故无输出
+	out, err = runShell(t, dir, `find . -name '*.nope' -exec echo X {} +`)
+	if got := exitCode(t, err); got != 0 || out != "" {
+		t.Fatalf("无命中不应执行批量命令: exit=%d out=%q", got, out)
+	}
+}
+
+// TestInternalFindExecSideEffect `-exec` 的真实副作用（内部 rm）确实落盘。
+func TestInternalFindExecSideEffect(t *testing.T) {
+	dir := setupFindTree(t)
+
+	out, err := runShell(t, dir, `find . -name 'top.txt' -exec rm {} \; && echo done`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("find -exec rm 应成功: exit=%d out=%q", got, out)
+	}
+	if out != "done\n" {
+		t.Fatalf("副作用执行后应继续下一命令: %q", out)
+	}
+	if _, statErr := os.Lstat(filepath.Join(dir, "top.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("top.txt 应已被 -exec rm 删除: err=%v", statErr)
+	}
+}
+
+// TestInternalFindExecSyntaxErrors `-exec` 语法缺失必须报错退出 2，而不是静默跳过
+// （find 被 ExecHandler 无条件拦截，静默等于让模型空转）。
+func TestInternalFindExecSyntaxErrors(t *testing.T) {
+	dir := setupFindTree(t)
+
+	cases := []struct{ script, wantErr string }{
+		{`find . -exec echo {}`, "missing ';' or '+'"},
+		{`find . -exec`, "missing ';' or '+'"},
+		{`find . -exec echo x +`, "'{}' must be the last argument"},
+	}
+	for _, c := range cases {
+		out, errText, err := runShellIO(t, dir, c.script)
+		if got := exitCode(t, err); got != 2 {
+			t.Fatalf("%s 应退出码 2: exit=%d out=%q stderr=%q", c.script, got, out, errText)
+		}
+		if !strings.Contains(errText, c.wantErr) {
+			t.Fatalf("%s 的 stderr 应含 %q: %q", c.script, c.wantErr, errText)
+		}
+	}
+}
+
+// TestInternalFindExecBuiltinScope `-exec` 只放行无副作用的内建（echo/printf/test/
+// true/false/pwd）：exit/cd 之类若直接调内建会掐掉会话或搬走遍历上下文（GNU 的 -exec
+// 起外部进程，天然没有这个问题），故按外部程序处理而失败——但 find 自身必须继续跑完。
+func TestInternalFindExecBuiltinScope(t *testing.T) {
+	dir := setupFindTree(t)
+
+	// pwd 是放行内建：输出当前目录（路径分隔符已归一为正斜杆，故按末段名比对）
+	out, err := runShell(t, dir, `find . -maxdepth 0 -exec pwd \;`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("find -exec pwd 应成功: exit=%d out=%q", got, out)
+	}
+	if got := filepath.Base(strings.TrimSpace(out)); got != filepath.Base(filepath.FromSlash(dir)) && got != filepath.Base(dir) {
+		t.Fatalf("应输出工作目录: %q", out)
+	}
+
+	// exit 不放行：即使模型写了 -exec exit，也不能把整个 shell 掐掉
+	out, _, err = runShellIO(t, dir, `find . -maxdepth 0 -exec exit \; ; echo after`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("find -exec exit 不应使 shell 异常退出: exit=%d out=%q", got, out)
+	}
+	if !strings.Contains(out, "after") {
+		t.Fatalf("find -exec exit 后 shell 应继续执行后续命令: %q", out)
 	}
 }

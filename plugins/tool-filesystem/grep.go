@@ -129,7 +129,12 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if exit != 0 {
 		return interp.NewExitStatus(uint8(exit))
 	}
-	if !opts.countOnly && !opts.filesOnly && matchedTotal == 0 {
+	// 无命中退出 1（对齐 GNU grep）。-l 同样如此：它只改变输出形态，不改变「是否有
+	// 命中」这一事实。这一点对 `find ... -exec grep -l ... {} \;` 至关重要——-exec
+	// 正是拿退出码当谓词真假，若 -l 无命中仍退 0，则「列出含 X 的文件」会退化成
+	// 「列出全部文件」。-c 例外：DSC 约定输出计数（含 0）且退 0，供 `grep -c | ...`
+	// 之类的管道取数。
+	if !opts.countOnly && matchedTotal == 0 {
 		return interp.NewExitStatus(1)
 	}
 	return nil

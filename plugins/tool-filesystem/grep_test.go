@@ -104,6 +104,16 @@ func TestInternalGrepRecursiveInvertCountAndExit(t *testing.T) {
 	if got := exitCode(t, err); got != 1 {
 		t.Fatalf("无命中应退出码 1: exit=%d out=%q", got, out)
 	}
+
+	// -l 无命中同样退 1（GNU grep 亦然）。这条是 `find -exec grep -l` 的语义基础：
+	// 退出码即 -exec 的谓词真假，退 0 会把「含 X 的文件」退化成「全部文件」。
+	out, err = runShell(t, dir, `grep -rl zzznotfound src`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("grep -rl 无命中应退出码 1: exit=%d out=%q", got, out)
+	}
+	if out != "" {
+		t.Fatalf("grep -rl 无命中不应有输出: %q", out)
+	}
 }
 
 // TestInternalGrepDirectoryWithoutRecursive 目录参数未给 -r 时按 POSIX 报

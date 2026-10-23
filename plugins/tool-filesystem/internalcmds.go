@@ -104,22 +104,31 @@ type internalCommand func(ctx context.Context, hc interp.HandlerContext, args []
 // C:\Windows\tree.com、C:\Windows\System32\sort.exe 之类同名程序）。find 与 sort/uniq
 // 的实现独立成文件（前者含表达式解析与 fnmatch，后者含排序键/fnmatch 无关的比较口径，
 // 见 internalcmds_find.go、internalcmds_sort.go）。
-var internalCommands = map[string]internalCommand{
-	"mkdir": cmdMkdir,
-	"ls":    cmdLs,
-	"cat":   cmdCat,
-	"touch": cmdTouch,
-	"rm":    cmdRm,
-	"cp":    cmdCp,
-	"mv":    cmdMv,
-	"find":  cmdFind,
-	"grep":  cmdGrep,
-	"sort":  cmdSort,
-	"uniq":  cmdUniq,
-	"head":  cmdHead,
-	"tail":  cmdTail,
-	"wc":    cmdWc,
-	"tree":  cmdTree,
+//
+// 在 init 里填充而非用字面量初始化：find 的 -exec 要按本表分派子命令
+// （findRunCommand），而 cmdFind 又出现在表里——字面量会让包级变量初始化形成
+// 「internalCommands → cmdFind → … → findRunCommand → internalCommands」的环，
+// 编译器直接报 initialization cycle。init 阶段赋值不参与该依赖分析。
+var internalCommands map[string]internalCommand
+
+func init() {
+	internalCommands = map[string]internalCommand{
+		"mkdir": cmdMkdir,
+		"ls":    cmdLs,
+		"cat":   cmdCat,
+		"touch": cmdTouch,
+		"rm":    cmdRm,
+		"cp":    cmdCp,
+		"mv":    cmdMv,
+		"find":  cmdFind,
+		"grep":  cmdGrep,
+		"sort":  cmdSort,
+		"uniq":  cmdUniq,
+		"head":  cmdHead,
+		"tail":  cmdTail,
+		"wc":    cmdWc,
+		"tree":  cmdTree,
+	}
 }
 
 // ---------- 共享辅助 ----------
