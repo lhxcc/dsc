@@ -610,6 +610,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		// 终端括号粘贴（如 Windows Terminal 的 Ctrl+V）插入到输入框。
+		// 回答模型提问（自定义输入模式）时模型的回合仍在进行中（thinking/streaming
+		// 为真），此时输入框就是回答框，必须照常接收粘贴——否则「@截图路径」这类
+		// 只能粘贴的内容完全无法输入。
+		if m.question != nil && m.question.customMode {
+			m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
+			m.syncInputHeight()
+			m.updateCompletion()
+			m.render()
+			return m, nil
+		}
 		if m.thinking || m.streaming {
 			return m, nil
 		}

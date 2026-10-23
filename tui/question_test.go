@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -369,5 +371,58 @@ func TestQuestionCustomModeOverlayHides(t *testing.T) {
 	}
 	if !strings.Contains(after, "自定义回答") {
 		t.Fatalf("customMode should show a one-line hint, got %q", after)
+	}
+}
+
+// TestQuestionCustomInputAcceptsPaste 回答模型提问时（模型回合仍在进行，thinking/
+// streaming 为真）粘贴必须进入回答框：截图路径这类内容只能粘贴，此前被
+// 「运行中忽略粘贴」直接丢弃。
+func TestQuestionCustomInputAcceptsPaste(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	ansCh := make(chan *userquestions.Answer, 1)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID: "q", Question: "which screenshot?", Options: []userquestions.Option{{Label: "A"}},
+	}}}, answer: ansCh})
+
+	m.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
+	if !m.question.customMode {
+		t.Fatal("应进入自定义输入模式")
+	}
+	m.thinking = true // 模型正阻塞等待回答
+	m.Update(tea.PasteMsg{Content: "C://shot//a.png"})
+	if got := m.input.Value(); got != "C://shot//a.png" {
+		t.Fatalf("粘贴内容应进入回答框，got %q", got)
+	}
+
+	// 运行期（无提问）仍按原语义忽略粘贴，避免污染排队中的输入
+	m.question = nil
+	m.Update(tea.PasteMsg{Content: "noise"})
+	if got := m.input.Value(); got != "C://shot//a.png" {
+		t.Fatalf("运行期不应接受粘贴，got %q", got)
+	}
+}
+
+// TestQuestionCustomInputAtCompletion 回答框内输入 "@" 应弹出文件补全菜单，
+// 且 Tab 可选中候选——此前自定义回答框完全没有补全。
+func TestQuestionCustomInputAtCompletion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "shot.png"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DSC_WORKSPACE_ROOT", dir)
+
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.Update(questionMsg{request: &userquestions.Request{Questions: []userquestions.Question{{
+		ID: "q", Question: "pick", Options: []userquestions.Option{{Label: "A"}},
+	}}}, answer: make(chan *userquestions.Answer, 1)})
+	m.Update(tea.KeyPressMsg{Code: 'c', Text: "c"})
+
+	m.Update(tea.KeyPressMsg{Code: '@', Text: "@"})
+	if !m.completion.active || len(m.completion.items) == 0 {
+		t.Fatalf("输入 @ 后应有文件候选，completion=%+v", m.completion)
+	}
+	m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+	if got := m.input.Value(); !strings.HasPrefix(got, "@") || !strings.Contains(got, "shot.png") {
+		t.Fatalf("Tab 应把候选写入回答框，got %q", got)
 	}
 }
