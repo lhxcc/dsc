@@ -1882,6 +1882,12 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 		m.logger.Warn("agent deferred to pending (missing LLM capability provider)", "name", agentEntry.Name)
 	}
 
+	// 聚合 LLM 已就绪：为启动期加载的 tool/dsc 插件补注入互通。
+	// 这些插件在 agent 激活前拉起，SetInterconnect 时 agentLLMServiceID 尚为 0，
+	// 只注入了非 LLM 通道；不补注入的话，依赖聚合 LLM 的插件（代码评审、Lua 的
+	// dsc.llm 等）会一直拿不到 LLM，直到手工热重载才恢复。
+	m.reinjectToolInterconnectLocked()
+
 	// 反应式重算：本轮加载可能补足先前 PENDING 提供者的能力依赖，触发其提升
 	_ = m.repairPendingLocked()
 
@@ -2064,6 +2070,44 @@ func validateCoreInfo(info *metadata.PluginInfo, wantType string) error {
 type interconnectRefs struct {
 	hasAggLLM    bool
 	agentLLMName string
+}
+
+// reinjectToolInterconnectLocked 在聚合 LLM 就绪后，为启动期加载的 tool/dsc 插件
+// 重新执行互通注入（需已持有 m.mu）。
+//
+// 启动期 provider 全部在 agent 激活前拉起，此时 agentLLMServiceID 尚未确定，
+// interconnectToolPlugin 只能注入 Tool/Notify/Agent 通道；若不再补一次，依赖聚合
+// LLM 的插件（代码评审、Lua 脚本的 dsc.llm 等）会一直拿不到 LLM，只有手工热重载
+// 后才恢复。重复注入本身安全：插件侧 SetInterconnect 以新客户端集整体替换旧集。
+func (m *Manager) reinjectToolInterconnectLocked() {
+	if m.agentLLMServiceID == 0 {
+		return
+	}
+	refs := interconnectRefs{hasAggLLM: true, agentLLMName: m.agentLLMName}
+
+	names := make([]string, 0, len(m.toolClients))
+	for name := range m.toolClients {
+		names = append(names, name)
+	}
+	sort.Strings(names) // 注入顺序确定，日志可复现
+
+	for _, name := range names {
+		toolClient := m.toolClients[name]
+		client := m.clients[name]
+		if toolClient == nil || client == nil {
+			continue
+		}
+		rpcClient, err := client.Client()
+		if err != nil {
+			m.logger.Warn("interconnect reinject skipped: client unavailable", "core", name, "error", err)
+			continue
+		}
+		grpcClient, ok := rpcClient.(*plugin.GRPCClient)
+		if !ok {
+			continue
+		}
+		m.interconnectToolPlugin(name, grpcClient, toolClient, refs)
+	}
 }
 
 // interconnectToolPlugin 互通机制 1/2/4：聚合 LLM、聚合 Tool 与插件通知服务挂在

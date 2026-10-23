@@ -298,8 +298,15 @@ func (m *Manager) reactivateAgentLocked(name string) {
 	}
 	m.agentServiceIDs[name] = llmID
 	m.agentLLMName = primaryLLM
+	// 记录聚合 LLM 服务 ID：它同时是「LLM 已就绪」的判定依据，动态加载/热重载
+	// 与插件互通补注入都依赖它非零（此前只在启动/热重载路径写入，PENDING 再激活
+	// 漏写，导致本路径激活后 tool 插件永远拿不到聚合 LLM）。
+	m.agentLLMServiceID = llmID
 	m.transitionLocked(name, StateActive, "")
 	m.logger.Info("agent reactivated after capability dependency injection", "name", name, "llmID", llmID, "primaryLLM", primaryLLM)
+
+	// LLM 就绪后为启动期已加载的 tool/dsc 插件补注入互通（见 reinjectToolInterconnectLocked）。
+	m.reinjectToolInterconnectLocked()
 }
 
 // pickPrimaryLLM 从 ResolvedDep 列表中选首个 Type=="llm" 且 ProviderName 非空的项，
