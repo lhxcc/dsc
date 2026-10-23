@@ -1265,10 +1265,15 @@ func (m *Manager) DeleteSession(id string) error {
 	return nil
 }
 
+// sessionDir 返回会话数据目录（<ExecDir>/sessions）。目录名与命名约定集中在
+// session 包，宿主各处（Store、压缩状态清理、日志）一律经此取路径。
+func (m *Manager) sessionDir() string {
+	return session.Dir(m.config.ExecDir)
+}
+
 // sessionStore 打开/创建多会话 store（ExecDir/sessions）。
 func (m *Manager) sessionStore() (*session.Store, error) {
-	dir := PJoin(m.config.ExecDir, "sessions")
-	return session.NewStore(dir)
+	return session.NewStore(m.sessionDir())
 }
 
 // ExportSession 导出指定会话为 Markdown transcript（ExecDir/exports/<id>.md），

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"dsc/core"
+	"dsc/session"
 	"dsc/tui"
 
 	"github.com/hashicorp/go-hclog"
@@ -313,13 +314,17 @@ func main() {
 		os.Setenv("DSC_TEMP_DIR", core.PJoin(execDir, "temp"))
 	}
 
-	// 会话日志目录（agent-react-loop 写入会话事件 JSONL）：未显式配置
-	// DSC_SESSION_DIR 时注入 <ExecDir>/sessions，与宿主 Store 路径
-	// （core/manager.go sessionStore 用 m.config.ExecDir/sessions）保持一致。
-	// 否则插件进程的 fallback "sessions"（CWD 相对）会与宿主 <ExecDir>/sessions
-	// 静默分歧——插件写一份、宿主读另一份，会话恢复失败。
+	// 会话目录（agent-react-loop 写会话日志、dsc-billion-context 写压缩状态）：
+	// 未显式配置 DSC_SESSION_DIR 时注入 <ExecDir>/sessions，路径唯一来源是
+	// session.Dir——宿主 Store、插件经 dsc.SessionDir() 读同一值，不得各自拼。
 	if os.Getenv("DSC_SESSION_DIR") == "" {
-		os.Setenv("DSC_SESSION_DIR", core.PJoin(execDir, "sessions"))
+		os.Setenv("DSC_SESSION_DIR", session.Dir(execDir))
+	}
+
+	// 记忆库目录（tool-memory-service 写入 memory.db）：未显式配置
+	// DSC_MEMORY_DIR 时注入 <ExecDir>/memory，插件经 dsc.MemoryDir() 读取同一值。
+	if os.Getenv("DSC_MEMORY_DIR") == "" {
+		os.Setenv("DSC_MEMORY_DIR", core.PJoin(execDir, core.MemoryDirName))
 	}
 
 	// 技能目录（dsc-system 的 skill 工具与 TUI 的 listSkills 都需引用）：
@@ -775,6 +780,7 @@ func main() {
 	// 有效上下文窗口下发所有插件（不止 agent）：压缩后端按它算触发阈值，缺省会退回
 	// 128K，云端 1M 窗口下几步就压缩。
 	injectContextWindow(merged, contextWindow)
+	logger.Info("context window injected to all plugins", "window", contextWindow, "plugins", len(merged.Plugins))
 
 	// 输出上限统一语义（不分本地/云端，行为一致）：向 LLM 插件注入 DSC_MAX_OUTPUT_TOKENS
 	// =有效上下文窗口值。探测命中（本地 LLAMACPP）注入探测窗口值；探测不命中（云端）注入

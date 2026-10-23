@@ -43,33 +43,7 @@ type compressCallRecord struct {
 	succeed bool
 }
 
-// ParseCompressArgs 解析 compress 调後 args 的 content 范围集（重建与
-// callId 回塔共用）。
-func ParseCompressArgs(text string) []PruneRange {
-	start := strings.Index(text, "{")
-	if start < 0 {
-		return nil
-	}
-	var req struct {
-		Content []struct {
-			StartRef string `json:"startId"`
-			EndRef   string `json:"endId"`
-			Summary  string `json:"summary"`
-			Topic    string `json:"topic"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal([]byte(text[start:]), &req); err != nil {
-		return nil
-	}
-	var ranges []PruneRange
-	for _, r := range req.Content {
-		if r.StartRef == "" || r.EndRef == "" || r.Summary == "" {
-			continue
-		}
-		ranges = append(ranges, PruneRange{StartRef: r.StartRef, EndRef: r.EndRef, Summary: r.Summary, Topic: r.Topic})
-	}
-	return ranges
-}
+// ParseCompressArgs 见 compressparse.go（宽松解析：围栏/尾逗号/截断救援/字段变体）。
 
 // compressResultOK 解析 tool-result JSON，报告 blocksCreated>0。
 func compressResultOK(text string) bool {

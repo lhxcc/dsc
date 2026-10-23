@@ -2406,15 +2406,13 @@ func getExecutableDir() (string, error) {
 
 // listSkills 扫描 skills 目录，按内置（builtin/）与外置（installed/）分组返回展示行。
 func listSkills() []string {
-	dir := os.Getenv("DSC_SKILLS_DIR")
-	if dir == "" {
-		// 使用程序所在的目录，而不是当前工作目录
-		exeDir, err := getExecutableDir()
-		if err != nil {
-			exeDir = "."
-		}
-		dir = core.PJoin(exeDir, "skills")
+	// 目录解析统一在 core（DSC_SKILLS_DIR 优先，缺省 <exeDir>/skills；不使用
+	// 当前工作目录——TUI 与插件看到的必须是同一个技能目录）。
+	exeDir, err := getExecutableDir()
+	if err != nil {
+		exeDir = "."
 	}
+	dir := core.SkillsDir(exeDir)
 	var out []string
 	if builtin := scanSkillSection(core.PJoin(dir, "builtin")); len(builtin) > 0 {
 		out = append(out, "内置技能（"+fmt.Sprint(len(builtin))+"）：")

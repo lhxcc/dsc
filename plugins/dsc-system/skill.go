@@ -510,13 +510,11 @@ func uninstallSkillView(result string) (json.RawMessage, error) {
 	return dsc.CardView("Skill", &dsc.ViewBadge{Text: "uninstalled", Tone: "yellow"}, fields), nil
 }
 
-// newSkillResident 初始化 skill 驻留：读 DSC_SKILLS_DIR（未设置时默认 ./skills），
+// newSkillResident 初始化 skill 驻留：目录经 SDK 统一解析（DSC_SKILLS_DIR，
+// 缺省 <ExecDir>/skills，与宿主 TUI 同源；不退回 cwd 相对路径），
 // 构建技能存储（目录缺失视为无技能，不阻断混合体装载），返回存储与外置安装目录。
 func newSkillResident() (*SkillStore, string) {
-	skillsDir := os.Getenv("DSC_SKILLS_DIR")
-	if skillsDir == "" {
-		skillsDir = "./skills"
-	}
+	skillsDir := dsc.SkillsDir()
 	installedDir := dsc.PJoin(skillsDir, "installed")
 	store := NewSkillStore(dsc.PJoin(skillsDir, "builtin"), installedDir)
 	return store, installedDir

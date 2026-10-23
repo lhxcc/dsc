@@ -140,9 +140,13 @@ func handlePageToImages(ctx context.Context, args json.RawMessage) (string, erro
 	}
 	first, last := contiguousPages(selected)
 
-	if p.OutDir == "" {
-		p.OutDir = dsc.PJoin(dsc.WorkspaceRoot(), "pdf-images",
-			strings.TrimSuffix(filepath.Base(p.FilePath), ".pdf"), "render")
+	// 默认产物目录：目标文件旁边的具名子目录（<源目录>/<源主名>-images/render）
+	srcAbs, err := dsc.ResolveWorkspacePath(p.FilePath)
+	if err != nil {
+		return "", err
+	}
+	if p.OutDir, err = ensureOutDir(p.OutDir, srcAbs, "render"); err != nil {
+		return "", fmt.Errorf("create out_dir: %w", err)
 	}
 	// 沙箱策略由宿主流水线统一判定，本插件不做越界检查
 	dpi := p.DPI

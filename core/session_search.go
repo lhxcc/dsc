@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"dsc/session"
 )
 
 // 会话全文检索（对齐 DSH session-query + session-query-sqlite）。
@@ -58,10 +60,10 @@ func (s *SessionSearcher) Rebuild() error {
 		return nil // 目录不存在不报错
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), session.FileSuffix) {
 			continue
 		}
-		sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
+		sessionID := strings.TrimSuffix(entry.Name(), session.FileSuffix)
 		path := PJoin(s.dir, entry.Name())
 		texts, err := extractTexts(path)
 		if err != nil {
@@ -110,7 +112,7 @@ func (s *SessionSearcher) Search(ctx context.Context, query string, limit int) (
 			}
 		}
 		if score > 0 {
-			info, _ := os.Stat(PJoin(s.dir, sessionID+".jsonl"))
+			info, _ := os.Stat(PJoin(s.dir, sessionID+session.FileSuffix))
 			var lastMod int64
 			if info != nil {
 				lastMod = info.ModTime().UnixMilli()

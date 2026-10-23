@@ -291,7 +291,7 @@ func ApplyAbsorb(ref, summary, absorbCallID string, messages []CoreMessage, stat
 	state.Absorbed = append(state.Absorbed, record)
 	state.Stats.AbsorbedTokens += tokens
 
-	resultText := "absorbed " + ref + " (~" + FormatTokenCount(tokens) + " tokens → summary ~" + FormatTokenCount(summaryTokens) + "). The original tool output is now hidden; your summary is the durable record."
+	resultText := "absorbed " + ref + " (~" + FormatTokenCount(tokens) + " tokens → summary ~" + FormatTokenCount(summaryTokens) + "). The original tool output will be hidden from the next request; your summary is the durable record."
 	if tokens > 0 && summaryTokens >= tokens {
 		resultText += " WARNING: your summary (~" + FormatTokenCount(summaryTokens) + " tokens) is not smaller than the original (~" + FormatTokenCount(tokens) + " tokens) — distill harder next time."
 	}

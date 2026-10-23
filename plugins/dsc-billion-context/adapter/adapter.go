@@ -5,8 +5,8 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
+	"strings"
 	"sync"
 
 	bcacp "dsc-billion-context/acp"
@@ -87,36 +87,43 @@ func FromCoreMessages(coreMsgs []bcacp.CoreMessage) []*proto.Message {
 	return out
 }
 
-// defaultIDProvider 默认 ID 提供者：基于消息内容生成稳定 ID。
-// 不含视图索引：同一条消息（相同 role + content + toolCallId + toolCalls）在
-// 任何视图位置都得到相同 ID，压缩/截断导致索引平移时 ref 映射仍正确。
-// hash 算法：FNV-1a（Go 标准库，无外部依赖）。调用方仍可覆盖以使用 session seq。
-func defaultIDProvider(_ int, msg *proto.Message) string {
-	h := fnv.New64a()
-	h.Write([]byte(msg.Role))
-	h.Write([]byte{0})
-	h.Write([]byte(msg.Content))
-	if msg.ToolCallId != "" {
-		h.Write([]byte{0})
-		h.Write([]byte(msg.ToolCallId))
-	}
-	for _, tc := range msg.ToolCalls {
-		h.Write([]byte{0})
-		h.Write([]byte(tc.Id))
-		h.Write([]byte(tc.Name))
-	}
-	return fmt.Sprintf("msg-%s-%016x", msg.Role, h.Sum64())
+// defaultIDProvider 默认 ID 提供者：**以消息在原始历史中的位置作为身份**。
+//
+// 为什么不是内容 hash：两条内容相同的消息（重复的"继续"、两次相同 compile 输出、
+// 相同工具结果）会得到同一个 ID，于是 MessageRefs.ByRaw 互相覆盖、CoveredMessageIDs
+// 判定错位——压缩会命中错误的消息。acp-kernel 里 ID 由宿主会话日志提供（天然唯一），
+// DSC 的 proto.Message 没有 id/seq 字段，位置就是最接近的等价物。
+//
+// 位置为什么稳定：pre-step 每轮收到的是 agent 的 append-only 原始历史（插件的改写
+// 只影响发给 LLM 的视图，不回写 agent 历史），因此同一消息在跨轮的位置不变；
+// 压缩/prune 造成的"视图平移"发生在渲染之后，不参与下一轮的 ID 分配。
+//
+// 注意：状态里若残留旧版（内容 hash）ID 的块，升级后首轮因 ID 失配会被 sync-blocks
+// 停用，等于一次性重新建立压缩记录；这是从错误 ID 迁移出来的一次性代价。
+func defaultIDProvider(idx int, _ *proto.Message) string {
+	return fmt.Sprintf("msg-%d", idx)
 }
 
+// PluginName 是本插件名（与 sdk.Config.Name 同源）。
+const PluginName = "dsc-billion-context"
+
+// StateFileSuffix 是压缩状态文件的命名：<会话 id>.<插件名>.json。
+//
+// 用插件名而不是某个跨模块共享的固定后缀（如 ".acp.json"）：插件是**可分离**的，
+// 宿主核心不该知道某个插件的落盘细节——删掉本插件后，core 里不该残留任何只为它
+// 服务的常量或清理代码。文件名自带插件名，同目录多个插件互不冲突、人工也看得懂。
+const StateFileSuffix = "." + PluginName + ".json"
+
 // StateStore 负责 acp state 的持久化（JSON 文件）。
-// 每个 session 一个 state 文件，路径为 dir/<sessionID>.json。
+// 每个 session 一个 state 文件，路径为 dir/<sessionID>.<插件名>.json，目录由调用方
+// 传 dsc.SessionDir()（与会话日志同目录，靠文件名区分）。
 type StateStore struct {
 	mu    sync.Mutex
 	dir   string
 	cache map[string]*bcacp.CompressionState // sessionID → state
 }
 
-// NewStateStore 创建状态存储。dir 为存储目录（通常 ExecDir/billion-context）。
+// NewStateStore 创建状态存储。dir 为存储目录（ExecDir/sessions，与宿主会话同目录）。
 func NewStateStore(dir string) *StateStore {
 	return &StateStore{
 		dir:   dir,
@@ -131,7 +138,10 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 	if st, ok := s.cache[sessionID]; ok {
 		return st, nil
 	}
-	path := s.path(sessionID)
+	path, err := s.path(sessionID)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -162,41 +172,93 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 }
 
 // Save 持久化指定 session 的 state。
+//
+// 原子写：先写同目录临时文件并 fsync，再 rename 覆盖目标。直接 WriteFile 在进程崩溃
+// 或断电时可能留下半截 JSON——下次 Load 解析失败虽然会重建，但压缩记录全丢，
+// 上下文随即重新膨胀（压缩是"只增不减"的收益，丢一次等于全部白做）。
 func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cache[sessionID] = state
-	if err := os.MkdirAll(s.dir, 0700); err != nil {
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
 		return fmt.Errorf("create acp state dir: %w", err)
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal acp state: %w", err)
 	}
-	return os.WriteFile(s.path(sessionID), data, 0600)
+
+	tmp, err := os.CreateTemp(s.dir, ".state-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp acp state: %w", err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp acp state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp acp state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp acp state: %w", err)
+	}
+	dst, err := s.path(sessionID)
+	if err != nil {
+		return err
+	}
+	// os.Rename 在 Windows 上等价于 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，可覆盖目标
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("commit acp state: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // path 返回 session state 文件路径。
-func (s *StateStore) path(sessionID string) string {
-	// 防止路径遍历：sessionID 仅允许字母数字与 -_
-	safe := sanitizeSessionID(sessionID)
-	return dsc.PJoin(s.dir, safe+".json")
+// 会话 id 只做校验、不做字符替换：替换会把两个不同会话折成同一个文件名（例如
+// 空格与下划线），使 state 串到别的会话上。合法性判断复用 SDK 的唯一实现。
+func (s *StateStore) path(sessionID string) (string, error) {
+	if !dsc.ValidSessionID(sessionID) {
+		return "", fmt.Errorf("invalid session id %q", sessionID)
+	}
+	return dsc.PJoin(s.dir, sessionID+StateFileSuffix), nil
 }
 
-// sanitizeSessionID 把 sessionID 限制为安全字符（防止路径遍历）。
-func sanitizeSessionID(id string) string {
-	out := make([]byte, 0, len(id))
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '-' || c == '_' {
-			out = append(out, c)
-		} else {
-			out = append(out, '_')
+// PruneOrphans 清理孤儿状态文件：会话已被删除（<id>.jsonl 不存在）时，其 state
+// 没有归属，留着只会在 sessions/ 里越积越多。
+//
+// 之所以由插件自己清理而不是宿主删除：宿主不该知道插件的落盘命名（插件可分离）。
+// 幂等、best-effort：任何错误都跳过，返回删除数量。
+func PruneOrphans(sessionsDir string) int {
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, StateFileSuffix) {
+			continue
+		}
+		id := strings.TrimSuffix(name, StateFileSuffix)
+		if !dsc.ValidSessionID(id) {
+			continue
+		}
+		if _, err := os.Stat(dsc.PJoin(sessionsDir, id+dsc.SessionFileSuffix)); err == nil {
+			continue // 会话仍在
+		}
+		if err := os.Remove(dsc.PJoin(sessionsDir, name)); err == nil {
+			removed++
 		}
 	}
-	if len(out) == 0 {
-		return "default"
-	}
-	return string(out)
+	return removed
 }

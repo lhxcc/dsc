@@ -444,21 +444,16 @@ func handleExtractImages(ctx context.Context, args json.RawMessage) (string, err
 	if p.FilePath == "" {
 		return "", fmt.Errorf("file_path is required")
 	}
-	if p.OutDir == "" {
-		// 默认输出到工作空间内 spill 同级目录
-		p.OutDir = dsc.PJoin(dsc.WorkspaceRoot(), "pdf-images",
-			strings.TrimSuffix(filepath.Base(p.FilePath), ".pdf"))
-	}
-
-	// 沙箱策略由宿主流水线统一判定，本插件不做越界检查
-	if err := dsc.MkdirAll(p.OutDir); err != nil {
-		return "", fmt.Errorf("create out_dir: %w", err)
-	}
-
 	// 虛擬根歸并統一走 SDK（源頭 core）：同 handleInfo（相對路徑錨定工作區根）
 	filePath, err := dsc.ResolveWorkspacePath(p.FilePath)
 	if err != nil {
 		return "", err
+	}
+
+	// 沙箱策略由宿主流水线统一判定，本插件不做越界检查；默认产物目录落在
+	// 目标文件旁边的具名子目录（<源目录>/<源主名>-images）。
+	if p.OutDir, err = ensureOutDir(p.OutDir, filePath, ""); err != nil {
+		return "", fmt.Errorf("create out_dir: %w", err)
 	}
 
 	f, err := os.Open(filePath)
@@ -618,7 +613,7 @@ func main() {
   "type": "object",
   "properties": {
     "file_path": {"type": "string", "description": "Path to the PDF file."},
-    "out_dir": {"type": "string", "description": "Output directory for extracted images. Must be within workspace root. If omitted, defaults to <workspace>/pdf-images/<filename>/."},
+    "out_dir": {"type": "string", "description": "Output directory for extracted images. Must be within workspace root. If omitted, a named subdirectory beside the source file (<dir>/<name>-images/) is used."},
     "pages": {"type": "string", "description": "Optional page selection for image extraction, e.g. \"1-3\".", "default": ""}
   },
   "required": ["file_path"]

@@ -13,7 +13,8 @@
 //   - search_context: 在压缩块摘要中搜索关键词
 //   - acp_status: 查看上下文使用率与可压缩范围
 //
-// state 持久化：每个 session 一个 JSON 文件（ExecDir/billion-context/<session>.json）。
+// state 持久化：每个 session 一个 JSON 文件，与宿主会话存档同目录
+// （ExecDir/sessions/<session>.acp.json，后缀区分）。
 // fork/恢复时经 session 事件日志重放重建（后续实现）。
 package main
 
@@ -28,7 +29,6 @@ import (
 	dsc "dsc-sdk"
 	"dsc/core"
 	"dsc/proto"
-	"dsc/session"
 
 	bcacp "dsc-billion-context/acp"
 	bcadapter "dsc-billion-context/adapter"
@@ -39,31 +39,45 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
-	// sessionID 当前会话 ID（DSC_SESSION_ID 注入；缺省按工作区派生的项目级键，
-	// 对齐宿主 session 存储的 SessionKeyForProject——同一项目同名、不同项目隔离）
+	// sessionID 当前会话 ID（须持 mu 读写）。
+	// 取值优先级：pre-step 事件里的 Session（宿主真实会话 ID，见 handlePreStep）>
+	// DSC_SESSION_ID env > 工作区派生的项目级键。此前只用后两者，而宿主从不注入
+	// DSC_SESSION_ID，于是永远落在工作区键上——同一工作区开多个会话/fork 时共用
+	// 一份 state（refs、blocks、nudge 基线互相污染，压缩会命中别的会话的消息）。
 	sessionID string
+
+	// logWindowOnce 首次 pre-step 打印生效窗口一次（启动期 stderr 尚未被宿主转发）。
+	logWindowOnce sync.Once
 
 	// lastMessages 缓存最近一次 pre-step 收到的 CoreMessage 列表，供 handleCompress
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
 	// 每次 handlePreStep 更新此缓存；handleCompress 从中读取。
 	lastMessages []bcacp.CoreMessage
+
+	// prunedState 启动时清理的孤儿状态文件数（首次 pre-step 时随窗口日志一起打印：
+	// 启动期 stderr 尚未被宿主转发）。
+	prunedState int
 }
 
 func main() {
-	// 从环境变量读取配置
-	execDir := dsc.ExecDir()
-	stateDir := dsc.PJoin(execDir, "billion-context")
-	store := bcadapter.NewStateStore(stateDir)
+	// state 与会话存档同目录，靠 <id>.acp.json 后缀区分，不再单独开 billion-context/。
+	// 目录一律经 SDK 解析（DSC_SESSION_DIR 优先），与宿主 Store 同一来源。
+	sessionsDir := dsc.SessionDir()
+	pruned := bcadapter.PruneOrphans(sessionsDir)
+	store := bcadapter.NewStateStore(sessionsDir)
 
-	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖）
+	// 上下文窗口（默认 128K，可经 DSC_CONTEXT_WINDOW 覆盖——宿主按配置 context_window
+	// 或端点探测值把该键注入所有插件，故云端 1M 窗口下应为 1048576；实际值在首个
+	// pre-step 打印一次，见 handlePreStep）
 	contextWindow := 131072
 	if n := dsc.ContextWindow(); n > 0 {
 		contextWindow = n
 	}
 
 	bc := &BillionContext{
-		store:  store,
-		config: bcacp.DefaultConfig(contextWindow),
+		store:       store,
+		config:      bcacp.DefaultConfig(contextWindow),
+		prunedState: pruned,
 	}
 
 	// 即时工具结果吸收开关（默认关闭，DSC_ACP_ABSORB=1 启用）：
@@ -78,7 +92,7 @@ func main() {
 	}
 
 	sdkInst := dsc.New(dsc.Config{
-		Name:    "dsc-billion-context",
+		Name:    bcadapter.PluginName,
 		Version: "0.3.0",
 		Type:    dsc.TypeDsc,
 		// 声明提供 "compaction" 能力：宿主检测到任何插件 Provides compaction 后，
@@ -275,10 +289,23 @@ func (bc *BillionContext) handleRequestError(ctx context.Context, dataJSON strin
 // 协议：dataJSON 为 AgentPreStepEvent 的 JSON（含 MessagesJSON 字段）
 // 返回：resultJSON 为 {"messages": [...]} 形式（改写后的 proto.Message 数组 JSON）
 func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (string, error) {
+	// 首个 pre-step 打印实际生效的窗口（此时 gRPC 已握手，stderr 会被宿主转发到日志），
+	// 用于核对云端 1M 窗口是否真的取代了 128K 默认值。
+	bc.logWindowOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "[billion-context] context window=%d state=%s/<id>%s\n",
+			bc.config.ModelContextLimit, dsc.SessionDir(), bcadapter.StateFileSuffix)
+		if bc.prunedState > 0 {
+			fmt.Fprintf(os.Stderr, "[billion-context] pruned %d orphan state file(s)\n", bc.prunedState)
+		}
+	})
 	var ev core.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("billion-context: parse pre-step event: %w", err)
 	}
+
+	// 记录宿主真实会话 ID：pre-step 载荷已带 req.GetSessionId()，但宿主从不注入
+	// DSC_SESSION_ID env，故必须以事件为准，否则同工作区多会话共用一份 state。
+	bc.setSessionID(ev.Session)
 
 	// 解析消息列表
 	var protoMsgs []*proto.Message
@@ -363,42 +390,17 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 // handleCompress 处理 compress 工具调用。
 func (bc *BillionContext) handleCompress(ctx context.Context, args json.RawMessage) (string, error) {
-	var req struct {
-		Content []struct {
-			StartRef string `json:"startId"`
-			EndRef   string `json:"endId"`
-			Summary  string `json:"summary"`
-			Topic    string `json:"topic,omitempty"`
-		} `json:"content"`
-	}
-	if err := json.Unmarshal(args, &req); err != nil {
-		return "", fmt.Errorf("invalid args: %w", err)
-	}
-	if len(req.Content) == 0 {
-		return "", fmt.Errorf("content is required (at least one range)")
+	// 宽松解析（代码围栏 / 尾逗号 / 输出截断救援 / 字段变体）：compress 的 summary
+	// 常是大段自然语言，严格 json.Unmarshal 失败会让整轮压缩作废、上下文继续膨胀。
+	ranges := bcacp.ParseCompressArgs(string(args))
+	if len(ranges) == 0 {
+		return "", fmt.Errorf("content is required: at least one range with startId/endId/summary")
 	}
 
 	sessionID := bc.getSessionID()
 	state, err := bc.store.Load(sessionID)
 	if err != nil {
 		return "", fmt.Errorf("load state: %w", err)
-	}
-
-	// 把请求转为 acp PruneRange 列表
-	ranges := make([]bcacp.PruneRange, 0, len(req.Content))
-	for _, r := range req.Content {
-		if r.StartRef == "" || r.EndRef == "" || r.Summary == "" {
-			continue
-		}
-		ranges = append(ranges, bcacp.PruneRange{
-			StartRef: r.StartRef,
-			EndRef:   r.EndRef,
-			Summary:  r.Summary,
-			Topic:    r.Topic,
-		})
-	}
-	if len(ranges) == 0 {
-		return "", fmt.Errorf("no valid ranges (each requires startId, endId, summary)")
 	}
 
 	// 从缓存获取最近一次 pre-step 的消息列表（解决"compress 工具调用时无消息列表"的致命 bug）
@@ -520,14 +522,27 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 }
 
 // getSessionID 获取当前会话 ID。
-// 优先级：环境变量 DSC_SESSION_ID > 项目级键（工作区路径派生，对齐宿主 session
-// 存储的 SessionKeyForProject——同一项目同名、不同项目隔离；替代硬编码 default，
-// 避免跨项目压缩状态被混入）。
+// 优先级：pre-step 事件透传的宿主真实会话 > 项目级键（SDK 的 ProjectSessionKey，
+// 与宿主 session 存储同一实现——同一项目同名、不同项目隔离）。
+// 不用环境变量承载会话 id：env 在子进程 spawn 时快照，中途切换会话不会同步。
 func (bc *BillionContext) getSessionID() string {
-	if id := os.Getenv("DSC_SESSION_ID"); id != "" {
-		return id
+	bc.mu.Lock()
+	cur := bc.sessionID
+	bc.mu.Unlock()
+	if cur != "" {
+		return cur
 	}
-	return session.SessionKeyForProject(dsc.WorkspaceRoot())
+	return dsc.ProjectSessionKey()
+}
+
+// setSessionID 记录当前会话 ID（pre-step 事件携带的宿主真实会话）。
+func (bc *BillionContext) setSessionID(id string) {
+	if id == "" {
+		return
+	}
+	bc.mu.Lock()
+	bc.sessionID = id
+	bc.mu.Unlock()
 }
 
 // estimateTokens 估算 proto.Message 列表的总 token 数。

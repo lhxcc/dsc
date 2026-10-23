@@ -316,7 +316,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 	// 历史以事件追加进 session（对齐 DSH：模型可见即已记录），不再维护独立消息数组。
 	a.sessMu.Lock()
 	if a.sess == nil {
-		projectKey := session.SessionKeyForProject(dsc.WorkspaceRoot())
+		projectKey := dsc.ProjectSessionKey()
 		restored, err := a.store.Ensure(projectKey)
 		if err != nil {
 			a.sessMu.Unlock()
@@ -1783,12 +1783,9 @@ func newAgent() (*ReactLoopAgent, error) {
 	if v := os.Getenv("DSC_TODO_ALLOW_PARALLEL"); v == "1" || strings.EqualFold(v, "true") {
 		agent.todoAllowParallel = true
 	}
-	// 多会话事件日志存储（DSC_SESSION_DIR，缺省落在插件工作目录下的 sessions/）
-	dir := os.Getenv("DSC_SESSION_DIR")
-	if dir == "" {
-		dir = "sessions"
-	}
-	store, err := session.NewStore(dir)
+	// 多会话事件日志存储：目录解析统一在 SDK（DSC_SESSION_DIR，缺省 <ExecDir>/sessions），
+	// 不得回退相对路径 "sessions"——插件 cwd 未必是 ExecDir，宿主会读不到。
+	store, err := session.NewStore(dsc.SessionDir())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open session store: %w", err)
 	}

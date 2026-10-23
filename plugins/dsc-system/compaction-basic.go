@@ -47,7 +47,6 @@ import (
 	"dsc/core"
 	"dsc/core/llmclient"
 	"dsc/proto"
-	"dsc/session"
 )
 
 // llmChat 聚合 LLM 的最小接口（*llmclient.Client 满足；单测以 fake 注入）。
@@ -87,6 +86,9 @@ type compactionBasicServer struct {
 	retainMin   int     // 保留尾部最少 token 数
 
 	states map[string]*compactionState // per-session 压缩记录（进程内，须持 mu）
+
+	// logWindowOnce 首次 pre-step 打印生效参数一次（启动期 stderr 尚未被宿主转发）。
+	logWindowOnce sync.Once
 }
 
 // newCompactionBasicServer 读 env 构建驻留（fail-soft：非法配置逐项回退默认；
@@ -158,6 +160,12 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	if s.window <= 0 {
 		return "", nil // 驻留禁用
 	}
+	// 首次 pre-step 打印实际生效的压缩参数（此时 gRPC 已握手，stderr 由宿主转发到日志）。
+	// 用于核对云端 1M 窗口：应看到 window=1048576、阈值=0.8 → 约 838k tokens 才触发。
+	s.logWindowOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "dsc-system: compaction-basic window=%d threshold=%.2f retain_ratio=%.2f\n",
+			s.window, s.threshold, s.retainRatio)
+	})
 	var ev core.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("compaction-basic: parse pre-step event: %w", err)
@@ -504,11 +512,11 @@ func (s *compactionBasicServer) stateFor(sessID string) *compactionState {
 }
 
 // sessionKey 会话状态键：优先事件透传的 session_id（宿主 ChatRequest.session_id），
-// 缺省按工作区派生项目级键（对齐宿主 session 存储的 SessionKeyForProject——
+// 缺省按工作区派生项目级键（SDK 的 ProjectSessionKey，与宿主 session 存储同一实现——
 // 同一项目同名、不同项目隔离）。
 func (s *compactionBasicServer) sessionKey(sessID string) string {
 	if sessID == "" {
-		return session.SessionKeyForProject(dsc.WorkspaceRoot())
+		return dsc.ProjectSessionKey()
 	}
 	return sessID
 }

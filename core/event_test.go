@@ -2,6 +2,7 @@ package core
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,22 +22,22 @@ func TestDefaultSessionIDFollowsWorkspaceRoot(t *testing.T) {
 	orig := WorkspaceRoot
 	defer func() { WorkspaceRoot = orig }()
 
-	// 平台样例：选一个含分隔符的典型路径，断言其经 SessionKeyForProject 转换后的结果。
-	// SessionKeyForProject 是平台无关的纯字符串变换，但 filepath.ToSlash 在不同平台
-	// 对 `\` 的处理不同——Windows 上 `\` → `/`，Linux/macOS 上 `\` 不变（是合法文件名字符）。
-	// 故 Windows 路径样例只在 Windows 上断言，其余平台用 Unix 样例。
-	var samplePath, wantKey string
+	// 平台样例：选一个含分隔符的典型路径，断言其经 SessionKeyForProject 转换后的前缀
+	// （键末尾另带路径短哈希，见 session.SessionKeyForProject）。
+	// SessionKeyForProject 是平台无关的纯字符串变换，但反斜杆只在 Windows 上才是
+	// 分隔符（Linux/macOS 上是合法文件名字符），故 Windows 样例只在 Windows 上断言。
+	var samplePath, wantPrefix string
 	if runtime.GOOS == "windows" {
 		samplePath = `C:\Users\Administrator\Desktop\DeepClean`
-		wantKey = "C--Users-Administrator-Desktop-DeepClean"
+		wantPrefix = "C=--Users--Administrator--Desktop--DeepClean-"
 	} else {
 		samplePath = "/home/jor/DeepClean"
-		wantKey = "home-jor-DeepClean"
+		wantPrefix = "home--jor--DeepClean-"
 	}
 	WorkspaceRoot = samplePath
-	if got := m.DefaultSessionID(); got != wantKey {
-		t.Errorf("DefaultSessionID() = %q, want %q (root=%q, platform=%s)",
-			got, wantKey, samplePath, runtime.GOOS)
+	if got := m.DefaultSessionID(); !strings.HasPrefix(got, wantPrefix) {
+		t.Errorf("DefaultSessionID() = %q, 应以 %q 开头 (root=%q, platform=%s)",
+			got, wantPrefix, samplePath, runtime.GOOS)
 	}
 	// 同时校验 DefaultSessionID 与 SessionKeyForProject(WorkspaceRoot) 等价——
 	// 这是该测试的核心断言（不再有假 "default"），跨平台都应成立。
