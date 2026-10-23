@@ -62,7 +62,7 @@ plugins:
     type: tool
     binary_path: ./plugins/tool-filesystem/tool-filesystem.exe
     enabled: true
-  # 记忆服务：memory_search / memory_add 等工具 + 推理被动记录 / 任务收尾插播提醒
+  # 记忆服务：memory_search / memory_add 工具 + 被動記錄推理過程，待辦或任務完成後主動記錄經驗教訓等。
   - name: tool-memory-service
     type: tool
     binary_path: ./plugins/tool-memory-service/tool-memory-service.exe
