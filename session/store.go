@@ -55,6 +55,7 @@ func SessionKeyForProject(projectRoot string) string {
 	// 反斜杆输入，须显式归一，见 AGENTS.md 路径纪律）
 	p := strings.ReplaceAll(projectRoot, "\\", "/")
 	p = strings.TrimPrefix(p, "/")
+	p = normalizeProjectPath(p)
 	if p == "" {
 		return "default"
 	}
@@ -77,6 +78,33 @@ func SessionKeyForProject(projectRoot string) string {
 		return "default"
 	}
 	return b.String() + "-" + shortPathHash(p)
+}
+
+// normalizeProjectPath 把「同一目录的不同写法」归一到同一形态：尾随分隔符与重复
+// 分隔符都去掉。会话键由此路径编码 + 短哈希而来，写法不同就等于换了一个会话——现场
+// 表现是「历史突然加载不出来」，实际只是工作区根多了个斜杆：
+//
+//	O:/Agents/Strada   → O=--Agents--Strada-CD976A24
+//	O:/Agents/Strada/  → O=--Agents--Strada---93781973   ← 同一目录，却是另一个会话
+//
+// 盘符大小写不做折叠：Windows 上 os.Getwd 已返回规范大小写，而折叠会改变现存所有
+// 会话键（等于集体丢历史）；大小写差异由启动日志的 session identity 一行暴露即可。
+func normalizeProjectPath(p string) string {
+	// UNC（//server/share）在 TrimPrefix 之后仍可能以 "/" 开头，保留其前导斜杆语义，
+	// 只折叠内部重复分隔符。
+	lead := ""
+	if strings.HasPrefix(p, "/") {
+		lead = "/"
+		p = strings.TrimPrefix(p, "/")
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	p = strings.TrimSuffix(p, "/")
+	if lead != "" && p != "" {
+		return lead + p
+	}
+	return p
 }
 
 // keyHashLen 是键末尾短哈希的字符数（8 位大写十六进制，等同 32 位）。
