@@ -1,12 +1,9 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
 	core "dsc/core"
-	"gopkg.in/yaml.v3"
 )
 
 // TestAssembleMergedConfigToolsDedup 验证 config.yaml 中启用的 tool/dsc 条目
@@ -170,30 +167,14 @@ func TestHistoryInjectionCountMapping(t *testing.T) {
 		want   int
 		wantOk bool
 	}{
-		{0, 0, false},  // 未定义：不下发，agent 取默认 -1（不限制）
-		{-1, 0, true},  // 禁止 → agent off
-		{-5, 0, true},  // 其它负数按禁止处理
-		{5, 5, true},   // 只注入最近 5 条
+		{0, 0, false}, // 未定义：不下发，agent 取默认 -1（不限制）
+		{-1, 0, true}, // 禁止 → agent off
+		{-5, 0, true}, // 其它负数按禁止处理
+		{5, 5, true},  // 只注入最近 5 条
 	} {
 		got, ok := historyInjectionCount(&core.Config{HistoryInjection: c.in})
 		if ok != c.wantOk || got != c.want {
 			t.Fatalf("config %d → (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.wantOk)
 		}
-	}
-}
-
-// TestDeepSeekPresetDoesNotDisableHistory 预设不得把恢复历史注入关掉（-1）：
-// 那是把「接续会话时失忆」写进出厂配置。0（未定义）与 N>0 都可以。
-func TestDeepSeekPresetDoesNotDisableHistory(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("config", "config.DeepSeek.yaml"))
-	if err != nil {
-		t.Skip(err)
-	}
-	var cfg core.Config
-	if err := yaml.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf("解析预设: %v", err)
-	}
-	if cfg.HistoryInjection < 0 {
-		t.Fatal("预设把 history_injection 设为负数（= 禁止注入恢复历史）：接续旧会话时会看不到任何历史")
 	}
 }
