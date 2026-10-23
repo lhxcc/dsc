@@ -8,9 +8,6 @@ import (
 
 	dsc "dsc-sdk"
 	"dsc/core"
-	"github.com/glebarez/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // setupMemoryDB 把全局 DB 指到临时库，测试结束恢复（DB 是包级单例）。
@@ -68,8 +65,8 @@ func searchVia(t *testing.T, keyword, scope string) []map[string]any {
 	return res.Results
 }
 
-// TestProjectScopeIsolation 默认只搜当前项目 + 全局：A 项目的记忆不得出现在 B 项目，
-// 需要跨项目翻查时显式 scope=all。
+// TestProjectScopeIsolation project 档严格等于「当前项目」：A 项目的记忆不得出现在
+// B 项目，也没有跨项目翻查的档位（别的项目的私有细节不该被顺手带进上下文）。
 func TestProjectScopeIsolation(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
@@ -77,43 +74,44 @@ func TestProjectScopeIsolation(t *testing.T) {
 
 	asProject(t, "/w/proj-b")
 	if got := searchVia(t, "CMake", "project"); len(got) != 0 {
-		t.Fatalf("B 项目默认搜索不应看到 A 项目记忆: %+v", got)
+		t.Fatalf("B 项目不应看到 A 项目记忆: %+v", got)
 	}
 	if got := searchVia(t, "CMake", ""); len(got) != 0 {
 		t.Fatalf("scope 缺省应按 project 处理: %+v", got)
 	}
-	if got := searchVia(t, "CMake", "all"); len(got) != 1 {
-		t.Fatalf("scope=all 应可跨项目检索，got %d 条", len(got))
+	// 未定义的档位（含此前的 all）回退默认 project，不会变成「全库」
+	if got := searchVia(t, "CMake", "all"); len(got) != 0 {
+		t.Fatalf("未知 scope 应回退 project，got %d 条", len(got))
 	}
 
-	// A 项目自己当然看得到
+	// A 项目自己看得到
 	asProject(t, "/w/proj-a")
 	if got := searchVia(t, "CMake", "project"); len(got) != 1 {
 		t.Fatalf("A 项目应看到自己的记忆，got %d 条", len(got))
 	}
 }
 
-// TestGlobalScopeVisibleEverywhere scope=global 的记忆（用户偏好、通用约定）
-// 在所有项目可见；scope=global 检索则只返回这些。
-func TestGlobalScopeVisibleEverywhere(t *testing.T) {
+// TestGlobalScopeIsSeparate global 档只含全局共享层：任一项目都能显式查到，
+// 但 project 档（默认）不会把它混进来——两档严格互斥，不做隐式合并。
+func TestGlobalScopeIsSeparate(t *testing.T) {
 	setupMemoryDB(t)
 	asProject(t, "/w/proj-a")
 	addVia(t, "用户偏好中文回复", "global")
 	addVia(t, "proj-a 私有约定", "project")
 
 	asProject(t, "/w/proj-b")
-	if got := searchVia(t, "中文", "project"); len(got) != 1 {
-		t.Fatalf("全局记忆应在任意项目可见，got %d 条", len(got))
+	if got := searchVia(t, "中文", "global"); len(got) != 1 {
+		t.Fatalf("全局层在任意项目都应可查到，got %d 条", len(got))
+	}
+	if got := searchVia(t, "中文", "project"); len(got) != 0 {
+		t.Fatalf("project 档不应混入全局条目，got %d 条", len(got))
 	}
 	if got := searchVia(t, "私有约定", "global"); len(got) != 0 {
-		t.Fatalf("scope=global 不应返回项目记忆，got %d 条", len(got))
-	}
-	if got := searchVia(t, "私有约定", "all"); len(got) != 1 {
-		t.Fatalf("scope=all 应返回项目记忆，got %d 条", len(got))
+		t.Fatalf("global 档不应返回项目记忆，got %d 条", len(got))
 	}
 
-	// memory_list 默认同样按 project 过滤（含全局）
-	args, _ := json.Marshal(map[string]any{"scope": "project"})
+	// memory_list 各自只列自己那一档
+	args, _ := json.Marshal(map[string]any{"scope": "global"})
 	out, err := handleList(context.Background(), args)
 	if err != nil {
 		t.Fatalf("memory_list: %v", err)
@@ -128,10 +126,10 @@ func TestGlobalScopeVisibleEverywhere(t *testing.T) {
 		t.Fatalf("parse list: %v", err)
 	}
 	if len(list.Memories) != 1 || list.Memories[0].Content != "用户偏好中文回复" {
-		t.Fatalf("B 项目列表应只含全局条目，got %+v", list.Memories)
+		t.Fatalf("global 列表应只含全局条目，got %+v", list.Memories)
 	}
-	if list.Memories[0].Project != "" {
-		t.Fatalf("全局条目的 project 应为空串，got %q", list.Memories[0].Project)
+	if list.Memories[0].Project != globalProject {
+		t.Fatalf("全局条目的 project 应为 %q，got %q", globalProject, list.Memories[0].Project)
 	}
 }
 
@@ -151,6 +149,11 @@ func TestDedupPerProject(t *testing.T) {
 		t.Fatal("跨项目不应判为重复")
 	}
 
+	// 全局层是同内容第三份，独立成条（不顶掉项目里的）
+	if g := addVia(t, "构建用 ninja", "global"); g["dedup"] == true {
+		t.Fatal("全局条目不应与项目条目判为重复")
+	}
+
 	// 同项目重复写入 → 去重
 	again := addVia(t, "构建用 ninja", "project")
 	if dedup, _ := again["dedup"].(bool); !dedup {
@@ -161,10 +164,14 @@ func TestDedupPerProject(t *testing.T) {
 	}
 }
 
-// TestProjectLabel 空项目键渲染为「全局」，其余原样展示。
+// TestProjectLabel 全局哨兵显示「全局」，空值（缺 project 列的旧库）显示「未归属」，
+// 其余原样展示。
 func TestProjectLabel(t *testing.T) {
-	if got := projectLabel(""); got != "全局" {
-		t.Fatalf("空键应显示全局，got %q", got)
+	if got := projectLabel(globalProject); got != "全局" {
+		t.Fatalf("全局哨兵应显示全局，got %q", got)
+	}
+	if got := projectLabel(""); got != "未归属" {
+		t.Fatalf("空值应显示未归属，got %q", got)
 	}
 	if got := projectLabel("w--proj-a-1234ABCD"); got != "w--proj-a-1234ABCD" {
 		t.Fatalf("项目键应原样展示，got %q", got)
@@ -183,50 +190,5 @@ func TestMemoryProjectColumnStamp(t *testing.T) {
 	}
 	if want := dsc.ProjectSessionKey(); mem.Project != want {
 		t.Fatalf("project = %q, want %q", mem.Project, want)
-	}
-}
-
-// TestAutoMigrateAddsProjectColumn 旧的单库（no project column）升级时自动补列，
-// 历史条目归为空项目键，按「全局」语义继续可检索——不需要单独的数据迁移脚本。
-func TestAutoMigrateAddsProjectColumn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	legacy, err := gorm.Open(sqlite.Open(path), &gorm.Config{Logger: logger.Discard})
-	if err != nil {
-		t.Fatalf("open legacy: %v", err)
-	}
-	if err := legacy.Exec(`CREATE TABLE memories (
-		id integer primary key autoincrement,
-		content text not null,
-		created_at integer not null,
-		last_access integer not null,
-		access_count integer not null default 0,
-		archived numeric not null default false,
-		source text default 'user')`).Error; err != nil {
-		t.Fatalf("create legacy table: %v", err)
-	}
-	if err := legacy.Exec(`INSERT INTO memories (content, created_at, last_access) VALUES ('旧条目', 1, 1)`).Error; err != nil {
-		t.Fatalf("insert legacy row: %v", err)
-	}
-	if sqlDB, err := legacy.DB(); err == nil {
-		_ = sqlDB.Close()
-	}
-
-	old := DB
-	if err := initDB(path); err != nil {
-		t.Fatalf("initDB on legacy db: %v", err)
-	}
-	t.Cleanup(func() {
-		if sqlDB, err := DB.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
-		DB = old
-	})
-
-	var mem Memory
-	if err := DB.Where("content = ?", "旧条目").First(&mem).Error; err != nil {
-		t.Fatalf("升级后应仍能读到旧条目: %v", err)
-	}
-	if mem.Project != "" {
-		t.Fatalf("历史条目应归为空项目键（全局），got %q", mem.Project)
 	}
 }

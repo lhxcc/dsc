@@ -45,12 +45,23 @@ type Memory struct {
 	Project string `gorm:"type:text;not null;default:'';index" json:"project"`
 }
 
-// 记忆作用域：project（当前项目，默认，含全局）/ global（只查全局）/ all（不按项目过滤）。
+// 记忆作用域只有两档，语义严格、互不重叠：
+//   - project：只作用于当前项目
+//   - global ：只作用于跨项目共享层（用户偏好、通用约定）
+//
+// 默认 project。不再提供「全部项目」档：跨项目翻查既难判定意图，也把别的项目
+// 的私有细节带进当前上下文。
 const (
 	scopeProject = "project"
 	scopeGlobal  = "global"
-	scopeAll     = "all"
 )
+
+// globalProject 是全局层在 project 列的存值。
+//
+// 刻意不用空串：空串是「未归属」，而没有 project 列的旧库升级上来的行正是空串。
+// 按 AGENTS「禁止保留兼容分支」，这些行不该被自动当成全局条目自动复活——
+// 要留下就 memory_update 显式认领。
+const globalProject = "*"
 
 // currentProjectKey 返回当前工作区的项目键（与会话文件名同一套规则）。
 func currentProjectKey() string {
@@ -65,26 +76,16 @@ func normalizeScope(raw, def string) string {
 		return scopeProject
 	case scopeGlobal:
 		return scopeGlobal
-	case scopeAll:
-		return scopeAll
-	case "":
-		return def
 	}
 	return def
 }
 
-// scopeWhere 给查询加上项目过滤。
-// project 作用域含全局条目——真正跨项目的事实（用户偏好、通用约定）不该被项目过滤挡住；
-// 要让记忆只在某项目可见，写的时候用 scope=project，它天然带了项目键。
+// scopeWhere 给查询加上归属过滤（两档严格互斥，不做隐式合并）。
 func scopeWhere(q *gorm.DB, scope string) *gorm.DB {
-	switch scope {
-	case scopeAll:
-		return q
-	case scopeGlobal:
-		return q.Where("project = ''")
-	default:
-		return q.Where("project = ? OR project = ''", currentProjectKey())
+	if scope == scopeGlobal {
+		return q.Where("project = ?", globalProject)
 	}
+	return q.Where("project = ?", currentProjectKey())
 }
 
 // CallLog 对应 call_logs 表
@@ -218,15 +219,10 @@ func searchMemories(query string, now time.Time, scope string) ([]resultItem, er
 		Project     string
 		RelScore    float64
 	}
-	// 项目过滤：project 作用域同时包含全局条目（见 scopeWhere 的说明）
-	extraWhere, extraArgs := "", []any{}
-	switch scope {
-	case scopeAll:
-	case scopeGlobal:
-		extraWhere = " AND m.project = ''"
-	default:
-		extraWhere = " AND (m.project = ? OR m.project = '')"
-		extraArgs = append(extraArgs, currentProjectKey())
+	// 归属过滤：两档严格互斥（见 scopeWhere）
+	extraWhere, extraArgs := " AND m.project = ?", []any{currentProjectKey()}
+	if scope == scopeGlobal {
+		extraArgs = []any{globalProject}
 	}
 	var ftsRows []ftsRow
 	args := append([]any{matchQuery}, extraArgs...)
@@ -377,7 +373,7 @@ func handleAdd(ctx context.Context, args json.RawMessage) (string, error) {
 	}
 	project := currentProjectKey()
 	if normalizeScope(req.Scope, scopeProject) == scopeGlobal {
-		project = ""
+		project = globalProject
 	}
 	id, dedup, err := addMemory(req.Content, req.Source, project)
 	if err != nil {
@@ -447,7 +443,7 @@ func handleUpdate(ctx context.Context, args json.RawMessage) (string, error) {
 	if req.Scope != "" {
 		// 允许把条目改归属（例如把历史遗留的全局条目收进当前项目）
 		if normalizeScope(req.Scope, "") == scopeGlobal {
-			updates["project"] = ""
+			updates["project"] = globalProject
 		} else {
 			updates["project"] = currentProjectKey()
 		}
@@ -529,10 +525,13 @@ func handleList(ctx context.Context, args json.RawMessage) (string, error) {
 
 // ---- 视图 ----
 
-// projectLabel 把项目键渲染为可读标签：空串代表全局条目。
+// projectLabel 把归属值渲染为可读标签：全局层显示「全局」，空值（未归属）显示「未归属」。
 func projectLabel(project string) string {
-	if project == "" {
+	switch project {
+	case globalProject:
 		return "全局"
+	case "":
+		return "未归属"
 	}
 	return project
 }
@@ -665,7 +664,7 @@ func main() {
                 "properties": {
                         "query": {"type": "string", "description": "自然语言查询语句"},
                         "keywords": {"type": "string", "description": "空格分隔的搜索关键词，优先于 query；缺省时取 query"},
-                        "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "检索范围：project=当前项目+全局（默认），global=仅全局，all=全部项目"}
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "检索范围：project=仅当前项目（默认），global=仅全局共享层"}
                 },
                 "description": "query 与 keywords 至少提供一个"
         }`)
@@ -701,7 +700,7 @@ func main() {
                         "page": {"type": "integer", "description": "页码，从 1 开始，默认 1"},
                         "page_size": {"type": "integer", "description": "每页条数，默认 20，最大 100"},
                         "source": {"type": "string", "description": "按来源筛选（可选）"},
-                        "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "范围：project=当前项目+全局（默认），global=仅全局，all=全部"},
+                        "scope": {"type": "string", "enum": ["project", "global"], "description": "范围：project=仅当前项目（默认），global=仅全局共享层"},
                         "archived": {"type": "boolean", "description": "是否只看已归档记忆，默认 false"}
                 }
         }`)
@@ -718,14 +717,14 @@ func main() {
 	// 查（搜索）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_search",
-		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、本次任务的经验教训等），默认只搜当前项目与全局记忆（scope=project），返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
+		Description: "搜索记忆库：按关键词检索历史记忆（用户偏好、项目约定、本次任务的经验教训等），默认只搜当前项目（scope=project）；用户偏好、跨项目约定等全局记忆需显式 scope=global 检索。返回按相关度与时间衰减排序的结果。参数 query 或 keywords 至少提供一个。",
 		Schema:      searchSchema,
 		Handler:     handleSearch,
 		// ContextFn 动态贡献 system prompt（每次 ListContext 求值，对齐 DSH
 		// ctx.systemPrompt.section）：记忆库规模/容量等运行态变化时即时反映。
 		ContextFn: func() string {
 			return "记忆服务：可用 memory_search 检索、memory_add 新增、memory_update 修改、memory_delete 删除、memory_list 列表。" +
-				"记忆按项目归属（memory_add 的 scope=project/global），检索默认只覆盖当前项目与全局；模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
+				"记忆归属分两档（memory_add 的 scope=project/global）：project 只属于当前项目，global 是跨项目共享层；检索默认只查当前项目，查全局记忆用 scope=global。模型的推理过程会被动记录，任务完成时会提醒写一条经验教训。"
 		},
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return memorySearchView(result)
@@ -764,7 +763,7 @@ func main() {
 	// 查列表（分页）
 	sdk.Tool(dsc.Tool{
 		Name:        "memory_list",
-		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目与全局记忆（scope=project），可按来源筛选、查看已归档记忆。",
+		Description: "分页列出记忆库中的记忆，按创建时间降序排列。默认列当前项目（scope=project），可按来源筛选、查看已归档记忆；scope=global 只列全局层。",
 		Schema:      listSchema,
 		Handler:     handleList,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
