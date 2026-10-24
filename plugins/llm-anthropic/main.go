@@ -15,7 +15,7 @@ import (
 	"sync"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
@@ -90,7 +90,7 @@ func omitZeroMaxTokens(req *http.Request, next option.MiddlewareNext) (*http.Res
 // buildMessageParams 构建 Anthropic 请求参数（消息、system、工具定义）。
 // maxTokens <= 0 表示不携带该字段（omitZeroMaxTokens 摘除零值，等模型自然结束）；
 // >0 时才显式携带。第二个返回值标记本请求是否引用了 Files API 的 file_id（须带 anthropic-beta 头）。
-func (p *AnthropicProvider) buildMessageParams(messages []core.Message, tools []core.Tool, maxTokens int64) (anthropic.MessageNewParams, bool) {
+func (p *AnthropicProvider) buildMessageParams(messages []dsc.Message, tools []dsc.LLMTool, maxTokens int64) (anthropic.MessageNewParams, bool) {
 	// 1. 构建 Anthropic 消息
 	var systemMsg string
 	userMessages := make([]anthropic.MessageParam, 0, len(messages))
@@ -252,7 +252,7 @@ func visionEnabled(baseURL, model string, envNoVisionOverride bool) bool {
 	case "1", "true", "on", "yes":
 		return false
 	}
-	return core.ModelSupportsImages(baseURL, model)
+	return dsc.ModelSupportsImages(baseURL, model)
 }
 
 // isDeepSeekEndpoint 按 base URL 是否指向 DeepSeek 判定 Files API 可用性
@@ -297,8 +297,8 @@ func (p *AnthropicProvider) fileContentBlocks(text string, refs []string) ([]ant
 		blocks = append(blocks, anthropic.NewTextBlock(text))
 	}
 	for _, ref := range refs {
-		if strings.HasPrefix(ref, core.TextRefPrefix) {
-			content, err := core.ResolveTextRef(ref)
+		if strings.HasPrefix(ref, dsc.TextRefPrefix) {
+			content, err := dsc.ResolveTextRef(ref)
 			if err != nil {
 				log.Printf("⚠️ 忽略无法解析的文本引用: %v", err)
 				continue
@@ -309,7 +309,7 @@ func (p *AnthropicProvider) fileContentBlocks(text string, refs []string) ([]ant
 		if !p.vision {
 			continue // 视觉关闭：跳过图像引用
 		}
-		url, err := core.ProjectImageRef(ref, core.DefaultProjectionMaxSide)
+		url, err := dsc.ProjectImageRef(ref, dsc.DefaultProjectionMaxSide)
 		if err != nil {
 			// 引用失效（截图过期/附件缺失）：占位文本留痕而非静默丢弃——
 			// 模型须知道该处曾有图（对齐 DSH offloadedImageText 语义）
@@ -350,7 +350,7 @@ func (p *AnthropicProvider) toolResultContentBlocks(text string, refs []string) 
 		if !p.vision {
 			continue // 视觉关闭：跳过图像引用
 		}
-		url, err := core.ProjectImageRef(ref, core.DefaultProjectionMaxSide)
+		url, err := dsc.ProjectImageRef(ref, dsc.DefaultProjectionMaxSide)
 		if err != nil {
 			log.Printf("⚠️ 图像引用投影失败: %v", err)
 			blocks = append(blocks, anthropic.ToolResultBlockParamContentUnion{
@@ -518,8 +518,8 @@ func concatReasoning(blocks []anthropic.ContentBlockUnion) string {
 }
 
 // extractToolCalls 从消息内容块中提取工具调用
-func extractToolCalls(blocks []anthropic.ContentBlockUnion) []core.ToolCall {
-	var toolCalls []core.ToolCall
+func extractToolCalls(blocks []anthropic.ContentBlockUnion) []dsc.ToolCall {
+	var toolCalls []dsc.ToolCall
 	for _, block := range blocks {
 		if block.Type != "tool_use" {
 			continue
@@ -532,7 +532,7 @@ func extractToolCalls(blocks []anthropic.ContentBlockUnion) []core.ToolCall {
 				argsMap = rawArgs
 			}
 		}
-		toolCalls = append(toolCalls, core.ToolCall{
+		toolCalls = append(toolCalls, dsc.ToolCall{
 			ID:        toolUse.ID,
 			Name:      toolUse.Name,
 			Arguments: argsMap,
@@ -541,14 +541,14 @@ func extractToolCalls(blocks []anthropic.ContentBlockUnion) []core.ToolCall {
 	return toolCalls
 }
 
-// usageFromAnthropic 将 Anthropic usage 转换为 core.Usage（nil 返回 nil）。
+// usageFromAnthropic 将 Anthropic usage 转换为 dsc.Usage（nil 返回 nil）。
 // 兼容启用提示缓存的 llama.cpp 等接口：其 input_tokens 仅统计未命中缓存的新增 token，
 // 已命中前缀单独计入 cache_read_input_tokens，真实上下文长度 = input + cache_read；
 // 标准 Anthropic 接口的 input_tokens 已含全部输入（cache_read 为其子集），
 // 此时 cache_read <= input，保持原值即可避免重复计数。
 // 命中率计算需要 miss 侧：以 CacheCreationInputTokens = 真实 prompt - cache_read 近似
 // （即本次请求中未被缓存提供的新增 token），否则未命中侧恒为 0，命中率恒显示 100%。
-func usageFromAnthropic(u *anthropic.Usage) *core.Usage {
+func usageFromAnthropic(u *anthropic.Usage) *dsc.Usage {
 	if u == nil {
 		return nil
 	}
@@ -563,7 +563,7 @@ func usageFromAnthropic(u *anthropic.Usage) *core.Usage {
 	if cacheMiss < 0 {
 		cacheMiss = 0
 	}
-	return &core.Usage{
+	return &dsc.Usage{
 		PromptTokens:             int32(promptTokens),
 		CompletionTokens:         int32(u.OutputTokens),
 		TotalTokens:              int32(promptTokens + u.OutputTokens),
@@ -582,7 +582,7 @@ func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64) int64 {
 	return p.maxTokens
 }
 
-func (p *AnthropicProvider) Chat(ctx context.Context, messages []core.Message, tools []core.Tool, maxTokens int) (*core.ChatResponse, error) {
+func (p *AnthropicProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
 	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens)))
 	opts := p.requestOptions(beta)
 	resp, err := p.client.Messages.New(ctx, params, opts...)
@@ -590,7 +590,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, messages []core.Message, t
 		return nil, err
 	}
 
-	return &core.ChatResponse{
+	return &dsc.ChatResponse{
 		Content:      concatText(resp.Content),
 		FinishReason: string(resp.StopReason),
 		ToolCalls:    extractToolCalls(resp.Content),
@@ -608,11 +608,11 @@ func (p *AnthropicProvider) requestOptions(beta bool) []option.RequestOption {
 	}
 }
 
-func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []core.Message, tools []core.Tool) (<-chan *core.ChatStreamResponse, error) {
+func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
 	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0))
 	stream := p.client.Messages.NewStreaming(ctx, params, p.requestOptions(beta)...)
 
-	ch := make(chan *core.ChatStreamResponse)
+	ch := make(chan *dsc.ChatStreamResponse)
 	dsc.SafeGoroutine(func() {
 		defer close(ch)
 		acc := newStreamAccumulator()
@@ -621,13 +621,13 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []core.Mess
 		for stream.Next() {
 			event := stream.Current()
 			if err := acc.accumulate(event); err != nil {
-				ch <- &core.ChatStreamResponse{Error: fmt.Sprintf("stream accumulate error: %v", err)}
+				ch <- &dsc.ChatStreamResponse{Error: fmt.Sprintf("stream accumulate error: %v", err)}
 				return
 			}
 			// 仅当文本有新增时才发送增量帧
 			text := concatText(acc.msg.Content)
 			if len(text) > prevLen {
-				ch <- &core.ChatStreamResponse{Content: text[prevLen:]}
+				ch <- &dsc.ChatStreamResponse{Content: text[prevLen:]}
 				prevLen = len(text)
 			}
 			// 思考过程增量（thinking 块）
@@ -639,16 +639,16 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []core.Mess
 				if llmStreamDebug {
 					fmt.Fprintf(os.Stderr, "[LLM-ANTHROPIC-REASONING] %s\n", reason[prevReasonLen:])
 				}
-				ch <- &core.ChatStreamResponse{Reasoning: reason[prevReasonLen:]}
+				ch <- &dsc.ChatStreamResponse{Reasoning: reason[prevReasonLen:]}
 				prevReasonLen = len(reason)
 			}
 		}
 		if err := stream.Err(); err != nil {
-			ch <- &core.ChatStreamResponse{Error: err.Error()}
+			ch <- &dsc.ChatStreamResponse{Error: err.Error()}
 			return
 		}
 		// 流结束：发送最终帧（工具调用与结束原因；文本已增量发送，不再重复）
-		resp := &core.ChatStreamResponse{
+		resp := &dsc.ChatStreamResponse{
 			FinishReason: string(acc.msg.StopReason),
 			ToolCalls:    extractToolCalls(acc.msg.Content),
 		}
@@ -752,7 +752,7 @@ func main() {
 		baseURL:         baseURL,
 	}
 
-	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 core.LLMGRPCPlugin
+	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 dsc.LLMGRPCPlugin
 	// 自动提供 LLMService + 元数据（重写自旧的 plugin.Serve 样板）。
 	sdk := dsc.New(dsc.Config{Name: "anthropic", Version: "1.2.0", Type: dsc.TypeLLM})
 	sdk.LLM(provider)

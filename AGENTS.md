@@ -193,6 +193,14 @@ DSC 的命令解析使用内置 POSIX shell 实现（mvdan/sh），所有路径�
 
 - **适用范围**：所有向模型或用户展示的路径字符串（错误消息、工具结果、日志、TUI 显示等），以及从外部输入或错误中提取的路径（必须用上述两行替换）。构造内部路径一律使用 `core.P*` / `dsc.P*` 正斜杆 helper（见规则 11），不得先经原生 filepath 拼接再用 ToSlash 补救。
 
+### 10.5 分層：core ← sdk ← plugins（插件不得 import core）
+
+插件一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`：
+
+- **为什么**：core 是宿主内核（事件总线、会话、计量、协议实现），会持续重构；sdk 是插件的稳定面（类型别名 + 薄转发）。更要紧的是**同一件事不能有第二份实现机会**——DSC 曾让宿主 `core.TokenMeter`（实测口径）成为无人调用的死代码，agent 插件自己用裸估算决定裁剪/压缩，口径一偏（纯 ASCII 高估 4~5 倍），1M 窗口里服务端实测 332K 的会话被判每轮超窗并反复裁剪。
+- **怎么做**：缺什么类型/函数就在 `sdk/` 加转发——类型用别名（`type X = core.X`，语义一致、无包装层），函数一行转发。命名冲突处取新名（如发模型用的工具 schema 叫 `dsc.LLMTool`，因 `dsc.Tool` 已是插件定义的工具）。
+- **守卫**：`core/plugin_sdk_boundary_test.go::TestPluginsDoNotImportCore` 扫描 `plugins/**`（含测试文件），检出即失败。新增例外须在该文件的映射里写明具体理由与迁移计划。
+
 ### 11. 路径 API 黑名单：禁止直接使用 Windows 下返回反斜杆的 filepath 函数
 
 filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实测 Clean/Dir/Join/Abs/Rel/Split/FromSlash/EvalSymlinks/Glob/WalkDir/Walk 均如此，甚至对正斜杆输入也归一化为反斜杆），与「内部 POSIX shell 统一视窗与 UNIX 都以正斜杆处理路径输入输出」相悖。

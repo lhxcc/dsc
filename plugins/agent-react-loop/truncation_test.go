@@ -1,13 +1,13 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"google.golang.org/grpc"
@@ -133,8 +133,8 @@ func TestTruncatedTextResponseWarnsAndContinues(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()

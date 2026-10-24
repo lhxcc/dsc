@@ -1,12 +1,12 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"io"
 	"sync"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -84,8 +84,8 @@ func TestRunLoopForwardsPluginViewJsonToToolFrame(t *testing.T) {
 	a.llmClient = &toolCallLLMClient{}
 	a.toolClient = &viewToolClient{}
 
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) { frames = append(frames, f) }
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) { frames = append(frames, f) }
 
 	res, err := a.runLoop(context.Background(), "do it", nil, emit)
 	if err != nil {
@@ -95,7 +95,7 @@ func TestRunLoopForwardsPluginViewJsonToToolFrame(t *testing.T) {
 		t.Fatalf("status = %s", res.Status)
 	}
 
-	var toolFrame *core.RunStreamResponse
+	var toolFrame *dsc.RunStreamResponse
 	for _, f := range frames {
 		if f.Status == "tool" && f.ToolName == "echo" && f.ToolResult != "" {
 			toolFrame = f

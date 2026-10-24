@@ -3,6 +3,42 @@
 獨立開發者的 Go 插件開發包：**不需要修改 DSC 主體程序或任何其他插件**，聲明式註冊
 工具 / LLM / Agent / 鈎子 / 互通回調，就可產出宿主零改動即可加載的插件二進制。
 
+## 分層：插件只依賴 SDK，不直接 import core
+
+```
+core  ←  sdk  ←  plugins
+```
+
+- **core** 是宿主內核（事件總線、會話、計量、協議實現），會持續重構；
+- **sdk** 是插件的穩定面：協議類型用別名（`type X = core.X`）+ 薄轉發函數，
+  插件據此編譯，不隨內核重構而碎；
+- **plugins** 一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`。
+
+理由不只是「整潔」：同一件事一旦有兩份實現機會，就會漂移。DSC 吃過這個虧——
+宿主的 `core.TokenMeter` 是實測口徑卻無人調用，agent 插件自己用裸估算決定裁剪/壓縮，
+兩邊口徑一偏（純 ASCII 被高估 4~5 倍），1M 窗口裡服務端實測 332K 的會話被判每輪超窗。
+
+守衛：`core/plugin_sdk_boundary_test.go::TestPluginsDoNotImportCore` 全倉掃描
+`plugins/**`（含測試），檢出即報錯。缺什麼類型/函數，就在 `sdk/` 裡加轉發——
+類型用別名（語義一致、無包裝層），函數用一行轉發。
+
+命名衝突注意：`dsc.Tool` 是「插件定義的工具」（Name/Description/Schema/Handler），
+而發給模型的工具 schema（core.Tool）在 SDK 裡叫 `dsc.LLMTool`。
+
+### 上下文計量（統一入口）
+
+```go
+meter := dsc.NewTokenMeter(window)
+// 拿到服務端上報的 usage 後，與「該次實際發出的消息估算」一起錨定（必須同源）
+meter.SampleUsage(dsc.PromptSideTokens(usage), dsc.EstimateProtoMessagesTokens(sent))
+// 之後問「下一發大概多少」，不要自己再估一遍
+projected := meter.Project(dsc.EstimateProtoMessagesTokens(pending))
+```
+
+對齊 DSH tokenMeter 的三層：`pressureTokens`（服務端實測 prompt 側）+
+`surfaceTokens`（啟發式增量）= `projectedTokens`。**啟發式只承擔增量，絕對誤差在錨點
+處被實測抵消**——這就是為什麼不要自己寫一份估算公式。
+
 ## 快速開始（最小工具插件）
 
 ```go

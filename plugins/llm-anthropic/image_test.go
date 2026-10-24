@@ -1,6 +1,7 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"encoding/base64"
 	"encoding/json"
 	"image"
@@ -9,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
@@ -36,7 +36,7 @@ func saveRef(t *testing.T, data []byte) string {
 	t.Helper()
 	t.Setenv("DSC_ATTACHMENT_DIR", t.TempDir())
 	t.Setenv("DSC_TEMP_DIR", t.TempDir())
-	ref, err := core.SaveImageAttachment(data)
+	ref, err := dsc.SaveImageAttachment(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestFileContentBlocksRef(t *testing.T) {
 func TestFileContentBlocksFileSource(t *testing.T) {
 	data := testPNGBytes(t)
 	ref := saveRef(t, data)
-	url, err := core.ProjectImageRef(ref, core.DefaultProjectionMaxSide)
+	url, err := dsc.ProjectImageRef(ref, dsc.DefaultProjectionMaxSide)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestBuildMessageParamsImages(t *testing.T) {
 	ref := saveRef(t, testPNGBytes(t))
 
 	off := &AnthropicProvider{vision: false}
-	params, beta := off.buildMessageParams([]core.Message{{Role: "user", Content: "hi", Images: []string{ref}}}, nil, 0)
+	params, beta := off.buildMessageParams([]dsc.Message{{Role: "user", Content: "hi", Images: []string{ref}}}, nil, 0)
 	if beta {
 		t.Fatal("无图片不应带 beta 头")
 	}
@@ -128,7 +128,7 @@ func TestBuildMessageParamsImages(t *testing.T) {
 	}
 
 	on := &AnthropicProvider{vision: true, filesAPI: false, fileCache: map[string]string{}}
-	params, beta = on.buildMessageParams([]core.Message{{Role: "user", Content: "hi", Images: []string{ref}}}, nil, 0)
+	params, beta = on.buildMessageParams([]dsc.Message{{Role: "user", Content: "hi", Images: []string{ref}}}, nil, 0)
 	if beta {
 		t.Fatal("base64 内联不应带 beta 头")
 	}
@@ -204,8 +204,8 @@ func TestToolResultContentBlocksVisionOff(t *testing.T) {
 func TestBuildMessageParamsToolImages(t *testing.T) {
 	ref := saveRef(t, testPNGBytes(t))
 	p := &AnthropicProvider{vision: true, filesAPI: false, fileCache: map[string]string{}}
-	params, beta := p.buildMessageParams([]core.Message{
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "call1", Name: "computer_use_screen"}}},
+	params, beta := p.buildMessageParams([]dsc.Message{
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "call1", Name: "computer_use_screen"}}},
 		{Role: "tool", Content: "ok", ToolCallID: "call1", Images: []string{ref}},
 	}, nil, 0)
 	if beta {

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"github.com/ebitengine/oto/v3"
 	"github.com/hajimehoshi/go-mp3"
 )
@@ -388,12 +388,12 @@ func main() {
 	sdk.Hook(dsc.Hook{
 		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
 			switch eventType {
-			case string(core.EventAgentStatus):
-				var ev core.AgentStatusEvent
+			case string(dsc.EventAgentStatus):
+				var ev dsc.AgentStatusEvent
 				if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 					return "", nil
 				}
-				if ev.Status != core.AgentStatusIdle {
+				if ev.Status != dsc.AgentStatusIdle {
 					return "", nil // 仅回合完成提醒，运行中/起始不打扰
 				}
 				// 事件已到达：先记日志（不受音频初始化影响，便于观测程序性触发）
@@ -402,7 +402,7 @@ func main() {
 					return "", nil // 音频未初始化（如无音频设备 / DSC_NOTIFY_NO_AUDIO），跳过播放
 				}
 				playQueue <- PlayRequest{SoundType: "success"}
-			case string(core.EventAgentError):
+			case string(dsc.EventAgentError):
 				// 回合失败 → error 音效
 				if globalCtx == nil {
 					return "", nil // 音频未初始化，跳过播放

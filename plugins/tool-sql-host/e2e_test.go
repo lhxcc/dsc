@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -48,7 +48,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "DSC_MODE=creation")
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -183,14 +183,15 @@ func toolNameList(list *proto.ListToolsResponse) []string {
 // TestPackDspConfinesToWorkspace 覆盖 pack_dsp 的路径隔离：它写出文件，故源目录与
 // 产物都必须落在宿主工作区（沙箱边界）内，越界的路径一律拒绝。
 func TestPackDspConfinesToWorkspace(t *testing.T) {
-	old := core.WorkspaceRoot
-	t.Cleanup(func() { core.WorkspaceRoot = old })
-	core.WorkspaceRoot = t.TempDir()
+	old := dsc.WorkspaceRoot()
+	t.Cleanup(func() { dsc.SetWorkspaceRoot(old) })
+	root := t.TempDir()
+	dsc.SetWorkspaceRoot(root)
 
-	if err := insideWorkspace(core.WorkspaceRoot + "/dsp/x.dsp"); err != nil {
+	if err := insideWorkspace(root + "/dsp/x.dsp"); err != nil {
 		t.Fatalf("工作区内路径应通过: %v", err)
 	}
-	if err := insideWorkspace(core.WorkspaceRoot + "/../escape.dsp"); err == nil {
+	if err := insideWorkspace(root + "/../escape.dsp"); err == nil {
 		t.Fatal("越出工作区的路径应被拒绝")
 	}
 	if err := insideWorkspace("/etc/passwd.dsp"); err == nil {

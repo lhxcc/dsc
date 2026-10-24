@@ -1,20 +1,20 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"runtime"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// setRoot 在测试期内直接设置统一根变量（core.WorkspaceRoot 在进程 init 时从
+// setRoot 在测试期内直接设置统一根变量（dsc.WorkspaceRoot 在进程 init 时从
 // DSC_WORKSPACE_ROOT/cwd 解析后冻结，t.Setenv 改不了它），测试结束后恢复。
 func setRoot(t *testing.T, root string) {
-	old := core.WorkspaceRoot
-	core.WorkspaceRoot = root
-	t.Cleanup(func() { core.WorkspaceRoot = old })
+	old := dsc.WorkspaceRoot()
+	dsc.SetWorkspaceRoot(root)
+	t.Cleanup(func() { dsc.SetWorkspaceRoot(old) })
 }
 
 func TestMapWorkspacePath(t *testing.T) {

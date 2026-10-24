@@ -1,12 +1,12 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
-	"dsc/core"
 )
 
 // TestShellView 校验 shell 工具的结构化视图：退出码徽标（0 绿 / 非 0 红）
@@ -30,7 +30,7 @@ func TestShellView(t *testing.T) {
 			if err != nil {
 				t.Fatalf("shellView: %v", err)
 			}
-			var v core.ToolView
+			var v dsc.ToolView
 			if err := json.Unmarshal(out, &v); err != nil {
 				t.Fatalf("view 非法: %v", err)
 			}

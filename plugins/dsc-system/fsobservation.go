@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"dsc/proto"
 )
 
@@ -188,7 +188,7 @@ func keyFor(_, path string) string {
 		}
 	}
 	if !filepath.IsAbs(p) {
-		p = dsc.PJoin(core.WorkspaceRoot, p)
+		p = dsc.PJoin(dsc.WorkspaceRoot(), p)
 	}
 	p = dsc.PClean(p)
 	if real, err := dsc.PEvalSymlinks(p); err == nil {

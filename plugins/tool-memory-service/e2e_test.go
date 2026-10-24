@@ -1,6 +1,7 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"encoding/json"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -35,12 +35,12 @@ func TestJoinMatchTerms(t *testing.T) {
 }
 
 // assertView 校验工具结果经完整 gRPC 链路透传的 ViewJson：非空且可解析为合法视图。
-func assertView(t *testing.T, resp *proto.ExecuteToolResponse) core.ToolView {
+func assertView(t *testing.T, resp *proto.ExecuteToolResponse) dsc.ToolView {
 	t.Helper()
 	if resp.ViewJson == "" {
 		t.Fatalf("ViewJson 为空（ViewFn 未生效或 gRPC 透传缺失）: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	cmd.Dir = hostDir
 	cmd.Env = os.Environ()
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,

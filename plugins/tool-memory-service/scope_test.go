@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 )
 
 // setupMemoryDB 把全局 DB 指到临时库，测试结束恢复（DB 是包级单例）。
@@ -26,13 +26,13 @@ func setupMemoryDB(t *testing.T) {
 }
 
 // asProject 切换当前工作区（项目键由它派生，与会话文件名同一套规则）。
-// 插件进程里工作区根是 core.WorkspaceRoot（宿主启动时按 DSC_WORKSPACE_ROOT 设定），
+// 插件进程里工作区根是 dsc.WorkspaceRoot（宿主启动时按 DSC_WORKSPACE_ROOT 设定），
 // 故测试直接改该变量，而不是设环境变量（已加载的包级变量不会跟随 env 变化）。
 func asProject(t *testing.T, root string) {
 	t.Helper()
-	old := core.WorkspaceRoot
-	core.WorkspaceRoot = root
-	t.Cleanup(func() { core.WorkspaceRoot = old })
+	old := dsc.WorkspaceRoot()
+	dsc.SetWorkspaceRoot(root)
+	t.Cleanup(func() { dsc.SetWorkspaceRoot(old) })
 }
 
 func addVia(t *testing.T, content, scope string) map[string]any {
@@ -339,8 +339,8 @@ func TestScopeAcceptsProjectKey(t *testing.T) {
 // keyOf 返回某个工作区根对应的项目键（不改当前上下文）。
 func keyOf(t *testing.T, root string) string {
 	t.Helper()
-	old := core.WorkspaceRoot
-	core.WorkspaceRoot = root
-	defer func() { core.WorkspaceRoot = old }()
+	old := dsc.WorkspaceRoot()
+	dsc.SetWorkspaceRoot(root)
+	defer func() { dsc.SetWorkspaceRoot(old) }()
 	return dsc.ProjectSessionKey()
 }

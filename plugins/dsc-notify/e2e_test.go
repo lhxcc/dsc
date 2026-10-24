@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -32,7 +32,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), "DSC_NOTIFY_NO_AUDIO=1")
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -59,12 +59,12 @@ func TestE2EWithHostClient(t *testing.T) {
 	// 4. Hook 服务可用：经 OnEvent 订阅宿主事件（agent/status idle）无错误。
 	// 这是 notify 程序性完成音效的核心链路：宿主广播 → 插件 Hook.OnEvent。
 	hc := proto.NewPluginHookServiceClient(conn)
-	idle := core.AgentStatusEvent{Agent: "agent-react-loop", Status: core.AgentStatusIdle}
+	idle := dsc.AgentStatusEvent{Agent: "agent-react-loop", Status: dsc.AgentStatusIdle}
 	data, _ := json.Marshal(idle)
-	if _, err := hc.OnEvent(ctx, &proto.OnEventRequest{Name: string(core.EventAgentStatus), DataJson: string(data)}); err != nil {
+	if _, err := hc.OnEvent(ctx, &proto.OnEventRequest{Name: string(dsc.EventAgentStatus), DataJson: string(data)}); err != nil {
 		t.Fatalf("OnEvent(agent/status idle) 失败: %v", err)
 	}
-	if _, err := hc.OnEvent(ctx, &proto.OnEventRequest{Name: string(core.EventAgentError), DataJson: `{"agent":"a","error":"boom"}`}); err != nil {
+	if _, err := hc.OnEvent(ctx, &proto.OnEventRequest{Name: string(dsc.EventAgentError), DataJson: `{"agent":"a","error":"boom"}`}); err != nil {
 		t.Fatalf("OnEvent(agent/error) 失败: %v", err)
 	}
 

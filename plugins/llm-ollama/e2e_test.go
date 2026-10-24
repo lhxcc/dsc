@@ -1,6 +1,7 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -68,7 +68,7 @@ func TestE2EWithHostClient(t *testing.T) {
 		"OLLAMA_THINKING=0",
 	)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -93,7 +93,7 @@ func TestE2EWithHostClient(t *testing.T) {
 		t.Fatalf("GetInfo = %+v, err %v", info, err)
 	}
 
-	// 5. LLMService 基础方法（SDK 复用 core.LLMGRPCPlugin）
+	// 5. LLMService 基础方法（SDK 复用 dsc.LLMGRPCPlugin）
 	llm := proto.NewLLMServiceClient(conn)
 	nm, err := llm.Name(ctx, &proto.NameRequest{})
 	if err != nil || nm.Name != "ollama" {

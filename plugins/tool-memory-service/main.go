@@ -13,7 +13,7 @@ import (
 	"time"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -885,7 +885,7 @@ func main() {
 		// pre-step：跟随会话日志，被动记录模型推理；任务收尾时以「一次性插播消息」
 		// 请求写记忆（详见 capture.go takeTaskRecordNotice）。
 		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
-			if eventType != string(core.EventAgentPreStep) {
+			if eventType != string(dsc.EventAgentPreStep) {
 				return "", nil
 			}
 			capturePreStep(dataJSON)

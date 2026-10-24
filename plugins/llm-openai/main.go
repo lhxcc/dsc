@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -60,11 +60,11 @@ type toolCallDeltaAccumulator struct {
 	ArgumentsStr string
 }
 
-// usageFromOpenAI 將 OpenAI usage 轉換為 core.Usage（nil 返回 nil）。
+// usageFromOpenAI 將 OpenAI usage 轉換為 dsc.Usage（nil 返回 nil）。
 // cached_tokens（DeepSeek/llama.cpp 的 prompt_tokens_details.cached_tokens）映射为
 // CacheReadInputTokens；命中率计算需要 miss 侧，按 REX 语义以
 // CacheCreationInputTokens = prompt - cached 近似（无缓存报告时保持 0）。
-func usageFromOpenAI(u *openai.Usage) *core.Usage {
+func usageFromOpenAI(u *openai.Usage) *dsc.Usage {
 	if u == nil {
 		return nil
 	}
@@ -76,7 +76,7 @@ func usageFromOpenAI(u *openai.Usage) *core.Usage {
 	if cacheMiss < 0 {
 		cacheMiss = 0
 	}
-	return &core.Usage{
+	return &dsc.Usage{
 		PromptTokens:             int32(u.PromptTokens),
 		CompletionTokens:         int32(u.CompletionTokens),
 		TotalTokens:              int32(u.TotalTokens),
@@ -98,7 +98,7 @@ func visionEnabled(baseURL, model string, envNoVisionOverride bool) bool {
 	case "1", "true", "on", "yes":
 		return false
 	}
-	return core.ModelSupportsImages(baseURL, model)
+	return dsc.ModelSupportsImages(baseURL, model)
 }
 
 // isDeepSeekEndpoint 按 base URL 是否指向 DeepSeek 判定 Files API 可用性
@@ -107,12 +107,12 @@ func isDeepSeekEndpoint(baseURL string) bool {
 	return strings.Contains(baseURL, "deepseek.com")
 }
 
-// toOpenAIMessages 把 core.Message 转换为 OpenAI 请求消息。用户消息携带图像且
+// toOpenAIMessages 把 dsc.Message 转换为 OpenAI 请求消息。用户消息携带图像且
 // 视觉开启时，构造多模态 content（文本 + image_url / file 块）；assistant 消息
 // 回带工具调用；tool 消息回带 tool_call_id 并在连续工具消息段结束后以一条 user
 // 图像消息补发其图像附件（OpenAI 协议工具消息不支持图像内容，且须紧跟
 // assistant tool_calls，故不能原地内嵌）。
-func (p *OpenAIProvider) toOpenAIMessages(messages []core.Message) []openai.ChatCompletionMessage {
+func (p *OpenAIProvider) toOpenAIMessages(messages []dsc.Message) []openai.ChatCompletionMessage {
 	openaiMessages := make([]openai.ChatCompletionMessage, 0, len(messages)+2)
 	// pendingToolImages 缓冲连续 tool 消息的图像附件（如 computer-use 截图），
 	// 段结束（下一条非 tool 消息或历史末尾）时统一补发；视觉关闭时
@@ -182,8 +182,8 @@ func (p *OpenAIProvider) fileContentBlocks(text string, refs []string) []openai.
 		parts = append(parts, openai.ChatMessagePart{Type: openai.ChatMessagePartTypeText, Text: text})
 	}
 	for _, ref := range refs {
-		if strings.HasPrefix(ref, core.TextRefPrefix) {
-			content, err := core.ResolveTextRef(ref)
+		if strings.HasPrefix(ref, dsc.TextRefPrefix) {
+			content, err := dsc.ResolveTextRef(ref)
 			if err != nil {
 				log.Printf("⚠️ 忽略无法解析的文本引用: %v", err)
 				continue
@@ -194,7 +194,7 @@ func (p *OpenAIProvider) fileContentBlocks(text string, refs []string) []openai.
 		if !p.vision {
 			continue // 视觉关闭：跳过图像引用
 		}
-		url, err := core.ProjectImageRef(ref, core.DefaultProjectionMaxSide)
+		url, err := dsc.ProjectImageRef(ref, dsc.DefaultProjectionMaxSide)
 		if err != nil {
 			// 引用失效（截图过期/附件缺失）：占位文本留痕而非静默丢弃——
 			// 模型须知道该处曾有图（对齐 DSH offloadedImageText 语义）
@@ -290,7 +290,7 @@ func (p *OpenAIProvider) uploadImage(dataURL string) string {
 	return file.ID
 }
 
-func (p *OpenAIProvider) Chat(ctx context.Context, messages []core.Message, tools []core.Tool, maxTokens int) (*core.ChatResponse, error) {
+func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
 	// 转换消息格式
 	openaiMessages := p.toOpenAIMessages(messages)
 
@@ -338,22 +338,22 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []core.Message, tool
 	}
 
 	if len(resp.Choices) == 0 {
-		return &core.ChatResponse{Content: "", FinishReason: "stop"}, nil
+		return &dsc.ChatResponse{Content: "", FinishReason: "stop"}, nil
 	}
 
 	choice := resp.Choices[0]
-	result := &core.ChatResponse{
+	result := &dsc.ChatResponse{
 		Content:      choice.Message.Content,
 		FinishReason: string(choice.FinishReason),
 	}
 
 	// 处理工具调用
 	if len(choice.Message.ToolCalls) > 0 {
-		result.ToolCalls = make([]core.ToolCall, len(choice.Message.ToolCalls))
+		result.ToolCalls = make([]dsc.ToolCall, len(choice.Message.ToolCalls))
 		for i, tc := range choice.Message.ToolCalls {
 			var args map[string]interface{}
 			json.Unmarshal([]byte(tc.Function.Arguments), &args)
-			result.ToolCalls[i] = core.ToolCall{
+			result.ToolCalls[i] = dsc.ToolCall{
 				ID:        tc.ID,
 				Name:      tc.Function.Name,
 				Arguments: args,
@@ -442,7 +442,7 @@ func (p *OpenAIProvider) HealthCheck(ctx context.Context) error { return nil }
 func (p *OpenAIProvider) VisionEnabled() bool                   { return p.vision }
 
 // ChatStream 實現 LLMProvider.ChatStream 接口
-func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message, tools []core.Tool) (<-chan *core.ChatStreamResponse, error) {
+func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
 	// 轉換消息格式
 	openaiMessages := p.toOpenAIMessages(messages)
 
@@ -493,7 +493,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 		}
 	}
 
-	ch := make(chan *core.ChatStreamResponse)
+	ch := make(chan *dsc.ChatStreamResponse)
 	dsc.SafeGoroutine(func() {
 		defer close(ch)
 
@@ -507,13 +507,13 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 				return
 			}
 			if err != nil {
-				ch <- &core.ChatStreamResponse{Error: err.Error()}
+				ch <- &dsc.ChatStreamResponse{Error: err.Error()}
 				return
 			}
 
 			// 處理 usage 數據（llama.cpp 等會在流式響應中攜帶 usage）
 			if resp.Usage != nil {
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Usage: usageFromOpenAI(resp.Usage),
 				}
 			}
@@ -533,14 +533,14 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 			// 處理文本增量
 			if delta.Content != "" {
 				textAccumulator.WriteString(delta.Content)
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Content: delta.Content,
 				}
 			}
 
 			// 處理思考過程增量（DeepSeek reasoning_content 等）
 			if delta.ReasoningContent != "" {
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Reasoning: delta.ReasoningContent,
 				}
 			}
@@ -582,19 +582,19 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 				}
 				streamFinished = true
 
-				// 轉換工具調用為 core.ToolCall：按 index 排序，保证多工具调用顺序稳定
+				// 轉換工具調用為 dsc.ToolCall：按 index 排序，保证多工具调用顺序稳定
 				// （map 遍历顺序随机，直接遍历会让同一流在不同运行下顺序漂移）。
 				idxList := make([]int, 0, len(toolCallAccums))
 				for idx := range toolCallAccums {
 					idxList = append(idxList, idx)
 				}
 				sort.Ints(idxList)
-				var toolCalls []core.ToolCall
+				var toolCalls []dsc.ToolCall
 				for _, idx := range idxList {
 					acc := toolCallAccums[idx]
 					var args map[string]interface{}
 					json.Unmarshal([]byte(acc.ArgumentsStr), &args)
-					toolCalls = append(toolCalls, core.ToolCall{
+					toolCalls = append(toolCalls, dsc.ToolCall{
 						ID:        acc.ID,
 						Name:      acc.Name,
 						Arguments: args,
@@ -606,7 +606,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []core.Message
 				// 把 usage 一并转发（部分服務會在 finish 分片攜帶 usage）；
 				// 若該分片同時含正文/工具調用，則轉發完後仍繼續讀流，
 				// 由後續的空 choices 結尾分片（或 io.EOF）收尾退出。
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Content:      "",
 					FinishReason: finishReason,
 					ToolCalls:    toolCalls,
@@ -650,7 +650,7 @@ func main() {
 		fileCache:       map[string]string{},
 	}
 
-	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 core.LLMGRPCPlugin
+	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 dsc.LLMGRPCPlugin
 	// 自动提供 LLMService + 元数据（重写自旧的 plugin.Serve 样板）。
 	sdk := dsc.New(dsc.Config{Name: "openai", Version: "1.2.0", Type: dsc.TypeLLM})
 	sdk.LLM(provider)

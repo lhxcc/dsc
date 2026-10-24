@@ -1,13 +1,13 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"encoding/json"
 	"io"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"github.com/hashicorp/go-hclog"
@@ -426,7 +426,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("todo_write 应携带 ViewJson: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("todo ViewJson 非法: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("ask_user_question 应携带 ViewJson: %+v", resp)
 	}
-	var v2 core.ToolView
+	var v2 dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v2); err != nil {
 		t.Fatalf("ask ViewJson 非法: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 
 // TestTodoWriteViewDirect 直接单测 todo_write 视图函数（计数卡片）。
 func TestTodoWriteViewDirect(t *testing.T) {
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(todoWriteView(2, 1, 3)), &v); err != nil {
 		t.Fatalf("视图 JSON 非法: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestAskQuestionViewDirect(t *testing.T) {
 		{ID: "q1", Selected: []string{"Option A"}, Custom: "notes"},
 		{ID: "q2", Selected: []string{}},
 	})
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(view), &v); err != nil {
 		t.Fatalf("视图 JSON 非法: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestGoalViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("create_goal 应携带 ViewJson，实际 %+v", resp)
 	}
-	var view core.ToolView
+	var view dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &view); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}

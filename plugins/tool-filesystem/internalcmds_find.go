@@ -43,7 +43,7 @@ import (
 	"strconv"
 	"strings"
 
-	"dsc/core"
+	dsc "dsc-sdk"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 )
@@ -518,7 +518,7 @@ func findRunCommand(ctx context.Context, hc interp.HandlerContext, argv []string
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	// 与其余派生点一致：Windows 上以 CREATE_NO_WINDOW 启动，避免 TUI 中弹出控制台
 	// 窗口（core/proc_attr_regression_test.go 会扫描所有 exec 派生点，漏接即失败）。
-	core.ConfigureChildProcessAttrs(cmd)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = hc.Dir
 	if env := findEnvList(hc.Env); len(env) > 0 {
 		cmd.Env = env

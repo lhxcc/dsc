@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -9,19 +10,18 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
 )
 
 // assertView 校验工具结果经完整 gRPC 链路透传的 ViewJson：非空且可解析为合法视图。
-func assertView(t *testing.T, resp *proto.ExecuteToolResponse) core.ToolView {
+func assertView(t *testing.T, resp *proto.ExecuteToolResponse) dsc.ToolView {
 	t.Helper()
 	if resp.ViewJson == "" {
 		t.Fatalf("ViewJson 为空（ViewFn 未生效或 gRPC 透传缺失）: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestE2EWithHostClient(t *testing.T) {
 		"DSC_REPEAT_EXCLUDE=todo_write",
 	)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -144,7 +144,7 @@ func TestFsObservationE2E(t *testing.T) {
 	}
 
 	// 2. 以宿主侧客户端拉起插件进程：注入 DSC_WORKSPACE_ROOT 对齐宿主加载
-	//    行为（插件进程经 core.WorkspaceRoot 解析相对路径观察键）
+	//    行为（插件进程经 dsc.WorkspaceRoot 解析相对路径观察键）
 	ws := filepath.Join(dir, "workspace")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestFsObservationE2E(t *testing.T) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+ws)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -317,7 +317,7 @@ func TestSpillE2E(t *testing.T) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), "DSC_SPILL_DIR="+spillDir)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -423,7 +423,7 @@ func TestSkillE2E(t *testing.T) {
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), "DSC_SKILLS_DIR="+skillsDir)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -563,7 +563,7 @@ func TestCompactionBasicE2E(t *testing.T) {
 		"DSC_COMPACTION_BASIC_CONTEXT_WINDOW=1000",
 	)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -695,7 +695,7 @@ func TestImageOffloadE2E(t *testing.T) {
 		cmd := exec.Command(exe)
 		cmd.Env = append(os.Environ(), env...)
 		client := plugin.NewClient(&plugin.ClientConfig{
-			HandshakeConfig:  core.Handshake,
+			HandshakeConfig:  dsc.Handshake,
 			Plugins:          map[string]plugin.Plugin{},
 			AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 			Cmd:              cmd,

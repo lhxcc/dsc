@@ -1,13 +1,13 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"google.golang.org/grpc"
@@ -36,7 +36,7 @@ type windowEnforcingLLM struct {
 }
 
 func (m *windowEnforcingLLM) Chat(ctx context.Context, in *proto.ChatRequest, opts ...grpc.CallOption) (*proto.ChatResponse, error) {
-	n := core.EstimateProtoMessagesTokens(in.Messages)
+	n := dsc.EstimateProtoMessagesTokens(in.Messages)
 	m.mu.Lock()
 	m.chatInputs = append(m.chatInputs, n)
 	m.mu.Unlock()
@@ -47,7 +47,7 @@ func (m *windowEnforcingLLM) Chat(ctx context.Context, in *proto.ChatRequest, op
 }
 
 func (m *windowEnforcingLLM) ChatStream(ctx context.Context, in *proto.ChatRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[proto.ChatStreamResponse], error) {
-	n := core.EstimateProtoMessagesTokens(in.Messages)
+	n := dsc.EstimateProtoMessagesTokens(in.Messages)
 	m.mu.Lock()
 	m.streamIn = append(m.streamIn, n)
 	m.streamMsgs = in.Messages
@@ -64,7 +64,7 @@ func buildOversizeSession(t *testing.T, a *ReactLoopAgent, rounds, perMsgTokens 
 	t.Helper()
 	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
 		&session.SurfaceOp{Op: session.SurfaceAppend})
-	// ASCII 约 4 字节/token（core.EstimateTextTokens 的口径），故按 4 倍字节数构造 perMsgTokens 规模
+	// ASCII 约 4 字节/token（dsc.EstimateTextTokens 的口径），故按 4 倍字节数构造 perMsgTokens 规模
 	body := strings.Repeat("x", perMsgTokens*4)
 	for i := 0; i < rounds; i++ {
 		mark := fmt.Sprintf("#round-%d", i)
@@ -84,7 +84,7 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 	a.llmServiceID, a.toolServiceID = 1, 1
 	buildOversizeSession(t, a, 10, 10000) // 20 条 × 10k ≈ 200K 估算 = 4 倍窗口
 
-	before := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	before := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
 	if before <= a.contextWindow*2 {
 		t.Fatalf("夹具不够大：估算 %d，应至少为窗口两倍", before)
 	}
@@ -94,8 +94,8 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	res, err := a.runLoop(context.Background(), "继续", nil, func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()
@@ -127,12 +127,12 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 	}
 
 	// 2) 确实裁掉了旧记录（而不是把 200K 硬发出去）
-	if got := core.EstimateProtoMessagesTokens(streamMsgs); got >= before/2 {
+	if got := dsc.EstimateProtoMessagesTokens(streamMsgs); got >= before/2 {
 		t.Fatalf("主请求估算 = %d, 期望远小于全量 %d（应裁掉最旧的部分）", got, before)
 	}
 
 	// 3) 会话全量历史仍在（裁剪只作用于本次请求，不写回、不删除）
-	after := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	after := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
 	if after < before {
 		t.Fatalf("会话历史被裁剪/删除：%d -> %d（裁剪不得写回会话）", before, after)
 	}
@@ -184,10 +184,10 @@ func TestOversizeTrimKeepsUserBoundary(t *testing.T) {
 	markSessionRestored(t, a)
 
 	full := a.sess.DeriveMessages()
-	msgs, dropped := fitMessagesToWindow(full, a.contextWindow, core.EstimateProtoMessagesTokens(full))
+	msgs, dropped := fitMessagesToWindow(full, a.contextWindow, dsc.EstimateProtoMessagesTokens(full))
 	if dropped == 0 {
 		t.Fatalf("应发生裁剪（总估算 %d, 预算 %d）",
-			core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()), int(float64(a.contextWindow)*oversizeTrimRatio))
+			dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages()), int(float64(a.contextWindow)*oversizeTrimRatio))
 	}
 	if msgs[0].Role != "system" {
 		t.Fatalf("首条应为 system，实际 %q", msgs[0].Role)
@@ -225,7 +225,7 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 
 	var mu sync.Mutex
 	var errs []string
-	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *core.RunStreamResponse) {
+	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *dsc.RunStreamResponse) {
 		if f.Error != "" {
 			mu.Lock()
 			errs = append(errs, f.Error)
@@ -255,7 +255,7 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 // TestNoTrimForAsciiHistoryWithinWindow 纯 ASCII/代码会话不得被误判超窗。
 //
 // 现场：1M 窗口、服务端实际 332K（32%）的代码会话，被当时的估算算成 1.1M（高估 5.3 倍），
-// 于是每一轮都触发裁剪并打印提示。根治是 core.EstimateTextTokens 改为按字符分类累加
+// 于是每一轮都触发裁剪并打印提示。根治是 dsc.EstimateTextTokens 改为按字符分类累加
 // （ASCII 4 字节/token），此处用同一口径构造「真实占窗口 40%」的历史，断言不裁剪、不提示。
 func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	a := newTestAgent(t)
@@ -273,7 +273,7 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	}
 	markSessionRestored(t, a)
 
-	est := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	est := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
 	if est < a.contextWindow*35/100 || est > a.contextWindow*45/100 {
 		t.Fatalf("夹具应约占窗口 40%%，实际估算 %d（窗口 %d）——估算口径又漂了？", est, a.contextWindow)
 	}
@@ -283,7 +283,7 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 	var mu sync.Mutex
 	var trimmed bool
-	res, err := a.runLoop(context.Background(), "继续", nil, func(f *core.RunStreamResponse) {
+	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
 		if strings.Contains(f.Output, "上下文裁剪") {
 			mu.Lock()
 			trimmed = true
@@ -324,7 +324,7 @@ func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
 	countTrimFrames := func() int {
 		var mu sync.Mutex
 		n := 0
-		_, err := a.runLoop(context.Background(), "继续", nil, func(f *core.RunStreamResponse) {
+		_, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
 			if strings.Contains(f.Output, "上下文裁剪") {
 				mu.Lock()
 				n++

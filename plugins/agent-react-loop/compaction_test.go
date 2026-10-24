@@ -1,13 +1,13 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"google.golang.org/grpc"
@@ -100,7 +100,7 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 	}
 	// 预置内容属于「重启恢复」的部分：标记恢复边界（压缩路径与注入上限都按它判定）
 	markSessionRestored(t, a)
-	if got := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
+	if got := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
 		t.Fatalf("预置历史估算 = %d token, 需 >= %d 才能触发压缩", got, a.contextWindow*8/10)
 	}
 
@@ -109,8 +109,8 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()
@@ -193,7 +193,7 @@ func TestCompactionNotTriggeredOnAccurateUsage(t *testing.T) {
 	}
 	// 预置内容属于「重启恢复」的部分：标记恢复边界（压缩路径与注入上限都按它判定）
 	markSessionRestored(t, a)
-	if got := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
+	if got := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
 		t.Fatalf("预置历史估算 = %d token, 需 >= %d 才能验证「估算虚高不触发压缩」", got, a.contextWindow*8/10)
 	}
 
@@ -203,8 +203,8 @@ func TestCompactionNotTriggeredOnAccurateUsage(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()

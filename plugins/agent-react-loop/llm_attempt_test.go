@@ -1,12 +1,12 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"errors"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"google.golang.org/grpc"
@@ -144,8 +144,8 @@ func TestStreamMidFailureRecordsPartialContent(t *testing.T) {
 	a.llmClient = &midFailStream{}
 	a.toolClient = &mockToolClient{}
 
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) { frames = append(frames, f) }
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) { frames = append(frames, f) }
 	_, err := a.runLoop(context.Background(), "测试", nil, emit)
 	if err == nil {
 		t.Fatalf("runLoop 应返回流错误")
@@ -184,7 +184,7 @@ func TestSuccessAttemptCarriesFinishReason(t *testing.T) {
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	res, err := a.runLoop(context.Background(), "测试", nil, func(*core.RunStreamResponse) {})
+	res, err := a.runLoop(context.Background(), "测试", nil, func(*dsc.RunStreamResponse) {})
 	if err != nil {
 		t.Fatalf("runLoop: %v", err)
 	}

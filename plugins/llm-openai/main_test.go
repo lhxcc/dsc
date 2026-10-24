@@ -1,6 +1,7 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -28,7 +28,7 @@ func testPNGRef(t *testing.T) string {
 	}
 	t.Setenv("DSC_ATTACHMENT_DIR", t.TempDir())
 	t.Setenv("DSC_TEMP_DIR", t.TempDir())
-	ref, err := core.SaveImageAttachment(buf.Bytes())
+	ref, err := dsc.SaveImageAttachment(buf.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestToOpenAIMessagesVisionGating(t *testing.T) {
 	ref := testPNGRef(t)
 
 	off := &OpenAIProvider{vision: false}
-	msgs := off.toOpenAIMessages([]core.Message{core.Message{Role: "user", Content: "hi", Images: []string{ref}}})
+	msgs := off.toOpenAIMessages([]dsc.Message{dsc.Message{Role: "user", Content: "hi", Images: []string{ref}}})
 	if len(msgs[0].MultiContent) != 1 || msgs[0].MultiContent[0].Text != "hi" {
 		t.Fatalf("vision off should keep text block (image skipped), got %+v", msgs[0])
 	}
@@ -71,7 +71,7 @@ func TestToOpenAIMessagesVisionGating(t *testing.T) {
 	}
 
 	on := &OpenAIProvider{vision: true, filesAPI: false, fileCache: map[string]string{}}
-	msgs = on.toOpenAIMessages([]core.Message{core.Message{Role: "user", Content: "hi", Images: []string{ref}}})
+	msgs = on.toOpenAIMessages([]dsc.Message{dsc.Message{Role: "user", Content: "hi", Images: []string{ref}}})
 	if len(msgs[0].MultiContent) != 2 {
 		t.Fatalf("vision on should build multimodal content, got %+v", msgs[0])
 	}
@@ -80,12 +80,12 @@ func TestToOpenAIMessagesVisionGating(t *testing.T) {
 // TestTextRefInjected 文本附件引用（dsc-txt://）即使视觉关闭也会作为文本块注入。
 func TestTextRefInjected(t *testing.T) {
 	t.Setenv("DSC_ATTACHMENT_DIR", t.TempDir())
-	ref, err := core.SaveTextAttachment([]byte("音乐插件状态：播放中"))
+	ref, err := dsc.SaveTextAttachment([]byte("音乐插件状态：播放中"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	off := &OpenAIProvider{vision: false}
-	msgs := off.toOpenAIMessages([]core.Message{core.Message{Role: "user", Content: "看看这个", Images: []string{ref}}})
+	msgs := off.toOpenAIMessages([]dsc.Message{dsc.Message{Role: "user", Content: "看看这个", Images: []string{ref}}})
 	if len(msgs[0].MultiContent) != 2 {
 		t.Fatalf("text ref should inject as text block even without vision, got %+v", msgs[0])
 	}
@@ -179,8 +179,8 @@ func TestToOpenAIMessagesToolImages(t *testing.T) {
 	ref := testPNGRef(t)
 
 	on := &OpenAIProvider{vision: true, filesAPI: false, fileCache: map[string]string{}}
-	msgs := on.toOpenAIMessages([]core.Message{
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "c1", Name: "computer_use_screen"}}},
+	msgs := on.toOpenAIMessages([]dsc.Message{
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "c1", Name: "computer_use_screen"}}},
 		{Role: "tool", Content: "ok", ToolCallID: "c1", Images: []string{ref}},
 		{Role: "user", Content: "看到什么了？"},
 	})
@@ -208,7 +208,7 @@ func TestToOpenAIMessagesToolImages(t *testing.T) {
 func TestToOpenAIMessagesToolImagesVisionOff(t *testing.T) {
 	ref := testPNGRef(t)
 	off := &OpenAIProvider{vision: false, filesAPI: false, fileCache: map[string]string{}}
-	msgs := off.toOpenAIMessages([]core.Message{
+	msgs := off.toOpenAIMessages([]dsc.Message{
 		{Role: "tool", Content: "ok", ToolCallID: "c1", Images: []string{ref}},
 	})
 	if len(msgs) != 1 || msgs[0].ToolCallID != "c1" {

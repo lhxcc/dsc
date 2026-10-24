@@ -27,7 +27,7 @@ import (
 	"sync"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"dsc/proto"
 
 	bcacp "dsc-billion-context/acp"
@@ -203,9 +203,9 @@ func main() {
 // 其余事件忽略（返回空 result，不影响宿主）。
 func (bc *BillionContext) onEvent(ctx context.Context, eventType, dataJSON string) (string, error) {
 	switch eventType {
-	case string(core.EventAgentPreStep):
+	case string(dsc.EventAgentPreStep):
 		return bc.handlePreStep(ctx, dataJSON)
-	case string(core.EventAgentRequestError):
+	case string(dsc.EventAgentRequestError):
 		return bc.handleRequestError(ctx, dataJSON)
 	default:
 		return "", nil
@@ -221,7 +221,7 @@ func (bc *BillionContext) onEvent(ctx context.Context, eventType, dataJSON strin
 // 紧急压缩策略：把最近的可压缩范围（跳过保留区与受保护工具）全部压缩为一条摘要。
 // 这比 nudge 路径更激进——nudge 在 45% 阈值触发；这里是溢出时的最后安全阀。
 func (bc *BillionContext) handleRequestError(ctx context.Context, dataJSON string) (string, error) {
-	var ev core.AgentRequestErrorEvent
+	var ev dsc.AgentRequestErrorEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("billion-context: parse request-error event: %w", err)
 	}
@@ -298,7 +298,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 			fmt.Fprintf(os.Stderr, "[billion-context] pruned %d orphan state file(s)\n", bc.prunedState)
 		}
 	})
-	var ev core.AgentPreStepEvent
+	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("billion-context: parse pre-step event: %w", err)
 	}

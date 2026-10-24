@@ -1,6 +1,7 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 )
@@ -280,19 +280,19 @@ type answerView struct {
 
 // askQuestionView 构造 ask_user_question 结果的结构化视图（答案表格）。
 func askQuestionView(views []answerView) string {
-	rows := make([]core.ViewRow, 0, len(views))
+	rows := make([]dsc.ViewRow, 0, len(views))
 	for _, v := range views {
-		rows = append(rows, core.ViewRow{
+		rows = append(rows, dsc.ViewRow{
 			"id":       v.ID,
 			"selected": strings.Join(v.Selected, ", "),
 			"custom":   v.Custom,
 		})
 	}
-	view, _ := json.Marshal(core.ToolView{
+	view, _ := json.Marshal(dsc.ToolView{
 		Kind:  "table",
 		Title: "Answers",
-		Badge: &core.ViewBadge{Text: fmt.Sprintf("%d", len(views)), Tone: "teal"},
-		Columns: []core.ViewColumn{
+		Badge: &dsc.ViewBadge{Text: fmt.Sprintf("%d", len(views)), Tone: "teal"},
+		Columns: []dsc.ViewColumn{
 			{Key: "id", Title: "id"},
 			{Key: "selected", Title: "selected"},
 			{Key: "custom", Title: "custom"},
@@ -346,11 +346,11 @@ func (a *ReactLoopAgent) execTodoWrite(tc *proto.ToolCall) (*proto.ExecuteToolRe
 
 // todoWriteView 构造 todo_write 结果的结构化视图（计数卡片）。
 func todoWriteView(pending, inProgress, completed int) string {
-	view, _ := json.Marshal(core.ToolView{
+	view, _ := json.Marshal(dsc.ToolView{
 		Kind:  "card",
 		Title: "Todos",
-		Badge: &core.ViewBadge{Text: fmt.Sprintf("%d in progress", inProgress), Tone: "green"},
-		Fields: []core.ViewField{
+		Badge: &dsc.ViewBadge{Text: fmt.Sprintf("%d in progress", inProgress), Tone: "green"},
+		Fields: []dsc.ViewField{
 			{Key: "pending", Value: strconv.Itoa(pending)},
 			{Key: "in_progress", Value: strconv.Itoa(inProgress), Tone: "green"},
 			{Key: "completed", Value: strconv.Itoa(completed), Tone: "teal"},
@@ -541,7 +541,7 @@ func goalViewSpec(g *session.GoalSnapshot, activation bool, rounds int) string {
 	if activation {
 		act, actTone = "armed", "green"
 	}
-	fields := []core.ViewField{
+	fields := []dsc.ViewField{
 		{Key: "id", Value: g.ID},
 		{Key: "rounds", Value: fmt.Sprintf("%d/%d", rounds, g.MaxGoalRounds)},
 		{Key: "revision", Value: strconv.Itoa(g.Revision)},
@@ -549,12 +549,12 @@ func goalViewSpec(g *session.GoalSnapshot, activation bool, rounds int) string {
 		{Key: "objective", Value: g.Objective},
 	}
 	if g.BlockedReason != nil {
-		fields = append(fields, core.ViewField{Key: "blocked", Value: g.BlockedReason.Message, Tone: "red"})
+		fields = append(fields, dsc.ViewField{Key: "blocked", Value: g.BlockedReason.Message, Tone: "red"})
 	}
-	b, err := json.Marshal(core.ToolView{
+	b, err := json.Marshal(dsc.ToolView{
 		Kind:   "card",
 		Title:  "Goal",
-		Badge:  &core.ViewBadge{Text: g.Phase, Tone: goalPhaseTone(g.Phase)},
+		Badge:  &dsc.ViewBadge{Text: g.Phase, Tone: goalPhaseTone(g.Phase)},
 		Fields: fields,
 	})
 	if err != nil {

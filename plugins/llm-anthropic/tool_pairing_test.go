@@ -1,9 +1,9 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"testing"
 
-	"dsc/core"
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
@@ -33,9 +33,9 @@ func resultIsError(m anthropic.MessageParam, id string) bool {
 // 一条 user 消息（Anthropic 要求 result 聚合在紧跟 assistant 的那条消息里）。
 func TestRepairToolPairingMergesParallelResults(t *testing.T) {
 	p := &AnthropicProvider{}
-	params, _ := p.buildMessageParams([]core.Message{
+	params, _ := p.buildMessageParams([]dsc.Message{
 		{Role: "user", Content: "hi"},
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "call_00", Name: "a"}, {ID: "call_01", Name: "b"}}},
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "call_00", Name: "a"}, {ID: "call_01", Name: "b"}}},
 		{Role: "tool", ToolCallID: "call_00", Content: "ra"},
 		{Role: "tool", ToolCallID: "call_01", Content: "rb"},
 	}, nil, 0)
@@ -57,9 +57,9 @@ func TestRepairToolPairingMergesParallelResults(t *testing.T) {
 // （is_error=true），否则整个请求会被 400 拒绝。
 func TestRepairToolPairingFillsMissingResult(t *testing.T) {
 	p := &AnthropicProvider{}
-	params, _ := p.buildMessageParams([]core.Message{
+	params, _ := p.buildMessageParams([]dsc.Message{
 		{Role: "user", Content: "hi"},
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "call_00", Name: "a"}, {ID: "call_01", Name: "b"}}},
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "call_00", Name: "a"}, {ID: "call_01", Name: "b"}}},
 		{Role: "tool", ToolCallID: "call_00", Content: "ra"},
 	}, nil, 0)
 
@@ -83,9 +83,9 @@ func TestRepairToolPairingFillsMissingResult(t *testing.T) {
 // result 必须排在该 user 消息最前（不能只发文本）。
 func TestRepairToolPairingResultPrecedesNextUserTurn(t *testing.T) {
 	p := &AnthropicProvider{}
-	params, _ := p.buildMessageParams([]core.Message{
+	params, _ := p.buildMessageParams([]dsc.Message{
 		{Role: "user", Content: "hi"},
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "call_00", Name: "a"}}},
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "call_00", Name: "a"}}},
 		{Role: "user", Content: "继续"},
 	}, nil, 0)
 
@@ -106,9 +106,9 @@ func TestRepairToolPairingResultPrecedesNextUserTurn(t *testing.T) {
 // 否则该 tool_use 永远没有紧随的 tool_result。
 func TestRepairToolPairingTrailingToolUse(t *testing.T) {
 	p := &AnthropicProvider{}
-	params, _ := p.buildMessageParams([]core.Message{
+	params, _ := p.buildMessageParams([]dsc.Message{
 		{Role: "user", Content: "hi"},
-		{Role: "assistant", Content: "调用工具", ToolCalls: []core.ToolCall{{ID: "call_00", Name: "a"}}},
+		{Role: "assistant", Content: "调用工具", ToolCalls: []dsc.ToolCall{{ID: "call_00", Name: "a"}}},
 	}, nil, 0)
 
 	msgs := params.Messages
@@ -141,9 +141,9 @@ func TestRepairToolPairingDropsOrphanResult(t *testing.T) {
 // TestRepairToolPairingKeepsValidHistory 合法历史（单工具调用 + 对应结果）不应被改动。
 func TestRepairToolPairingKeepsValidHistory(t *testing.T) {
 	p := &AnthropicProvider{}
-	params, _ := p.buildMessageParams([]core.Message{
+	params, _ := p.buildMessageParams([]dsc.Message{
 		{Role: "user", Content: "hi"},
-		{Role: "assistant", ToolCalls: []core.ToolCall{{ID: "call_00", Name: "a"}}},
+		{Role: "assistant", ToolCalls: []dsc.ToolCall{{ID: "call_00", Name: "a"}}},
 		{Role: "tool", ToolCallID: "call_00", Content: "ra"},
 		{Role: "assistant", Content: "done"},
 	}, nil, 0)
