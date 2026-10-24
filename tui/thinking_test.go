@@ -49,10 +49,10 @@ func TestZhAnimationRevealsOneByOne(t *testing.T) {
 		t.Fatalf("新周期应从全遮开始，got %d", got)
 	}
 
-	// 满格时可见文字就是完整文案
+	// 满格时正文全亮，句点按当前帧伸缩（见 TestDotsGrowAndShrink）
 	a.frame = reveal
-	if got := ansi.Strip(a.zhText()); got != zhThinkText() {
-		t.Fatalf("满格后应为完整文案，got %q", got)
+	if got, want := ansi.Strip(a.zhText()), zhVisibleAt(reveal); got != want {
+		t.Fatalf("满格后应为 %q，got %q", want, got)
 	}
 }
 
@@ -63,11 +63,11 @@ func TestZhAnimationIsScanBeam(t *testing.T) {
 	a := &thinkAnim{kind: thinkAnimZh}
 	n := len(zhThinkRunes)
 
-	// 第 0 帧：光点在首字，其后全是实心块，句点常显
+	// 第 0 帧：光点在首字，其后全是实心块；句点按帧伸缩，其余补空格占位
 	a.frame = 0
 	raw := a.zhText()
-	if got := ansi.Strip(raw); got != zhThinkText() {
-		t.Fatalf("遮罩不该改变可见字符，got %q want %q", got, zhThinkText())
+	if got, want := ansi.Strip(raw), zhVisibleAt(0); got != want {
+		t.Fatalf("遮罩不该改变可见字符，got %q want %q", got, want)
 	}
 	if addr := ansi.Strip(a.zhText()); addr == "" {
 		t.Fatal("不应为空")
@@ -116,11 +116,11 @@ func TestEnAnimationMorphsToThinking(t *testing.T) {
 		if strings.Contains(text, "SEEKING") {
 			sawUpper = true
 		}
-		// 擦除阶段：整句被清空，只剩一条句点
-		if strings.Contains(text, strings.Repeat(" ", len(enSrc))+"..") {
+		// 擦除阶段：整句被清空，只剩句点（点数逐帧伸缩，故只判空白词槽）
+		if strings.Contains(text, strings.Repeat(" ", len(enSrc))+".") {
 			sawEmptyWord = true
 		}
-		if strings.Contains(text, "Deep Thinking..") {
+		if strings.Contains(text, "Deep Thinking.") {
 			sawThinking = true
 		}
 	}
@@ -137,9 +137,9 @@ func TestEnAnimationMorphsToThinking(t *testing.T) {
 	// 大小写波阶段只翻大小写、不换字母：忽略大小写应恒等于 Deep Seeking..
 	for f := 0; f < enWaveFrames; f++ {
 		a.frame = f
-		got := strings.TrimRight(ansi.Strip(a.enText()), " ")
-		if !strings.EqualFold(got, "Deep Seeking..") {
-			t.Fatalf("波形阶段 frame=%d 应仍为 Deep Seeking..（仅大小写变化），got %q", f, got)
+		got := strings.TrimRight(ansi.Strip(a.enText()), ". ")
+		if !strings.EqualFold(got, enSrc) {
+			t.Fatalf("波形阶段 frame=%d 应仍为 %q（仅大小写变化），got %q", f, enSrc, got)
 		}
 	}
 	// 且确实在翻动：本段内不应每一帧都完全一致
@@ -277,14 +277,116 @@ func TestEnAnimationMovesTheFirstWord(t *testing.T) {
 		t.Fatalf("写出第 2 字应为 De，got %q", got)
 	}
 
-	// 定格：Deep Thinking..，且静止
+	// 定格：Deep Thinking + 句点（点数仍逐帧伸缩，故只判正文）
 	a.frame = writeStart + enWriteFrames
-	got := ansi.Strip(a.enText())
-	if !strings.HasPrefix(got, "Deep Thinking..") {
-		t.Fatalf("定格应为 Deep Thinking..，got %q", got)
+	got := strings.TrimRight(ansi.Strip(a.enText()), ". ")
+	if got != enDst {
+		t.Fatalf("定格应为 %q，got %q", enDst, got)
 	}
-	a.frame++
-	if next := ansi.Strip(a.enText()); next != got {
-		t.Fatalf("定格期应静止: %q vs %q", got, next)
+	got = ansi.Strip(a.enText())
+	// 定格期：正文不再变化，但句点仍在逐帧伸缩（进行中标记不能死掉）
+	body := strings.TrimRight(got, ". ")
+	dotsSeen := map[string]bool{}
+	for f := 0; f < enHoldFrames; f++ {
+		a.frame = writeStart + enWriteFrames + f
+		text := ansi.Strip(a.enText())
+		if strings.TrimRight(text, ". ") != body {
+			t.Fatalf("定格期正文应保持 %q，frame=%d 得到 %q", body, f, text)
+		}
+		dotsSeen[strings.TrimSuffix(text, " ")] = true
+	}
+	if len(dotsSeen) < 2 {
+		t.Fatalf("定格期句点应仍在伸缩，实际只有 %v", dotsSeen)
+	}
+}
+
+// zhVisibleAt 返回中文动画在指定帧的可见文字（正文 + 当前点数的句点 + 占位空格）。
+func zhVisibleAt(frame int) string {
+	return string(zhThinkRunes) + strings.Repeat(".", dotsAt(frame)) +
+		strings.Repeat(" ", dotsWidth-dotsAt(frame))
+}
+
+// TestDotsGrowAndShrink 句点逐帧伸缩：1→2→3→2 循环，所以既能看到「多点一个」，
+// 也能看到「少一个」（用户要的「逐个消失」），且永不为 0（归零看起来像已经想完）。
+func TestDotsGrowAndShrink(t *testing.T) {
+	seen := map[int]bool{}
+	var seq []int
+	for f := 0; f < len(dotsStates)*dotsFramesPerState; f++ {
+		n := dotsAt(f)
+		if n < 1 || n > dotsWidth {
+			t.Fatalf("frame=%d 点数 %d 越界（应在 1..%d）", f, n, dotsWidth)
+		}
+		seen[n] = true
+		if len(seq) == 0 || seq[len(seq)-1] != n {
+			seq = append(seq, n)
+		}
+	}
+	if len(seq) != len(dotsStates) {
+		t.Fatalf("一个周期内的点数量变化序列应为 %v，实际 %v", dotsStates, seq)
+	}
+	for _, n := range []int{1, 2, 3} {
+		if !seen[n] {
+			t.Fatalf("周期内应出现 %d 个点，实际只见到 %v", n, seen)
+		}
+	}
+	// 必须有「减少」的一步（3→2），否则只是单调增长，不是「逐个消失」
+	shrunk := false
+	for i := 1; i < len(seq); i++ {
+		if seq[i] < seq[i-1] {
+			shrunk = true
+			break
+		}
+	}
+	if !shrunk {
+		t.Fatalf("句点序列 %v 没有减少的步骤（应能逐个消失）", seq)
+	}
+
+	// 每种状态持续 dotsFramesPerState 帧，避免闪得比 spinner 还快
+	if a, b := dotsAt(0), dotsAt(1); a != b {
+		t.Fatalf("同一状态应持续 %d 帧（frame0=%d frame1=%d）", dotsFramesPerState, a, b)
+	}
+	if a, b := dotsAt(0), dotsAt(dotsFramesPerState); a == b {
+		t.Fatalf("跨过 %d 帧后点数应变化（都是 %d）", dotsFramesPerState, a)
+	}
+}
+
+// TestThinkAnimAlternatesKinds 一个周期播完自动切到另一种动画，两种往复循环：
+// 单轮常跑几分钟，固定一种看久了只剩单调。
+func TestThinkAnimAlternatesKinds(t *testing.T) {
+	a := &thinkAnim{kind: thinkAnimZh}
+
+	// 中文周期内语种不变（不在句子中间跳语言）
+	for f := 0; f < zhCycle()-1; f++ {
+		a.tick()
+		if a.kind != thinkAnimZh {
+			t.Fatalf("中文周期内（frame=%d）不应切换语种", a.frame)
+		}
+	}
+	// 再推进一帧即满一个周期 → 切到英文，帧号归零
+	a.tick()
+	if a.kind != thinkAnimEn {
+		t.Fatalf("中文播完应切到英文，实际 kind=%d", a.kind)
+	}
+	if a.frame != 0 {
+		t.Fatalf("切换后帧号应归零，实际 %d", a.frame)
+	}
+
+	// 英文周期同样在结束时切回中文
+	for f := 0; f < enCycle()-1; f++ {
+		a.tick()
+	}
+	a.tick()
+	if a.kind != thinkAnimZh {
+		t.Fatalf("英文播完应切回中文，实际 kind=%d", a.kind)
+	}
+
+	// 连续多轮：两种语种都必须出现（不是卡在一种）
+	counts := map[thinkAnimKind]int{}
+	for i := 0; i < zhCycle()+enCycle(); i++ {
+		counts[a.kind]++
+		a.tick()
+	}
+	if counts[thinkAnimZh] == 0 || counts[thinkAnimEn] == 0 {
+		t.Fatalf("两个周期内应两种语种都出现，实际 %v", counts)
 	}
 }

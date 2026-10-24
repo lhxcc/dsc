@@ -13,8 +13,12 @@ import (
 // 只有一个 1 列宽的 spinner 时，长回合里很难一眼看出程序是活着还是在等 IO：
 // 一行不动的提示等于噪音。这里在 spinner 后加一段会说话的文字。
 //
-// 两种动画，每轮随机选一种（随机点选放在 startTurn，一轮之内不切换，避免
-// 文字在一个回合里来回跳）：
+// 两种动画**轮换播放**：每轮随机选一种开场，一种播完一个周期就切到另一种，如此
+// 往复——单轮常跑几分钟（agent 做编程任务时一轮几十步），固定一种看久了只剩单调。
+// 语种在周期边界切换而不是每帧切换，文字才不会在同一个回合里来回跳。
+//
+// 两种动画的句点都做**逐字伸缩**：1→2→3→2 循环（每态 2 帧 ≈ 200ms），所以常能看到
+// 「..」少一个、再多回来。句点区宽度恒为 dotsWidth（不足补空格），行尾不动。
 //
 //	中文：一道蓝紫扫描光带从左往右推过「深度求索中..」。光带未到之处是被暗紫
 //	      色实心块盖住的，光带扫过即点亮成字，身后留一段紫色余晖；扫到句点后
@@ -46,6 +50,23 @@ var (
 	zhTrailSty = lipgloss.NewStyle().Foreground(lipgloss.Color("#A88CFF"))
 )
 
+// 句点动画：1→2→3→2 循环。宽度固定为 dotsWidth（不足补空格），
+// 否则「点少了」会让行尾字符左移一格，整行每秒抖一次比不动还难看。
+const (
+	dotsFramesPerState = 2 // 每态 2 帧 ≈ 200ms
+	dotsWidth          = 3 // 最多三个点；显示宽度恒为此值
+)
+
+// dotsStates 是句点数的循环序列。做成 1→2→3→2 而不是 0→3→0：
+// 归零那一刻看起来像「已经想完了」，与「进行中」的语义相反。
+var dotsStates = []int{1, 2, 3, 2}
+
+// dotsAt 返回当前帧应显示的点数（1..dotsWidth）。
+func dotsAt(frame int) int {
+	i := (frame / dotsFramesPerState) % len(dotsStates)
+	return dotsStates[i]
+}
+
 // thinkAnimKind 是动画语种。
 type thinkAnimKind int
 
@@ -68,8 +89,30 @@ func (a *thinkAnim) reset() {
 	a.frame = 0
 }
 
-// tick 推进一帧。
-func (a *thinkAnim) tick() { a.frame++ }
+// tick 推进一帧；一个周期播完就切到另一种动画（长回合不至于从头到尾同一个样子）。
+func (a *thinkAnim) tick() {
+	a.frame++
+	if a.frame >= a.cycleFrames() {
+		a.kind = a.kind.next()
+		a.frame = 0
+	}
+}
+
+// next 返回另一种动画（两种之间轮换）。
+func (k thinkAnimKind) next() thinkAnimKind {
+	if k == thinkAnimZh {
+		return thinkAnimEn
+	}
+	return thinkAnimZh
+}
+
+// cycleFrames 返回当前语种一个周期的帧数。
+func (a *thinkAnim) cycleFrames() int {
+	if a.kind == thinkAnimZh {
+		return zhCycle()
+	}
+	return enCycle()
+}
 
 // randThinkKind 随机选一种动画。Go 1.20+ 的全局 rand 已自动播种，
 // 这里不需要（也不该）自己持有带锁的源。
@@ -103,16 +146,17 @@ const (
 // 「深度求索中」读起来像已经想完了。它照常显示，但光带扫过时同样被点亮。
 var zhThinkRunes = []rune("深度求索中")
 
-const zhThinkDots = ".."
+// zhThinkDots 句点区的最大形态（仅用于测试与宽度核对；实际显示逐帧伸缩）。
+const zhThinkDots = "..."
 
-// zhThinkText 完整文案（正文 + 句点），仅用于测试与宽度核对。
+// zhThinkText 完整文案（正文 + 满格句点）。
 func zhThinkText() string {
 	return string(zhThinkRunes) + zhThinkDots
 }
 
-// zhTotalCells 光带要扫过的字符位数（正文 + 句点）。
+// zhTotalCells 光带要扫过的字符位数（正文 + 句点区固定宽度）。
 func zhTotalCells() int {
-	return len(zhThinkRunes) + len([]rune(zhThinkDots))
+	return len(zhThinkRunes) + dotsWidth
 }
 
 // zhCycle 中文动画一个周期的帧数。
@@ -140,16 +184,21 @@ func (a *thinkAnim) zhText() string {
 			b.WriteString(thinkTextSty.Render(s))
 		}
 	}
-	// 句点常显；光带扫到哪儿，哪儿亮一下。
-	for j, r := range []rune(zhThinkDots) {
-		s := string(r)
+	// 句点逐帧伸缩（1→2→3→2）：只渲染当前数量的点，其余补空格占位，行尾不动。
+	// 光带扫到点上时同样点亮——句点也是「正在推进」的一部分。
+	dots := dotsAt(a.frame)
+	for j := 0; j < dotsWidth; j++ {
+		if j >= dots {
+			b.WriteString(thinkTextSty.Render(" "))
+			continue
+		}
 		switch n + j {
 		case head:
-			b.WriteString(zhScanSty.Render(s))
+			b.WriteString(zhScanSty.Render("."))
 		case head - 1:
-			b.WriteString(zhTrailSty.Render(s))
+			b.WriteString(zhTrailSty.Render("."))
 		default:
-			b.WriteString(thinkTextSty.Render(s))
+			b.WriteString(thinkTextSty.Render("."))
 		}
 	}
 	return b.String()
@@ -197,22 +246,23 @@ const (
 	enDst = "Deep Thinking"
 )
 
-const (
-	enSuffix = ".."
-	// enWidth 整段目标显示宽度：按最长的 "Deep Thinking.."（5+8+2）计。
-	// 每帧都补到该宽度，阶段切换时行尾不右移——否则同一回合里
-	// 「(5 秒 · Ctrl+C 取消)」会左右跳一格。
-	enWidth = len(enDst) + len(enSuffix)
-)
+// enWidth 整段目标显示宽度：按最长的 "Deep Thinking..."（5+8+dotsWidth）计。
+// 每帧都补到该宽度，阶段切换与句点伸缩时行尾都不右移——否则同一回合里
+// 「(N 秒 · Ctrl+C 取消)」会左右跳一格。
+const enWidth = len(enDst) + dotsWidth
+
+// enCycle 英文动画一个周期的帧数。
+func enCycle() int {
+	return enWaveFrames + enUpperFrames + enEraseFrames + enWriteFrames + enHoldFrames
+}
 
 func (a *thinkAnim) enText() string {
 	wave := enWaveFrames
 	upper := wave + enUpperFrames
 	erase := upper + enEraseFrames
 	write := erase + enWriteFrames
-	cycle := write + enHoldFrames
 
-	g := a.frame % cycle
+	g := a.frame % enCycle()
 
 	// body 是句点之前的整句。
 	//
@@ -273,8 +323,10 @@ func (a *thinkAnim) enText() string {
 		}
 		b.WriteString(thinkTextSty.Render(s))
 	}
-	b.WriteString(thinkTextSty.Render(enSuffix))
-	if pad := enWidth - len(body) - len(enSuffix); pad > 0 {
+	// 句点逐帧伸缩（1→2→3→2），其余补空格占位：行尾宽度恒定。
+	dots := dotsAt(a.frame)
+	b.WriteString(thinkTextSty.Render(strings.Repeat(".", dots)))
+	if pad := enWidth - len(body) - dots; pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
 	}
 	return b.String()
