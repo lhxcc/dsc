@@ -218,7 +218,7 @@ type Model struct {
 
 	// 当前轮运行指标（对齐 REX working 行）：runStart 记录启动时刻，elapsed 为
 	// 已耗时秒数（每秒 elapsedTick 刷新）；turnTokens 为本轮累计下行生成 token；
-	// cacheHit/cacheMiss 为最近一次请求的 prompt 缓存命中/写入 token。
+	// cacheHit/cacheMiss 为最近一次请求的 prompt 缓存命中 / 未命中 token（miss = prompt - hit）。
 	runStart   time.Time
 	elapsed    int
 	turnTokens int
@@ -3395,9 +3395,16 @@ func (m *Model) trackTurnUsage(u *core.Usage, turn, step int32) {
 		m.lastUsageTurn = turn
 		m.lastUsageStep = step
 	}
-	if u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
+	// 命中率两侧：hit = 命中缓存的部分，miss = prompt - hit。
+	// 不再用 CacheCreationInputTokens 充当 miss——那是「写入缓存」的原义（Anthropic 才有），
+	// OpenAI 兼容端点为 0，拿它当 miss 会让命中率恒显示 100%。
+	if u.PromptTokens > 0 || u.CacheReadInputTokens > 0 {
 		m.cacheHit = u.CacheReadInputTokens
-		m.cacheMiss = u.CacheCreationInputTokens
+		miss := u.PromptTokens - u.CacheReadInputTokens
+		if miss < 0 {
+			miss = 0
+		}
+		m.cacheMiss = miss
 	}
 }
 

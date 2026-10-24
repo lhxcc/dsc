@@ -542,33 +542,33 @@ func extractToolCalls(blocks []anthropic.ContentBlockUnion) []dsc.ToolCall {
 }
 
 // usageFromAnthropic 将 Anthropic usage 转换为 dsc.Usage（nil 返回 nil）。
-// 兼容启用提示缓存的 llama.cpp 等接口：其 input_tokens 仅统计未命中缓存的新增 token，
-// 已命中前缀单独计入 cache_read_input_tokens，真实上下文长度 = input + cache_read；
-// 标准 Anthropic 接口的 input_tokens 已含全部输入（cache_read 为其子集），
-// 此时 cache_read <= input，保持原值即可避免重复计数。
-// 命中率计算需要 miss 侧：以 CacheCreationInputTokens = 真实 prompt - cache_read 近似
-// （即本次请求中未被缓存提供的新增 token），否则未命中侧恒为 0，命中率恒显示 100%。
+// 口径契约（见 core.PromptSideTokens）：Usage.PromptTokens 报**完整** prompt（含缓存）。
+//
+// Anthropic 的 input_tokens 不含缓存部分：命中前缀在 cache_read_input_tokens、本次新写入
+// 缓存的在 cache_creation_input_tokens，故完整 prompt = 三者相加。启用提示缓存的
+// llama.cpp 等兼容端点的 input_tokens 也只统计未命中部分，但（旧版实现）会把
+// cache_read 报得比 input 还大——此时按「input 已含 cache_read」的旧语义兜底，保持
+// 原值，避免把同一段前缀算两遍。
+// CacheCreation 保持 Anthropic 的原义（写入缓存的 token），不再冒充「未命中」：
+// 命中率由 prompt - cacheRead 推出，见 TUI trackTurnUsage。
 func usageFromAnthropic(u *anthropic.Usage) *dsc.Usage {
 	if u == nil {
 		return nil
 	}
-	promptTokens := u.InputTokens
-	if u.CacheReadInputTokens > u.InputTokens {
-		promptTokens += u.CacheReadInputTokens
-	}
+	// Anthropic 官方语义：input_tokens 只算「未被缓存服务、也没用于建缓存」的部分，
+	// 命中与写入分别落在 cache_read / cache_creation，故完整 prompt = 三者之和。
+	// llama.cpp 等 Anthropic 兼容端口的 input_tokens 同样只报新增部分（实测 input=4、
+	// cache_read=173、真实上下文 177），加法一致。
+	promptTokens := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
 	if promptTokens <= 0 && u.OutputTokens <= 0 {
 		return nil
-	}
-	cacheMiss := promptTokens - u.CacheReadInputTokens
-	if cacheMiss < 0 {
-		cacheMiss = 0
 	}
 	return &dsc.Usage{
 		PromptTokens:             int32(promptTokens),
 		CompletionTokens:         int32(u.OutputTokens),
 		TotalTokens:              int32(promptTokens + u.OutputTokens),
 		CacheReadInputTokens:     int32(u.CacheReadInputTokens),
-		CacheCreationInputTokens: int32(cacheMiss),
+		CacheCreationInputTokens: int32(u.CacheCreationInputTokens),
 	}
 }
 

@@ -72,16 +72,17 @@ func usageFromOpenAI(u *openai.Usage) *dsc.Usage {
 	if u.PromptTokensDetails != nil {
 		cacheRead = int32(u.PromptTokensDetails.CachedTokens)
 	}
-	cacheMiss := int32(u.PromptTokens) - cacheRead
-	if cacheMiss < 0 {
-		cacheMiss = 0
-	}
+	// 口径契约（见 core.PromptSideTokens）：PromptTokens 报**完整** prompt。
+	// OpenAI 兼容端点的 prompt_tokens 本就含命中缓存的部分（prompt = miss + cached），
+	// 故此处不做任何相加；CacheRead 只是其中「由缓存承担」的部分，供显示命中率。
+	// CacheCreation 在 OpenAI 侧没有对应计数（写入缓存不单独上报），留 0——曾经把
+	// 「miss」塞进这个字段，导致下游 prompt+cacheRead+cacheCreation 算成 2×prompt。
 	return &dsc.Usage{
 		PromptTokens:             int32(u.PromptTokens),
 		CompletionTokens:         int32(u.CompletionTokens),
 		TotalTokens:              int32(u.TotalTokens),
 		CacheReadInputTokens:     cacheRead,
-		CacheCreationInputTokens: cacheMiss,
+		CacheCreationInputTokens: 0,
 	}
 }
 

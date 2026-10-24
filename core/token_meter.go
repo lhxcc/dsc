@@ -134,13 +134,23 @@ func (tm *TokenMeter) Window() int {
 	return tm.contextWindow
 }
 
-// PromptSideTokens 返回 usage 的 prompt 侧用量（prompt + cacheRead + cacheWrite）——
-// 上下文占用只算输入侧；输出已随历史进入下一发的 prompt，计进来会重复。
+// PromptSideTokens 返回 usage 的 prompt 侧用量——上下文占用只算输入侧；输出已随历史
+// 进入下一发的 prompt，计进来会重复。
+//
+// **口径契约（改动前先读这段）**：Usage.PromptTokens 必须是**完整 prompt**（含命中缓存
+// 的全部输入），CacheRead/CacheCreation 只是其中「由缓存承担 / 写入缓存」的部分，用于
+// 显示命中率，**不得再加进总数**。各家上报语义本就不同（Anthropic 的 input_tokens 不含
+// 缓存、OpenAI 兼容端点的 prompt_tokens 含缓存），统一在 provider 的 usage 映射里归一
+// ——归一化只做一次，消费侧（本函数、压缩、裁剪、TUI）都按同一个数走。
+//
+// 曾经的 bug：这里写成 prompt + cacheRead + cacheCreation，而 OpenAI 兼容端点本就
+// prompt = miss + cached，于是变成 P + cached + (P-cached) = 2P。缓存命中 99.95% 的
+// 会话（服务端实测 498K）被算成 ~1.05M，误报「单轮内容超出上下文窗口」。
 func PromptSideTokens(usage *Usage) int {
 	if usage == nil {
 		return 0
 	}
-	return int(usage.PromptTokens) + int(usage.CacheReadInputTokens) + int(usage.CacheCreationInputTokens)
+	return int(usage.PromptTokens)
 }
 
 // UpdateContextWindow 更新上下文窗口大小（模型探测后可能变化）。
@@ -167,9 +177,8 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 		m.CompletionTokens = int(tm.lastUsage.CompletionTokens)
 		m.CacheReadTokens = int(tm.lastUsage.CacheReadInputTokens)
 		m.CacheCreationTokens = int(tm.lastUsage.CacheCreationInputTokens)
-		// 提示缓存感知：完整请求 token = prompt + cache_read
-		fullPrompt := m.PromptTokens + m.CacheReadTokens
-		m.TotalTokens = fullPrompt + m.CompletionTokens
+		// PromptTokens 已含缓存部分（见 PromptSideTokens 的契约说明），不再相加
+		m.TotalTokens = m.PromptTokens + m.CompletionTokens
 		m.Source = "usage"
 		m.ProjectedTokens = tm.projectLocked(est)
 	} else {

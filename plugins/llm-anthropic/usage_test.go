@@ -26,16 +26,23 @@ func TestUsageFromAnthropicCacheSemantics(t *testing.T) {
 	if u.CacheReadInputTokens != 173 {
 		t.Fatalf("CacheReadInputTokens = %d, 期望 173", u.CacheReadInputTokens)
 	}
-	// llama.cpp 语义：未命中侧近似为 真实 prompt - cache_read = 177-173 = 4，
-	// 否则命中率恒 100%（miss 侧恒 0）。
-	if u.CacheCreationInputTokens != 4 {
-		t.Fatalf("CacheCreationInputTokens = %d, 期望 4（177-173）", u.CacheCreationInputTokens)
+	// CacheCreationInputTokens 保持原义（写入缓存的 token）。llama.cpp 不上报写入量，故为 0；
+	// 命中率的未命中侧由 prompt - cache_read 推出（见 TUI trackTurnUsage），不再借用此字段。
+	if u.CacheCreationInputTokens != 0 {
+		t.Fatalf("CacheCreationInputTokens = %d, 期望 0（该端点不上报缓存写入）", u.CacheCreationInputTokens)
 	}
 
-	// 标准 Anthropic 语义：input_tokens 已含全部输入，cache_read 为其子集 → 保持原值
+	// 标准 Anthropic 语义：input_tokens 不算缓存部分（官方文档：input_tokens 是「未被
+	// 缓存读取、也未用于建缓存」的输入），故完整 prompt = input + cache_read + cache_creation。
+	// 这里 cache_read(500) 小于 input(1000) 也照样相加——两者是并列的三段，不是子集关系。
 	u = usageFromAnthropic(&anthropic.Usage{InputTokens: 1000, OutputTokens: 20, CacheReadInputTokens: 500})
-	if u.PromptTokens != 1000 {
-		t.Fatalf("标准 Anthropic 语义 PromptTokens = %d, 期望 1000（input 已含缓存，不得重复加）", u.PromptTokens)
+	if u.PromptTokens != 1500 {
+		t.Fatalf("标准 Anthropic 语义 PromptTokens = %d, 期望 1500（input+cache_read）", u.PromptTokens)
+	}
+	// 写入缓存的部分同样计入：input 100 + 命中 0 + 写入 800 = 900
+	u = usageFromAnthropic(&anthropic.Usage{InputTokens: 100, OutputTokens: 5, CacheCreationInputTokens: 800})
+	if u.PromptTokens != 900 {
+		t.Fatalf("含缓存写入 PromptTokens = %d, 期望 900（input+cache_creation）", u.PromptTokens)
 	}
 
 	// 无缓存（首请求）：cache_read=0 → 保持 input

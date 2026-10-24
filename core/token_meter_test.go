@@ -33,13 +33,13 @@ func TestTokenMeterUpdateUsage(t *testing.T) {
 	if m.Source != "usage" {
 		t.Errorf("有 usage 时 Source 应为 usage，got %q", m.Source)
 	}
-	// 提示缓存感知：完整请求 = prompt(5000) + cache_read(3000) = 8000
-	// 总量 = 8000 + completion(200) = 8200
-	if m.TotalTokens != 8200 {
-		t.Errorf("TotalTokens 应为 8200（prompt+cache_read+completion），got %d", m.TotalTokens)
+	// 口径契约：PromptTokens 已是完整 prompt（含命中缓存的部分），不再加 cache_read
+	// 总量 = prompt(5000) + completion(200) = 5200
+	if m.TotalTokens != 5200 {
+		t.Errorf("TotalTokens 应为 5200（prompt+completion），got %d", m.TotalTokens)
 	}
-	if m.Pressure < 0.81 || m.Pressure > 0.83 {
-		t.Errorf("Pressure 应约 0.82，got %.4f", m.Pressure)
+	if m.Pressure < 0.51 || m.Pressure > 0.53 {
+		t.Errorf("Pressure 应约 0.52，got %.4f", m.Pressure)
 	}
 }
 
@@ -55,7 +55,7 @@ func TestTokenMeterShouldCompact(t *testing.T) {
 		t.Error("90% 应压缩")
 	}
 
-	// 有锚点：实测 prompt 侧 8000（5000+3000）→ 80%
+	// 有锚点：实测 prompt 侧 8000 → 80%
 	tm.SampleUsage(8000, 8000)
 	if !tm.ShouldCompact(8000, 0.80) {
 		t.Error("压力 80% 应触发压缩")
@@ -305,10 +305,14 @@ func TestTokenMeterProjectAnchored(t *testing.T) {
 }
 
 // TestPromptSideTokens 上下文占用只算输入侧：输出已随历史进入下一发 prompt，计进来会重复。
+//
+// 口径契约：PromptTokens 是**完整** prompt（含缓存），cache_read/cache_write 只是其中
+// 的构成，**不得相加**。曾经的 bug 正是这里相加，把缓存命中 99.95% 的会话（实测 498K）
+// 算成 ~1.05M，误报「单轮内容超出上下文窗口」。
 func TestPromptSideTokens(t *testing.T) {
 	u := &Usage{PromptTokens: 5000, CompletionTokens: 200, CacheReadInputTokens: 3000, CacheCreationInputTokens: 500}
-	if got := PromptSideTokens(u); got != 8500 {
-		t.Fatalf("PromptSideTokens = %d, want 8500（prompt+cacheRead+cacheWrite，不含输出）", got)
+	if got := PromptSideTokens(u); got != 5000 {
+		t.Fatalf("PromptSideTokens = %d, want 5000（PromptTokens 已含缓存，不得相加）", got)
 	}
 	if got := PromptSideTokens(nil); got != 0 {
 		t.Fatalf("nil usage 应为 0，got %d", got)

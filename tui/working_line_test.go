@@ -155,22 +155,27 @@ func TestStepStartFrameAnchorsTTFT(t *testing.T) {
 	}
 }
 
-// TestTrackTurnUsage 累计下行生成 token；缓存字段按最近一次请求覆盖。
+// TestTrackTurnUsage 累计下行生成 token；缓存命中率两侧按最近一次请求覆盖。
+//
+// 命中率的分母口径：miss = PromptTokens - CacheReadInputTokens（PromptTokens 按契约
+// 已含缓存部分，见 core.PromptSideTokens）。不再拿 CacheCreationInputTokens 当 miss——
+// 那是「写入缓存」的原义，OpenAI 兼容端点为 0，会让命中率恒显示 100%。
 func TestTrackTurnUsage(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 
-	m.trackTurnUsage(&core.Usage{CompletionTokens: 100, CacheReadInputTokens: 80, CacheCreationInputTokens: 20}, 1, 0)
-	if m.turnTokens != 100 || m.cacheHit != 80 || m.cacheMiss != 20 {
-		t.Fatalf("trackTurnUsage 后: turn=%d hit=%d miss=%d", m.turnTokens, m.cacheHit, m.cacheMiss)
+	m.trackTurnUsage(&core.Usage{PromptTokens: 1000, CompletionTokens: 100, CacheReadInputTokens: 800}, 1, 0)
+	if m.turnTokens != 100 || m.cacheHit != 800 || m.cacheMiss != 200 {
+		t.Fatalf("trackTurnUsage 后: turn=%d hit=%d miss=%d（期望 100/800/200）",
+			m.turnTokens, m.cacheHit, m.cacheMiss)
 	}
 
 	// 第二步：下行累计，缓存覆盖
-	m.trackTurnUsage(&core.Usage{CompletionTokens: 50, CacheReadInputTokens: 95, CacheCreationInputTokens: 5}, 2, 0)
+	m.trackTurnUsage(&core.Usage{PromptTokens: 2000, CompletionTokens: 50, CacheReadInputTokens: 1900}, 2, 0)
 	if m.turnTokens != 150 {
 		t.Fatalf("turnTokens 应累计为 150, got %d", m.turnTokens)
 	}
-	if m.cacheHit != 95 || m.cacheMiss != 5 {
-		t.Fatalf("cache 应覆盖为 hit=95 miss=5, got hit=%d miss=%d", m.cacheHit, m.cacheMiss)
+	if m.cacheHit != 1900 || m.cacheMiss != 100 {
+		t.Fatalf("cache 应覆盖为 hit=1900 miss=100, got hit=%d miss=%d", m.cacheHit, m.cacheMiss)
 	}
 }
 
