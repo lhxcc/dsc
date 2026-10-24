@@ -356,9 +356,10 @@ type Model struct {
 
 	// 当前会话 id（初始 default；/session 切换或新建时更新，供 /export 使用）
 	currentSessionID string
-	// acpStatus 压缩插件最近一次发布的运行状态（事件 acp/status，见 /acp 命令）。
-	// 载荷是插件自定义的扁平 kv：TUI 只负责展示，不理解其语义。
-	acpStatus map[string]any
+	// ctxStatus 上下文管理后端最近一次上报的状态（宿主协议 core.EventContextStatus）。
+	// 前端只依赖协议结构，不依赖任何插件名或插件的私有字段；有上报才置 hasCtxStatus。
+	ctxStatus    core.ContextStatusEvent
+	hasCtxStatus bool
 
 	// 用户评审通道：program 供 askProvider 把问题送进事件循环；question 为待回答的问题
 	program  *tea.Program
@@ -429,12 +430,13 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
-	// 订阅压缩插件发布的运行状态：插件不认识 TUI，只发事件；展示由前端决定。
+	// 订阅上下文管理状态：事件名与载荷都是宿主协议（core.EventContextStatus），
+	// 发布方是当期生效的压缩后端——前端不认识它，也不该认识。
 	// 回调可能来自插件 goroutine，改状态一律经事件循环（program.Send）。
 	if manager != nil {
-		manager.OnEvent(core.EventName(acpStatusEvent), func(ec core.EventContext) (any, error) {
-			if payload, ok := ec.Data.(map[string]any); ok && m.program != nil {
-				m.program.Send(acpStatusMsg{payload: payload})
+		manager.OnEvent(core.EventContextStatus, func(ec core.EventContext) (any, error) {
+			if st, ok := ec.Data.(core.ContextStatusEvent); ok && m.program != nil {
+				m.program.Send(ctxStatusMsg{status: st})
 			}
 			return nil, nil
 		})
@@ -770,8 +772,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.render()
 		return m, nil
 
-	case acpStatusMsg:
-		m.acpStatus = msg.payload
+	case ctxStatusMsg:
+		m.ctxStatus = msg.status
+		m.hasCtxStatus = true
 		return m, nil
 
 	case jobDoneMsg:
@@ -2584,7 +2587,7 @@ func (m *Model) buildHelpText() string {
 		"  /session new  新建会话并切换",
 		"  /session delete <id>  删除指定会话",
 		"  /export    导出当前会话为 Markdown 文件",
-		"  /acp       查看上下文压缩状态（占用/压缩/卸载/回取）",
+		"  /context   查看上下文管理状态（占用/已压/可回收），别名 /acp",
 		"  /exit        退出聊天",
 	)
 	return strings.Join(lines, "\n")
@@ -2656,10 +2659,11 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			m.virtualGotoBottom()
 			return true, nil
 		}
-	case "/acp":
-		// 压缩/卸载/回取的运行面板：这些过程对用户不可见，只能靠一组累计数字判断
+	case "/context", "/acp":
+		// 上下文管理的运行面板（/acp 为旧别名）：这些过程对用户不可见，只能靠一组
+		// 累计数字判断
 		// "压缩到底有没有在省、回取有没有在白白导出"。
-		if m.acpStatus == nil {
+		if !m.hasCtxStatus {
 			// 注意 typed-nil：把 (*core.Manager)(nil) 塞进接口后 != nil，
 			// 会在方法里解引用空指针直接 panic——所以显式判空后再赋值。
 			var backend compactionBackendReporter
@@ -2668,7 +2672,7 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			}
 			m.appendMessage(dimSty.Render(noACPStatusText(backend)))
 		} else {
-			m.appendMessage(renderACPStatus(m.acpStatus))
+			m.appendMessage(renderContextStatus(m.ctxStatus))
 		}
 		m.input.SetValue("")
 		m.completion = completion{}
@@ -3702,26 +3706,17 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	return err
 }
 
-// acpStatusEvent 压缩插件发布运行状态的事件名（插件侧常量同值）。
-const acpStatusEvent = "acp/status"
+// ctxStatusMsg 把后端上报的状态送进 bubbletea 事件循环（回调在别的 goroutine）。
+type ctxStatusMsg struct{ status core.ContextStatusEvent }
 
-// acpStatusMsg 把插件状态送进 bubbletea 事件循环（插件回调在别的 goroutine）。
-type acpStatusMsg struct{ payload map[string]any }
-
-// renderACPStatus 把插件发布的扁平 kv 渲染成一段可读文本。
+// renderContextStatus 把宿主协议里的上下文管理状态渲染成一段可读文本。
 //
-// 展示口径：先给"占了多少"，再给"省了多少"，最后给"取回情况"——这三层回答的是
-// 三个不同问题（要不要压、压了有没有用、取回是不是顺畅），混在一起看就只剩噪声。
-func renderACPStatus(p map[string]any) string {
-	num := func(k string) int {
-		switch v := p[k].(type) {
-		case float64:
-			return int(v)
-		case int:
-			return v
-		}
-		return 0
-	}
+// **这里不认识任何插件**：只有 core.ContextStatusEvent 的字段，加上后端自述的
+// Metrics（标签、次数、token 量、说明）。前端因此不需要随压缩插件更换而改代码。
+//
+// 展示口径：占了多少 → 压了多少 → 还有什么可压；Metrics 逐条照抄标签，
+// 不猜语义（「确定性压缩」「可回取」这些名字只有发布方懂，前端只管排版）。
+func renderContextStatus(st core.ContextStatusEvent) string {
 	short := func(n int) string {
 		switch {
 		case n >= 1_000_000:
@@ -3732,39 +3727,43 @@ func renderACPStatus(p map[string]any) string {
 		return fmt.Sprintf("%d", n)
 	}
 
-	tokens, limit := num("tokens"), num("limit")
 	var b strings.Builder
 	b.WriteString(assistantNameSty.Render(assistantMark + " DSC · 上下文压缩\n"))
-	if limit > 0 {
-		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n", short(tokens), short(limit), pctOf(tokens, limit))
+	if st.Limit > 0 {
+		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n", short(st.Tokens), short(st.Limit), pctOf(st.Tokens, st.Limit))
 	} else {
-		fmt.Fprintf(&b, "  占用: %s\n", short(tokens))
+		fmt.Fprintf(&b, "  占用: %s\n", short(st.Tokens))
 	}
-	tiers := make([]int, 0, 3)
-	if raw, ok := p["tiers"].([]any); ok {
-		for _, v := range raw {
-			if f, ok := v.(float64); ok {
-				tiers = append(tiers, int(f))
-			}
+	if st.BlocksTotal > 0 || st.BlocksActive > 0 {
+		fmt.Fprintf(&b, "  块: %d active / %d total", st.BlocksActive, st.BlocksTotal)
+		if st.BlocksNote != "" {
+			fmt.Fprintf(&b, "（%s）", st.BlocksNote)
 		}
+		b.WriteString("\n")
 	}
-	b.WriteString(fmt.Sprintf("  块: %d active / %d total", num("blocks"), num("blocksTotal")))
-	if len(tiers) == 3 {
-		b.WriteString(fmt.Sprintf("（T1=%d T2=%d T3=%d）", tiers[0], tiers[1], tiers[2]))
+	if st.TokensReclaimed > 0 || st.Compressions > 0 {
+		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", short(st.TokensReclaimed), st.Compressions)
 	}
-	b.WriteString("\n")
-	fmt.Fprintf(&b, "  已压: %s（%d 次压缩）+ %s（absorb 蒸馏）\n",
-		short(num("compressed")), num("compressions"), short(num("absorbed")))
-	if num("crush") > 0 {
-		fmt.Fprintf(&b, "  确定性压缩: %d 次，省 %s\n", num("crush"), short(num("crushSaved")))
+	for _, m := range st.Metrics {
+		b.WriteString("  " + m.Label + ":")
+		if m.Value > 0 {
+			fmt.Fprintf(&b, " %d 次", m.Value)
+		}
+		if m.Tokens > 0 {
+			if m.Value > 0 {
+				b.WriteString("，")
+			} else {
+				b.WriteString(" ")
+			}
+			b.WriteString(short(m.Tokens))
+		}
+		if m.Note != "" {
+			fmt.Fprintf(&b, "（%s）", m.Note)
+		}
+		b.WriteString("\n")
 	}
-	if num("stored") > 0 {
-		fmt.Fprintf(&b, "  已卸载可回取: %d 条（%s）\n", num("stored"), short(num("storedTokens")))
-		fmt.Fprintf(&b, "  回取: %d 次（其中导出 %d 次），落空 %d 次\n",
-			num("retrieved"), num("exported"), num("misses"))
-	}
-	if c := num("compressibleCount"); c > 0 {
-		fmt.Fprintf(&b, "  可压范围: %d 段（详情问模型或用 acp_status）\n", c)
+	if st.CompressibleRanges > 0 {
+		fmt.Fprintf(&b, "  可压范围: %d 段\n", st.CompressibleRanges)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

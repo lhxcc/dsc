@@ -6,7 +6,7 @@ package core
 // 回合开始发 agent/status(running)；进入 LLM 请求前发 agent/pre-step；
 // LLM 请求失败发 agent/request-error。事件经 EventBus 同步分发（dispatchEventToPlugins）
 // 给订阅插件（Hook.OnEvent），是任何插件皆可独立订阅的系统级能力（如通知插件
-// 区分成败音效、billion-context 插件拦截 pre-step 改写消息列表）。
+// 区分成败音效、上下文压缩类插件拦截 pre-step 改写消息列表）。
 //
 // 分发模式对齐 DSH Cordis ctx.on()：模式由事件名决定（见 eventDispatchMode
 // 映射表），listener 不感知模式——通知型 listener 忽略 next、返回 ("", nil)；
@@ -25,14 +25,14 @@ const (
 
 	// EventAgentPreStep 进入 LLM 请求前事件（对齐 DSH agent/pre-step，waterfall 模式）。
 	// agent 在收集本步要发给 LLM 的消息列表之后、实际发送请求之前广播。
-	// 拦截型 listener 可改写消息列表（如 billion-context 注入 <acp> 标签、应用 prune、
+	// 拦截型 listener 可改写消息列表（如压缩后端插件注入上下文标签、应用裁剪、
 	// 注入 nudge）；通知型 listener 可记录每步开始时点。
 	// 载荷：AgentPreStepEvent{Agent, Turn, Step, MessagesJSON, Signal}
 	EventAgentPreStep EventName = "agent/pre-step"
 
 	// EventAgentRequestError LLM 请求失败事件（对齐 DSH agent/request-error，waterfall 模式）。
 	// LLM 调用返回非 nil 错误时广播。拦截型 listener 可决定是否重试——返回非空
-	// ResultJSON 含 {"retry": true} 时 agent 重新发起请求（如 billion-context 触发
+	// ResultJSON 含 {"retry": true} 时 agent 重新发起请求（如压缩后端插件触发
 	// 上下文溢出压缩后重试）；不调 next 或返回空 result 视为放弃重试。
 	// 载荷：AgentRequestErrorEvent{Agent, Turn, Step, Error, Code}
 	EventAgentRequestError EventName = "agent/request-error"

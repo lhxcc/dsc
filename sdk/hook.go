@@ -40,7 +40,7 @@ type Hook struct {
 	//     err 非空 veto 整条链（停止后续插件与兜底 next）
 	//
 	// 通知型 listener（如 notify、approval 审计）写法：返回 ("", nil)。
-	// 拦截型 listener（如 billion-context）写法：根据 eventType 改写 resultJSON 返回。
+	// 拦截型 listener 写法：根据 eventType 改写 resultJSON 返回。
 	OnEvent func(ctx context.Context, eventType, dataJSON string) (resultJSON string, err error)
 	// ContextFn 贡献 system prompt 片段（对齐 DSH ctx.systemPrompt.section）。
 	// 任何插件类型（tool/llm/agent/policy/dsc）均可实现。宿主聚合所有插件

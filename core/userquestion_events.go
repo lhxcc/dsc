@@ -5,7 +5,7 @@ package core
 //
 // 为什么需要它：ask_user_question / 计划评审会让 agent **阻塞等待用户回答**，
 // 此时没有回合结束事件、也没有错误事件——用户离开屏幕就完全不知道模型卡住了。
-// 通知类插件（dsc-notify）订阅本事件即可播放提示音，而不必关心提问来自哪条路径。
+// 通知类插件（声明 notify 能力者）订阅本事件即可播放提示音，而不必关心提问来自哪条路径。
 
 // EventUserQuestionAsked 宿主即将向用户展示提问（ask_user_question、计划评审等）时广播。
 // 载荷：UserQuestionAskedEvent（JSON）。

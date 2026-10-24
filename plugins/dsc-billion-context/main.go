@@ -40,7 +40,7 @@ type BillionContext struct {
 	store  *bcadapter.StateStore
 	config bcacp.Config
 	// interconnect 互通句柄（宿主挂载聚合服务后回调注入）；用于向宿主事件总线
-	// 发布 acp/status 供 TUI 展示。未连接时为 nil，发布静默跳过。
+	// 用于上报宿主协议的 context/status。未连接时为 nil，发布静默跳过。
 	interconnect *dsc.Interconnect
 
 	// lastTokenCount 最近一次 pre-step 观测到的上下文占用（宿主估算或本地兜底）。
@@ -240,7 +240,7 @@ func main() {
 		})
 	}
 
-	// 互通：拿到宿主的事件发布句柄（acp/status 走它）
+	// 互通：拿到宿主的事件发布句柄（context/status 走它）
 	sdkInst.SetInterconnect(func(ctx context.Context, ic *dsc.Interconnect) error {
 		bc.mu.Lock()
 		bc.interconnect = ic
@@ -427,7 +427,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 		result.Messages = bc.persistCCROffloads(result.Messages, result.CCROffloads)
 	}
 
-	// 缓存 state 与最近一次 token 数：status 报告与 acp/status 事件都要用真实占用，
+	// 缓存 state 与最近一次 token 数：status 报告与 context/status 事件都要用真实占用，
 	// 之前 handleStatus 用「已压缩 token + 1000」当占用，报出来的百分比毫无意义。
 	bc.mu.Lock()
 	bc.state = result.State
@@ -435,7 +435,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	bc.mu.Unlock()
 
 	// 可观测性：把压缩/卸载/回取的累计数据发布到宿主事件总线，TUI 的 /acp 面板读它。
-	bc.publishACPStatus(result.State)
+	bc.publishContextStatus(result.State)
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -842,41 +842,49 @@ func (bc *BillionContext) noteRetrieval(hit, exported bool) {
 	}
 }
 
-// EventACPStatus 压缩状态事件名：插件 → 宿主事件总线 → TUI 的 /acp 面板。
-// 与 agent/status 等一样是自定义事件，宿主按名字分发，不理解载荷内容。
-const EventACPStatus = "acp/status"
-
-// publishACPStatus 把压缩相关的累计指标发布到宿主事件总线（事件名 acp/status）。
+// publishContextStatus 把压缩运行状态按**宿主协议**上报（core.ContextStatusEvent）。
 //
-// 载荷刻意做成扁平的 kv（全是数字 + 少量字符串），这样 TUI 不必了解 ACP 的内部
-// 结构就能展示；插件与前端之间只约定这几个字段。
-func (bc *BillionContext) publishACPStatus(state *bcacp.CompressionState) {
+// 事件名与载荷结构都由宿主定义：本插件只是「当前生效的压缩后端」这一角色的实现，
+// 不该让前端认识自己的名字或内部字段。专有指标（确定性压缩、可回取条目、回取/导出
+// 次数）走 Metrics 自述——标签由这里给，前端只按「标签/次数/token 量/说明」排版。
+func (bc *BillionContext) publishContextStatus(state *bcacp.CompressionState) {
 	if bc.interconnect == nil || state == nil {
 		return
 	}
 	report := bcacp.BuildStatus(nil, state, bc.config, bc.lastTokenCount)
-	payload, err := json.Marshal(map[string]any{
-		"usage":             report.ContextUsage,
-		"tokens":            report.TokenCount,
-		"limit":             report.ModelContextLimit,
-		"blocks":            report.ActiveBlocks,
-		"blocksTotal":       report.TotalBlocks,
-		"tiers":             []int{report.Breakdown["tier1"], report.Breakdown["tier2"], report.Breakdown["tier3"]},
-		"compressed":        report.Breakdown["tokensCompressed"],
-		"compressions":      report.Breakdown["compressionCount"],
-		"absorbed":          report.Breakdown["absorbedTokens"],
-		"crush":             report.Breakdown["crushCount"],
-		"crushSaved":        report.Breakdown["crushTokensSaved"],
-		"stored":            report.Breakdown["ccrStored"],
-		"storedTokens":      report.Breakdown["ccrStoredTokens"],
-		"retrieved":         report.Breakdown["ccrRetrieved"],
-		"exported":          report.Breakdown["ccrExported"],
-		"misses":            report.Breakdown["retrievalMisses"],
-		"compressibleCount": len(report.CompressibleRanges),
-	})
+	bd := report.Breakdown
+
+	st := dsc.ContextStatusEvent{
+		Tokens:             report.TokenCount,
+		Limit:              report.ModelContextLimit,
+		BlocksActive:       report.ActiveBlocks,
+		BlocksTotal:        report.TotalBlocks,
+		BlocksNote:         fmt.Sprintf("T1=%d T2=%d T3=%d", bd["tier1"], bd["tier2"], bd["tier3"]),
+		TokensReclaimed:    bd["tokensCompressed"],
+		Compressions:       bd["compressionCount"],
+		CompressibleRanges: len(report.CompressibleRanges),
+	}
+	if v := bd["absorbedTokens"]; v > 0 {
+		st.Metrics = append(st.Metrics, dsc.ContextMetric{Label: "absorb 蒸馏", Tokens: v})
+	}
+	if bd["crushCount"] > 0 {
+		st.Metrics = append(st.Metrics, dsc.ContextMetric{
+			Label: "确定性压缩", Value: bd["crushCount"], Tokens: bd["crushTokensSaved"],
+		})
+	}
+	if bd["ccrStored"] > 0 {
+		st.Metrics = append(st.Metrics, dsc.ContextMetric{
+			Label: "已卸载可回取", Value: bd["ccrStored"], Tokens: bd["ccrStoredTokens"],
+		})
+		st.Metrics = append(st.Metrics, dsc.ContextMetric{
+			Label: "回取", Value: bd["ccrRetrieved"],
+			Note: fmt.Sprintf("导出 %d · 落空 %d", bd["ccrExported"], bd["retrievalMisses"]),
+		})
+	}
+	payload, err := json.Marshal(st)
 	if err != nil {
 		return
 	}
 	// 发布失败不影响主流程：可观测性坏了不能挡住压缩
-	_ = bc.interconnect.Notify(EventACPStatus, string(payload))
+	_ = bc.interconnect.Notify(string(dsc.EventContextStatus), string(payload))
 }

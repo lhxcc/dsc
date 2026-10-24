@@ -170,7 +170,7 @@ type Manager struct {
 	// compactionBackend config.yaml 中显式声明的压缩后端插件名（对齐 DSH preset
 	// 的 compaction group）。registerDscCoreLocked 检测插件名匹配时验证其
 	// Provides compaction 能力声明；空串 = 默认（agent 走内联压缩，后端经
-	// pre-step 事件接管——压缩引擎已插件化，见 plugins/dsc-system/compaction-basic.go）。
+	// pre-step 事件接管——压缩引擎已插件化，实现见声明 compaction 能力的插件）。
 	compactionBackend string
 
 	// credentialStore 插件凭据存储（对齐 DSH packages/credentials/credentials）：
@@ -786,7 +786,7 @@ func (m *Manager) hotReloadPlugin(name, newBinaryPath string, execDir string, ha
 	m.mu.RUnlock()
 
 	// 准备阶段：若旧实例登记过工具，则在新进程上重新 stage（host broker 挂载 + 互通 + 列清单）。
-	// 旧实例无工具时跳过——避免对纯后台插件（如 dsc-notify）发起无谓的 ToolService 调用。
+	// 旧实例无工具时跳过——避免对纯后台插件（如通知类）发起无谓的 ToolService 调用。
 	var st *stagedTool
 	if hadTools && broker != nil {
 		toolClient := proto.NewToolServiceClient(grpcClient.Conn)
@@ -1347,7 +1347,7 @@ func (m *Manager) ListContext(ctx context.Context) (string, error) {
 	}
 	// compaction 后端状态标记（对齐 DSH ctx.compaction Service 的运行时查询）：
 	// 只认 compaction 字段选定的那一个后端——「有任一插件声明该能力」不足以判定接管，
-	// 否则未选中的插件（如同时启用的 dsc-billion-context）会让 agent 误判为有后端
+	// 否则未被选中的同类插件（同时启用了多个压缩后端时）会让 agent 误判为有后端
 	// 而跳过内联压缩，实际却由另一个后端在跑。
 	if m.compactionBackendActive() {
 		parts = append(parts, "[DSC_COMPACTION_BACKEND_ACTIVE]")
@@ -2215,7 +2215,7 @@ func (m *Manager) registerDscCoreLocked(name string, info *metadata.PluginInfo, 
 			st.client = client
 			m.commitDscToolPluginLocked(st)
 		}
-		// len(st.tools) == 0：插件无工具（如 dsc-notify），不登记 tool provider。
+		// len(st.tools) == 0：插件不提供工具（如纯后台的通知类），不登记 tool provider。
 	}
 	// 压缩后端检测（对齐 DSH preset compaction group + 能力验证）：
 	// config.yaml 中 compaction 字段显式选择后端，宿主验证该

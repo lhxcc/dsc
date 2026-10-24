@@ -60,6 +60,16 @@ func (s *coreNotifyServer) Notify(ctx context.Context, req *proto.NotifyRequest)
 		s.m.events.Emit(JobDoneEvent, EventContext{Data: snap})
 		return &proto.NotifyResponse{}, nil
 	}
+	// 上下文状态是**宿主协议**（core/context_status.go）：按结构解码后分发，
+	// 前端拿到的就是类型化载荷，不必自己去猜某个插件的 kv 结构。
+	if req.GetName() == string(EventContextStatus) {
+		var st ContextStatusEvent
+		if err := json.Unmarshal([]byte(req.GetData()), &st); err != nil {
+			return nil, fmt.Errorf("notify: invalid %s data: %w", EventContextStatus, err)
+		}
+		s.m.events.Emit(EventContextStatus, EventContext{Data: st})
+		return &proto.NotifyResponse{}, nil
+	}
 	data := any(req.GetData())
 	if req.GetData() != "" {
 		var v any
@@ -128,7 +138,7 @@ func (m *Manager) WarnIfCompactionBackendMissing() string {
 // compactionBackendActive 报告选定的压缩后端是否已加载且声明了 compaction 能力。
 //
 // 只认 compaction 字段指定的那一个：其它插件即使同样声明 Provides compaction 也不
-// 参与接管（否则 dsc-system.compaction-basic 与 dsc-billion-context 的 pre-step 改写
+// 参与接管（否则同时启用的两个压缩后端 pre-step 改写会
 // 会叠加成双重压缩，且与配置意图不符）。
 func (m *Manager) compactionBackendActive() bool {
 	m.mu.RLock()
@@ -325,9 +335,9 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 	}
 
 	// agent/pre-step 的「消息改写权」只归 compaction 字段选定的后端：多个插件可能都
-	// 声明 Provides compaction（dsc-system 的 compaction-basic 与 dsc-billion-context），
+	// 声明 Provides compaction（基础压缩与上下文管理插件都会声明），
 	// 若全部采纳就会层层改写、叠加压缩，与配置选择的后端不符。
-	// 注意仍向所有插件派发——pre-step 还承载副作用（dsc-system 重置重复调用链、
+	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、
 	// 通知型 listener 等），只是它们的 result_json 不参与载荷改写；未选后端时
 	// 一律不采纳改写，由 agent 内联压缩兜底。
 	backend := ""

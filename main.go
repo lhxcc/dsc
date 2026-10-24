@@ -339,7 +339,7 @@ func main() {
 		os.Setenv("DSC_TEMP_DIR", core.PJoin(execDir, "temp"))
 	}
 
-	// 会话目录（agent-react-loop 写会话日志、dsc-billion-context 写压缩状态）：
+	// 会话目录（agent 写会话日志、压缩后端插件写自己的状态文件）：
 	// 未显式配置 DSC_SESSION_DIR 时注入 <ExecDir>/sessions，路径唯一来源是
 	// session.Dir——宿主 Store、插件经 dsc.SessionDir() 读同一值，不得各自拼。
 	if os.Getenv("DSC_SESSION_DIR") == "" {
@@ -352,7 +352,7 @@ func main() {
 		os.Setenv("DSC_MEMORY_DIR", core.PJoin(execDir, core.MemoryDirName))
 	}
 
-	// 技能目录（dsc-system 的 skill 工具与 TUI 的 listSkills 都需引用）：
+	// 技能目录（插件的技能工具与 TUI 的 listSkills 都需引用）：
 	// 未显式配置 DSC_SKILLS_DIR 时注入 <ExecDir>/skills，避免插件 fallback
 	// "./skills"（CWD 相对）与 TUI 的 <exeDir>/skills 不一致。
 	if os.Getenv("DSC_SKILLS_DIR") == "" {
@@ -942,7 +942,7 @@ func main() {
 			}
 			adminAddr = finalAddr
 			logger.Info("admin api started", "addr", adminAddr)
-			// 把实际监听地址注入到环境变量，供 tool-harness-webui 等插件子进程读取
+			// 把实际监听地址注入到环境变量，供需要它的插件子进程读取
 			os.Setenv("DSC_ADMIN_ADDR", adminAddr)
 		}
 	}
