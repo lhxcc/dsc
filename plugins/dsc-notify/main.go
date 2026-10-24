@@ -150,6 +150,20 @@ func initSoundCache() {
 		120*time.Millisecond,
 	)
 
+	// question: 轻快的三音上行（520→660→880Hz），专用于「模型在等你回答」。
+	// 与 success（300→600 双音）和 error（700Hz 三连）区分开：不表示成败，只表示
+	// 「有人在等你」——用户离开屏幕时最容易漏掉的正是这一种。
+	{
+		var qb bytes.Buffer
+		for i, f := range []float64{520, 660, 880} {
+			if i > 0 {
+				qb.Write(make([]byte, int(0.04*float64(globalSampleRate))*globalChannels*bytesPerSample))
+			}
+			qb.Write(generateContinuousPCM(90*time.Millisecond, []float64{f}, 10.0))
+		}
+		soundMap["question"] = qb.Bytes()
+	}
+
 	// warning: 双脉冲 600Hz（原设计，保持不变）
 	soundMap["warning"] = generatePulsePCM(
 		150*time.Millisecond,
@@ -402,6 +416,18 @@ func main() {
 					return "", nil // 音频未初始化（如无音频设备 / DSC_NOTIFY_NO_AUDIO），跳过播放
 				}
 				playQueue <- PlayRequest{SoundType: "success"}
+			case string(dsc.EventUserQuestionAsked):
+				// 模型弹了选项在等人回答：agent 此时阻塞，既不会有 idle 也不会有 error，
+				// 不响一声用户根本不知道它卡住了。
+				var ev dsc.UserQuestionAskedEvent
+				if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
+					return "", nil
+				}
+				log.Printf("🔔 等待用户回答：%d 个问题（%s）", ev.Questions, ev.Header)
+				if globalCtx == nil {
+					return "", nil // 音频未初始化，跳过播放
+				}
+				playQueue <- PlayRequest{SoundType: "question"}
 			case string(dsc.EventAgentError):
 				// 回合失败 → error 音效
 				if globalCtx == nil {

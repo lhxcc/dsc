@@ -49,7 +49,22 @@ func (m *Manager) Ask(ctx context.Context, req *userquestions.Request) (*userque
 	if provider == nil {
 		return nil, &userquestions.Error{Code: userquestions.ErrNoProvider, Err: fmt.Errorf("no user-questions provider is registered")}
 	}
+	// 提问即将展示给用户：广播事件让通知类插件提醒（用户离开屏幕时靠音效知道模型在等回答）。
+	// 放在调 provider 之前、且不因事件失败影响提问——事件只是旁路提醒。
+	m.emitUserQuestionAsked(req)
 	return provider(ctx, req)
+}
+
+// emitUserQuestionAsked 广播「即将提问」事件；无事件总线时静默跳过。
+func (m *Manager) emitUserQuestionAsked(req *userquestions.Request) {
+	if m == nil || m.events == nil || req == nil {
+		return
+	}
+	ev := UserQuestionAskedEvent{Questions: len(req.Questions)}
+	if len(req.Questions) > 0 {
+		ev.Header = req.Questions[0].Header
+	}
+	m.events.Emit(EventUserQuestionAsked, EventContext{Context: context.Background(), Data: ev})
 }
 
 // userQuestionsGRPCServer 暴露给 agent 的 gRPC 服务端。

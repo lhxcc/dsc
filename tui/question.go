@@ -55,6 +55,11 @@ type pendingQuestion struct {
 	// 用户输入文本回车即作为该问题回答。Esc 返回选项列表（仅 customMode 由选项触发时
 	// 才可返回；c 键直接进入的同此行为）。
 	customMode bool
+
+	// scroll 覆盖层正文的滚动偏移（行）。只在内容超过终端可用高度时才非零：
+	// 模型把问题/选项写得很长时，框体会先自动长高（auto-grow），长到顶到屏幕
+	// 上限才开窗滚动——用户仍能读到全部内容，而不是被裁掉开头。
+	scroll int
 }
 
 // askProvider 宿主注册的 UI provider：把问题发给 TUI 并阻塞等待回答。
@@ -133,6 +138,13 @@ func (m *Model) handleQuestionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.render()
 		return m, nil
+	case "pgup", "ctrl+u":
+		// 覆盖层内容高于终端时滚动正文（自动长高到顶后的逃生通道）
+		m.scrollQuestion(-1)
+		return m, nil
+	case "pgdown", "ctrl+d":
+		m.scrollQuestion(+1)
+		return m, nil
 	case "space", "x":
 		if multi && len(opts) > 0 {
 			if q.multi == nil {
@@ -160,6 +172,29 @@ func (m *Model) handleQuestionKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.advanceOrSubmit(q)
 	}
 	return m, nil
+}
+
+// scrollQuestion 按页滚动覆盖层正文（dir<0 上、>0 下）。只在内容超过终端可用
+// 高度时才有实际效果；选中项的可视化由 questionLayoutOf 的钳制逻辑保证。
+func (m *Model) scrollQuestion(dir int) {
+	q := m.question
+	if q == nil {
+		return
+	}
+	lay := m.questionLayoutOf(q)
+	page := lay.window - 1
+	if page < 1 {
+		page = 1
+	}
+	q.scroll += dir * page
+	if maxScroll := len(lay.lines) - lay.window; q.scroll > maxScroll {
+		q.scroll = maxScroll
+	}
+	if q.scroll < 0 {
+		q.scroll = 0
+	}
+	m.syncViewportHeight()
+	m.render()
 }
 
 // syncViewportHeight 把 vpHeight() 计算结果同步到 viewport 实例的 Height。
@@ -368,6 +403,197 @@ func (m *Model) isCustomOption(q *pendingQuestion, idx int) bool {
 // 自定义模式下覆盖层消失，焦点已落到主输入框）。
 // 自定义模式下保留一行提示，让用户知道当前正在回答模型问题、Enter 提交后模型
 // 才会继续——避免误以为是常规消息输入。
+// questionBoxWidth 覆盖层的内容宽度：终端宽度减去边框（2 列）与内边距（左右各 1），
+// 上限 100 列（再宽难读）。折行由 lipgloss 的 Width 完成——模型一段长文字不会再把
+// 框撑出屏幕右侧被裁掉。
+func (m *Model) questionBoxWidth() int {
+	if m.width <= 0 {
+		// 尚未收到首个 WindowSizeMsg（测试或极早期）：按 80 列排版，
+		// 而不是压到 20 列把每行都折成碎片。
+		return 76
+	}
+	w := m.width - 4
+	if w > 100 {
+		w = 100
+	}
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
+
+// questionChromeRows 是「消息区 + 问题覆盖层」之外界面固定占用的行数。
+// 与 vpHeight 的其余扣减项保持一致（标题/状态/提示/边框/输入框/思考行/待办面板）。
+func (m *Model) questionChromeRows() int {
+	h := titleRows + statusRows + infoRows + boxBorder + m.input.Height()
+	if m.thinking || m.streaming {
+		h += thinkingRow
+	}
+	return h + m.todoPanelRows()
+}
+
+// questionBudgetRows 问题覆盖层可用的最大总行数（含边框）：把消息区压到
+// minQuestionViewportRows 行之前，覆盖层可以一直长高——模型写多少就长多高，
+// 而不是像以前那样无上限地长、最后被 AltScreen 从顶部裁掉（用户看不到开头）。
+func (m *Model) questionBudgetRows() int {
+	budget := m.high - m.questionChromeRows() - minQuestionViewportRows
+	if budget < 6 {
+		budget = 6
+	}
+	return budget
+}
+
+// minQuestionViewportRows 覆盖层展开时消息区至少保留的行数（有上下文可参考）。
+const minQuestionViewportRows = 3
+
+// questionLayout 是覆盖层的排版结果：已折行的正文、每个选项的起始行、可见窗口。
+type questionLayout struct {
+	width    int
+	lines    []string
+	optStart []int // 每个选项（含兜底项）在 lines 中的起始下标
+	window   int   // 可见行数（< len(lines) 时需要滚动）
+	scroll   int   // 顶部被滚掉的行数
+	total    int
+	// overflow 表示内容被折叠（需要滚动）：此时框内底部多一行滚动提示，
+	// 预算必须为它留一行——否则渲染结果比 questionRows() 多一行，
+	// 整屏就超出终端高度（AltScreen 从顶部裁掉问题开头）。
+	overflow bool
+}
+
+// wrapToWidth 把一段文本按宽度折行，并把每行补齐到 w 列。
+//
+// 补白是必须的：框体不再设置 Width（否则 lipgloss 会按「含内边距的总宽」再折一次，
+// 把已经折好的行又切碎，实际渲染行数多于预算 → 整屏超出终端高度、顶部被裁）。
+// 行宽统一由这里保证，框体只负责加边框与内边距。
+func wrapToWidth(s string, w int) []string {
+	pad := lipgloss.NewStyle().Width(w)
+	if s == "" {
+		return []string{pad.Render("")}
+	}
+	out := strings.Split(lipgloss.NewStyle().Width(w).Render(s), "\n")
+	for i := range out {
+		out[i] = pad.Render(strings.TrimRight(out[i], " "))
+	}
+	return out
+}
+
+// questionLayoutOf 计算当前问题的排版：先拼全文并按宽度折行，再按预算开窗。
+//
+// 行数不设「最多显示 N 行」的硬上限，而是让窗口吃满预算（auto-grow）；只有内容
+// 真的超过终端可用高度时才开窗滚动，并保证当前选中项始终在窗口内——否则模型写了
+// 十几个选项时，光标能移到看不见的地方。
+func (m *Model) questionLayoutOf(q *pendingQuestion) questionLayout {
+	qq := q.request.Questions[q.current]
+	w := m.questionBoxWidth()
+
+	title := "问题"
+	if qq.Header != "" {
+		title = qq.Header
+	}
+	if len(q.request.Questions) > 1 {
+		title = fmt.Sprintf("%s (%d/%d)", title, q.current+1, len(q.request.Questions))
+	}
+
+	var lines []string
+	lines = append(lines, wrapToWidth(assistantMark+" DSC · "+title, w)...)
+	lines = append(lines, "")
+	lines = append(lines, wrapToWidth(qq.Question, w)...)
+	if d := strings.TrimSpace(qq.Detail); d != "" {
+		// Detail 是模型给的补充说明（此前 TUI 完全不显示，等于丢掉了模型输出的一半）
+		lines = append(lines, "")
+		lines = append(lines, wrapToWidth(dimSty.Render(d), w)...)
+	}
+	lines = append(lines, "")
+
+	opts := m.questionOptions(q)
+	multi := qq.MultiSelect
+	modelLen := len(opts) - 1
+	optStart := make([]int, 0, len(opts))
+	for i, o := range opts {
+		if i == modelLen {
+			lines = append(lines, dimSty.Render(strings.Repeat("─", 20)))
+		}
+		optStart = append(optStart, len(lines))
+		mark := "  "
+		if multi {
+			if q.multi[i] {
+				mark = "✓ "
+			}
+		} else if i == q.cursor {
+			mark = "❯ "
+		}
+		line := mark + o.Label
+		if o.Description != "" {
+			line += "  " + dimSty.Render(o.Description)
+		}
+		if i == q.cursor {
+			line = accentSty.Render(line)
+		}
+		lines = append(lines, wrapToWidth(line, w)...)
+	}
+
+	hint := "↑/↓ 或 ←/→ 选择 · Enter 确认 · 末项为自定义输入 · Esc 放弃"
+	if multi {
+		hint = "Space 勾选 · Enter 确认 · 末项为自定义输入 · Esc 放弃"
+	}
+	lines = append(lines, "")
+	lines = append(lines, wrapToWidth(dimSty.Render(hint), w)...)
+
+	// 窗口高度：终端尺寸未知（尚未 resize）时不限高，先按内容原样铺开——
+	// 这时的行数无人能判断，硬开窗只会把内容切碎。
+	budget := 1 << 30
+	if m.high > 0 {
+		budget = m.questionBudgetRows() - 2 // 去掉上下边框
+	}
+	window := len(lines)
+	overflow := false
+	if window > budget {
+		overflow = true
+		window = budget - 1 // 留一行给滚动提示
+		if window < 1 {
+			window = 1
+		}
+	}
+	scroll := q.scroll
+	// 选中项必须在窗口内：移到框外等于让用户盲选
+	if len(optStart) > 0 {
+		cur := optStart[q.cursor]
+		if cur < scroll {
+			scroll = cur
+		}
+		if cur >= scroll+window {
+			scroll = cur - window + 1
+		}
+	}
+	if maxScroll := len(lines) - window; scroll > maxScroll {
+		scroll = maxScroll
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	q.scroll = scroll
+
+	return questionLayout{
+		width: w, lines: lines, optStart: optStart,
+		window: window, scroll: scroll, total: len(lines), overflow: overflow,
+	}
+}
+
+// questionRows 覆盖层当前占用的总行数（含边框），供 vpHeight 扣减。
+func (m *Model) questionRows() int {
+	if m.question == nil || len(m.question.request.Questions) == 0 {
+		return 0
+	}
+	if m.question.customMode {
+		return 1 // 仅一行轻量提示
+	}
+	lay := m.questionLayoutOf(m.question)
+	if lay.overflow {
+		return lay.window + 1 + 2 // 可见正文 + 滚动提示 + 上下边框
+	}
+	return lay.window + 2
+}
+
 func (m *Model) questionView() string {
 	q := m.question
 	if q == nil || len(q.request.Questions) == 0 {
@@ -377,61 +603,15 @@ func (m *Model) questionView() string {
 		// 自定义文字输入模式：覆盖层主体消失，仅保留一行轻量提示
 		return dimSty.Render("✎ 自定义回答：在下方输入框输入，Enter 提交 · Esc 返回选项")
 	}
-	qq := q.request.Questions[q.current]
-	var b strings.Builder
-	title := "问题"
-	if qq.Header != "" {
-		title = qq.Header
+	lay := m.questionLayoutOf(q)
+	end := lay.scroll + lay.window
+	if end > len(lay.lines) {
+		end = len(lay.lines)
 	}
-	if len(q.request.Questions) > 1 {
-		title = fmt.Sprintf("%s (%d/%d)", title, q.current+1, len(q.request.Questions))
+	body := strings.Join(lay.lines[lay.scroll:end], "\n")
+	if lay.overflow {
+		// 有折叠时在框内底部标出位置与滚动键（内容本身不改，全部可读到）
+		body += "\n" + dimSty.Render(fmt.Sprintf("↕ %d-%d/%d · PgUp/PgDn 滚动", lay.scroll+1, end, len(lay.lines)))
 	}
-	body := assistantMark + " DSC · " + title + "\n\n" +
-		qq.Question + "\n\n" +
-		m.renderQuestionOptions(q) +
-		"\n" + dimSty.Render("↑/↓ 或 ←/→ 选择 · Enter 确认 · 末项为自定义输入 · Esc 放弃")
-	if qq.MultiSelect {
-		body += "\n" + dimSty.Render("Space 勾选 · Enter 确认 · 末项为自定义输入 · Esc 放弃")
-	}
-	b.WriteString(questionBoxSty.Render(body))
-	return b.String()
-}
-
-// renderQuestionOptions 渲染当前问题选项列表（当前项高亮；多选显示勾选标记）。
-// 末尾始终追加"✎ 其他（手动输入）"兜底项，与前缀模型选项之间留一行分隔线，
-// 视觉上明确区分模型选项与逃生通道。
-func (m *Model) renderQuestionOptions(q *pendingQuestion) string {
-	opts := m.questionOptions(q)
-	multi := q.request.Questions[q.current].MultiSelect
-	var b strings.Builder
-	modelLen := len(opts) - 1 // 末尾 1 项为兜底项
-	for i, o := range opts {
-		if i == modelLen {
-			// 模型选项与兜底项之间留一行虚分隔线
-			b.WriteString(dimSty.Render(strings.Repeat("─", 20)) + "\n")
-		}
-		var line string
-		if multi {
-			mark := "  "
-			if q.multi[i] {
-				mark = "✓ "
-			}
-			line = mark + o.Label
-		} else {
-			marker := "  "
-			if i == q.cursor {
-				marker = "❯ "
-			}
-			line = marker + o.Label
-		}
-		if i == q.cursor {
-			line = accentSty.Render(line)
-		}
-		b.WriteString(line)
-		if o.Description != "" {
-			b.WriteString("  " + dimSty.Render(o.Description))
-		}
-		b.WriteString("\n")
-	}
-	return strings.TrimSuffix(b.String(), "\n")
+	return questionBoxSty.Render(body)
 }

@@ -1,6 +1,11 @@
 package core
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"dsc/userquestions"
+)
 
 // TestHostContextMetersPrefersReported agent 上报的投影值是权威值（决策发生在 agent 进程），
 // 宿主只保管与发布；没有上报值时退回实测 prompt 侧用量。
@@ -67,4 +72,42 @@ func TestHostContextMetersNilSafe(t *testing.T) {
 	m.NoteContextUsage("s", &Usage{PromptTokens: 1}, 1) // 不得 panic
 	m.ResetContextMeters("s")
 	m.SetContextWindow(1)
+}
+
+// TestAskEmitsUserQuestionEvent 提问前广播 userquestion/asked，供通知插件提醒用户；
+// 没有 provider 时不得广播（请求根本没到用户面前）。
+func TestAskEmitsUserQuestionEvent(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	var got []UserQuestionAskedEvent
+	m.events.On(EventUserQuestionAsked, func(ec EventContext) (any, error) {
+		if ev, ok := ec.Data.(UserQuestionAskedEvent); ok {
+			got = append(got, ev)
+		}
+		return nil, nil
+	})
+
+	// 未注册 provider：不广播（此时没有 UI 呈现）
+	req := &userquestions.Request{Questions: []userquestions.Question{{ID: "q", Header: "确认", Question: "继续？"}}}
+	if _, err := m.Ask(context.Background(), req); err == nil {
+		t.Fatal("未注册 provider 应返回错误")
+	}
+	if len(got) != 0 {
+		t.Fatalf("未呈现给用户时不应广播，实际 %d 次", len(got))
+	}
+
+	// 注册 provider：提问前广播一次，载荷带问题数与标题
+	if err := m.RegisterUserQuestionProvider(func(ctx context.Context, r *userquestions.Request) (*userquestions.Answer, error) {
+		if len(got) != 1 {
+			t.Fatalf("调 provider 时事件应已广播，实际 %d 次", len(got))
+		}
+		return &userquestions.Answer{}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Ask(context.Background(), req); err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if len(got) != 1 || got[0].Questions != 1 || got[0].Header != "确认" {
+		t.Fatalf("事件载荷不对：%+v", got)
+	}
 }

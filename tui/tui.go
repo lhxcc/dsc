@@ -548,11 +548,12 @@ func (m *Model) vpHeight() int {
 	if m.thinking || m.streaming {
 		h -= thinkingRow
 	}
-	if q := m.questionView(); q != "" {
+	if rows := m.questionRows(); rows > 0 {
 		// 问题覆盖层占独立行（View 组装位于 viewport 之后）：viewport 必须等量收缩，
 		// 否则覆盖层被推到终端可视区之外（AltScreen 截断）——提问弹出后界面无任何
-		// 可见变化。与 inputCursorAbs 的行数计入保持对称。
-		h -= strings.Count(q, "\n") + 1
+		// 可见变化。用 questionRows() 而不是数渲染结果的行数：覆盖层高度现在受
+		// 终端预算约束（见 questionLayoutOf），两处必须用同一个口径。
+		h -= rows
 	}
 	if m.completion.active && len(m.completion.items) > 0 {
 		// 减去补全菜单的高度：显示行数（窗口封顶 maxCompRows）+ 1 行提示
