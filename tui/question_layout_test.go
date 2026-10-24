@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"charm.land/bubbletea/v2"
-	"dsc/core"
 	"dsc/userquestions"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -147,25 +146,5 @@ func TestQuestionOverlayFitsTerminal(t *testing.T) {
 		if rows > size[1] {
 			t.Fatalf("%dx%d：渲染 %d 行超出终端高度", size[0], size[1], rows)
 		}
-	}
-}
-
-// TestQuestionBellFallback 没有通知能力时退回终端响铃；有插件提供 notify 能力时
-// 不重复响（插件已经响了）。
-func TestQuestionBellFallback(t *testing.T) {
-	// 无 manager（测试/早期）：保守地响铃，总比无声好
-	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
-	if !m.questionBellNeeded() {
-		t.Fatal("无 manager 时应退回响铃")
-	}
-
-	// 有 manager 但没有插件提供 notify：响铃（插件不存在的情况）
-	manager := core.NewManager(&core.ManagerConfig{})
-	m2 := New(&stubAgent{}, manager, context.Background(), "m", "minimal", 131072)
-	if manager.HasPluginProvidingCapability("notify") {
-		t.Fatal("空 manager 不应报告 notify 能力")
-	}
-	if !m2.questionBellNeeded() {
-		t.Fatal("无 notify 插件时应退回响铃")
 	}
 }

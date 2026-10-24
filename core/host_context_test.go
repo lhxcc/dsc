@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"dsc/proto/metadata"
 	"dsc/userquestions"
 )
 
@@ -74,8 +75,8 @@ func TestHostContextMetersNilSafe(t *testing.T) {
 	m.SetContextWindow(1)
 }
 
-// TestAskEmitsUserQuestionEvent 提问前广播 userquestion/asked，供通知插件提醒用户；
-// 没有 provider 时不得广播（请求根本没到用户面前）。
+// TestAskEmitsUserQuestionEvent 只有存在 notify 能力时才广播 userquestion/asked：
+// 「不装通知插件 = 静音」是用户可控的开关，宿主不能照发不误。
 func TestAskEmitsUserQuestionEvent(t *testing.T) {
 	m := NewManager(&ManagerConfig{})
 	var got []UserQuestionAskedEvent
@@ -85,24 +86,27 @@ func TestAskEmitsUserQuestionEvent(t *testing.T) {
 		}
 		return nil, nil
 	})
-
-	// 未注册 provider：不广播（此时没有 UI 呈现）
-	req := &userquestions.Request{Questions: []userquestions.Question{{ID: "q", Header: "确认", Question: "继续？"}}}
-	if _, err := m.Ask(context.Background(), req); err == nil {
-		t.Fatal("未注册 provider 应返回错误")
-	}
-	if len(got) != 0 {
-		t.Fatalf("未呈现给用户时不应广播，实际 %d 次", len(got))
-	}
-
-	// 注册 provider：提问前广播一次，载荷带问题数与标题
 	if err := m.RegisterUserQuestionProvider(func(ctx context.Context, r *userquestions.Request) (*userquestions.Answer, error) {
-		if len(got) != 1 {
-			t.Fatalf("调 provider 时事件应已广播，实际 %d 次", len(got))
-		}
 		return &userquestions.Answer{}, nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	req := &userquestions.Request{Questions: []userquestions.Question{{ID: "q", Header: "确认", Question: "继续？"}}}
+
+	// 没有插件提供 notify：不广播（用户要的就是这个静音开关）
+	if _, err := m.Ask(context.Background(), req); err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("无 notify 能力时不应广播，实际 %d 次", len(got))
+	}
+
+	// 有插件声明 notify 能力：广播一次，载荷带问题数与标题
+	m.coreMetadata["dsc-notify"] = &metadata.PluginInfo{
+		Capabilities: map[string]string{"notify": "true"},
+	}
+	if !m.HasPluginProvidingCapability("notify") {
+		t.Fatal("夹具未生效：应报告 notify 能力")
 	}
 	if _, err := m.Ask(context.Background(), req); err != nil {
 		t.Fatalf("Ask: %v", err)

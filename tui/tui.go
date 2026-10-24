@@ -754,12 +754,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 提问后选项被切掉一部分。对齐 WindowSizeMsg 的处理路径。
 		m.viewport.SetHeight(m.vpHeight())
 		m.render()
-		// 宿主已广播 userquestion/asked 给订阅插件（如 dsc-notify 播放提示音）；
-		// 但没有插件提供 notify 能力时那一声就没人响——用户离开屏幕不会知道
-		// 模型在等回答。此时退回终端响铃（BEL）：不依赖任何插件，代价最小。
-		if msg.request != nil && m.questionBellNeeded() {
-			return m, ringTerminalBell()
-		}
 		return m, nil
 
 	case jobDoneMsg:
@@ -3380,25 +3374,6 @@ func (m *Model) runInfoLine() string {
 		info += fmt.Sprintf(" · 缓存命中 %.2f%%", float64(hit)*100/float64(hit+miss))
 	}
 	return "  " + dimSty.Render(info)
-}
-
-// questionBellNeeded 报告弹出提问时是否需要退回终端响铃：只有当**没有任何插件**
-// 提供 notify 能力时才需要——否则 dsc-notify 已经响了，再响一次就是双响。
-func (m *Model) questionBellNeeded() bool {
-	if m.manager == nil {
-		return true
-	}
-	return !m.manager.HasPluginProvidingCapability("notify")
-}
-
-// ringTerminalBell 向终端写一个 BEL。写 stderr 而不是 stdout：stdout 被 bubbletea
-// 的渲染器接管，直接写会破坏帧；BEL 是零宽控制符，从任何 fd 到达终端都会发声，
-// 且不留任何字符。
-func ringTerminalBell() tea.Cmd {
-	return func() tea.Msg {
-		fmt.Fprint(os.Stderr, "\a")
-		return nil
-	}
 }
 
 // noteContextUsage 把一帧 usage 交宿主计量实例保管，并回读"已用容量"。
