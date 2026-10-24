@@ -165,3 +165,20 @@ func TestLsMissingPathStillReports(t *testing.T) {
 		t.Fatalf("无法访问的参数不应被印成目录标题: %q", out)
 	}
 }
+
+// TestLsEmptyDirPrintsNothing 空目录（或只有隐藏项且未加 -a）时 ls 必须零输出。
+//
+// 此前非 -l/-1 分支无条件 Fprintln，空目录会吐一个空行——模型会把空行读成"有输出"，
+// 脚本里 `ls | wc -l` 也会多数一行。GNU ls 对空目录不输出任何字节。
+func TestLsEmptyDirPrintsNothing(t *testing.T) {
+	dir := t.TempDir()
+	for _, script := range []string{`ls`, `ls -1`, `mkdir .hidden && ls`} {
+		if out, err := runShell(t, dir, script); err != nil || out != "" {
+			t.Fatalf("%s 应零输出，实际 %q (err=%v)", script, out, err)
+		}
+	}
+	// 有内容时仍按 GNU 单行空格分隔输出
+	if out, _ := runShell(t, dir, `mkdir a b && ls`); out != "a  b\n" {
+		t.Fatalf("非空目录应输出 %q，实际 %q", "a  b\n", out)
+	}
+}

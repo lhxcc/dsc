@@ -484,7 +484,11 @@ func lsDir(ctx context.Context, hc interp.HandlerContext, p string, showAll, lon
 		for _, it := range items {
 			names = append(names, lsName(it.name, it.fi, classify))
 		}
-		fmt.Fprintln(hc.Stdout, strings.Join(names, "  "))
+		// 空目录不输出任何东西（GNU ls 同此）：此前无条件 Fprintln，会吐出一个空行，
+		// 模型把空行当成"有输出"读，脚本里 `ls | wc -l` 也会多数一行。
+		if len(names) > 0 {
+			fmt.Fprintln(hc.Stdout, strings.Join(names, "  "))
+		}
 	}
 	return nil
 }
