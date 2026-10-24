@@ -356,6 +356,9 @@ type Model struct {
 
 	// 当前会话 id（初始 default；/session 切换或新建时更新，供 /export 使用）
 	currentSessionID string
+	// acpStatus 压缩插件最近一次发布的运行状态（事件 acp/status，见 /acp 命令）。
+	// 载荷是插件自定义的扁平 kv：TUI 只负责展示，不理解其语义。
+	acpStatus map[string]any
 
 	// 用户评审通道：program 供 askProvider 把问题送进事件循环；question 为待回答的问题
 	program  *tea.Program
@@ -411,7 +414,7 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(accent)
 
-	return &Model{
+	m := &Model{
 		agent:            agent,
 		manager:          manager,
 		ctx:              ctx,
@@ -426,6 +429,17 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
+	// 订阅压缩插件发布的运行状态：插件不认识 TUI，只发事件；展示由前端决定。
+	// 回调可能来自插件 goroutine，改状态一律经事件循环（program.Send）。
+	if manager != nil {
+		manager.OnEvent(core.EventName(acpStatusEvent), func(ec core.EventContext) (any, error) {
+			if payload, ok := ec.Data.(map[string]any); ok && m.program != nil {
+				m.program.Send(acpStatusMsg{payload: payload})
+			}
+			return nil, nil
+		})
+	}
+	return m
 }
 
 // defaultSessionID 决定启动时的当前会话标识：优先取宿主的默认（项目）会话 id
@@ -754,6 +768,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 提问后选项被切掉一部分。对齐 WindowSizeMsg 的处理路径。
 		m.viewport.SetHeight(m.vpHeight())
 		m.render()
+		return m, nil
+
+	case acpStatusMsg:
+		m.acpStatus = msg.payload
 		return m, nil
 
 	case jobDoneMsg:
@@ -2566,6 +2584,7 @@ func (m *Model) buildHelpText() string {
 		"  /session new  新建会话并切换",
 		"  /session delete <id>  删除指定会话",
 		"  /export    导出当前会话为 Markdown 文件",
+		"  /acp       查看上下文压缩状态（占用/压缩/卸载/回取）",
 		"  /exit        退出聊天",
 	)
 	return strings.Join(lines, "\n")
@@ -2637,6 +2656,21 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			m.virtualGotoBottom()
 			return true, nil
 		}
+	case "/acp":
+		// 压缩/卸载/回取的运行面板：这些过程对用户不可见，只能靠一组累计数字判断
+		// "压缩到底有没有在省、回取有没有在白白导出"。
+		if m.acpStatus == nil {
+			m.appendMessage(dimSty.Render("（暂无压缩状态：dsc-billion-context 未启用或尚未跑过一个回合）"))
+		} else {
+			m.appendMessage(renderACPStatus(m.acpStatus))
+		}
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, nil
+
 	case "/sessions":
 		if m.manager != nil {
 			summaries, err := m.manager.ListSessions()
@@ -3660,4 +3694,79 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	}
 	_, err := p.Run()
 	return err
+}
+
+// acpStatusEvent 压缩插件发布运行状态的事件名（插件侧常量同值）。
+const acpStatusEvent = "acp/status"
+
+// acpStatusMsg 把插件状态送进 bubbletea 事件循环（插件回调在别的 goroutine）。
+type acpStatusMsg struct{ payload map[string]any }
+
+// renderACPStatus 把插件发布的扁平 kv 渲染成一段可读文本。
+//
+// 展示口径：先给"占了多少"，再给"省了多少"，最后给"取回情况"——这三层回答的是
+// 三个不同问题（要不要压、压了有没有用、取回是不是顺畅），混在一起看就只剩噪声。
+func renderACPStatus(p map[string]any) string {
+	num := func(k string) int {
+		switch v := p[k].(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		}
+		return 0
+	}
+	short := func(n int) string {
+		switch {
+		case n >= 1_000_000:
+			return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
+		case n >= 1_000:
+			return fmt.Sprintf("%dK", n/1_000)
+		}
+		return fmt.Sprintf("%d", n)
+	}
+
+	tokens, limit := num("tokens"), num("limit")
+	var b strings.Builder
+	b.WriteString(assistantNameSty.Render(assistantMark + " DSC · 上下文压缩\n"))
+	if limit > 0 {
+		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n", short(tokens), short(limit), pctOf(tokens, limit))
+	} else {
+		fmt.Fprintf(&b, "  占用: %s\n", short(tokens))
+	}
+	tiers := make([]int, 0, 3)
+	if raw, ok := p["tiers"].([]any); ok {
+		for _, v := range raw {
+			if f, ok := v.(float64); ok {
+				tiers = append(tiers, int(f))
+			}
+		}
+	}
+	b.WriteString(fmt.Sprintf("  块: %d active / %d total", num("blocks"), num("blocksTotal")))
+	if len(tiers) == 3 {
+		b.WriteString(fmt.Sprintf("（T1=%d T2=%d T3=%d）", tiers[0], tiers[1], tiers[2]))
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "  已压: %s（%d 次压缩）+ %s（absorb 蒸馏）\n",
+		short(num("compressed")), num("compressions"), short(num("absorbed")))
+	if num("crush") > 0 {
+		fmt.Fprintf(&b, "  确定性压缩: %d 次，省 %s\n", num("crush"), short(num("crushSaved")))
+	}
+	if num("stored") > 0 {
+		fmt.Fprintf(&b, "  已卸载可回取: %d 条（%s）\n", num("stored"), short(num("storedTokens")))
+		fmt.Fprintf(&b, "  回取: %d 次（其中导出 %d 次），落空 %d 次\n",
+			num("retrieved"), num("exported"), num("misses"))
+	}
+	if c := num("compressibleCount"); c > 0 {
+		fmt.Fprintf(&b, "  可压范围: %d 段（详情问模型或用 acp_status）\n", c)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// pctOf 计算百分比（limit<=0 时返回 0）。
+func pctOf(v, limit int) float64 {
+	if limit <= 0 {
+		return 0
+	}
+	return float64(v) * 100 / float64(limit)
 }

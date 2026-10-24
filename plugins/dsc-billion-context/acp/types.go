@@ -116,6 +116,19 @@ type CompressionStats struct {
 	TokensCompressed int `json:"tokensCompressed"`
 	CompressionCount int `json:"compressionCount"`
 	AbsorbedTokens   int `json:"absorbedTokens,omitempty"`
+
+	// ---- 可观测性：省了多少、取回多少次（用户与模型都看不到过程，只能看这组数）----
+	// CrushCount / CrushTokensSaved 确定性压缩（absorb 第一段）的命中次数与省下的 token。
+	CrushCount       int `json:"crushCount,omitempty"`
+	CrushTokensSaved int `json:"crushTokensSaved,omitempty"`
+	// CCRStored / CCRStoredTokens 已卸载条数与原文规模（一次性写进附件库的量）。
+	CCRStored       int `json:"ccrStored,omitempty"`
+	CCRStoredTokens int `json:"ccrStoredTokens,omitempty"`
+	// CCRRetrieved / CCRExported 回取次数与其中导出成文件的次数（导出率过高说明内联上限偏低）。
+	CCRRetrieved int `json:"ccrRetrieved,omitempty"`
+	CCRExported  int `json:"ccrExported,omitempty"`
+	// RetrievalMisses 取不到的 ref 次数（模型幻觉或条目被淘汰——>0 值得排查）。
+	RetrievalMisses int `json:"retrievalMisses,omitempty"`
 }
 
 // AbsorbRecord 一次即时工具结果吸收（对齐 acp-kernel AbsorbRecord）：

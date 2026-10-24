@@ -604,12 +604,12 @@ func isCrushed(text string) bool {
 //   - Messages：替换过文本的消息列表
 //   - Crushed：压到阈值以下（无需再 absorb）
 //   - Distilled：压过但仍偏大（交由 absorb prompt 继续）
-func ApplyCrush(messages []CoreMessage, state *CompressionState, config Config, tokenCount int) ([]CoreMessage, int, int) {
+func ApplyCrush(messages []CoreMessage, state *CompressionState, config Config, tokenCount int) ([]CoreMessage, CrushStats) {
+	stats := CrushStats{}
 	if !config.Crush.Enabled || !config.Absorb.Enabled || len(messages) == 0 {
-		return messages, 0, 0
+		return messages, stats
 	}
 	out := make([]CoreMessage, len(messages))
-	crushed, distilled := 0, 0
 	for i, msg := range messages {
 		out[i] = msg
 		if isCrushed(msg.Text) {
@@ -626,12 +626,20 @@ func ApplyCrush(messages []CoreMessage, state *CompressionState, config Config, 
 					crushMarkerPrefix, eval.Strategy, eval.Before, eval.After, text)
 			}
 			out[i].Text = text
+			stats.TokensSaved += eval.Before - eval.After
 			if eval.Kind == CrushCrushed {
-				crushed++
+				stats.Crushed++
 			} else {
-				distilled++
+				stats.Distilled++
 			}
 		}
 	}
-	return out, crushed, distilled
+	return out, stats
+}
+
+// CrushStats 一次 crush 节点的结果（供累计到 state.Stats 做可观测性）。
+type CrushStats struct {
+	Crushed     int
+	Distilled   int
+	TokensSaved int
 }

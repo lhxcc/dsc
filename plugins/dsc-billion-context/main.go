@@ -39,6 +39,13 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
+	// interconnect 互通句柄（宿主挂载聚合服务后回调注入）；用于向宿主事件总线
+	// 发布 acp/status 供 TUI 展示。未连接时为 nil，发布静默跳过。
+	interconnect *dsc.Interconnect
+
+	// lastTokenCount 最近一次 pre-step 观测到的上下文占用（宿主估算或本地兜底）。
+	lastTokenCount int
+
 	// state 当前会话的压缩状态（含 CCR 条目索引）；pre-step 每轮刷新，
 	// 供 acp_retrieve 查条目（工具调用不带会话上下文，只能读最近一次快照）。
 	state *bcacp.CompressionState
@@ -233,6 +240,14 @@ func main() {
 		})
 	}
 
+	// 互通：拿到宿主的事件发布句柄（acp/status 走它）
+	sdkInst.SetInterconnect(func(ctx context.Context, ic *dsc.Interconnect) error {
+		bc.mu.Lock()
+		bc.interconnect = ic
+		bc.mu.Unlock()
+		return nil
+	})
+
 	// Hook: 拦截 agent/pre-step 改写消息列表 + ContextFn 贡献 ACP system prompt
 	sdkInst.Hook(dsc.Hook{
 		OnEvent: bc.onEvent,
@@ -412,10 +427,15 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 		result.Messages = bc.persistCCROffloads(result.Messages, result.CCROffloads)
 	}
 
-	// 缓存 state 供 acp_retrieve 查条目
+	// 缓存 state 与最近一次 token 数：status 报告与 acp/status 事件都要用真实占用，
+	// 之前 handleStatus 用「已压缩 token + 1000」当占用，报出来的百分比毫无意义。
 	bc.mu.Lock()
 	bc.state = result.State
+	bc.lastTokenCount = tokenCount
 	bc.mu.Unlock()
+
+	// 可观测性：把压缩/卸载/回取的累计数据发布到宿主事件总线，TUI 的 /acp 面板读它。
+	bc.publishACPStatus(result.State)
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -570,8 +590,10 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 		return "", fmt.Errorf("load state: %w", err)
 	}
 
-	// 估算当前 token 数（无消息列表时用 state 估算）
-	tokenCount := state.Stats.TokensCompressed + 1000 // 粗略估算
+	// 用最近一次 pre-step 的真实占用；没有时退回 0（而不是拿"已压缩量"冒充占用）
+	bc.mu.Lock()
+	tokenCount := bc.lastTokenCount
+	bc.mu.Unlock()
 	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
 	text := bcacp.FormatStatus(report)
 
@@ -761,6 +783,7 @@ func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessa
 	}
 	entry, ok := bcacp.FindCCREntry(st.CCR, in.Ref)
 	if !ok {
+		bc.noteRetrieval(false, false)
 		return bcacp.CCRRetrieveNotFound(in.Ref), nil
 	}
 	if entry.Kind == bcacp.CCRKindImage {
@@ -781,6 +804,7 @@ func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessa
 	}
 	plan := bcacp.PlanRetrieval(entry, bc.config, text)
 	if plan.Inline {
+		bc.noteRetrieval(true, false)
 		return plan.Text, nil
 	}
 	// 超限：导出到工作区，返回指针（模型用自己的文件工具分页读）
@@ -792,5 +816,67 @@ func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessa
 	if err := os.WriteFile(full, []byte(text), 0o644); err != nil {
 		return "", fmt.Errorf("acp_retrieve: 导出失败: %w", err)
 	}
+	bc.noteRetrieval(true, true)
 	return bcacp.CCRPointerText(entry, "acp-retrieved/"+plan.ExportPath, bc.config.CCR.InlineLimitTokens), nil
+}
+
+// noteRetrieval 累计回取指标（命中/导出/落空）。
+//
+// 为什么值得记：`retrievalMisses` 涨说明模型在编 ref 或条目被淘汰后仍被引用；
+// `ccrExported` 占比高说明内联上限偏低、模型被迫多走一次文件读取。两者都是
+// 调参信号，不看数据只能靠猜。
+func (bc *BillionContext) noteRetrieval(hit, exported bool) {
+	bc.mu.Lock()
+	st := bc.state
+	bc.mu.Unlock()
+	if st == nil {
+		return
+	}
+	if !hit {
+		st.Stats.RetrievalMisses++
+		return
+	}
+	st.Stats.CCRRetrieved++
+	if exported {
+		st.Stats.CCRExported++
+	}
+}
+
+// EventACPStatus 压缩状态事件名：插件 → 宿主事件总线 → TUI 的 /acp 面板。
+// 与 agent/status 等一样是自定义事件，宿主按名字分发，不理解载荷内容。
+const EventACPStatus = "acp/status"
+
+// publishACPStatus 把压缩相关的累计指标发布到宿主事件总线（事件名 acp/status）。
+//
+// 载荷刻意做成扁平的 kv（全是数字 + 少量字符串），这样 TUI 不必了解 ACP 的内部
+// 结构就能展示；插件与前端之间只约定这几个字段。
+func (bc *BillionContext) publishACPStatus(state *bcacp.CompressionState) {
+	if bc.interconnect == nil || state == nil {
+		return
+	}
+	report := bcacp.BuildStatus(nil, state, bc.config, bc.lastTokenCount)
+	payload, err := json.Marshal(map[string]any{
+		"usage":             report.ContextUsage,
+		"tokens":            report.TokenCount,
+		"limit":             report.ModelContextLimit,
+		"blocks":            report.ActiveBlocks,
+		"blocksTotal":       report.TotalBlocks,
+		"tiers":             []int{report.Breakdown["tier1"], report.Breakdown["tier2"], report.Breakdown["tier3"]},
+		"compressed":        report.Breakdown["tokensCompressed"],
+		"compressions":      report.Breakdown["compressionCount"],
+		"absorbed":          report.Breakdown["absorbedTokens"],
+		"crush":             report.Breakdown["crushCount"],
+		"crushSaved":        report.Breakdown["crushTokensSaved"],
+		"stored":            report.Breakdown["ccrStored"],
+		"storedTokens":      report.Breakdown["ccrStoredTokens"],
+		"retrieved":         report.Breakdown["ccrRetrieved"],
+		"exported":          report.Breakdown["ccrExported"],
+		"misses":            report.Breakdown["retrievalMisses"],
+		"compressibleCount": len(report.CompressibleRanges),
+	})
+	if err != nil {
+		return
+	}
+	// 发布失败不影响主流程：可观测性坏了不能挡住压缩
+	_ = bc.interconnect.Notify(EventACPStatus, string(payload))
 }

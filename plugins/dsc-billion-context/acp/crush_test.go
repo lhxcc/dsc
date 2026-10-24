@@ -34,8 +34,8 @@ func TestCrushDisabledByDefault(t *testing.T) {
 	}
 	body := strings.Repeat(`{"a":1,"b":2}`+"\n", 200)
 	msgs := []CoreMessage{toolMsg("t1", "shell", body)}
-	out, crushed, distilled := ApplyCrush(msgs, CreateInitialState(), cfg, 9_000)
-	if crushed+distilled != 0 || out[0].Text != body {
+	out, stats := ApplyCrush(msgs, CreateInitialState(), cfg, 9_000)
+	if stats.Crushed+stats.Distilled != 0 || out[0].Text != body {
 		t.Fatal("关闭时不得改动任何字节")
 	}
 }
@@ -103,9 +103,9 @@ func TestCrushLogKeepsEveryErrorLine(t *testing.T) {
 	}
 	body := strings.Join(lines, "\n")
 	cfg := crushConfig()
-	out, crushed, distilled := ApplyCrush([]CoreMessage{toolMsg("t1", "shell", body)},
+	out, stats := ApplyCrush([]CoreMessage{toolMsg("t1", "shell", body)},
 		CreateInitialState(), cfg, 9_000)
-	if crushed+distilled == 0 {
+	if stats.Crushed+stats.Distilled == 0 {
 		t.Fatal("长日志应被压缩")
 	}
 	// 每条不同的 ERROR 行都必须逐字可见
@@ -170,12 +170,12 @@ func TestCrushIdempotent(t *testing.T) {
 	}(), ",\n") + "\n]"
 	state := CreateInitialState()
 	msgs := []CoreMessage{toolMsg("t1", "shell", body)}
-	out1, crushed, _ := ApplyCrush(msgs, state, cfg, 9_000)
-	if crushed != 1 {
-		t.Fatalf("首次应压缩 1 条, got %d", crushed)
+	out1, stats := ApplyCrush(msgs, state, cfg, 9_000)
+	if stats.Crushed != 1 {
+		t.Fatalf("首次应压缩 1 条, got %d", stats.Crushed)
 	}
-	out2, crushed2, distilled2 := ApplyCrush(out1, state, cfg, 9_000)
-	if crushed2+distilled2 != 0 || out2[0].Text != out1[0].Text {
+	out2, stats2 := ApplyCrush(out1, state, cfg, 9_000)
+	if stats2.Crushed+stats2.Distilled != 0 || out2[0].Text != out1[0].Text {
 		t.Fatal("已压缩过的文本不应被再次压缩")
 	}
 }
@@ -197,4 +197,48 @@ func minOf(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestStatusReportsSavings 状态报告要说清「省了多少」：分层块数 + crush/CCR 明细。
+// 这些过程用户看不见，只有这组累计数字能回答"压缩到底有没有用"。
+func TestStatusReportsSavings(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	state := CreateInitialState()
+	state.Blocks = []CompressionBlock{
+		{BlockID: "b0", Tier: Tier1, Active: true, CompressedTokens: 40_000},
+		{BlockID: "b1", Tier: Tier1, Active: true, CompressedTokens: 30_000},
+		{BlockID: "b2", Tier: Tier2, Active: true, CompressedTokens: 70_000},
+		{BlockID: "b3", Tier: Tier1, Active: false, CompressedTokens: 10_000},
+	}
+	state.Stats.TokensCompressed = 140_000
+	state.Stats.CompressionCount = 3
+	state.Stats.CrushCount = 2
+	state.Stats.CrushTokensSaved = 8_000
+	state.Stats.CCRStored = 5
+	state.Stats.CCRStoredTokens = 60_000
+	state.Stats.CCRRetrieved = 4
+	state.Stats.CCRExported = 1
+
+	r := BuildStatus(nil, state, cfg, 300_000)
+	if r.ActiveBlocks != 3 || r.TotalBlocks != 4 {
+		t.Fatalf("块统计不对: active=%d total=%d", r.ActiveBlocks, r.TotalBlocks)
+	}
+	if r.Breakdown["tier1"] != 2 || r.Breakdown["tier2"] != 1 || r.Breakdown["tier3"] != 0 {
+		t.Fatalf("分层统计应只数 active: %v", r.Breakdown)
+	}
+	if r.Breakdown["crushTokensSaved"] != 8_000 || r.Breakdown["ccrStored"] != 5 ||
+		r.Breakdown["ccrRetrieved"] != 4 || r.Breakdown["ccrExported"] != 1 {
+		t.Fatalf("节省明细丢失: %v", r.Breakdown)
+	}
+	if r.TokenCount != 300_000 {
+		t.Fatalf("占用应取传入的真实值: %d", r.TokenCount)
+	}
+
+	text := FormatStatus(r)
+	for _, want := range []string{"T1=2 T2=1 T3=0", "Crush: 2 deterministic compactions, 8000 tokens saved",
+		"Stored: 5 payloads (60000 tokens)", "Retrievals: 4 (1 exported to files)"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("状态文本应包含 %q，实际：\n%s", want, text)
+		}
+	}
 }

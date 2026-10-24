@@ -84,19 +84,47 @@ func BuildStatus(messages []CoreMessage, state *CompressionState, config Config,
 			activeCount++
 		}
 	}
+	t1, t2, t3 := 0, 0, 0
+	for _, b := range state.Blocks {
+		if !b.Active {
+			continue
+		}
+		switch b.Tier {
+		case Tier1:
+			t1++
+		case Tier2:
+			t2++
+		case Tier3:
+			t3++
+		}
+	}
+	st := state.Stats
 	return StatusReport{
 		ContextUsage:       usage,
 		TokenCount:         tokenCount,
 		ModelContextLimit:  config.ModelContextLimit,
 		ActiveBlocks:       activeCount,
 		TotalBlocks:        len(state.Blocks),
-		TokensCompressed:   state.Stats.TokensCompressed,
+		TokensCompressed:   st.TokensCompressed,
 		CompressibleRanges: ComputeCompressibleRanges(messages, state, config),
 		Breakdown: map[string]int{
-			"tokensCompressed": state.Stats.TokensCompressed,
-			"compressionCount": state.Stats.CompressionCount,
-			"activeBlocks":     activeCount,
-			"totalBlocks":      len(state.Blocks),
+			"tokensCompressed":  st.TokensCompressed,
+			"compressionCount":  st.CompressionCount,
+			"activeBlocks":      activeCount,
+			"totalBlocks":       len(state.Blocks),
+			"tier1":             t1,
+			"tier2":             t2,
+			"tier3":             t3,
+			"absorbedTokens":    st.AbsorbedTokens,
+			"crushCount":        st.CrushCount,
+			"crushTokensSaved":  st.CrushTokensSaved,
+			"ccrStored":         st.CCRStored,
+			"ccrStoredTokens":   st.CCRStoredTokens,
+			"ccrRetrieved":      st.CCRRetrieved,
+			"ccrExported":       st.CCRExported,
+			"retrievalMisses":   st.RetrievalMisses,
+			"tokensInContext":   tokenCount,
+			"modelContextLimit": config.ModelContextLimit,
 		},
 	}
 }
@@ -110,6 +138,24 @@ func FormatStatus(report StatusReport) string {
 	sb.WriteString(fmt.Sprintf("  Blocks: %d active / %d total\n", report.ActiveBlocks, report.TotalBlocks))
 	sb.WriteString(fmt.Sprintf("  Compressed: %d tokens reclaimed across %d compressions\n",
 		report.TokensCompressed, report.Breakdown["compressionCount"]))
+	// 节省明细：压缩/确定性压缩/无损卸载三条通路各自省了多少
+	bd := report.Breakdown
+	if bd["crushCount"] > 0 || bd["ccrStored"] > 0 || bd["absorbedTokens"] > 0 {
+		sb.WriteString(fmt.Sprintf("  Tiers: T1=%d T2=%d T3=%d active\n", bd["tier1"], bd["tier2"], bd["tier3"]))
+		if bd["crushTokensSaved"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Crush: %d deterministic compactions, %d tokens saved\n",
+				bd["crushCount"], bd["crushTokensSaved"]))
+		}
+		if bd["ccrStored"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Stored: %d payloads (%d tokens) retrievable via acp_retrieve\n",
+				bd["ccrStored"], bd["ccrStoredTokens"]))
+			sb.WriteString(fmt.Sprintf("  Retrievals: %d (%d exported to files)\n",
+				bd["ccrRetrieved"], bd["ccrExported"]))
+		}
+		if bd["absorbedTokens"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Absorbed: %d tokens distilled\n", bd["absorbedTokens"]))
+		}
+	}
 	if len(report.CompressibleRanges) > 0 {
 		sb.WriteString(fmt.Sprintf("\nCompressible ranges (%d):\n", len(report.CompressibleRanges)))
 		for i, r := range report.CompressibleRanges {
@@ -184,6 +230,10 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 		if cr, off := ApplyCCR(rendered, state, config); len(off) > 0 || config.CCR.Enabled {
 			rendered = cr
 			ccrOffloads = off
+			for _, o := range off {
+				state.Stats.CCRStored++
+				state.Stats.CCRStoredTokens += o.Entry.Tokens
+			}
 		}
 	}
 
@@ -194,8 +244,10 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 		rendered = HideAbsorbedMessages(rendered, state)
 		// crush：absorb 的第一段——先用纯确定性策略把大结果压下去，压到阈值下
 		// 就不必再让模型蒸馏（省一次往返，也就省一次可能塞不进窗口的调用）。
-		if cr, crushed, distilled := ApplyCrush(rendered, state, config, tokenCount); crushed+distilled > 0 {
+		if cr, cs := ApplyCrush(rendered, state, config, tokenCount); cs.Crushed+cs.Distilled > 0 {
 			rendered = cr
+			state.Stats.CrushCount += cs.Crushed + cs.Distilled
+			state.Stats.CrushTokensSaved += cs.TokensSaved
 		}
 		if ap := AppendAbsorbPrompts(rendered, state, config, tokenCount); ap.PromptedCount > 0 {
 			rendered = ap.Messages
