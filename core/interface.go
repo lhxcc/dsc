@@ -137,6 +137,9 @@ type Usage struct {
 	TotalTokens              int32 `json:"total_tokens"`
 	CacheReadInputTokens     int32 `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int32 `json:"cache_creation_input_tokens"`
+	// ContextTokens 预计下一次请求的上下文占用（core.TokenMeter 投影：实测锚点 + 增量）。
+	// 0 = 未提供。决策（裁剪/压缩）与宿主展示读的是同一个数，见 core.PromptSideTokens 的契约说明。
+	ContextTokens int32 `json:"context_tokens"`
 }
 
 // Handshake 是宿主和插件间的握手配置

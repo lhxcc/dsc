@@ -313,3 +313,27 @@ func TestFormatTokensPerSecond(t *testing.T) {
 		}
 	}
 }
+
+// TestNoteContextUsageUsesHostMeter TUI 的「已用」必须来自宿主计量实例（与决策同源），
+// agent 上报了投影值（Usage.ContextTokens）就用它，没有才退回实测 prompt。
+func TestNoteContextUsageUsesHostMeter(t *testing.T) {
+	manager := core.NewManager(&core.ManagerConfig{})
+	m := New(&stubAgent{}, manager, context.Background(), "Agentic-Turbo-Coder", "minimal", 1000000)
+
+	// agent 上报投影值 512000（实测 prompt 498000）：已用取投影
+	m.noteContextUsage(&core.Usage{PromptTokens: 498000, ContextTokens: 512000})
+	if m.usedTokens != 512000 {
+		t.Fatalf("已用应取宿主计量实例的投影值 512000，got %d", m.usedTokens)
+	}
+	if got := manager.ContextTokens(m.currentSessionID); got != 512000 {
+		t.Fatalf("宿主实例应保管 512000，got %d", got)
+	}
+
+	// 旧 agent 不带上报值：退回实测 prompt
+	m2 := New(&stubAgent{}, manager, context.Background(), "Agentic-Turbo-Coder", "minimal", 1000000)
+	m2.currentSessionID = "other-session"
+	m2.noteContextUsage(&core.Usage{PromptTokens: 1234})
+	if m2.usedTokens != 1234 {
+		t.Fatalf("无上报值时应退回实测 prompt 1234，got %d", m2.usedTokens)
+	}
+}

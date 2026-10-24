@@ -120,6 +120,10 @@ message Usage {
   int32 total_tokens = 3;      // 合计
   int32 cache_read_input_tokens = 4;     // 命中 prompt 缓存的输入 token 数（Anthropic cache_read / OpenAI cached_tokens）
   int32 cache_creation_input_tokens = 5; // 写入 prompt 缓存的输入 token 数（Anthropic cache_creation）
+  // 预计下一次请求的上下文占用（core.TokenMeter 的投影值：服务端实测锚点 + 自锚点以来的
+  // 启发式增量）。0 表示未提供（旧 agent 或首次请求）。宿主展示上下文占用以它为准，
+  // 与 agent 的裁剪/压缩判定同源——不再各自用另一种口径另算一遍。
+  int32 context_tokens = 6;
 }
 
 // --- LLM Service 消息定義 ---

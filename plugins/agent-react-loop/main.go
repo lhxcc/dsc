@@ -91,8 +91,8 @@ type ReactLoopAgent struct {
 	store *session.Store
 
 	// 上下文容量管理（由宿主透過 DSC_CONTEXT_WINDOW 傳入）
-	contextWindow    int         // 總容量（token 數），0 表示未設置（不做自動壓縮）
-	lastPromptTokens int32       // 最近一次 LLM 請求的 prompt token 數 ≈ 當前已用容量
+	contextWindow    int        // 總容量（token 數），0 表示未設置（不做自動壓縮）
+	lastPromptTokens int32      // 最近一次 LLM 請求的 prompt token 數 ≈ 當前已用容量
 	lastUsage        *dsc.Usage // 最近一次 LLM 請求的完整 usage 信息
 	// usageMu 保護 lastPromptTokens/lastUsage：串流 loop 喺唔持 sessMu 時寫入，
 	// 而 DebugSnapshot（另一 goroutine）要讀 lastPromptTokens，故用專鎖避免跨 goroutine
@@ -116,6 +116,11 @@ type ReactLoopAgent struct {
 	// 会话级设置以 log-only history/limit 事件持久化（每次 Run 折叠还原），
 	// 无事件时退回 DSC_HISTORY_INJECTION 环境变量默认。用于控制本地模型预填充长度。
 	historyInjection int
+
+	// lastContextTokens 本步请求的上下文占用投影（core.TokenMeter 的 Project 结果）。
+	// 随 usage 帧（Usage.ContextTokens）上报给宿主：宿主侧计量实例据此对外发布，
+	// TUI 显示的就是这个数——与裁剪/压缩决策同源，不再另算一套。
+	lastContextTokens int
 
 	// lastTrimDropped 上一轮超窗裁剪省略的消息条数（0 = 未裁剪）。仅用于提示去重：
 	// 真超窗时每轮都会裁掉同样一段，逐轮打印提示只会刷屏。
@@ -484,6 +489,10 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs)
 		projectedTokens := meter.Project(currentEstimate)
+		// 决策用的这个数同时是展示口径：随帧上报宿主（见 usageSnapshot）
+		a.usageMu.Lock()
+		a.lastContextTokens = projectedTokens
+		a.usageMu.Unlock()
 		msgs, droppedMsgs := fitMessagesToWindow(msgs, a.contextWindow, projectedTokens)
 		if droppedMsgs > 0 {
 			if len(msgs) > 0 && msgs[0].Role == "system" {
@@ -907,21 +916,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			sess.Append(session.TurnEnd, &session.TurnData{Turn: turnNo, Reason: "completed"}, nil)
 			turnOpen = false
 			if emit != nil {
-				// success 幀攜帶當前已用容量，供 TUI 標題欄顯示「已用/總容量」
-				usage := &dsc.Usage{
-					PromptTokens: a.lastPromptTokens,
-				}
-				if a.lastUsage != nil {
-					usage.CompletionTokens = a.lastUsage.CompletionTokens
-					usage.TotalTokens = a.lastUsage.TotalTokens
-					usage.CacheReadInputTokens = a.lastUsage.CacheReadInputTokens
-					usage.CacheCreationInputTokens = a.lastUsage.CacheCreationInputTokens
-				} else {
-					usage.TotalTokens = a.lastPromptTokens
-				}
+				// success 幀攜帶當前已用容量，供 TUI 標題欄顯示「已用/總容量」。
+				// 统一走 usageSnapshot：上下文投影（ContextTokens）只在那一处装配，
+				// 否则三份字面量各写一遍，漏一个字段就是「标题口径与决策不一致」。
 				emit(&dsc.RunStreamResponse{
 					Status: "success",
-					Usage:  usage,
+					Usage:  a.usageSnapshot(),
 				})
 			}
 			return &dsc.AgentResult{
@@ -1097,16 +1097,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			sess.Append(session.TurnEnd, &session.TurnData{Turn: turnNo, Reason: "goal-concluded"}, nil)
 			turnOpen = false
 			if emit != nil {
-				usage := &dsc.Usage{PromptTokens: a.lastPromptTokens}
-				if a.lastUsage != nil {
-					usage.CompletionTokens = a.lastUsage.CompletionTokens
-					usage.TotalTokens = a.lastUsage.TotalTokens
-					usage.CacheReadInputTokens = a.lastUsage.CacheReadInputTokens
-					usage.CacheCreationInputTokens = a.lastUsage.CacheCreationInputTokens
-				} else {
-					usage.TotalTokens = a.lastPromptTokens
-				}
-				emit(&dsc.RunStreamResponse{Status: "success", Usage: usage})
+				emit(&dsc.RunStreamResponse{Status: "success", Usage: a.usageSnapshot()})
 			}
 			return &dsc.AgentResult{Output: content, Status: "success"}, nil
 		}
@@ -1158,14 +1149,17 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 // 否则退化为仅携带最近一次 prompt 用量。随工具帧携带，供 TUI 在每步工具调用
 // 后实时刷新容量显示（对齐 REX 每步 usage 事件即时更新统计行的观感）。
 func (a *ReactLoopAgent) usageSnapshot() *dsc.Usage {
-	usage := &dsc.Usage{PromptTokens: a.lastPromptTokens}
+	a.usageMu.Lock()
+	lastPrompt, lastCtx := a.lastPromptTokens, a.lastContextTokens
+	a.usageMu.Unlock()
+	usage := &dsc.Usage{PromptTokens: lastPrompt, ContextTokens: int32(lastCtx)}
 	if a.lastUsage != nil {
 		usage.CompletionTokens = a.lastUsage.CompletionTokens
 		usage.TotalTokens = a.lastUsage.TotalTokens
 		usage.CacheReadInputTokens = a.lastUsage.CacheReadInputTokens
 		usage.CacheCreationInputTokens = a.lastUsage.CacheCreationInputTokens
 	} else {
-		usage.TotalTokens = a.lastPromptTokens
+		usage.TotalTokens = lastPrompt
 	}
 	return usage
 }

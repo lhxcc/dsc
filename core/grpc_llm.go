@@ -156,6 +156,7 @@ func UsageToProto(u *Usage) *proto.Usage {
 		TotalTokens:              u.TotalTokens,
 		CacheReadInputTokens:     u.CacheReadInputTokens,
 		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		ContextTokens:            u.ContextTokens,
 	}
 }
 
@@ -170,6 +171,7 @@ func UsageFromProto(u *proto.Usage) *Usage {
 		TotalTokens:              u.TotalTokens,
 		CacheReadInputTokens:     u.CacheReadInputTokens,
 		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		ContextTokens:            u.ContextTokens,
 	}
 }
 

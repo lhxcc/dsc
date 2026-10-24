@@ -370,6 +370,10 @@ type Model struct {
 
 // New 创建一个聊天界面模型
 func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) *Model {
+	// 宿主侧计量实例需要窗口换算百分比；模型切换后由 SwitchModel 再同步
+	if manager != nil && contextWindow > 0 {
+		manager.SetContextWindow(contextWindow)
+	}
 	input := textarea.New()
 	// 占位符只讲「在这里能做什么」，不重复按键提示：按键（Enter 发送 / Ctrl+J 换行 /
 	// Ctrl+Q 退出）统一由底部状态栏承担一处即可，两处都写既冗长又容易互相漂移
@@ -1079,11 +1083,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// （对齐 REX 每步 usage 事件即时更新统计行），不必等轮末 success 帧。
 			// 已用容量以 prompt_tokens 为准（反映当前上下文总长度），而非 TotalTokens。
 			if f.Usage != nil {
-				if f.Usage.PromptTokens > 0 {
-					m.usedTokens = int(f.Usage.PromptTokens)
-				} else if f.Usage.TotalTokens > 0 {
-					m.usedTokens = int(f.Usage.TotalTokens)
-				}
+				m.noteContextUsage(f.Usage)
 				m.trackTurnUsage(f.Usage, msg.frame.Turn, msg.frame.Step)
 				m.settleStepMetrics(f.Usage)
 			}
@@ -1133,12 +1133,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamOpen = false
 			m.clearStream() // 成功/失敗後清理流通道狀態，避免後續 pumpStreamIfOpen 誤判「流進行中」
 			if f.Status == "success" && f.Usage != nil {
-				// 已用容量以 prompt_tokens 為準（反映當前上下文總長度），而非 TotalTokens。
-				if f.Usage.PromptTokens > 0 {
-					m.usedTokens = int(f.Usage.PromptTokens)
-				} else if f.Usage.TotalTokens > 0 {
-					m.usedTokens = int(f.Usage.TotalTokens)
-				}
+				m.noteContextUsage(f.Usage)
 				m.trackTurnUsage(f.Usage, f.Turn, f.Step)
 				m.settleStepMetrics(f.Usage)
 			}
@@ -3378,6 +3373,30 @@ func (m *Model) runInfoLine() string {
 		info += fmt.Sprintf(" · 缓存命中 %.2f%%", float64(hit)*100/float64(hit+miss))
 	}
 	return "  " + dimSty.Render(info)
+}
+
+// noteContextUsage 把一帧 usage 交宿主计量实例保管，并回读"已用容量"。
+//
+// 为什么不再直接取 f.Usage.PromptTokens：已用容量要与 agent 的裁剪/压缩判定同源。
+// 实例归宿主（core.Manager.ctxMeters），agent 随帧上报它算出的投影值
+// （Usage.ContextTokens），宿主只保管与发布、不重算——这样 TUI、cron、将来的
+// 前端读到的是同一个数。没有上报值（旧 agent / 首帧）时退回实测 prompt 侧用量。
+func (m *Model) noteContextUsage(u *core.Usage) {
+	if u == nil {
+		return
+	}
+	if m.manager != nil {
+		m.manager.NoteContextUsage(m.currentSessionID, u, int(u.ContextTokens))
+		if v := m.manager.ContextTokens(m.currentSessionID); v > 0 {
+			m.usedTokens = v
+			return
+		}
+	}
+	if u.PromptTokens > 0 {
+		m.usedTokens = int(u.PromptTokens)
+	} else if u.TotalTokens > 0 {
+		m.usedTokens = int(u.TotalTokens)
+	}
 }
 
 // trackTurnUsage 累計當前輪的運行指標：下行生成 token 與 prompt 緩存命中/寫入。

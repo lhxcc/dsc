@@ -1,8 +1,8 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"fmt"
 	"strings"
 	"sync"
@@ -374,5 +374,68 @@ func TestSwitchSessionResetsUsage(t *testing.T) {
 	}
 	if gotDropped != 0 {
 		t.Fatalf("切会话后裁剪提示状态应清零，实际 %d", gotDropped)
+	}
+}
+
+// usageReportingLLM 流里回报固定 prompt 用量，用于验证 usage 帧携带上下文投影。
+type usageReportingLLM struct {
+	compactMockLLM
+	promptTokens int
+}
+
+func (m *usageReportingLLM) ChatStream(ctx context.Context, in *proto.ChatRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[proto.ChatStreamResponse], error) {
+	// 回报的用量取本次请求的真实估算（真实 provider 也是这样：prompt_tokens 反映实际发送量），
+	// 否则「实测 30000 vs 投影 1300」只是 mock 在撒谎，测不出任何东西。
+	est := int32(dsc.EstimateProtoMessagesTokens(in.Messages))
+	m.mu.Lock()
+	m.streamMsgs = in.Messages
+	m.mu.Unlock()
+	return &compactMockStream{usage: &proto.Usage{
+		PromptTokens: est,
+		TotalTokens:  est + 10,
+	}}, nil
+}
+
+// TestUsageFramesCarryContextTokens 展示口径与决策口径必须同源：
+// agent 随 usage 帧上报 core.TokenMeter 的投影值（Usage.ContextTokens），
+// 宿主据此显示「已用」，不再自己按 prompt_tokens 另算一套。
+func TestUsageFramesCarryContextTokens(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 200000
+	a.llmServiceID, a.toolServiceID = 1, 1
+	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
+		&session.SurfaceOp{Op: session.SurfaceAppend})
+	a.sess.Append(session.UserMessage, &session.UserMessageData{Content: strings.Repeat("x", 4000), Source: "user"},
+		&session.SurfaceOp{Op: session.SurfaceAppend})
+	markSessionRestored(t, a)
+
+	llm := &usageReportingLLM{promptTokens: 30000}
+	a.llmClient = llm
+	a.toolClient = &mockToolClient{}
+
+	var frames []*dsc.RunStreamResponse
+	if _, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
+		frames = append(frames, f)
+	}); err != nil {
+		t.Fatalf("runLoop: %v", err)
+	}
+
+	sawUsage := false
+	for _, f := range frames {
+		if f.Usage == nil {
+			continue
+		}
+		sawUsage = true
+		if f.Usage.ContextTokens <= 0 {
+			t.Fatalf("usage 帧应携带 ContextTokens（上下文投影），实际 %+v", f.Usage)
+		}
+		// 正常回合里投影应贴近实测 prompt（同一份上下文的两种量法，差一行回复的量级）
+		if diff := int(f.Usage.ContextTokens) - int(f.Usage.PromptTokens); diff > 2000 || diff < -2000 {
+			t.Fatalf("ContextTokens=%d 与实测 PromptTokens=%d 偏差过大（%+d）",
+				f.Usage.ContextTokens, f.Usage.PromptTokens, diff)
+		}
+	}
+	if !sawUsage {
+		t.Fatal("未发出任何带 usage 的帧")
 	}
 }
