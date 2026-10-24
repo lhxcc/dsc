@@ -34,7 +34,12 @@ func newTestCompactionBasicServer(t *testing.T, window int) *compactionBasicServ
 }
 
 // bigMsgs 生成 n 条约 tokensPer 条的大消息（user/assistant 交替）。
-func bigMsgs(n, charsPer int) []*proto.Message {
+//
+// 实现按 core.EstimateTextTokens 的口径构造：ASCII 约 4 字节/token，故每个 token 写 4 个
+// 字节。此前实现直接写 charsPer 个字节——那时估算把每个字符当 1 token，两者恰好相等；
+// 估算改成「按字符分类累加」后（修掉纯 ASCII 高估 4~5 倍的 bug），这里必须同步换算，
+// 否则夹具只有预期压力的 1/4，压缩阈值再也够不到。
+func bigMsgs(n, tokensPer int) []*proto.Message {
 	msgs := make([]*proto.Message, 0, n)
 	for i := 0; i < n; i++ {
 		role := "user"
@@ -43,7 +48,7 @@ func bigMsgs(n, charsPer int) []*proto.Message {
 		}
 		msgs = append(msgs, &proto.Message{
 			Role:    role,
-			Content: strings.Repeat("x", charsPer),
+			Content: strings.Repeat("x", tokensPer*4),
 		})
 	}
 	return msgs

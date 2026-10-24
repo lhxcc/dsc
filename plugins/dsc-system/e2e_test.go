@@ -592,7 +592,7 @@ func TestCompactionBasicE2E(t *testing.T) {
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		msgs = append(msgs, &proto.Message{Role: role, Content: strings.Repeat("x", 300)})
+		msgs = append(msgs, &proto.Message{Role: role, Content: strings.Repeat("x", 1200)})
 	}
 	msgsJSON, err := json.Marshal(msgs)
 	if err != nil {
@@ -775,7 +775,7 @@ func TestImageOffloadE2E(t *testing.T) {
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		m := &proto.Message{Role: role, Content: strings.Repeat("x", 300)}
+		m := &proto.Message{Role: role, Content: strings.Repeat("x", 1200)}
 		switch i {
 		case 13:
 			m.Images = []string{imgC}
@@ -804,7 +804,7 @@ func TestImageOffloadE2E(t *testing.T) {
 	if !strings.Contains(got[2].Content, "[image omitted to fit request image limits; "+imgD+"]") || len(got[2].Images) != 0 {
 		t.Fatalf("B: msg14 image must be offloaded: %+v", got[2])
 	}
-	if len(got[3].Images) != 1 || got[3].Images[0] != imgB || !strings.Contains(got[3].Content, strings.Repeat("x", 300)) {
+	if len(got[3].Images) != 1 || got[3].Images[0] != imgB || !strings.Contains(got[3].Content, strings.Repeat("x", 1200)) {
 		t.Fatalf("B: newest image + tail verbatim must stay: %+v", got[3])
 	}
 }

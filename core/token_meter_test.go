@@ -66,23 +66,35 @@ func TestTokenMeterShouldCompact(t *testing.T) {
 	}
 }
 
-// TestTokenMeterEstimateTextTokens 校验文本估算：英文按 /4，CJK 按 rune 数。
+// TestTokenMeterEstimateTextTokens 校验文本估算：按字符分类累加——宽字符 1 token/字，
+// 其余 4 字节/token。
+//
+// 回归背景：旧实现取「整串字节/4」与「整串 rune 数」的较大者，纯 ASCII 时 runes==bytes，
+// 于是按 1 token/字符计（真实约 0.25），代码类会话被高估 4~5 倍，进而触发毫无必要的
+// 上下文裁剪/压缩。此处的期望值就是按正确口径重算的：
 func TestTokenMeterEstimateTextTokens(t *testing.T) {
-	// 英文："hello" 5 字节 → 5/4 = 1.25 → 2 tokens；rune 数 = 5 → 取大者 = 5
-	if got := EstimateTextTokens("hello"); got != 5 {
-		t.Errorf("EstimateTextTokens(\"hello\") = %d, want 5", got)
+	cases := []struct {
+		in   string
+		want int
+		why  string
+	}{
+		{"hello", 2, "5 字节英文 → ceil(5/4)"},
+		{"你好", 2, "两个 CJK 字 → 2"},
+		{"hi你好", 3, "ceil(2/4)=1 + 2 CJK 字"},
+		{"", 0, "空串"},
+		{"if (x < 10) { y = z; }", 6, "18 字节代码 → ceil(18/4)，不得按字符数算成 19"},
+		{"全角（），。", 6, "全角标点按 1 token/字"},
+		{"abc你好def", 4, "窄字节 3+3 合并后 ceil(6/4)=2 + 2 CJK 字（宽窄边界不另计）"},
 	}
-	// CJK："你好" 6 字节 → 6/4 = 1.5 → 2 tokens；rune 数 = 2 → 取大者 = 2
-	if got := EstimateTextTokens("你好"); got != 2 {
-		t.Errorf("EstimateTextTokens(\"你好\") = %d, want 2", got)
+	for _, c := range cases {
+		if got := EstimateTextTokens(c.in); got != c.want {
+			t.Errorf("EstimateTextTokens(%q) = %d, want %d（%s）", c.in, got, c.want, c.why)
+		}
 	}
-	// 混合："hi你好" 8 字节 → 2；rune 数 = 4 → 取大者 = 4
-	if got := EstimateTextTokens("hi你好"); got != 4 {
-		t.Errorf("EstimateTextTokens(\"hi你好\") = %d, want 4", got)
-	}
-	// 空串
-	if got := EstimateTextTokens(""); got != 0 {
-		t.Errorf("EstimateTextTokens(\"\") = %d, want 0", got)
+	// 纯 ASCII 长文本不得再退化成「1 token/字符」（旧 bug 的判据）
+	ascii := strings.Repeat("a", 4000)
+	if got := EstimateTextTokens(ascii); got != 1000 {
+		t.Errorf("4000 字节纯 ASCII 应约 1000 tokens，got %d（按字符数算会是 4000）", got)
 	}
 }
 
@@ -90,30 +102,30 @@ func TestTokenMeterEstimateTextTokens(t *testing.T) {
 func TestTokenMeterEstimateMessageTokens(t *testing.T) {
 	msg := &Message{Role: "user", Content: "hello"}
 	got := EstimateMessageTokens(msg)
-	// content = 5 tokens + 4 (role+delimiter) = 9
-	if got != 9 {
-		t.Errorf("EstimateMessageTokens = %d, want 9 (5 content + 4 overhead)", got)
+	// content = ceil(5/4) = 2 tokens + 4 (role+delimiter) = 6
+	if got != 6 {
+		t.Errorf("EstimateMessageTokens = %d, want 6 (2 content + 4 overhead)", got)
 	}
 
 	// tool 消息有不同开销
 	toolMsg := &Message{Role: "tool", Content: "result"}
 	got = EstimateMessageTokens(toolMsg)
-	// content = 6 + 6 (tool overhead) = 12
-	if got != 12 {
-		t.Errorf("tool message tokens = %d, want 12", got)
+	// content = ceil(6/4) = 2 + 6 (tool overhead) = 8
+	if got != 8 {
+		t.Errorf("tool message tokens = %d, want 8", got)
 	}
 }
 
 // TestTokenMeterEstimateMessagesTokens 校验多条消息总估算。
 func TestTokenMeterEstimateMessagesTokens(t *testing.T) {
 	msgs := []*Message{
-		{Role: "user", Content: "hello"},   // 5 + 4 = 9
-		{Role: "assistant", Content: "hi"}, // 2 + 4 = 6
-		{Role: "user", Content: "bye"},     // 3 + 4 = 7
+		{Role: "user", Content: "hello"},   // ceil(5/4)=2 + 4 = 6
+		{Role: "assistant", Content: "hi"}, // ceil(2/4)=1 + 4 = 5
+		{Role: "user", Content: "bye"},     // ceil(3/4)=1 + 4 = 5
 	}
 	got := EstimateMessagesTokens(msgs)
-	if got != 22 {
-		t.Errorf("EstimateMessagesTokens = %d, want 22", got)
+	if got != 16 {
+		t.Errorf("EstimateMessagesTokens = %d, want 16", got)
 	}
 }
 
@@ -121,10 +133,10 @@ func TestTokenMeterEstimateMessagesTokens(t *testing.T) {
 // CJK 感知（rune 计数）、角色开销、图像结构引用、工具调用名称+参数；供宿主 pre-step
 // 与压缩插件共用同一估算（回归「各持私有字节/4 估算导致压力判定漂移」）。
 func TestEstimateProtoMessageTokens(t *testing.T) {
-	// 纯 ASCII 文本：max(bytes/4, runes) = runes → 5 + 4 = 9（同 core.Message 版）
+	// 纯 ASCII 文本：ceil(5/4)=2 + 4 = 6（同 core.Message 版；旧口径按字符数算成 9）
 	got := EstimateProtoMessageTokens(&proto.Message{Role: "user", Content: "hello"})
-	if got != 9 {
-		t.Errorf("ascii user msg = %d, want 9", got)
+	if got != 6 {
+		t.Errorf("ascii user msg = %d, want 6", got)
 	}
 	// CJK：每字 1 token（rune 计数），3 字 + 4 = 7
 	got = EstimateProtoMessageTokens(&proto.Message{Role: "user", Content: "你好啊"})
@@ -134,10 +146,10 @@ func TestEstimateProtoMessageTokens(t *testing.T) {
 	// tool 角色 +6；工具调用 name+args 估算 +8
 	got = EstimateProtoMessageTokens(&proto.Message{
 		Role:    "tool",
-		Content: "ok", // 2 + 6 = 8
+		Content: "ok", // ceil(2/4)=1 + 6 = 7
 	})
-	if got != 8 {
-		t.Errorf("tool msg = %d, want 8", got)
+	if got != 7 {
+		t.Errorf("tool msg = %d, want 7", got)
 	}
 	// 图像按结构引用计价（对齐 DSH estimateStructuralBlock，当时有效/过期无效）：
 	// "dsc-shot://a"（12 字符）→ 4 + ceil(12/4) = 7；1 + 4 + 7 = 12
@@ -152,17 +164,17 @@ func TestEstimateProtoMessageTokens(t *testing.T) {
 	got = EstimateProtoMessageTokens(&proto.Message{
 		Role:      "assistant",
 		ToolCalls: []*proto.ToolCall{{Name: "shell", ArgumentsJson: `{"cmd":"ls"}`}},
-	}) // content 空 0 + 4 + EstimateTextTokens(`shell{"cmd":"ls"}`)(17) + 8 = 29
-	if got != 29 {
-		t.Errorf("tool-call msg = %d, want 29", got)
+	}) // content 空 0 + 4 + EstimateTextTokens(`shell{"cmd":"ls"}`)(17 字节 → 5) + 8 = 17
+	if got != 17 {
+		t.Errorf("tool-call msg = %d, want 17", got)
 	}
 	// 列表求和
 	msgs := []*proto.Message{
-		{Role: "user", Content: "hello"}, // 9
-		{Role: "tool", Content: "ok"},    // 8
+		{Role: "user", Content: "hello"}, // 6
+		{Role: "tool", Content: "ok"},    // 7
 	}
-	if got := EstimateProtoMessagesTokens(msgs); got != 17 {
-		t.Errorf("EstimateProtoMessagesTokens = %d, want 17", got)
+	if got := EstimateProtoMessagesTokens(msgs); got != 13 {
+		t.Errorf("EstimateProtoMessagesTokens = %d, want 13", got)
 	}
 }
 

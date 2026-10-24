@@ -184,16 +184,58 @@ func EstimateMessageTokens(msg *Message) int {
 	return toks
 }
 
-// EstimateTextTokens 估算一段文本的 token 数。
-// 取「字节数/4」与「rune 数」的较大者——英文按 /4（约 4 字符 1 token）；
-// CJK（UTF-8 每字 3 字节）字节/4 会低估，故回调为 rune 数（每字按 1 token）。
+// EstimateTextTokens 估算一段文本的 token 数，**按字符分类累加**：
+//   - 宽字符（CJK 表意/假名/韩文/全角符号/emoji）：1 token/字
+//     （UTF-8 三字节，按字节/4 会低估到 0.75/字）
+//   - 其余（ASCII/拉丁/代码）：4 字节/token
+//
+// 旧实现取「整串字节/4」与「整串 rune 数」的**较大者**，意图是「英文按 /4、CJK 按字数」，
+// 但整串只能取一个规则：纯 ASCII/代码时 runes == bytes，于是按 1 token/字符计，是真实值的
+// 4~5 倍。后果是代码类会话被算到窗口之上，触发毫无必要的上下文裁剪与压缩
+// （实测同一份会话：估算 1,113,557，按本函数口径约 209,589，而服务端实际约 332K）。
 func EstimateTextTokens(s string) int {
-	bytes := len(s)
-	runes := utf8.RuneCountInString(s)
-	if byBytes := (bytes + 3) / 4; byBytes > runes {
-		return byBytes
+	if s == "" {
+		return 0
 	}
-	return runes
+	wide, narrow := 0, 0
+	for _, r := range s {
+		if isWideRune(r) {
+			wide++
+			continue
+		}
+		narrow += utf8.RuneLen(r)
+	}
+	return wide + (narrow+3)/4
+}
+
+// isWideRune 报告是否为「一字约一个 token」的宽字符。范围取 East Asian Wide/Fullwidth
+// 的常见区段 + emoji：宁可把这几个区段判宽（1/字），也不要让 CJK 按字节/4 低估。
+func isWideRune(r rune) bool {
+	switch {
+	case r < 0x1100:
+		return false // ASCII / 拉丁 / 希腊 / 西里尔等：按字节折 4
+	case r <= 0x115F:
+		return true // 韩文字母
+	case r == 0x2329 || r == 0x232A:
+		return true
+	case r >= 0x2E80 && r <= 0xA4CF:
+		return true // CJK 部首、假名、CJK 统一表意、彝文
+	case r >= 0xAC00 && r <= 0xD7A3:
+		return true // 韩文音节
+	case r >= 0xF900 && r <= 0xFAFF:
+		return true // CJK 兼容表意
+	case r >= 0xFE30 && r <= 0xFE6F:
+		return true // CJK 兼容形式
+	case r >= 0xFF00 && r <= 0xFF60:
+		return true // 全角字符
+	case r >= 0xFFE0 && r <= 0xFFE6:
+		return true // 全角符号
+	case r >= 0x1F300 && r <= 0x1FAFF:
+		return true // emoji
+	case r >= 0x20000 && r <= 0x3FFFD:
+		return true // CJK 扩展 B 及以后
+	}
+	return false
 }
 
 // EstimateProtoMessageTokens 估算单条 proto 消息的 token 数（proto 版

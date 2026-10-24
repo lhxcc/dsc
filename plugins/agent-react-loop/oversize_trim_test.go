@@ -64,7 +64,8 @@ func buildOversizeSession(t *testing.T, a *ReactLoopAgent, rounds, perMsgTokens 
 	t.Helper()
 	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
 		&session.SurfaceOp{Op: session.SurfaceAppend})
-	body := strings.Repeat("x", perMsgTokens) // ASCII：估算 ≈ 字节 = perMsgTokens
+	// ASCII 约 4 字节/token（core.EstimateTextTokens 的口径），故按 4 倍字节数构造 perMsgTokens 规模
+	body := strings.Repeat("x", perMsgTokens*4)
 	for i := 0; i < rounds; i++ {
 		mark := fmt.Sprintf("#round-%d", i)
 		a.sess.Append(session.UserMessage, &session.UserMessageData{Content: mark + body, Source: "user"},
@@ -169,7 +170,7 @@ func TestOversizeTrimKeepsUserBoundary(t *testing.T) {
 	a.llmServiceID, a.toolServiceID = 1, 1
 	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
 		&session.SurfaceOp{Op: session.SurfaceAppend})
-	body := strings.Repeat("x", 10000)
+	body := strings.Repeat("x", 10000*4) // ≈ 10000 tokens
 	for i := 0; i < 10; i++ {
 		callID := fmt.Sprintf("call-%d", i)
 		a.sess.Append(session.UserMessage, &session.UserMessageData{Content: body, Source: "user"},
@@ -182,7 +183,8 @@ func TestOversizeTrimKeepsUserBoundary(t *testing.T) {
 	}
 	markSessionRestored(t, a)
 
-	msgs, dropped := fitMessagesToWindow(a.sess.DeriveMessages(), a.contextWindow)
+	full := a.sess.DeriveMessages()
+	msgs, dropped := fitMessagesToWindow(full, a.contextWindow, core.EstimateProtoMessagesTokens(full))
 	if dropped == 0 {
 		t.Fatalf("应发生裁剪（总估算 %d, 预算 %d）",
 			core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()), int(float64(a.contextWindow)*oversizeTrimRatio))
@@ -223,7 +225,7 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 
 	var mu sync.Mutex
 	var errs []string
-	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000), nil, func(f *core.RunStreamResponse) {
+	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *core.RunStreamResponse) {
 		if f.Error != "" {
 			mu.Lock()
 			errs = append(errs, f.Error)
@@ -248,4 +250,129 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 		t.Fatal("应向上层报错误帧")
 	}
 	mu.Unlock()
+}
+
+// TestNoTrimForAsciiHistoryWithinWindow 纯 ASCII/代码会话不得被误判超窗。
+//
+// 现场：1M 窗口、服务端实际 332K（32%）的代码会话，被当时的估算算成 1.1M（高估 5.3 倍），
+// 于是每一轮都触发裁剪并打印提示。根治是 core.EstimateTextTokens 改为按字符分类累加
+// （ASCII 4 字节/token），此处用同一口径构造「真实占窗口 40%」的历史，断言不裁剪、不提示。
+func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 50000
+	a.llmServiceID, a.toolServiceID = 1, 1
+	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
+		&session.SurfaceOp{Op: session.SurfaceAppend})
+	// 10 条 × 2000 tokens ≈ 20000 tokens ≈ 窗口 40%（ASCII 4 字节/token）
+	body := strings.Repeat("x", 2000*4)
+	for i := 0; i < 5; i++ {
+		a.sess.Append(session.UserMessage, &session.UserMessageData{Content: body, Source: "user"},
+			&session.SurfaceOp{Op: session.SurfaceAppend})
+		a.sess.Append(session.AssistantMessage, &session.AssistantMessageData{Content: body},
+			&session.SurfaceOp{Op: session.SurfaceAppend})
+	}
+	markSessionRestored(t, a)
+
+	est := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	if est < a.contextWindow*35/100 || est > a.contextWindow*45/100 {
+		t.Fatalf("夹具应约占窗口 40%%，实际估算 %d（窗口 %d）——估算口径又漂了？", est, a.contextWindow)
+	}
+
+	llm := &windowEnforcingLLM{window: a.contextWindow}
+	a.llmClient = llm
+	a.toolClient = &mockToolClient{}
+	var mu sync.Mutex
+	var trimmed bool
+	res, err := a.runLoop(context.Background(), "继续", nil, func(f *core.RunStreamResponse) {
+		if strings.Contains(f.Output, "上下文裁剪") {
+			mu.Lock()
+			trimmed = true
+			mu.Unlock()
+		}
+	})
+	if err != nil {
+		t.Fatalf("runLoop: %v", err)
+	}
+	if res.Status != "success" {
+		t.Fatalf("状态 = %s", res.Status)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if trimmed {
+		t.Fatal("历史只占窗口 40%，不应触发裁剪（估算被高估才会这样）")
+	}
+	// 全量历史都应发出去（11 条历史/当前消息 + system）
+	if got := len(llm.streamMsgs); got < 11 {
+		t.Fatalf("主请求消息数 = %d, 期望全量（不应丢历史）", got)
+	}
+}
+
+// TestTrimNoticePrintedOncePerDropCount 真超窗时，同一省略条数只提示一次。
+//
+// 现场表现：每轮都打印「已省略最早 93 条消息」，把消息区刷满。真超窗时每轮裁掉的是
+// 同一段，重复提示没有新信息；条数变化时才应再提示。
+func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 50000
+	a.llmServiceID, a.toolServiceID = 1, 1
+	buildOversizeSession(t, a, 10, 10000) // 估算 200K ≈ 4 倍窗口
+
+	llm := &windowEnforcingLLM{window: a.contextWindow}
+	a.llmClient = llm
+	a.toolClient = &mockToolClient{}
+
+	countTrimFrames := func() int {
+		var mu sync.Mutex
+		n := 0
+		_, err := a.runLoop(context.Background(), "继续", nil, func(f *core.RunStreamResponse) {
+			if strings.Contains(f.Output, "上下文裁剪") {
+				mu.Lock()
+				n++
+				mu.Unlock()
+			}
+		})
+		if err != nil {
+			t.Fatalf("runLoop: %v", err)
+		}
+		return n
+	}
+
+	if got := countTrimFrames(); got != 1 {
+		t.Fatalf("首次裁剪应提示 1 次，实际 %d 次", got)
+	}
+	// 第二轮：历史结构不变（只是多了当前用户消息与助手回复），省略条数应相同 → 不再提示
+	if got := countTrimFrames(); got != 0 {
+		t.Fatalf("同一省略条数不应重复提示，第二轮实际提示 %d 次", got)
+	}
+}
+
+// TestSwitchSessionResetsUsage 切换会话必须清掉上一会话的用量与裁剪状态。
+//
+// 此前 SwitchSession 只换 sess 与 turnCounter，lastPromptTokens 留着上一会话的值。
+// 一旦上个会话占满 1M 窗口，切到新会话后「已用容量」仍显示旧值，新会话的空历史会被
+// 判定超窗，触发裁剪/压缩（并把提示打进新会话）。
+func TestSwitchSessionResetsUsage(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 1000000
+	a.llmServiceID, a.toolServiceID = 1, 1
+
+	// 模拟上一会话已用到 900K，且上一轮做过裁剪
+	a.usageMu.Lock()
+	a.lastPromptTokens = 900000
+	a.lastTrimDropped = 93
+	a.usageMu.Unlock()
+
+	if err := a.SwitchSession(context.Background(), "another-session"); err != nil {
+		t.Fatalf("SwitchSession: %v", err)
+	}
+
+	a.usageMu.Lock()
+	gotTokens, gotDropped := a.lastPromptTokens, a.lastTrimDropped
+	a.usageMu.Unlock()
+	if gotTokens != 0 {
+		t.Fatalf("切会话后 lastPromptTokens 应清零，实际 %d", gotTokens)
+	}
+	if gotDropped != 0 {
+		t.Fatalf("切会话后裁剪提示状态应清零，实际 %d", gotDropped)
+	}
 }
