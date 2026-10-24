@@ -2660,7 +2660,13 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		// 压缩/卸载/回取的运行面板：这些过程对用户不可见，只能靠一组累计数字判断
 		// "压缩到底有没有在省、回取有没有在白白导出"。
 		if m.acpStatus == nil {
-			m.appendMessage(dimSty.Render("（暂无压缩状态：dsc-billion-context 未启用或尚未跑过一个回合）"))
+			// 注意 typed-nil：把 (*core.Manager)(nil) 塞进接口后 != nil，
+			// 会在方法里解引用空指针直接 panic——所以显式判空后再赋值。
+			var backend compactionBackendReporter
+			if m.manager != nil {
+				backend = m.manager
+			}
+			m.appendMessage(dimSty.Render(noACPStatusText(backend)))
 		} else {
 			m.appendMessage(renderACPStatus(m.acpStatus))
 		}
@@ -3761,6 +3767,35 @@ func renderACPStatus(p map[string]any) string {
 		fmt.Fprintf(&b, "  可压范围: %d 段（详情问模型或用 acp_status）\n", c)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// noACPStatusText 没有压缩状态时要说清"为什么没有"，而不是笼统地说"未启用"。
+//
+// 三种情况在用户眼里长得一样，原因和修法却完全不同：
+//   - 配置指定了后端但插件没加载 → 改 config.yaml 的 plugins 列表
+//   - 根本没配后端            → 配 compaction 字段
+//   - 配好了、插件也在跑       → 只是还没跑过一个回合，等下一轮
+//
+// compactionBackendReporter 只依赖"能报后端状态"这一项能力——测试可给假实现，
+// 也让这里不必知道 Manager 的其余部分。
+type compactionBackendReporter interface {
+	CompactionBackendState() (string, bool)
+}
+
+func noACPStatusText(manager compactionBackendReporter) string {
+	if manager == nil {
+		return "（暂无压缩状态：未连接宿主管理器）"
+	}
+	configured, active := manager.CompactionBackendState()
+	switch {
+	case configured == "":
+		return "（暂无压缩状态：config.yaml 未指定 compaction 后端，当前走 agent 内联压缩）"
+	case !active:
+		return "（压缩后端 " + configured + " 已配置但未生效：插件未加载或未声明 Provides compaction）\n" +
+			"  检查 config.yaml：plugins 列表里要有该项且 enabled: true（Windows 的 binary_path 需带 .exe）"
+	default:
+		return "（压缩后端 " + configured + " 已在运行，但还没有状态上报——跑一个回合后再看）"
+	}
 }
 
 // pctOf 计算百分比（limit<=0 时返回 0）。

@@ -65,3 +65,33 @@ func TestACPStatusMsgStored(t *testing.T) {
 		t.Fatalf("面板应显示占用，实际：%s", view)
 	}
 }
+
+// TestNoACPStatusText 三种"没有状态"的原因要给不同的话：
+// 配置了但插件没加载 / 根本没配 / 配好了只是还没跑。
+func TestNoACPStatusText(t *testing.T) {
+	if got := noACPStatusText(nil); !strings.Contains(got, "未连接宿主管理器") {
+		t.Fatalf("nil 的说明不对: %s", got)
+	}
+	// 没配后端：说明当前走内联压缩
+	if got := noACPStatusText(fakeBackend{}); !strings.Contains(got, "未指定 compaction 后端") {
+		t.Fatalf("未配置后端时应说明走内联压缩: %s", got)
+	}
+	// 配了但没生效：用户实际踩到的场景（plugins 列表里被注释掉）
+	got := noACPStatusText(fakeBackend{name: "dsc-billion-context"})
+	if !strings.Contains(got, "已配置但未生效") || !strings.Contains(got, "dsc-billion-context") {
+		t.Fatalf("配置未生效时应点名后端并说明原因: %s", got)
+	}
+	// 后端在跑但还没上报
+	got = noACPStatusText(fakeBackend{name: "dsc-billion-context", active: true})
+	if !strings.Contains(got, "还没有状态上报") {
+		t.Fatalf("已生效时应说明等一轮: %s", got)
+	}
+}
+
+// fakeBackend 假的压缩后端报告器。
+type fakeBackend struct {
+	name   string
+	active bool
+}
+
+func (f fakeBackend) CompactionBackendState() (string, bool) { return f.name, f.active }

@@ -815,6 +815,13 @@ func main() {
 	pluginsDir := core.PJoin(execDir, "plugins")
 	pluginsSnap := pluginsDir + "-backup"
 	loadErr := mgr.LoadFromConfig(merged)
+	if loadErr == nil {
+		// 配置了压缩后端却没生效时，宿主此前是**静默**回落到内联压缩的：用户只看到
+		// "新压缩没生效"，日志里也没有一句解释。这里至少留一条明确告警。
+		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
+			logger.Warn(warn)
+		}
+	}
 	if loadErr != nil {
 		// 先锁定最近「正常」备份（避免把下面刚备份的坏版当成正常版回读），
 		// 再把当前坏版各自备份留档，最后分别还原各自最近正常备份续启
