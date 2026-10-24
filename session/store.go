@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -80,31 +81,38 @@ func SessionKeyForProject(projectRoot string) string {
 	return b.String() + "-" + shortPathHash(p)
 }
 
-// normalizeProjectPath 把「同一目录的不同写法」归一到同一形态：尾随分隔符与重复
-// 分隔符都去掉。会话键由此路径编码 + 短哈希而来，写法不同就等于换了一个会话——现场
-// 表现是「历史突然加载不出来」，实际只是工作区根多了个斜杆：
+// normalizeProjectPath 把「同一目录的不同写法」归一到同一形态：折叠重复分隔符、
+// 去掉尾随分隔符。会话键由此路径编码 + 短哈希而来，写法不同就等于换了一个会话——
+// 现场表现是「历史突然加载不出来」，实际只是工作区根多了个分隔符：
 //
 //	O:/Agents/Strada   → O=--Agents--Strada-CD976A24
 //	O:/Agents/Strada/  → O=--Agents--Strada---93781973   ← 同一目录，却是另一个会话
 //
-// 盘符大小写不做折叠：Windows 上 os.Getwd 已返回规范大小写，而折叠会改变现存所有
-// 会话键（等于集体丢历史）；大小写差异由启动日志的 session identity 一行暴露即可。
+// 归一本身不自己写：标准库 path 的 Clean 就是这件事的规范实现（纯 POSIX 语义、与平台
+// 无关；AGENTS.md §10 禁的是 filepath 包的同名函数族，它们会返回原生反斜杆路径）。
+// 为什么不直接用 core.PClean：core 已经 import session（manager.go / session_search.go），
+// session 反向 import core 会成环；core.PClean 只是在那族函数外包一层 toSlash，对已归一
+// 为正斜杆的输入，结果与 path 的 Clean 完全一致。
+//
+// 两处刻意保留：
+//   - UNC 的前导双分隔符（\\server\share）：path.Clean 会压成单斜杆，与相对路径
+//     server/share 撞键，故统一还原为 "//" 前缀（一/二/三个前导斜杆都归到同一键）。
+//   - 盘符大小写不折叠：Windows 上 os.Getwd 已返回规范大小写，而折叠会改掉现存所有
+//     会话键（等于集体丢历史）；大小写不一致由启动日志的 session identity 暴露。
 func normalizeProjectPath(p string) string {
-	// UNC（//server/share）在 TrimPrefix 之后仍可能以 "/" 开头，保留其前导斜杆语义，
-	// 只折叠内部重复分隔符。
 	lead := ""
-	if strings.HasPrefix(p, "/") {
-		lead = "/"
-		p = strings.TrimPrefix(p, "/")
+	for strings.HasPrefix(p, "/") {
+		lead += "/"
+		p = p[1:]
 	}
-	for strings.Contains(p, "//") {
-		p = strings.ReplaceAll(p, "//", "/")
+	if p == "" {
+		return ""
 	}
-	p = strings.TrimSuffix(p, "/")
-	if lead != "" && p != "" {
-		return lead + p
+	cleaned := path.Clean(p)
+	if lead != "" {
+		return "//" + cleaned // UNC 归一为固定双前导，避免前导数量不同就换会话
 	}
-	return p
+	return cleaned
 }
 
 // keyHashLen 是键末尾短哈希的字符数（8 位大写十六进制，等同 32 位）。
