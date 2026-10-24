@@ -164,17 +164,21 @@ func TestSessionKeyPathSpellingNormalized(t *testing.T) {
 		"O:/Agents/Strada/",
 		"O:/Agents/Strada//",
 		"O://Agents//Strada",
-		`O:/Agents/Strada`,
-		`O:/Agents/Strada/`,
+		`O://Agents//Strada`,
+		`O://Agents//Strada//`,
 	} {
 		if got := SessionKeyForProject(variant); got != canonical {
 			t.Errorf("%q 应归一到 %q，实际 %q", variant, canonical, got)
 		}
 	}
-	// UNC 不影响归一：反斜杆/正斜杆两种写法同键，且尾随斜杆同样被吃掉
+
+	// UNC：反斜杆/正斜杆、一/二/三个前导分隔符都归到同一键，且键内不得残留分隔符
+	// （Windows 的 filepath.Clean 保留双前导、POSIX 压成单个，不先去前导就会各算一键）
 	unc := SessionKeyForProject(`\\server\share\dir`)
-	if alt := SessionKeyForProject(`//server/share/dir/`); alt != unc {
-		t.Errorf("UNC 写法应同键: %q vs %q", unc, alt)
+	for _, variant := range []string{"//server/share/dir/", "///server/share/dir", "//server//share//dir"} {
+		if got := SessionKeyForProject(variant); got != unc {
+			t.Errorf("UNC %q 应与 %q 同键，实际 %q", variant, unc, got)
+		}
 	}
 	if strings.ContainsAny(unc, `/\\`) {
 		t.Errorf("UNC 键含路径分隔符（不能做文件名）: %q", unc)

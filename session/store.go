@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -88,31 +87,24 @@ func SessionKeyForProject(projectRoot string) string {
 //	O:/Agents/Strada   → O=--Agents--Strada-CD976A24
 //	O:/Agents/Strada/  → O=--Agents--Strada---93781973   ← 同一目录，却是另一个会话
 //
-// 归一本身不自己写：标准库 path 的 Clean 就是这件事的规范实现（纯 POSIX 语义、与平台
-// 无关；AGENTS.md §10 禁的是 filepath 包的同名函数族，它们会返回原生反斜杆路径）。
-// 为什么不直接用 core.PClean：core 已经 import session（manager.go / session_search.go），
-// session 反向 import core 会成环；core.PClean 只是在那族函数外包一层 toSlash，对已归一
-// 为正斜杆的输入，结果与 path 的 Clean 完全一致。
+// 归一不用 core.PClean：core 已经 import session（manager.go / session_search.go），
+// 反向 import 会成环。规则 11 对此有明文安排——session 包用本地等价实现
+// session/posix.go（守卫白名单里的唯一 filepath 使用点），此处即调它的 posixClean。
 //
-// 两处刻意保留：
-//   - UNC 的前导双分隔符（\\server\share）：path.Clean 会压成单斜杆，与相对路径
-//     server/share 撞键，故统一还原为 "//" 前缀（一/二/三个前导斜杆都归到同一键）。
-//   - 盘符大小写不折叠：Windows 上 os.Getwd 已返回规范大小写，而折叠会改掉现存所有
-//     会话键（等于集体丢历史）；大小写不一致由启动日志的 session identity 暴露。
+// 不用标准库 path 包的 Clean：它只认 `/` 当分隔符，反斜杆会被当成普通字符原样保留
+// （实测对 `O:\a\b` 调用后结果仍含反斜杆），那样会话键会混进文件名非法字符。
+//
+// 前导分隔符先全部去掉，UNC 与绝对路径同等对待：Windows 的 filepath 清理函数保留
+// `\\server\share` 的双前导、POSIX 压成单个，不去掉的话同一台网络共享在两类平台上
+// 会算出不同的键（代价是相对路径 server/share 与之同键——工作区根恒为绝对路径，无实害）。
+// 盘符大小写不折叠（Windows 上 os.Getwd 已是规范大小写，折叠会
+// 改掉现存所有键）；大小写不一致由启动日志的 session identity 行暴露。
 func normalizeProjectPath(p string) string {
-	lead := ""
-	for strings.HasPrefix(p, "/") {
-		lead += "/"
-		p = p[1:]
-	}
+	p = strings.TrimLeft(p, "/")
 	if p == "" {
 		return ""
 	}
-	cleaned := path.Clean(p)
-	if lead != "" {
-		return "//" + cleaned // UNC 归一为固定双前导，避免前导数量不同就换会话
-	}
-	return cleaned
+	return posixClean(p)
 }
 
 // keyHashLen 是键末尾短哈希的字符数（8 位大写十六进制，等同 32 位）。

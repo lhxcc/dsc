@@ -13,3 +13,17 @@ func posixJoin(elem ...string) string {
 func posixDir(path string) string {
 	return filepath.ToSlash(filepath.Dir(path))
 }
+
+// posixClean 等价 core.PClean：按平台语义清理后强制归一化为正斜杆。
+//
+// 为什么不能用标准库 path 包的 Clean（它同样是「清理」语义）：path 只把 `/` 当分隔符，
+// 反斜杆在它眼里是普通字符，于是 `path.Clean(`+"`O:\\a\\b`"+`)` 会原样保留反斜杆——
+// 那违背规则 10「一律归一化为正斜杆」。实测（Windows）：path 保留反斜杆，本函数转换。
+// 反斜杆一旦漏进会话键，键就会含文件名非法字符，会话直接落不了盘。
+//
+// 与 core.PClean 的唯一差别是 UNC 前导分隔符：Windows 的 filepath.Clean 会保留
+// `\\server\share` 的双前导，POSIX 上则压成单个——调用方若需要跨平台一致的键，
+// 应先把前导分隔符去掉（见 session.normalizeProjectPath）。
+func posixClean(p string) string {
+	return filepath.ToSlash(filepath.Clean(p))
+}
