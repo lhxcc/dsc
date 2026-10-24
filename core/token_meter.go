@@ -40,6 +40,9 @@ type TokenMeasurement struct {
 	ContextWindow int `json:"context_window"`
 	// Pressure 上下文压力比（0.0 ~ 1.0+），= TotalTokens / ContextWindow。
 	Pressure float64 `json:"pressure"`
+	// ProjectedTokens 下一次请求的预计占用（实测锚点 + 自锚点以来的启发式增量）。
+	// 决策（裁剪/压缩）与提示文案一律用这个值，与 TUI 显示的实测值同源。
+	ProjectedTokens int `json:"projected_tokens"`
 	// Source 计量来源："usage"（provider 上报）或 "estimate"（启发式估算）。
 	Source string `json:"source"`
 }
@@ -52,6 +55,14 @@ type TokenMeter struct {
 	lastUsage     *Usage // 最近一次 provider 上报的用量（精确锚点）
 	contextWindow int    // 上下文窗口大小
 	totalTokens   int    // 当前估算的总 token（用于无 usage 时回退）
+
+	// 锚点与增量基线（对齐 DSH tokenMeter 的 pressureTokens / sampledSurfaceTokens）：
+	//   pressureTokens  服务端上报的 prompt 侧用量（prompt + cacheRead + cacheWrite）
+	//   sampledEstimate 取锚点那一刻「所发消息列表」的启发式估算
+	// 两者必须来自同一个请求，否则增量算错。projected = pressure + (当前估算 − sampled)。
+	pressureTokens  int
+	sampledEstimate int
+	hasSample       bool
 }
 
 // NewTokenMeter 创建 token 计量服务。contextWindow 为上下文窗口大小（token 数）。
@@ -72,13 +83,64 @@ func (tm *TokenMeter) UpdateUsage(usage *Usage) {
 		return
 	}
 	tm.lastUsage = usage
-	// 提示缓存感知：prompt_tokens + cache_read_input_tokens = 完整请求 token
-	// （对齐 DSC 既有的 llama.cpp 提示缓存感知逻辑）
-	fullPrompt := int(usage.PromptTokens)
-	if usage.CacheReadInputTokens > 0 {
-		fullPrompt += int(usage.CacheReadInputTokens)
-	}
+	fullPrompt := PromptSideTokens(usage)
 	tm.totalTokens = fullPrompt + int(usage.CompletionTokens)
+	// 只有用量、不掌握「当次所发消息的估算」时也建立锚点，但不设增量基线：
+	// 投影会退化为实测值（保守下界），而不是把整段估算加到实测上（那会重复计）。
+	tm.pressureTokens = fullPrompt
+	tm.sampledEstimate = 0
+	tm.hasSample = true
+}
+
+// SampleUsage 记录一次「实测锚点 + 增量基线」：promptSideTokens 是服务端为某个请求
+// 上报的 prompt 侧用量，sentEstimate 是**同一个请求**发出的消息列表的启发式估算。
+// 之后用 Project 回答「下一发大概多少」——启发式只承担增量，绝对误差在锚点处被实测抵消。
+func (tm *TokenMeter) SampleUsage(promptSideTokens, sentEstimate int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.pressureTokens = promptSideTokens
+	tm.sampledEstimate = sentEstimate
+	tm.hasSample = true
+	tm.totalTokens = promptSideTokens
+}
+
+// Reset 清空锚点（会话切换、压缩改写历史后调用）：此后 Project 退回纯估算，
+// 直到下一次服务端上报重新锚定。
+func (tm *TokenMeter) Reset() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.pressureTokens = 0
+	tm.sampledEstimate = 0
+	tm.hasSample = false
+	tm.totalTokens = 0
+	tm.lastUsage = nil
+}
+
+// Project 返回「即将发出的请求」的上下文占用估计：
+//   - 有锚点：实测 pressure + 自锚点以来的启发式增量
+//   - 无锚点（首次请求 / 重启恢复 / 刚压缩完）：退回 currentEstimate
+//
+// currentEstimate 为当前待发消息列表的启发式估算（core.EstimateProtoMessagesTokens）。
+func (tm *TokenMeter) Project(currentEstimate int) int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.projectLocked(currentEstimate)
+}
+
+// Window 返回当前上下文窗口大小。
+func (tm *TokenMeter) Window() int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.contextWindow
+}
+
+// PromptSideTokens 返回 usage 的 prompt 侧用量（prompt + cacheRead + cacheWrite）——
+// 上下文占用只算输入侧；输出已随历史进入下一发的 prompt，计进来会重复。
+func PromptSideTokens(usage *Usage) int {
+	if usage == nil {
+		return 0
+	}
+	return int(usage.PromptTokens) + int(usage.CacheReadInputTokens) + int(usage.CacheCreationInputTokens)
 }
 
 // UpdateContextWindow 更新上下文窗口大小（模型探测后可能变化）。
@@ -98,6 +160,7 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 		ContextWindow: tm.contextWindow,
 	}
 
+	est := EstimateMessagesTokens(messages)
 	if tm.lastUsage != nil {
 		// 精确路径：provider 上报了 usage
 		m.PromptTokens = int(tm.lastUsage.PromptTokens)
@@ -108,9 +171,11 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 		fullPrompt := m.PromptTokens + m.CacheReadTokens
 		m.TotalTokens = fullPrompt + m.CompletionTokens
 		m.Source = "usage"
+		m.ProjectedTokens = tm.projectLocked(est)
 	} else {
 		// 回退路径：字节级启发式估算（对齐 DSH estimateMessage）
-		m.TotalTokens = EstimateMessagesTokens(messages)
+		m.TotalTokens = est
+		m.ProjectedTokens = est
 		m.Source = "estimate"
 	}
 
@@ -121,15 +186,34 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 	return m
 }
 
-// ShouldCompact 判断当前压力是否超过阈值，需要触发压缩。
-// thresholdRatio 为触发比例（如 0.80）。
-func (tm *TokenMeter) ShouldCompact(thresholdRatio float64) bool {
+// ShouldCompact 判断「下一次请求」的预计占用是否超过阈值，需要触发压缩。
+// currentEstimate 为待发消息列表的启发式估算，thresholdRatio 为触发比例（如 0.80）。
+func (tm *TokenMeter) ShouldCompact(currentEstimate int, thresholdRatio float64) bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	if tm.contextWindow <= 0 || tm.totalTokens <= 0 {
+	if tm.contextWindow <= 0 {
 		return false
 	}
-	return float64(tm.totalTokens)/float64(tm.contextWindow) >= thresholdRatio
+	projected := tm.projectLocked(currentEstimate)
+	return projected > 0 && float64(projected)/float64(tm.contextWindow) >= thresholdRatio
+}
+
+// projectLocked 是 Project 的无锁实现（须已持有读锁）。
+func (tm *TokenMeter) projectLocked(currentEstimate int) int {
+	if currentEstimate < 0 {
+		currentEstimate = 0
+	}
+	if !tm.hasSample {
+		return currentEstimate
+	}
+	delta := 0
+	if tm.sampledEstimate > 0 {
+		delta = currentEstimate - tm.sampledEstimate
+	}
+	if p := tm.pressureTokens + delta; p > 0 {
+		return p
+	}
+	return 0
 }
 
 // EstimateMessagesTokens 估算消息列表的总 token 数（对齐 DSH estimateMessage）。

@@ -47,22 +47,25 @@ func TestTokenMeterUpdateUsage(t *testing.T) {
 func TestTokenMeterShouldCompact(t *testing.T) {
 	tm := NewTokenMeter(10000)
 
-	// 无 usage → 不压缩
-	if tm.ShouldCompact(0.80) {
-		t.Error("无 usage 时不应压缩")
+	// 无锚点：退回纯估算。估算 4000 → 40%，不触发。
+	if tm.ShouldCompact(4000, 0.80) {
+		t.Error("40% 不应压缩")
+	}
+	if !tm.ShouldCompact(9000, 0.80) {
+		t.Error("90% 应压缩")
 	}
 
-	// 压力 82% → 超过 80% 阈值
-	tm.UpdateUsage(&Usage{
-		PromptTokens:         5000,
-		CompletionTokens:     200,
-		CacheReadInputTokens: 3000,
-	})
-	if !tm.ShouldCompact(0.80) {
-		t.Error("压力 82% 应触发压缩")
+	// 有锚点：实测 prompt 侧 8000（5000+3000）→ 80%
+	tm.SampleUsage(8000, 8000)
+	if !tm.ShouldCompact(8000, 0.80) {
+		t.Error("压力 80% 应触发压缩")
 	}
-	if tm.ShouldCompact(0.90) {
-		t.Error("压力 82% 不应触发 90% 阈值")
+	if tm.ShouldCompact(8000, 0.90) {
+		t.Error("压力 80% 不应触发 90% 阈值")
+	}
+	// 锚点 + 增量：估算涨到 9500 表示本轮又多了 1500 → 95%
+	if !tm.ShouldCompact(9500, 0.90) {
+		t.Error("实测 8000 + 增量 1500 = 95% 应触发 90% 阈值")
 	}
 }
 
@@ -262,3 +265,52 @@ func TestTokenMeterEstimateToolTokens(t *testing.T) {
 // 消除未使用 import 警告
 var _ = context.Background
 var _ = strings.Contains
+
+// TestTokenMeterProjectAnchored 锁定「实测锚点 + 启发式增量」的投影语义（对齐 DSH
+// tokenMeter 的 projectedTokens = pressureTokens + surfaceTokens − sampledSurfaceTokens）：
+// 启发式只承担增量，绝对误差在锚点处被实测值抵消。
+func TestTokenMeterProjectAnchored(t *testing.T) {
+	tm := NewTokenMeter(1_000_000)
+
+	// 无锚点（首次请求 / 重启恢复）：退回纯估算
+	if got := tm.Project(120000); got != 120000 {
+		t.Fatalf("无锚点应退回估算 120000，got %d", got)
+	}
+
+	// 实测 332000，采样时消息列表估算 320000 → 现在估算 325000（涨 5000）
+	tm.SampleUsage(332000, 320000)
+	if got := tm.Project(325000); got != 337000 {
+		t.Fatalf("锚定后投影 = 332000 + (325000-320000) = 337000，got %d", got)
+	}
+	// 估算下降（例如压缩/裁剪后）：投影随之下降，但不低于 0
+	if got := tm.Project(20000); got != 32000 {
+		t.Fatalf("减量同样生效：332000 + (20000-320000) = 32000，got %d", got)
+	}
+	if got := tm.Project(0); got != 12000 {
+		t.Fatalf("332000 - 320000 = 12000，got %d", got)
+	}
+
+	// 无基线（只知道用量、不知道当次消息估算）：投影退化为实测值，不应把整段估算加上去
+	tm2 := NewTokenMeter(1_000_000)
+	tm2.UpdateUsage(&Usage{PromptTokens: 90000})
+	if got := tm2.Project(500000); got != 90000 {
+		t.Fatalf("无基线时投影应为实测值 90000（而非 90000+500000），got %d", got)
+	}
+
+	// Reset（切会话 / 压缩后）：回到纯估算
+	tm.Reset()
+	if got := tm.Project(70000); got != 70000 {
+		t.Fatalf("Reset 后应退回估算 70000，got %d", got)
+	}
+}
+
+// TestPromptSideTokens 上下文占用只算输入侧：输出已随历史进入下一发 prompt，计进来会重复。
+func TestPromptSideTokens(t *testing.T) {
+	u := &Usage{PromptTokens: 5000, CompletionTokens: 200, CacheReadInputTokens: 3000, CacheCreationInputTokens: 500}
+	if got := PromptSideTokens(u); got != 8500 {
+		t.Fatalf("PromptSideTokens = %d, want 8500（prompt+cacheRead+cacheWrite，不含输出）", got)
+	}
+	if got := PromptSideTokens(nil); got != 0 {
+		t.Fatalf("nil usage 应为 0，got %d", got)
+	}
+}

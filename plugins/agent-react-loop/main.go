@@ -121,6 +121,10 @@ type ReactLoopAgent struct {
 	// 真超窗时每轮都会裁掉同样一段，逐轮打印提示只会刷屏。
 	lastTrimDropped int
 
+	// meter 上下文占用的唯一计量（core.TokenMeter）：实测锚点 + 启发式增量。
+	// 裁剪/压缩/提示文案/单轮超窗判定全部读它，不得各自再用估算另算一遍。
+	meter *core.TokenMeter
+
 	// 記錄上次的工具名稱列表，用於檢測模式是否切換
 	lastToolNames []string
 	// 標記是否需要重置 system prompt（例如模式切換導致工具上下線時）
@@ -471,16 +475,16 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 派生历史裁进窗口（丢弃最旧的完整轮次，允许接近上限但不允许超过），再走后面的
 		// 压缩判断。裁剪只作用于本次请求，surface/事件日志一字不改，切回大窗口时全量历史原样恢复。
 		//
-		// 判定用的「已用容量」取服务端上报值与我们的估算的**较大者**：服务端值是上一发的
-		// 真实用量（最准），估算覆盖本轮新增内容（工具结果可能一次就涨很多）。此前这里
-		// 只看估算，而当时的估算对纯 ASCII/代码高估 4~5 倍，于是 1M 窗口、服务端实际
-		// 332K（32%）的会话被算成 1.1M 超窗，每轮都裁一刀并打印提示——用户看到的
-		// 「裁剪信息反复出现」就是这个。
-		effectiveTokens := int(a.lastPromptTokens)
-		if est := core.EstimateProtoMessagesTokens(msgs); est > effectiveTokens {
-			effectiveTokens = est
-		}
-		msgs, droppedMsgs := fitMessagesToWindow(msgs, a.contextWindow, effectiveTokens)
+		// 「已用容量」只有一个来源：core.TokenMeter 的投影值（实测锚点 + 自锚点以来的
+		// 启发式增量，对齐 DSH tokenMeter 的 projectedTokens）。裁剪、压缩、提示文案、
+		// 单轮超窗判定全部读这同一个数——此前这里各算各的（一处看服务端值、一处看纯估算），
+		// 口径一偏就整盘错：纯 ASCII 高估 4~5 倍时，1M 窗口、服务端实测 332K 的会话
+		// 被判超窗，每轮都裁历史并打印提示。
+		meter := a.tokenMeter()
+		meter.UpdateContextWindow(a.contextWindow)
+		currentEstimate := core.EstimateProtoMessagesTokens(msgs)
+		projectedTokens := meter.Project(currentEstimate)
+		msgs, droppedMsgs := fitMessagesToWindow(msgs, a.contextWindow, projectedTokens)
 		if droppedMsgs > 0 {
 			if len(msgs) > 0 && msgs[0].Role == "system" {
 				// 重新构造而非复制：proto.Message 内含 protobuf 的内部状态（含 mutex），
@@ -497,8 +501,8 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			// 条数变化（历史继续增长）时才再次提示。
 			if emit != nil && droppedMsgs != a.lastTrimDropped {
 				emit(&core.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文裁剪: 历史超出 %d tokens 窗口，已省略最早 %d 条消息（会话记录未删除）]\n",
-						a.contextWindow, droppedMsgs),
+					Output: fmt.Sprintf("\n[上下文裁剪: 预计占用 %d / %d tokens，已省略最早 %d 条消息（会话记录未删除）]\n",
+						projectedTokens, a.contextWindow, droppedMsgs),
 					Status: "tool",
 				})
 			}
@@ -509,7 +513,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 裁完仍超窗口：只可能是「单轮内容本身超窗」（例如一次粘贴 200K tokens），
 		// 无论怎么丢历史都塞不进。此时明确报错，而不是把注定被 provider 拒绝的请求发出去。
 		if a.contextWindow > 0 {
-			if est := core.EstimateProtoMessagesTokens(msgs); est > a.contextWindow {
+			if est := a.tokenMeter().Project(core.EstimateProtoMessagesTokens(msgs)); est > a.contextWindow {
 				err := fmt.Errorf("单轮内容超出上下文窗口（约 %d > %d tokens）：请拆分输入、减少一次性粘贴的内容，或改用更大窗口的模型", est, a.contextWindow)
 				if emit != nil {
 					emit(&core.RunStreamResponse{Status: "error", Error: err.Error()})
@@ -540,18 +544,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		//        而压缩会把它摘要化、永久改写会话。既然本次请求已在窗口内（≤90%），
 		//        没理由为省这点余量把「留给大窗口的那部分历史」销毁掉。
 		compacted := false
-		promptTokens := int(a.lastPromptTokens)
-		if a.contextWindow > 0 && a.historyInjection == 0 && promptTokens <= 0 {
-			if est := core.EstimateProtoMessagesTokens(msgs); est > promptTokens {
-				promptTokens = est
-			}
-		}
 		if droppedMsgs == 0 && a.contextWindow > 0 && a.historyInjection == 0 &&
-			float64(promptTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
+			float64(projectedTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
 			if emit != nil {
 				emit(&core.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文压缩: 已用 %d%% 容量，即将压缩对话历史]\n",
-						promptTokens*100/a.contextWindow),
+					Output: fmt.Sprintf("\n[上下文压缩: 预计占用 %d%% 容量，即将压缩对话历史]\n",
+						projectedTokens*100/a.contextWindow),
 					Status: "tool",
 				})
 			}
@@ -599,10 +597,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				sess.Append(session.CompactionSummary, &session.CompactionSummaryData{
 					Content: "以下是此前对话的压缩摘要，请基于它继续当前任务：\n" + summary,
 				}, &session.SurfaceOp{Op: session.SurfaceReplace, Start: nodes[1], End: nodes[keep-1]})
-				// 压缩后已用容量无法精确获取，重置为 0（下一轮服务端 usage 会更新为真实值）
+				// 压缩改写了历史：旧锚点（实测值 + 采样时的消息估算）全部失效，清空后
+				// Project 退回纯估算，直到下一次服务端 usage 重新锚定。
 				a.usageMu.Lock()
 				a.lastPromptTokens = 0
 				a.usageMu.Unlock()
+				a.tokenMeter().Reset()
 				compacted = true
 			}
 		}
@@ -643,6 +643,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		}
 		seenInjects = iterPendingInjects
 		firstRequest = false
+		// 本次请求实际发出的消息估算：服务端回报用量时与它配对写入计量锚点
+		// （增量基线必须与被测请求同源，否则投影会算错）。
+		sentEstimate := core.EstimateProtoMessagesTokens(msgs)
 		// 步开始信号帧：在 LLM 请求真实发出前发射（emit 包装器自动携带
 		// Turn/Step 编号），TUI 以此时刻测 TTFT/初速——覆盖 prompt 处理
 		// 与排队等待；仅靠首个内容帧打点会把这部分首响等待低估为零。
@@ -716,6 +719,14 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 					a.lastPromptTokens = cr.Usage.PromptTokens
 					a.lastUsage = core.UsageFromProto(cr.Usage)
 					a.usageMu.Unlock()
+					// 锚定上下文计量：实测 prompt 侧用量 + 本次所发消息的估算。
+					// 之后 Project(currentEstimate) = 实测 + 增量，绝对误差被实测抵消。
+					//
+					// 只在「本次请求未被裁剪」时锚定：裁剪是请求级的（历史仍全在会话里），
+					// 发出的列表与后续派生的历史不同源，拿它当增量基线会把差额算成增长。
+					if droppedMsgs == 0 {
+						a.tokenMeter().SampleUsage(core.PromptSideTokens(core.UsageFromProto(cr.Usage)), sentEstimate)
+					}
 				}
 				content += cr.Content
 				if cr.Content != "" {
@@ -1598,6 +1609,7 @@ func (a *ReactLoopAgent) SwitchSession(ctx context.Context, sessionID string) er
 	a.lastUsage = nil
 	a.lastTrimDropped = 0
 	a.usageMu.Unlock()
+	a.tokenMeter().Reset()
 	fmt.Printf("[Agent Loop] switched to session %s (%d events, last turn %d)\n",
 		sessionID, sess.Len(), a.turnCounter)
 	return nil
@@ -1833,6 +1845,15 @@ func (a *ReactLoopAgent) Shutdown(ctx context.Context, force bool) error {
 	a.connMu.Unlock()
 
 	return nil
+}
+
+// tokenMeter 返回上下文计量器（懒初始化：窗口可能晚于构造才确定，测试构造也不设它）。
+// 全 agent 只有这一个计量入口——裁剪、压缩、提示文案、单轮超窗判定都读它。
+func (a *ReactLoopAgent) tokenMeter() *core.TokenMeter {
+	if a.meter == nil {
+		a.meter = core.NewTokenMeter(a.contextWindow)
+	}
+	return a.meter
 }
 
 // newAgent 从宿主注入的环境变量构建 ReactLoopAgent（配置读取 + 会话存储初始化）。
