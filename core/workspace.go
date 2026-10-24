@@ -105,7 +105,9 @@ func mapWorkspacePathFor(p, root, goos string) string {
 	// 规则匹配统一在正斜杆副本上进行（模型可能传入 \workspace、\x 等 Windows 风格）。
 	// 注意不用 filepath.ToSlash：它在非 Windows 宿主上是空操作（反斜杆在 POSIX
 	// 不是分隔符），纯函数必须显式替换才能宿主无关。
-	slash := strings.ReplaceAll(p, "\\", "/")
+	// 规则 10：两行连续替换，先双反斜杆（UNC 网络路径那类写法）再单个，顺序不可颠倒。
+	slash := strings.ReplaceAll(p, `\\`, "/")
+	slash = strings.ReplaceAll(slash, "\\", "/")
 
 	// 1. WSL 路径映射：/mnt/c/... → C:/...，/mnt/d/... → D:/...（仅 Windows）
 	if goos == "windows" && strings.HasPrefix(slash, "/mnt/") {
@@ -128,7 +130,9 @@ func mapWorkspacePathFor(p, root, goos string) string {
 	if root == "" {
 		return p
 	}
-	r := strings.TrimRight(strings.ReplaceAll(root, "\\", "/"), "/")
+	// 规则 10：同上，两行连续替换后再去尾随分隔符。
+	r := strings.ReplaceAll(root, `\\`, "/")
+	r = strings.TrimRight(strings.ReplaceAll(r, "\\", "/"), "/")
 
 	// 2. /workspace 虚拟根映射（所有平台生效）
 	const prefix = "/workspace"

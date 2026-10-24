@@ -268,6 +268,8 @@ func resolveRefPath(wsRoot, ref string) string {
 		// 别名后的余下部分显式把反斜杆视作分隔符（对齐 core.mapWorkspacePathFor 的
 		// 同款处理）：模型/用户可能写 \workspace\sub\x.png，而 POSIX 宿主上反斜杆
 		// 不是分隔符、filepath.ToSlash 也是空操作，必须显式替换才能宿主无关。
+		// 规则 10：两行连续替换（先双反斜杆再单个），顺序不可颠倒。
+		rel = strings.ReplaceAll(rel, `\\`, "/")
 		rel = strings.ReplaceAll(rel, "\\", "/")
 		if wsRoot != "" {
 			return core.PJoin(wsRoot, rel)

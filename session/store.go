@@ -51,9 +51,14 @@ import (
 //	/home/jor/my-project → home--jor--my-project（"-" 原样保留，与分隔符区分）
 //	/w/a--b → w--a~d~db（名字里连写的 "-" 才转义）
 func SessionKeyForProject(projectRoot string) string {
-	// 先统一反斜杆为正斜杆（跨平台：仅靠平台相关转换函数无法处理另一平台的
-	// 反斜杆输入，须显式归一，见 AGENTS.md 路径纪律）
-	p := strings.ReplaceAll(projectRoot, "\\", "/")
+	// 统一反斜杆为正斜杆，必须按规则 10 写**两行连续替换**、顺序不可颠倒：
+	// 先处理双反斜杆（网络路径 `\\server\share` 与 JSON 转义残留都可能出现），再处理
+	// 单个。只写一行单反斜杆替换会把 `\\server` 转成 `//server`——多出一个分隔符，
+	// 虽然后面的归一能吃掉，但那是靠下游兜底，不是这行该有的语义。
+	// 也不能用平台相关转换函数：在 Linux 上 `\` 不是分隔符，Windows 风格输入不会被
+	// 转换（AGENTS.md §10）。
+	p := strings.ReplaceAll(projectRoot, `\\`, "/")
+	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.TrimPrefix(p, "/")
 	p = normalizeProjectPath(p)
 	if p == "" {
