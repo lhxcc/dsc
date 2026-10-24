@@ -142,8 +142,12 @@ type CompressionState struct {
 	Absorbed []AbsorbRecord `json:"absorbed,omitempty"`
 	// TerminalStreak 近满无解连续计数（terminal-escape 信号，对齐 #300）
 	TerminalStreak int `json:"terminalStreak,omitempty"`
-	NextBlockID    int `json:"nextBlockId"`
-	NextRunID      int `json:"nextRunId"`
+	// CCR 已卸载内容的索引（字节在附件库里，这里只存引用与元数据）。
+	CCR []CCREntry `json:"ccr,omitempty"`
+	// NextCCRID 下一个回取 ref 的序号（单调递增，永不复用）。
+	NextCCRID   int `json:"nextCcrId,omitempty"`
+	NextBlockID int `json:"nextBlockId"`
+	NextRunID   int `json:"nextRunId"`
 }
 
 // Config 压缩配置（对齐 acp-kernel Config，精简版）。
@@ -188,6 +192,10 @@ type Config struct {
 	// Crush 工具结果的确定性压缩（absorb 两段式的第一段，默认关闭）。
 	// 只在 Absorb.Enabled 时生效：没有第二段兜底时压一半没有意义。
 	Crush CrushConfig `json:"crush"`
+	// CCR 内容缓存回取：大工具结果按内容 hash 存一次，线上只留占位符，
+	// 模型用 acp_retrieve 取回（默认关闭）。文本复用 dsc-txt:// 附件库，
+	// 图像只记 dsc-img:// ref——不另建存储层。
+	CCR CCRConfig `json:"ccr"`
 }
 
 // AbsorbConfig 吸收配置（对齐 acp-kernel AbsorbConfig）。
@@ -239,6 +247,13 @@ func DefaultConfig(modelContextLimit int) Config {
 			Enabled:       false,
 			ToolName:      "absorb",
 			MinToolTokens: 1000,
+		},
+		CCR: CCRConfig{
+			Enabled:           false,
+			MinToolTokens:     2000,
+			InlineLimitTokens: 4000,
+			ToolName:          "acp_retrieve",
+			MaxEntries:        200,
 		},
 	}
 }

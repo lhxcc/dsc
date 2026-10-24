@@ -127,6 +127,8 @@ type ProcessTurnResult struct {
 	Messages []CoreMessage     `json:"messages"`
 	State    *CompressionState `json:"state"`
 	Nudge    *NudgeDecision    `json:"nudge,omitempty"`
+	// CCROffloads 本步需要宿主落盘的内容（kernel 不做 IO，只产出副作用）。
+	CCROffloads []CCROffload `json:"-"`
 }
 
 // ProcessTurn 每轮跑 pipeline（对齐 acp-kernel processTurn）。
@@ -136,8 +138,8 @@ type ProcessTurnResult struct {
 //	assign-refs → advance-survival → sync-blocks → prune(render)
 //	→ hide-compress-calls → absorb(hide+prompt) → decide-nudge → emergency-truncate
 //
-// 仍未实现：ccr-store（acp_retrieve 无损内容仓库）、filter（可插拔过滤框架）、
-// output-steering（冗长度分级）、packs（提示面/工具面定制）。
+// 仍未实现：filter（可插拔过滤框架）、output-steering（冗长度分级）、
+// packs（提示面/工具面定制）。
 //
 // 关于 merge-blocks（old-gen 块批合并）：acp-kernel 的 README/DESIGN 仍写着这个
 // 节点与 mergeMarkedBlocks，但**当前源码的 pipeline 里已经没有它**（节点表见
@@ -146,7 +148,8 @@ type ProcessTurnResult struct {
 // 条件做对（按摘要质量而非块数，见 nudge.go）。
 //
 // 已对齐（勿重复实现）：assign-refs / 存活升级 / sync-blocks / prune /
-// crush（确定性压缩）/ hide-compress-calls / absorb(hide+prompt) /
+// ccr-store（无损回取，复用 dsc-txt:// 附件库）/ crush（确定性压缩）/
+// hide-compress-calls / absorb(hide+prompt) /
 // decide-nudge（计数+质量双路径）/ emergency-truncate / 孤儿配对清理。
 //
 // 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
@@ -171,6 +174,17 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	// 「块」与「调用参数」里各存一份，压缩收益被抵消，模型还会反复看到旧压缩调用。
 	if hid := HideConsumedCompressCalls(state, rendered); hid.Hidden > 0 {
 		rendered = hid.Messages
+	}
+
+	// 5.5 ccr-store：大工具结果到达即按内容 hash 卸载，线上只留确定性占位符。
+	// 放在 absorb 之前：absorb 看到的是占位符（很短），自然不会再要求蒸馏一份
+	// 已经不存在的原文——这也是内核把 ccr-store 排在 absorb 前面的原因。
+	var ccrOffloads []CCROffload
+	if config.CCR.Enabled {
+		if cr, off := ApplyCCR(rendered, state, config); len(off) > 0 || config.CCR.Enabled {
+			rendered = cr
+			ccrOffloads = off
+		}
 	}
 
 	// 6. absorb（DSC 扩展，仅 Absorb.Enabled）：先隐藏已吸收的 tool-call/result 对，
@@ -198,8 +212,9 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	}
 
 	return ProcessTurnResult{
-		Messages: rendered,
-		State:    state,
-		Nudge:    &nudge,
+		Messages:    rendered,
+		State:       state,
+		Nudge:       &nudge,
+		CCROffloads: ccrOffloads,
 	}
 }

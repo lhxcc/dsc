@@ -13,6 +13,30 @@ DSC 上下文管理插件：以 [acp-kernel](https://github.com/ranxianglei/acp-
 - **crush 確定性壓縮**（absorb 第一段，默認關）：JSON 同值提升/相同行折疊（結果仍是合法 JSON）、日誌按級篩選（**每個 ERROR 行逐字保留**）、代碼註釋剝離（字符串感知）；純函數、fail-open、帶最小收益門
 - **state 持久化**：每個 session 一個 JSON 文件，與會話存檔同目錄（`ExecDir/sessions/<session>.acp.json`，以 `.acp.json` 後綴與 `<session>.jsonl` 區分）
 
+## CCR：內容緩存回取（默認關，`DSC_ACP_CCR=1`）
+
+absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CCR 讓它可逆——大工具
+結果**到達時**按內容 hash 存一次，線上只留確定性佔位符，模型用 `acp_retrieve` 取回。
+
+**不另建存儲層**，直接複用 DSC 已有的內容尋址設施：
+
+| 內容 | 存哪 | 回取怎麼交付 |
+| --- | --- | --- |
+| 文本 | 附件庫 `dsc-txt://<sha256>`（`SaveTextAttachment`，同內容自動去重） | ≤ `inlineLimitTokens`（默認 4000）直接內聯；超過則導出到 `<workspace>/acp-retrieved/<sha>.txt`，返回指針由模型自己的文件工具分頁讀 |
+| 圖像 | 字節本來就在附件庫（`dsc-img://<sha256>`），CCR 只記 ref | 取回時把 ref 掛回工具結果，provider 解析成圖像塊（不佔文本預算） |
+| 其它二進制 | 同上導出路徑 | 返回指針 |
+
+佔位符是**確定性**的（同條目必然同字節），到達時替換一次、此後不變——前綴緩存才不會被打斷：
+
+```
+📦 [acp-stored c00003 · text · shell · 4213 tok] `npm run build`
+   → acp_retrieve("c00003") 取回完整內容
+```
+
+邊界：`ref` 單調遞增、**永不複用**（複用會讓「取到的其實是別的内容」無法分辨）；每會話
+最多 `maxEntries` 條（默認 200，最舊的先淘汰）；回取有內聯上限，避免剛省下的上下文又被
+一次塞回去。落盤失敗時**回滾成原文**，絕不留一個取不回來的佔位符。
+
 ## 4 個模型可見工具
 
 | 工具               | 用途                                        |

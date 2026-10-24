@@ -39,6 +39,10 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
+	// state 当前会话的压缩状态（含 CCR 条目索引）；pre-step 每轮刷新，
+	// 供 acp_retrieve 查条目（工具调用不带会话上下文，只能读最近一次快照）。
+	state *bcacp.CompressionState
+
 	// sessionID 当前会话 ID（须持 mu 读写）。
 	// 取值优先级：pre-step 事件里的 Session（宿主真实会话 ID，见 handlePreStep）>
 	// DSC_SESSION_ID env > 工作区派生的项目级键。此前只用后两者，而宿主从不注入
@@ -87,6 +91,23 @@ func main() {
 		if n := os.Getenv("DSC_ACP_ABSORB_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {
 				bc.config.Absorb.MinToolTokens = v
+			}
+		}
+	}
+
+	// 内容缓存回取（CCR）开关（默认关闭，DSC_ACP_CCR=1 启用）。
+	// 与 absorb 相互独立：absorb 是有损蒸馏，CCR 是把原文按内容 hash 存起来随时取回；
+	// 两者可以只开一个，也可以都开（CCR 的占位符很短，absorb 不会再要求蒸馏它）。
+	if dsc.EnvBool("DSC_ACP_CCR", false) {
+		bc.config.CCR.Enabled = true
+		if n := os.Getenv("DSC_ACP_CCR_MIN_TOKENS"); n != "" {
+			if v, err := parseInt(n); err == nil && v >= 0 {
+				bc.config.CCR.MinToolTokens = v
+			}
+		}
+		if n := os.Getenv("DSC_ACP_CCR_INLINE_TOKENS"); n != "" {
+			if v, err := parseInt(n); err == nil && v > 0 {
+				bc.config.CCR.InlineLimitTokens = v
 			}
 		}
 	}
@@ -180,6 +201,35 @@ func main() {
                           },
                           "required": ["ref", "summary"]
                         }`),
+		})
+	}
+
+	// 回取工具（启用 CCR 时注册）：把占位符换回原文。
+	if bc.config.CCR.Enabled {
+		sdkInst.Tool(dsc.Tool{
+			Name:        bc.config.CCR.ToolName,
+			Description: "Fetch the full content behind an [acp-stored cNNNNN] placeholder. Inline up to a size limit; larger payloads are exported to a workspace file you read with your own file tool.",
+			Handler:     bc.handleRetrieve,
+			Schema:      json.RawMessage(bcacp.CCRToolSchema()),
+			// 图像条目：把 ref 挂回工具结果，由 provider 解析成真正的图像块
+			ImagesFn: func(ctx context.Context, args json.RawMessage, result string) []string {
+				var in struct {
+					Ref string `json:"ref"`
+				}
+				if json.Unmarshal(args, &in) != nil {
+					return nil
+				}
+				bc.mu.Lock()
+				defer bc.mu.Unlock()
+				if bc.state == nil {
+					return nil
+				}
+				entry, ok := bcacp.FindCCREntry(bc.state.CCR, in.Ref)
+				if !ok || entry.Kind != bcacp.CCRKindImage {
+					return nil
+				}
+				return entry.Images
+			},
 		})
 	}
 
@@ -354,6 +404,18 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// 属性每轮估算会变化，破坏前缀缓存。改为仅用 mNNNNN ref 映射，标签信息经
 	// acp_status 工具按需查询）
 	result := bcacp.ProcessTurn(coreMsgs, state, bc.config, tokenCount)
+
+	// CCR 副作用：把要卸载的正文写进内容寻址附件库（dsc-txt://<sha>），
+	// 并校验 sha 与条目一致——不一致说明正文在 acp 与插件之间被改写过，
+	// 此时**回滚该条**（恢复原文）而不是留一个取不回来的占位符。
+	if len(result.CCROffloads) > 0 {
+		result.Messages = bc.persistCCROffloads(result.Messages, result.CCROffloads)
+	}
+
+	// 缓存 state 供 acp_retrieve 查条目
+	bc.mu.Lock()
+	bc.state = result.State
+	bc.mu.Unlock()
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -634,4 +696,101 @@ func parseInt(s string) (int, error) {
 		n = n*10 + int(c-'0')
 	}
 	return n, nil
+}
+
+// persistCCROffloads 把 CCR 要卸载的正文写进附件库，并校验 sha。
+//
+// 失败处理：附件写不进去（磁盘满、权限）时，**把该条消息的正文恢复原样**——
+// 留一个指向不存在内容的占位符，模型会反复回取失败，比不压缩更糟。
+func (bc *BillionContext) persistCCROffloads(msgs []bcacp.CoreMessage, offloads []bcacp.CCROffload) []bcacp.CoreMessage {
+	restore := map[string]bool{}
+	for _, off := range offloads {
+		if off.Body == "" {
+			continue // 纯图像条目没有正文要存（图像字节本来就在附件库）
+		}
+		ref, err := dsc.SaveTextAttachment([]byte(off.Body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[billion-context] CCR 落盘失败（%s）: %v\n", off.Entry.Ref, err)
+			restore[off.MessageID] = true
+			continue
+		}
+		// SaveTextAttachment 返回 dsc-txt://<sha256>，与条目 sha 必须一致
+		if ref != dsc.TextRefPrefix+off.Entry.Shasum {
+			fmt.Fprintf(os.Stderr, "[billion-context] CCR sha 不一致（%s: %s ≠ %s），回滚该条\n",
+				off.Entry.Ref, ref, dsc.TextRefPrefix+off.Entry.Shasum)
+			restore[off.MessageID] = true
+		}
+	}
+	if len(restore) == 0 {
+		return msgs
+	}
+	for i := range msgs {
+		if restore[msgs[i].ID] {
+			// 原文已随 offload 存过一份（Body），此处按 ID 回填
+			for _, off := range offloads {
+				if off.MessageID == msgs[i].ID {
+					msgs[i].Text = off.Body
+					break
+				}
+			}
+		}
+	}
+	return msgs
+}
+
+// handleRetrieve 处理 acp_retrieve 工具调用：把占位符换回原文。
+//
+// 交付形态（见 acp.PlanRetrieval）：
+//   - 图像条目 → 正文给一句话，图像 ref 经 ImagesFn 挂回工具结果（provider 解析）
+//   - 文本且未超内联上限 → 直接内联
+//   - 文本超限 → 导出到工作区 acp-retrieved/，返回指针让模型自己分页读
+//
+// 为什么要设上限：回取不设限等于把刚省下的上下文又塞回去，还可能一次撑爆窗口。
+func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessage) (string, error) {
+	var in struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 参数解析失败: %w", err)
+	}
+	bc.mu.Lock()
+	st := bc.state
+	bc.mu.Unlock()
+	if st == nil {
+		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+	}
+	entry, ok := bcacp.FindCCREntry(st.CCR, in.Ref)
+	if !ok {
+		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+	}
+	if entry.Kind == bcacp.CCRKindImage {
+		head := fmt.Sprintf("[acp-retrieved %s] 已将 %d 张图像重新挂回本次工具结果，请直接查看。",
+			entry.Ref, len(entry.Images))
+		// 图像条目可能还带说明文字：有就一起给（否则模型为看这句话还得再取一次）
+		if txt, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum); err == nil && txt != "" {
+			plan := bcacp.PlanRetrieval(entry, bc.config, txt)
+			if plan.Inline {
+				return head + "\n\n" + plan.Text, nil
+			}
+		}
+		return head, nil
+	}
+	text, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum)
+	if err != nil {
+		return "", fmt.Errorf("acp_retrieve: 读取原文失败（%s）: %w", entry.Ref, err)
+	}
+	plan := bcacp.PlanRetrieval(entry, bc.config, text)
+	if plan.Inline {
+		return plan.Text, nil
+	}
+	// 超限：导出到工作区，返回指针（模型用自己的文件工具分页读）
+	dir := dsc.PJoin(dsc.WorkspaceRoot(), "acp-retrieved")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 创建导出目录失败: %w", err)
+	}
+	full := dsc.PJoin(dir, plan.ExportPath)
+	if err := os.WriteFile(full, []byte(text), 0o644); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 导出失败: %w", err)
+	}
+	return bcacp.CCRPointerText(entry, "acp-retrieved/"+plan.ExportPath, bc.config.CCR.InlineLimitTokens), nil
 }
