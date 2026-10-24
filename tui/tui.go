@@ -371,7 +371,11 @@ type Model struct {
 // New 创建一个聊天界面模型
 func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) *Model {
 	input := textarea.New()
-	input.Placeholder = "输入消息，回车发送，Shift+Enter/Ctrl+J 换行，Ctrl+Q 退出"
+	// 占位符只讲「在这里能做什么」，不重复按键提示：按键（Enter 发送 / Ctrl+J 换行 /
+	// Ctrl+Q 退出）统一由底部状态栏承担一处即可，两处都写既冗长又容易互相漂移
+	// （此前一处写「回车发送」、另一处写「Enter 发送」）。腾出的位置改为提示 @ 引用，
+	// 那是输入框独有的能力，看着占位符就能发现。
+	input.Placeholder = "输入消息；@ 引用文件或图片"
 	input.CharLimit = 4096
 	input.ShowLineNumbers = false
 	// 对齐 REX：关闭虚拟光标，改用真实终端光标。虚拟光标在消息区动态重排时无法
