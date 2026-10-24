@@ -573,7 +573,7 @@ func main() {
 	})
 
 	sdk.OnStart(func(ctx context.Context) error {
-		if os.Getenv("DSC_MUSICPLAYER_NO_AUDIO") == "1" {
+		if dsc.EnvBool("DSC_MUSICPLAYER_NO_AUDIO", false) {
 			log.Println("⚠️ DSC_MUSICPLAYER_NO_AUDIO=1，跳过音频初始化")
 			return nil
 		}

@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"io"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"github.com/hashicorp/go-hclog"
@@ -34,9 +34,25 @@ func newTestAgent(t *testing.T) *ReactLoopAgent {
 		blockedAfterConsecutiveRounds: 3,
 		// runner 日志丢弃（测试无需日志；生产 newAgent 会注入本地 hclog）
 		logger: hclog.New(&hclog.LoggerOptions{Output: io.Discard}),
-		// 与 newAgent 缺省一致：-1 = 不限制历史注入（0 会关闭压缩并禁用历史）
-		historyInjection: -1,
+		// 与 newAgent 缺省一致：0 = 未定义（默认不限制历史注入）
+		historyInjection: 0,
 	}
+}
+
+// markSessionRestored 模拟「从存档恢复会话」：把已构造的日志落盘再重新加载。
+// 恢复边界（restoredThrough）由此写入——历史注入上限只作用于这一段，
+// 与真实重启路径完全一致；不这样做的会话会把预置历史当成「本次运行新产生的」，
+// 注入上限对它不生效。
+func markSessionRestored(t *testing.T, a *ReactLoopAgent) {
+	t.Helper()
+	if err := a.store.Save(a.sess); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+	reloaded, err := a.store.Ensure(a.sess.ID())
+	if err != nil || reloaded == nil {
+		t.Fatalf("reload session: %v", err)
+	}
+	a.sess = reloaded
 }
 
 func callTool(t *testing.T, a *ReactLoopAgent, name, args string) (*proto.ExecuteToolResponse, bool) {
@@ -410,7 +426,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("todo_write 应携带 ViewJson: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("todo ViewJson 非法: %v", err)
 	}
@@ -426,7 +442,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("ask_user_question 应携带 ViewJson: %+v", resp)
 	}
-	var v2 core.ToolView
+	var v2 dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v2); err != nil {
 		t.Fatalf("ask ViewJson 非法: %v", err)
 	}
@@ -437,7 +453,7 @@ func TestTodoAndAskViewSpec(t *testing.T) {
 
 // TestTodoWriteViewDirect 直接单测 todo_write 视图函数（计数卡片）。
 func TestTodoWriteViewDirect(t *testing.T) {
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(todoWriteView(2, 1, 3)), &v); err != nil {
 		t.Fatalf("视图 JSON 非法: %v", err)
 	}
@@ -455,7 +471,7 @@ func TestAskQuestionViewDirect(t *testing.T) {
 		{ID: "q1", Selected: []string{"Option A"}, Custom: "notes"},
 		{ID: "q2", Selected: []string{}},
 	})
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(view), &v); err != nil {
 		t.Fatalf("视图 JSON 非法: %v", err)
 	}
@@ -481,7 +497,7 @@ func TestGoalViewSpec(t *testing.T) {
 	if resp.Error != "" || resp.ViewJson == "" {
 		t.Fatalf("create_goal 应携带 ViewJson，实际 %+v", resp)
 	}
-	var view core.ToolView
+	var view dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &view); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}

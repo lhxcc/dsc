@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"testing"
+
+	"github.com/ollama/ollama/api"
 )
 
 // TestOllamaThinkingEnabled 守护思考开关的前缀语义：DSC_OLLAMA_THINKING 优先，
@@ -101,5 +103,36 @@ func TestResolveOllamaConfigDSCPrefixGroup(t *testing.T) {
 	}
 	if model != "llama3.1:latest" {
 		t.Fatalf("默认 MODEL 应为 llama3.1:latest: %q", model)
+	}
+}
+
+// TestApplyMaxTokens 守护 ollama 请求级 max_tokens 的语义：>0 经 num_predict 转发，
+// 0 不设置 Options（与 openai/anthropic 一致，避免把 0 透传成「无上限」覆盖默认）。
+func TestApplyMaxTokens(t *testing.T) {
+	// 正数：写入 num_predict
+	var req api.ChatRequest
+	applyMaxTokens(&req, 4096)
+	if req.Options == nil {
+		t.Fatal("maxTokens>0 应写入 Options")
+	}
+	if n, ok := req.Options["num_predict"].(int); !ok || n != 4096 {
+		t.Fatalf("num_predict 应为 4096，实际 %v", req.Options["num_predict"])
+	}
+
+	// 零值：清空 Options，不污染服务端默认
+	req = api.ChatRequest{Options: map[string]any{"temperature": 0.7}}
+	applyMaxTokens(&req, 0)
+	if _, ok := req.Options["num_predict"]; ok {
+		t.Fatal("maxTokens=0 不应写入 num_predict")
+	}
+	if temp, ok := req.Options["temperature"].(float64); !ok || temp != 0.7 {
+		t.Fatalf("maxTokens=0 不应清掉其它 Options，实际 %v", req.Options)
+	}
+
+	// 负数：不写入
+	req = api.ChatRequest{}
+	applyMaxTokens(&req, -1)
+	if _, ok := req.Options["num_predict"]; ok {
+		t.Fatal("maxTokens<0 不应写入 num_predict")
 	}
 }

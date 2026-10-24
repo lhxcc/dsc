@@ -277,6 +277,18 @@ func ptcEnvEnabled() bool {
 	return false
 }
 
+// historyInjectionCount 返回应下发给 agent 的 DSC_HISTORY_INJECTION 值。
+//
+// config 与 agent 共用 DSC 的三值语义，原值透传、不翻译：负值=不注入恢复历史、
+// 0=未定义（按默认 = 不限制）、N>0=只注入恢复历史中最近 N 条。0 也照常下发——
+// 两边对 0 的理解一致，没有需要转换的地方。
+func historyInjectionCount(cfg *core.Config) (int, bool) {
+	if cfg == nil {
+		return 0, false
+	}
+	return cfg.HistoryInjection, true
+}
+
 func main() {
 	// 捕获 panic：打印完整堆栈而非仅值，并以非零码退出——否则 recover 后 main
 	// 落到 os.Exit(exitCode) 时 exitCode 仍为默认 0，CI 会把崩溃误判为成功。
@@ -286,6 +298,20 @@ func main() {
 			os.Exit(1)
 		}
 	}()
+
+	// dsc help / -h / --help：打印用法后直接退出（不加载插件、不进 TUI）。
+	// 必须放在 version/setup 之前——两者都会扫位置参数，`dsc help` 不该被它们先吃掉。
+	if isHelpCommand(os.Args[1:]) {
+		printHelp()
+		os.Exit(0)
+	}
+
+	// 未知旗标/位置参数 fail-loud：此前一律被静默忽略，`dsc -h`、`dsc hepl` 这类
+	// 拼写错误会直接启动 TUI，用户只看到「命令没按预期做」，比报错难查得多。
+	if err := checkArgs(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
 
 	// dsc version：输出版本信息后直接退出（不加载插件、不进 TUI）。
 	if isVersionCommand(os.Args[1:]) {
@@ -588,16 +614,13 @@ func main() {
 	// 避免 Windows 下日志显示反斜杆路径造成人类与模型所见不一致。
 	logger.Info("workspace root", "root", filepath.ToSlash(core.WorkspaceRoot))
 
-	// /settings history 持久化的历史注入编码（config.yaml history_injection）在启动时
-	// 下发 agent 子进程：0 未定义（默认不限制，不设）；-1 禁止（不注入）→ agent 0；
-	// N>0 启用并注入 N 条 → agent N。
-	if mainCfg != nil && mainCfg.HistoryInjection != 0 {
-		agentCount := mainCfg.HistoryInjection
-		if agentCount == -1 {
-			agentCount = 0 // config 禁止 → agent off
-		}
-		os.Setenv("DSC_HISTORY_INJECTION", strconv.Itoa(agentCount))
-		logger.Info("history injection from config", "encoded", mainCfg.HistoryInjection, "agent", agentCount)
+	// /settings history 持久化的历史注入条数（config.yaml history_injection）在启动时
+	// 原值下发 agent 子进程：负值=不注入恢复历史、0=未定义（默认不限制）、N=最近 N 条。
+	// config 与 agent 共用同一套 DSC 三值语义，不做转换——与 DSH 的「-1 不限制 /
+	// 0 不注入」刻意不同：Go 的零值是未设置，把 0 当关闭会让漏写配置意外关掉历史。
+	if n, ok := historyInjectionCount(mainCfg); ok {
+		os.Setenv("DSC_HISTORY_INJECTION", strconv.Itoa(n))
+		logger.Info("history injection from config", "count", n)
 	}
 
 	// 放大 go-core GRPCBroker 的连接超时（库默认 5 秒，见 EnvConnTimeout）：
@@ -756,6 +779,13 @@ func main() {
 		contextWindow = defaultContextWindow
 	}
 	logger.Info("context window", "window", contextWindow, "source", windowSource)
+	// 工作区根与默认会话标识：会话存档文件名就是「工作区路径 → 会话键」的编码，
+	// 所以「历史没加载」最常见的两种原因都能在这一行看出来——①工作区根不是你以为的
+	// 那个目录（例如从资源管理器启动 dsc.exe，cwd 变成程序目录）；②会话键与已有存档
+	// 文件名不一致。用 -log 启动即可核对，无需猜。
+	logger.Info("session identity", "workspace_root", core.WorkspaceRoot,
+		"default_session", session.SessionKeyForProject(core.WorkspaceRoot),
+		"session_dir", session.Dir(execDir))
 	// 文本引用注入上限随上下文容量换算（TUI 与 -input 共用；窗口未知保持默认 1 MiB）
 	tui.SetTextRefContextWindow(contextWindow)
 

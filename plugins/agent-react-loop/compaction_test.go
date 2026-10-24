@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/session"
 	"google.golang.org/grpc"
@@ -84,19 +84,23 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 	a.contextWindow = 50000 // 模拟宿主注入 DSC_CONTEXT_WINDOW
 	a.lastPromptTokens = 0  // 模拟重启：无上次请求的 usage
 
-	// 预置足够大的历史：12 条消息，字符估算超过 80% 窗口（40k），确保必然触发压缩
+	// 预置历史：2 轮（4 条）约 84% 窗口（42k/50k）——**在窗口之内**，故走压缩而非裁剪。
+	// 超过窗口的情形由 TestOversizeHistoryTrimmedToWindow 覆盖（那里压缩请求自身就会
+	// 超限，只能先裁）。
 	// v3 不变量：surface node 0 必须是 system/message（runLoop 每步经
 	// commitSystemPrompt 提交到事件日志）。测试预置 system 节点模拟生产启动。
 	a.sess.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys"},
 		&session.SurfaceOp{Op: session.SurfaceAppend})
-	big := strings.Repeat("历史对话内容撑大上下文占用。", 1000) // 14 字 ×1000 = 14k 字 → ~3.5k token
-	for i := 0; i < 6; i++ {
+	big := strings.Repeat("历史对话内容撑大上下文占用。", 750) // 14 字 ×750 = 10.5k 字 → 估算 10.5k token/条
+	for i := 0; i < 2; i++ {
 		a.sess.Append(session.UserMessage, &session.UserMessageData{Content: big, Source: "user"},
 			&session.SurfaceOp{Op: session.SurfaceAppend})
 		a.sess.Append(session.AssistantMessage, &session.AssistantMessageData{Content: big},
 			&session.SurfaceOp{Op: session.SurfaceAppend})
 	}
-	if got := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
+	// 预置内容属于「重启恢复」的部分：标记恢复边界（压缩路径与注入上限都按它判定）
+	markSessionRestored(t, a)
+	if got := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
 		t.Fatalf("预置历史估算 = %d token, 需 >= %d 才能触发压缩", got, a.contextWindow*8/10)
 	}
 
@@ -105,8 +109,8 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()
@@ -129,9 +133,9 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 		t.Fatalf("压缩 Chat 调用次数 = %d, 期望 >= 1（重启后首请求前应先压缩历史）", chatCalls)
 	}
 
-	// 2) 主请求收到的历史已被压缩：远小于全量（12 条历史 + 1 条当前 = 13 条）
-	if len(streamMsgs) >= 13 {
-		t.Fatalf("主请求消息数 = %d, 期望 < 13（压缩后应显著减少，而非把全量历史发给模型）", len(streamMsgs))
+	// 2) 主请求收到的历史已被压缩：远小于全量（4 条历史 + 1 条当前 = 5 条）
+	if len(streamMsgs) >= 5 {
+		t.Fatalf("主请求消息数 = %d, 期望 < 5（压缩后应显著减少，而非把全量历史发给模型）", len(streamMsgs))
 	}
 
 	// 3) 摘要节点在列（压缩落地）
@@ -187,7 +191,9 @@ func TestCompactionNotTriggeredOnAccurateUsage(t *testing.T) {
 		a.sess.Append(session.AssistantMessage, &session.AssistantMessageData{Content: big},
 			&session.SurfaceOp{Op: session.SurfaceAppend})
 	}
-	if got := core.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
+	// 预置内容属于「重启恢复」的部分：标记恢复边界（压缩路径与注入上限都按它判定）
+	markSessionRestored(t, a)
+	if got := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages()); got < a.contextWindow*8/10 {
 		t.Fatalf("预置历史估算 = %d token, 需 >= %d 才能验证「估算虚高不触发压缩」", got, a.contextWindow*8/10)
 	}
 
@@ -197,8 +203,8 @@ func TestCompactionNotTriggeredOnAccurateUsage(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()

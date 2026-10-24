@@ -184,3 +184,17 @@ func keySet(m map[string]bool) []string {
 	}
 	return out
 }
+
+// TestHistoryInjectionCountPassThrough config 与 agent 共用 DSC 三值语义，
+// 原值透传、不翻译（负值=不注入恢复历史、0=未定义即默认不限制、N 条）。
+func TestHistoryInjectionCountPassThrough(t *testing.T) {
+	if _, ok := historyInjectionCount(nil); ok {
+		t.Fatal("nil config 不应下发")
+	}
+	for _, want := range []int{-1, 0, 1, 50} {
+		got, ok := historyInjectionCount(&core.Config{HistoryInjection: want})
+		if !ok || got != want {
+			t.Fatalf("config %d → (%d,%v), want (%d,true)", want, got, ok, want)
+		}
+	}
+}

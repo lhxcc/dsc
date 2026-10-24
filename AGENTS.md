@@ -193,17 +193,50 @@ DSC 的命令解析使用内置 POSIX shell 实现（mvdan/sh），所有路径�
 
 - **适用范围**：所有向模型或用户展示的路径字符串（错误消息、工具结果、日志、TUI 显示等），以及从外部输入或错误中提取的路径（必须用上述两行替换）。构造内部路径一律使用 `core.P*` / `dsc.P*` 正斜杆 helper（见规则 11），不得先经原生 filepath 拼接再用 ToSlash 补救。
 
+### 10.5 分層：core ← sdk ← plugins（插件不得 import core）
+
+插件一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`：
+
+- **为什么**：core 是宿主内核（事件总线、会话、计量、协议实现），会持续重构；sdk 是插件的稳定面（类型别名 + 薄转发）。更要紧的是**同一件事不能有第二份实现机会**——DSC 曾让宿主 `core.TokenMeter`（实测口径）成为无人调用的死代码，agent 插件自己用裸估算决定裁剪/压缩，口径一偏（纯 ASCII 高估 4~5 倍），1M 窗口里服务端实测 332K 的会话被判每轮超窗并反复裁剪。
+- **怎么做**：缺什么类型/函数就在 `sdk/` 加转发——类型用别名（`type X = core.X`，语义一致、无包装层），函数一行转发。命名冲突处取新名（如发模型用的工具 schema 叫 `dsc.LLMTool`，因 `dsc.Tool` 已是插件定义的工具）。
+- **守卫**：`core/plugin_sdk_boundary_test.go::TestPluginsDoNotImportCore` 扫描 `plugins/**`（含测试文件），检出即失败。新增例外须在该文件的映射里写明具体理由与迁移计划。
+
 ### 11. 路径 API 黑名单：禁止直接使用 Windows 下返回反斜杆的 filepath 函数
 
 filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实测 Clean/Dir/Join/Abs/Rel/Split/FromSlash/EvalSymlinks/Glob/WalkDir/Walk 均如此，甚至对正斜杆输入也归一化为反斜杆），与「内部 POSIX shell 统一视窗与 UNIX 都以正斜杆处理路径输入输出」相悖。
 
 - **黑名单**：`filepath.Join / Abs / Clean / Rel / Split / FromSlash / EvalSymlinks / Glob / WalkDir / Walk / Dir / Separator` 一律禁止直接使用；由 `core/filepath_guard_test.go` 哨兵测试全仓守护，检出即报错（注释提及亦算命中，须改写）。
 
+- **`path.Clean` 同样在黑名单**：标准库 path 只认 `/` 作分隔符，把反斜杆当普通字符**原样保留**（它只「清理」不「转换」），对 `O:\a\b` 清理后结果仍含反斜杆，违反规则 10。需要清理时用 `core.PClean` 或包内 `posixClean`（先按平台语义清理、再强制正斜杆）。正则带前置 `\b`，不会误捕 `posixpath.Clean` 这类本地等价实现。
+
 - **正确接入**：本仓主模块（core/session/tui/cron/main 等）用 `core.P*`（PJoin/PAbs/PClean/PRel/PSplit/PDir/PEvalSymlinks/PGlob/PWalkDir/PWalk，先原生计算再归一化为正斜杆）；插件用 SDK 转发 `dsc.P*`；libs/sh、plugin、cron、session 等因独立模块或包级 import 环无法引入 core 的，用其本地等价实现（libs/sh/internal/posixpath、plugin/internal/pathx、cron/posix.go、session/posix.go，均登记守卫测试 fileAllowlist）。`string(filepath.Separator)` 一律用 `"/"`。
 
 - **豁免口径**：目录豁免（skipDirs）仅限 (a) 非直管的 vendored 第三方源码（libs/anthropic-sdk-go、libs/go-openai、libs/go-lua、libs/jig-lisp、libs/toon-go、libs/fasttemplate、libs/bytebufferpool、plugins/tool-2fa-master/vendor）；(b) 仓库内非运行时产物（builder、examples、docs、testdata 等）；(c) 逐条登记理由的语义例外（见下）。**本仓直管的 libs（libs/sh、libs/cron 等）无豁免权**，必须同样遵守黑名单——直管代码不得以「第三方」名义豁免。
 
   `libs/vodka` 属本仓自研（Web 框架），归属上按直管论，但登记为语义例外：其 filepath 用法集中在 HTTP 框架内部（静态文件服务、session 文件存储、模板加载），不进入模型可见的路径链路，且在该语境下原生分隔符本就是正确选择——改造无收益，反而会改坏框架内部的路径语义。例外须像这样逐条登记具体理由，不得笼统以「第三方」「非直管」名义豁免。
+
+### 12. 数值语义约定：零值必须表示「未定义 / 走默认」
+
+凡 Go 代码中出现「数量 / 档位 / 开关」类数值字段（配置项、环境变量、proto 跨进程字段、JSON/YAML 入参），一律遵守三值编码——**`0` 必须为未定义，`-1` 或负值必须为禁用，正值必须为启用或具体数值**：
+
+- **`0` = 未定义**：交由默认逻辑处理。**绝不**把 `0` 当作「关闭 / 禁用」——Go 的零值就是 `0`，漏写字段、YAML/JSON 反序列化失败、结构体新增字段、任何一次「没设值」都会静默使其生效，是默认踩得到的陷阱。主动关闭行为交给负值。
+
+- **负值（典型 `-1`）= 禁用 / 不注入 / 不携带**：表示「主动关掉某行为」。
+
+- **正值 = 启用或具体数值**：`N > 0` 表示「最近 N 条」「最多 N 页」「注入 N 条」等具体量。
+
+配套红线：
+
+1. **判定分支不得裸用 `== 0` 表达「禁用」**。表达「启用 / 具体值」用 `> 0`，表达「缺省 / 未设置」用 `== 0` 或 `<= 0`。
+
+2. **布尔开关走 opt-out 模型**：默认开启，以「显式标注关闭」表达禁用（如 `ok && v != "false"`），全仓统一经 SDK `EnvBool(key, def)` 解析，**不得**再出现 `== "1"`、`!= "" && != "0"`、`== "1" || EqualFold "true"` 等互不兼容的内联写法（同一 `DSC_XXX=true` 在不同插件里结论不同，即协议层语义分歧）。
+
+3. **跨进程边界尤其要守这条**——零值隐患最常发生在协议交换处：
+   - proto 的 `service_id` 等 ID 字段用 1-based（`atomic.AddUint32` 从 0 起），故 `0` 约定为「未提供」是安全的**特例**，不要套用到数量字段；
+   - 工具入参结构体必须带 `> 0` / `<= 0` 守卫，不得让真值 `0` 与「缺省」碰撞；
+   - JSON/YAML 反序列化时 `omitempty` 与缺省值要区分清楚，避免缺省被当成真值或反之。
+
+4. **先例与反例**：`history_injection`（`README.md` §语义分歧）按此三值编码——`-1`=不注入 / `0`=未定义(默认不限制) / `N>0`=最近 N 条；`max_tokens=0` 在 openai 由 `resolveMaxTokens`、anthropic 由 `omitZeroMaxTokens` 中间件摘除，在 ollama 经 `num_predict` 转发且**绝不以 `0` 上送**（避免被服务端当无限）；反面教材：`DSC_HISTORY_INJECTION` 曾按 DSH 的 `-1=不限制` 反向实现、`num_predict=0` 被 ollama 当无上限、布尔 env 三套写法并存——均属未守此约定所致。
 
 ## 文档同步
 

@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -35,7 +35,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	cmd := osexec.Command(exe)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+ws)
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,

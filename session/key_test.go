@@ -150,3 +150,37 @@ func TestSessionKeySeparatorUnambiguous(t *testing.T) {
 		t.Fatalf("key=%q 只应有 1 处分隔符 \"--\"", key)
 	}
 }
+
+// TestSessionKeyPathSpellingNormalized 同一目录的「不同写法」必须映射到同一会话键：
+// 尾随分隔符、重复分隔符都归一。否则只是工作区根多打了个斜杆，就会切到一个空会话，
+// 现场表现成「历史突然加载不出来了」。
+func TestSessionKeyPathSpellingNormalized(t *testing.T) {
+	canonical := SessionKeyForProject("O:/Agents/Strada")
+	// 锁定规范写法的键值：归一化不得改动既有会话文件名，否则现存会话集体「丢历史」
+	if canonical != "O=--Agents--Strada-CD976A24" {
+		t.Fatalf("规范路径键值变了（会让现存会话找不到）：%q", canonical)
+	}
+	for _, variant := range []string{
+		"O:/Agents/Strada/",
+		"O:/Agents/Strada//",
+		"O://Agents//Strada",
+		`O://Agents//Strada`,
+		`O://Agents//Strada//`,
+	} {
+		if got := SessionKeyForProject(variant); got != canonical {
+			t.Errorf("%q 应归一到 %q，实际 %q", variant, canonical, got)
+		}
+	}
+
+	// UNC：反斜杆/正斜杆、一/二/三个前导分隔符都归到同一键，且键内不得残留分隔符
+	// （Windows 的 filepath.Clean 保留双前导、POSIX 压成单个，不先去前导就会各算一键）
+	unc := SessionKeyForProject(`\\server\share\dir`)
+	for _, variant := range []string{"//server/share/dir/", "///server/share/dir", "//server//share//dir"} {
+		if got := SessionKeyForProject(variant); got != unc {
+			t.Errorf("UNC %q 应与 %q 同键，实际 %q", variant, unc, got)
+		}
+	}
+	if strings.ContainsAny(unc, `/\\`) {
+		t.Errorf("UNC 键含路径分隔符（不能做文件名）: %q", unc)
+	}
+}

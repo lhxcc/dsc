@@ -51,10 +51,16 @@ import (
 //	/home/jor/my-project → home--jor--my-project（"-" 原样保留，与分隔符区分）
 //	/w/a--b → w--a~d~db（名字里连写的 "-" 才转义）
 func SessionKeyForProject(projectRoot string) string {
-	// 先统一反斜杆为正斜杆（跨平台：仅靠平台相关转换函数无法处理另一平台的
-	// 反斜杆输入，须显式归一，见 AGENTS.md 路径纪律）
-	p := strings.ReplaceAll(projectRoot, "\\", "/")
+	// 统一反斜杆为正斜杆，必须按规则 10 写**两行连续替换**、顺序不可颠倒：
+	// 先处理双反斜杆（网络路径 `\\server\share` 与 JSON 转义残留都可能出现），再处理
+	// 单个。只写一行单反斜杆替换会把 `\\server` 转成 `//server`——多出一个分隔符，
+	// 虽然后面的归一能吃掉，但那是靠下游兜底，不是这行该有的语义。
+	// 也不能用平台相关转换函数：在 Linux 上 `\` 不是分隔符，Windows 风格输入不会被
+	// 转换（AGENTS.md §10）。
+	p := strings.ReplaceAll(projectRoot, `\\`, "/")
+	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.TrimPrefix(p, "/")
+	p = normalizeProjectPath(p)
 	if p == "" {
 		return "default"
 	}
@@ -77,6 +83,33 @@ func SessionKeyForProject(projectRoot string) string {
 		return "default"
 	}
 	return b.String() + "-" + shortPathHash(p)
+}
+
+// normalizeProjectPath 把「同一目录的不同写法」归一到同一形态：折叠重复分隔符、
+// 去掉尾随分隔符。会话键由此路径编码 + 短哈希而来，写法不同就等于换了一个会话——
+// 现场表现是「历史突然加载不出来」，实际只是工作区根多了个分隔符：
+//
+//	O:/Agents/Strada   → O=--Agents--Strada-CD976A24
+//	O:/Agents/Strada/  → O=--Agents--Strada---93781973   ← 同一目录，却是另一个会话
+//
+// 归一不用 core.PClean：core 已经 import session（manager.go / session_search.go），
+// 反向 import 会成环。规则 11 对此有明文安排——session 包用本地等价实现
+// session/posix.go（守卫白名单里的唯一 filepath 使用点），此处即调它的 posixClean。
+//
+// 不用标准库 path 包的 Clean：它只认 `/` 当分隔符，反斜杆会被当成普通字符原样保留
+// （实测对 `O:\a\b` 调用后结果仍含反斜杆），那样会话键会混进文件名非法字符。
+//
+// 前导分隔符先全部去掉，UNC 与绝对路径同等对待：Windows 的 filepath 清理函数保留
+// `\\server\share` 的双前导、POSIX 压成单个，不去掉的话同一台网络共享在两类平台上
+// 会算出不同的键（代价是相对路径 server/share 与之同键——工作区根恒为绝对路径，无实害）。
+// 盘符大小写不折叠（Windows 上 os.Getwd 已是规范大小写，折叠会
+// 改掉现存所有键）；大小写不一致由启动日志的 session identity 行暴露。
+func normalizeProjectPath(p string) string {
+	p = strings.TrimLeft(p, "/")
+	if p == "" {
+		return ""
+	}
+	return posixClean(p)
 }
 
 // keyHashLen 是键末尾短哈希的字符数（8 位大写十六进制，等同 32 位）。

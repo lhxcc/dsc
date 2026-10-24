@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 )
 
@@ -136,12 +136,12 @@ func TestImageOffloadHandlePreStep(t *testing.T) {
 		{Role: "tool", Content: "t1", Images: []string{r2, r3}},
 	}
 	// 预算 3：总量 3 ≤ 3，零开销
-	if res, err := s.handleHostEvent(ctx, string(core.EventAgentPreStep), preStepPayload(t, msgs)); err != nil || res != "" {
+	if res, err := s.handleHostEvent(ctx, string(dsc.EventAgentPreStep), preStepPayload(t, msgs)); err != nil || res != "" {
 		t.Fatalf("within budget must be no-op, got %q err=%v", res, err)
 	}
 	// 预算 1：r1、r2 退役
 	t.Setenv(envMaxRequestImages, "1")
-	res, err := s.handleHostEvent(ctx, string(core.EventAgentPreStep), preStepPayload(t, msgs))
+	res, err := s.handleHostEvent(ctx, string(dsc.EventAgentPreStep), preStepPayload(t, msgs))
 	if err != nil {
 		t.Fatalf("handleHostEvent: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestImageOffloadHandlePreStep(t *testing.T) {
 		t.Fatalf("newest must stay: %+v", out.Messages[1].Images)
 	}
 	// 非预算事件（request-error 等）：忽略
-	if res, err := s.handleHostEvent(ctx, string(core.EventAgentRequestError), `{"agent":"a","code":"context_window_exceeded"}`); err != nil || res != "" {
+	if res, err := s.handleHostEvent(ctx, string(dsc.EventAgentRequestError), `{"agent":"a","code":"context_window_exceeded"}`); err != nil || res != "" {
 		t.Fatalf("request-error must be ignored, got %q err=%v", res, err)
 	}
 }
@@ -183,7 +183,7 @@ func TestChainPreStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chainPreStep: %v", err)
 	}
-	var ev core.AgentPreStepEvent
+	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(chained), &ev); err != nil {
 		t.Fatalf("parse chained payload: %v", err)
 	}

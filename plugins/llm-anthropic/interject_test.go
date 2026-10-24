@@ -1,17 +1,16 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"strings"
 	"testing"
-
-	"dsc/core"
 )
 
 // TestInterjectionSystemMessageKeepsSystemPrompt 插播消息（role=system 追加在消息末尾）
 // 不得覆盖顶层 system prompt：Anthropic 只接受顶层 system，列表里的后续 system 必须
 // 降级为 user 轮并标注来源，否则一次插播会把整套 system prompt 替换掉。
 func TestInterjectionSystemMessageKeepsSystemPrompt(t *testing.T) {
-	msgs := []core.Message{
+	msgs := []dsc.Message{
 		{Role: "system", Content: "REAL SYSTEM PROMPT"},
 		{Role: "user", Content: "do the task"},
 		{Role: "assistant", Content: "working"},

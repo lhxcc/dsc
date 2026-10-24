@@ -44,6 +44,8 @@ type grepOpts struct {
 	fixed         bool // -F：模式按字面文本
 	extended      bool // -E/-G：ERE（Go regexp 原生）
 	word          bool // -w：整词匹配
+	lineRegexp    bool // -x：整行匹配（与 -w 同时给出时以 -x 为准，GNU 口径）
+	quiet         bool // -q：不输出，命中即退 0（谓词用法，如 `grep -q pat f && ...`）
 	before, after int  // -B/-A/-C 上下文行数
 	maxCount      int  // -m N：每个文件最多命中 N 行（0 = 不限）
 
@@ -53,7 +55,7 @@ type grepOpts struct {
 }
 
 // grepSupported 报错时列出的受支持旗标（缺旗标时报错要能指引模型改用可用写法）。
-const grepSupported = "-i -v -n -c -l -o -F -E -w -r/-R -m N -A N -B N -C N " +
+const grepSupported = "-i -v -n -c -l -o -q -x -F -E -w -r/-R -m N -A N -B N -C N " +
 	"--include=GLOB --exclude=GLOB --exclude-dir=GLOB"
 
 func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
@@ -118,7 +120,13 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 			continue
 		}
 		matchedTotal += count
-		if opts.countOnly {
+		// -q 是谓词用法：命中即退 0，不再读后续目标（GNU 同样在首个命中处停下；
+		// 大仓库里 `grep -rq` 因此不必扫完整个工作区）。错误也一并让位——GNU 的
+		// 「命中即退 0」优先于先前累积的非零状态。
+		if opts.quiet && matchedTotal > 0 {
+			return nil
+		}
+		if opts.countOnly && !opts.quiet {
 			if showName {
 				fmt.Fprintf(hc.Stdout, "%s:%d\n", tg.display, count)
 			} else {
@@ -129,7 +137,12 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if exit != 0 {
 		return interp.NewExitStatus(uint8(exit))
 	}
-	if !opts.countOnly && !opts.filesOnly && matchedTotal == 0 {
+	// 无命中退出 1（对齐 GNU grep）：默认输出、-l、-q、-c 一律如此。-c 并不是例外
+	// ——GNU 同样「打印 0 但退 1」（实测 `grep -c zzz f` → 输出 0、exit 1；`grep -rc`
+	// 全零 → 逐文件打印 0、exit 1）。此前 -c 被排除在外，是加 -c/-l 时的遗留写法，
+	// 取数场景（`n=$(grep -c …)`）不看退出码，故统一后不受影响；而 `grep -c x f && …`
+	// 这类写法必须与 GNU 同结论，否则模型写对也跑错。
+	if matchedTotal == 0 {
 		return interp.NewExitStatus(1)
 	}
 	return nil
@@ -211,6 +224,10 @@ func parseGrepArgs(hc interp.HandlerContext, args []string) (grepOpts, string, b
 				opts.onlyMatching = true
 			case "word-regexp":
 				opts.word = true
+			case "line-regexp":
+				opts.lineRegexp = true
+			case "quiet", "silent":
+				opts.quiet = true
 			case "recursive", "dereference-recursive":
 				opts.recursive = true
 			case "max-count", "after-context", "before-context", "context":
@@ -264,6 +281,10 @@ func parseGrepArgs(hc interp.HandlerContext, args []string) (grepOpts, string, b
 					opts.extended = false
 				case 'w':
 					opts.word = true
+				case 'x':
+					opts.lineRegexp = true
+				case 'q':
+					opts.quiet = true
 				case 'r', 'R':
 					opts.recursive = true
 				case 'h', 'H', 's':
@@ -317,7 +338,11 @@ func compileGrepPattern(pat string, opts grepOpts) (*regexp.Regexp, error) {
 	case !opts.extended:
 		pat = breToERE(pat)
 	}
-	if opts.word {
+	// -x 与 -w 同时给出时以 -x 为准（GNU：-w 在 -x 下不起作用）——整行匹配必然
+	// 蕴含整词匹配，再套 \b 只会因行首尾非词字符而误判。
+	if opts.lineRegexp {
+		pat = `^(?:` + pat + `)$`
+	} else if opts.word {
 		pat = `\b(?:` + pat + `)\b`
 	}
 	if opts.ignoreCase {
@@ -388,7 +413,7 @@ func grepOne(hc interp.HandlerContext, tg grepTarget, re *regexp.Regexp, opts gr
 		binOpts.countOnly = true
 		binOpts.filesOnly = false
 		n := grepStream(hc, br, re, binOpts, false, tg.display)
-		if n > 0 && !opts.countOnly && !opts.filesOnly {
+		if n > 0 && !opts.countOnly && !opts.filesOnly && !opts.quiet {
 			fmt.Fprintf(hc.Stdout, "Binary file %s matches\n", tg.display)
 		}
 		return n, nil
@@ -463,7 +488,7 @@ func grepStream(hc interp.HandlerContext, r io.Reader, re *regexp.Regexp, opts g
 	afterLeft := 0
 	lastPrinted := 0
 	emit := func(lineNo int, text string, isMatch bool) {
-		if opts.countOnly || opts.filesOnly {
+		if opts.countOnly || opts.filesOnly || opts.quiet {
 			return
 		}
 		// 组间分隔符仅在有上下文行时输出（GNU 口径）：无 -A/-B/-C 时命中行
@@ -502,13 +527,18 @@ func grepStream(hc interp.HandlerContext, r io.Reader, re *regexp.Regexp, opts g
 				break
 			}
 			count++
+			// -q：只关心「有没有命中」，首个命中即停止读入（大文件/大仓库下避免
+			// 白读剩余内容），输出一律抑制。
+			if opts.quiet {
+				return count
+			}
 			// 先补上之前缓存的前置上下文
 			start := ln - len(ring)
 			for i, prev := range ring {
 				emit(start+i, prev, false)
 			}
 			ring = ring[:0]
-			if opts.onlyMatching && !opts.countOnly && !opts.filesOnly {
+			if opts.onlyMatching && !opts.countOnly && !opts.filesOnly && !opts.quiet {
 				for _, m := range re.FindAllString(line, -1) {
 					if prefix {
 						fmt.Fprintf(hc.Stdout, "%s:", name)
@@ -536,7 +566,7 @@ func grepStream(hc interp.HandlerContext, r io.Reader, re *regexp.Regexp, opts g
 			}
 		}
 	}
-	if opts.filesOnly && count > 0 {
+	if opts.filesOnly && count > 0 && !opts.quiet {
 		fmt.Fprintln(hc.Stdout, name)
 	}
 	return count

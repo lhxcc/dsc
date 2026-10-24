@@ -67,7 +67,4 @@ func envInt(key string) int {
 	return v
 }
 
-func envBool(key string) bool {
-	v := strings.TrimSpace(os.Getenv(key))
-	return v != "" && v != "0"
-}
+func envBool(key string) bool { return EnvBool(key, false) }

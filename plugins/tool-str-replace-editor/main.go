@@ -12,14 +12,14 @@ import (
 	"strings"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"github.com/aymanbagabas/go-udiff"
 )
 
 // withinBase 判斷 real 路徑是否在 base 目錄（含 base 自身）之內。
 // Windows 文件系統大小寫不敏感，故忽略大小寫比較（對齊宿主 containsPath）。
 // 路徑分隔符一律用 "/"（正斜杆）：safePath 的入参 real/realBase 来自 dsc.PAbs /
-// dsc.PJoin / dsc.PClean / core.CanonicalPath，这些 P* 函数在 Windows 上也
+// dsc.PJoin / dsc.PClean / dsc.CanonicalPath，这些 P* 函数在 Windows 上也
 // 返回正斜杆结果（与 AGENTS.md 规则 11「内部 POSIX shell 统一正斜杆」一致）。
 // 不得使用 string(os.PathSeparator)——Windows 上是反斜杆，与 P* 返回的正斜杆
 // 不匹配，会让 withinBase 永远返回 false，导致所有相对路径都被拒绝
@@ -52,7 +52,7 @@ func isAbsPath(path string) bool {
 }
 
 // makeAbsPath 將路徑轉換為絕對路徑，正確處理 Unix 絕對路徑和 Windows 盤符絕對路徑。
-// 模型書寫的虛擬根路徑（/workspace）已在入口經 core.MapWorkspacePath 映射為真實路徑；
+// 模型書寫的虛擬根路徑（/workspace）已在入口經 dsc.MapWorkspacePath 映射為真實路徑；
 // 裸 POSIX 路徑（/docs）保持真實根語義，此處純絕對化後在 Windows 上即為當前盤根。
 func makeAbsPath(reqPath string) (string, error) {
 	// 路徑統一保持正斜槓（dsc.PAbs 結果一律正斜槓，Windows 上 os.* 亦接受正斜槓）。
@@ -106,7 +106,7 @@ func safePath(base, reqPath string) (string, error) {
 		return "", err
 	}
 	// 根也經 CanonicalPath 解析真實路徑（穿透 junction/符號鏈接）
-	realBase, err := core.CanonicalPath(absBase)
+	realBase, err := dsc.CanonicalPath(absBase)
 	if err != nil {
 		return "", err
 	}
@@ -127,7 +127,7 @@ func safePath(base, reqPath string) (string, error) {
 
 	// 把目標整條 canonical 化（穿透 junction/符號鏈接至真實落點），再校驗真實
 	// 路徑仍在 base 內——防 workspace 內指向外部的 junction 寫穿沙箱（P0-3）。
-	realReq, err := core.CanonicalPath(absReq)
+	realReq, err := dsc.CanonicalPath(absReq)
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +138,7 @@ func safePath(base, reqPath string) (string, error) {
 }
 
 // normalizeWorkspacePath 已删除：/workspace 前缀剥离（以及此前缺失的裸 / 锚定）
-// 统一由 core.MapWorkspacePath 承担（本入口经 mappedPath 接入），避免两套归并
+// 统一由 dsc.MapWorkspacePath 承担（本入口经 mappedPath 接入），避免两套归并
 // 语义并存（AGENTS.md 重复逻辑必须抽取）。
 
 type strReplaceEditorArgs struct {
@@ -151,12 +151,12 @@ type strReplaceEditorArgs struct {
 	ViewRange  []int  `json:"view_range"`
 }
 
-// slashErr 委托 core.SlashErr（公共实现，见 core/errslash.go）：把文件系统
+// slashErr 委托 dsc.SlashErr（公共实现，见 core/errslash.go）：把文件系统
 // 错误里的原生路径归一为正斜杆（Windows 上 os.* 错误内嵌反斜杆路径，直接透传
 // 给模型/用户时与其余正斜杆路径风格不一致）。本地不再保留第二份替换实现
 // （对齐 AGENTS.md 重复逻辑必须抽取）。
 func slashErr(err error) error {
-	return core.SlashErr(err)
+	return dsc.SlashErr(err)
 }
 
 // readFileForEdit 读取待编辑文件内容。路径指向目录时给出明确提示：Windows 上
@@ -246,7 +246,7 @@ func visitDir(dirPath string, depth int, rows *[]string) {
 			typeChar = "d"
 		}
 		fullPath := dsc.PJoin(dirPath, name)
-		relPath := filepath.ToSlash(strings.TrimPrefix(fullPath, dsc.PClean(core.WorkspaceRoot)+"/"))
+		relPath := filepath.ToSlash(strings.TrimPrefix(fullPath, dsc.PClean(dsc.WorkspaceRoot())+"/"))
 		*rows = append(*rows, fmt.Sprintf("%s\t%s", typeChar, relPath))
 		if e.IsDir() {
 			visitDir(fullPath, depth+1, rows)
@@ -295,16 +295,16 @@ func strReplaceEditorHandler(ctx context.Context, argsJSON json.RawMessage) (str
 		return "", fmt.Errorf("command is required (one of: view, create, str_replace, insert)")
 	}
 
-	// 使用安全路徑檢查；workspace 根統一來自 core.WorkspaceRoot
+	// 使用安全路徑檢查；workspace 根統一來自 dsc.WorkspaceRoot
 	// （宿主按 config workspace_root 解析並經 DSC_WORKSPACE_ROOT 注入，對齊 DSH 單一策略歸屬）
-	workspaceRoot := core.WorkspaceRoot
+	workspaceRoot := dsc.WorkspaceRoot()
 
-	// 虛擬根歸并統一走 core.MapWorkspacePath（源頭在 core，SDK 供第三方插件復用，
+	// 虛擬根歸并統一走 dsc.MapWorkspacePath（源頭在 core，SDK 供第三方插件復用，
 	// 各插件不再自行轉換）：/workspace 前綴錨定工作區根；裸 POSIX 路徑（如
 	// /docs/architecture.md）保持真實根語義（Windows 上經下方 isAbsPath→dsc.PAbs
 	// 解析為當前盤根，與 Linux 把 /docs 解析到真實根行為一致），模型須以 /workspace
 	// 前綴引用工作區文件。
-	mappedPath := core.MapWorkspacePath(args.Path)
+	mappedPath := dsc.MapWorkspacePath(args.Path)
 	// 映射後落在工作區根內的路徑轉為相對形式，與模型直接傳相對路徑共用 safePath
 	// 的 join 分支（create 可自建缺失父目錄；view 缺失路徑報工作區內真實路徑錯誤，
 	// 而非走絕對分支報盤根 lstat 錯誤）。工作區外路徑保持絕對形式由 abs 分支校驗。
@@ -434,13 +434,13 @@ func appendDiff(msg, path, oldContent, newContent string) string {
 }
 
 // strReplaceEditor 是工具 handler 的包级入口：业务处理后于唯一出口做错误
-// 路径归一（core.SlashErr）。safePath 在路径不存在等失败分支直接返回原生错误
+// 路径归一（dsc.SlashErr）。safePath 在路径不存在等失败分支直接返回原生错误
 // （如 EvalSymlinks 父目录失败的 *os.PathError，内嵌反斜杆原生路径——历史
 // 回归即漏在此），逐点补挂易漏，统一在此结构化归一（宿主聚合工具服务出口
 // 另有文本级兜底）。
 func strReplaceEditor(ctx context.Context, args json.RawMessage) (string, error) {
 	res, err := strReplaceEditorHandler(ctx, args)
-	return res, core.SlashErr(err)
+	return res, dsc.SlashErr(err)
 }
 
 func main() {
@@ -452,7 +452,7 @@ func main() {
 	// shell 等原生命令无法解析 /workspace 虚拟前缀，模型应优先使用真实路径；
 	// /workspace 仍作为工作区根别名被本工具与 sandbox 接受（对齐 DSH 以真实
 	// 路径呈现 workspace-write 根的设计，避免模型臆造不存在的虚拟路径而死循环）。
-	workspaceRoot := core.WorkspaceRoot
+	workspaceRoot := dsc.WorkspaceRoot()
 	if workspaceRoot == "" {
 		workspaceRoot = "."
 	}

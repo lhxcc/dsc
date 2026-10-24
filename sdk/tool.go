@@ -8,12 +8,14 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"dsc/core"
 	"dsc/core/agentclient"
 	"dsc/core/llmclient"
 	"dsc/core/notify"
 	"dsc/core/toolclient"
 	"dsc/proto"
 	"dsc/proto/metadata"
+
 	plugin "github.com/hashicorp/go-plugin"
 	"google.golang.org/grpc"
 )
@@ -50,6 +52,15 @@ type Tool struct {
 // CapabilityRequiresNeverApproval 声明式能力标签：本工具要求前置审批策略为 never。
 // 与宿主 core 侧同名常量同值（对齐同一 wire token，见 proto.Tool.capabilities 注释）。
 const CapabilityRequiresNeverApproval = "requires-never-approval"
+
+// CapabilityReadOnly 声明式能力标签：本工具的任何调用都不写。
+// 与宿主 core 侧同名常量同值（wire token 一致）。
+const CapabilityReadOnly = "read-only"
+
+// ToolCallReadOnly 按工具声明的能力标签判定一次调用是否只读——agent 侧并行的唯一依据。
+func ToolCallReadOnly(capabilities []string, argsJSON string) bool {
+	return core.ToolCallReadOnly(capabilities, argsJSON)
+}
 
 // toolGRPCPlugin 是 go-core 适配器：注册 ToolService + PluginMetadata +
 // PluginHookService（钩子为可选注册，未设置时为空实现，宿主调用无副作用）。

@@ -126,28 +126,13 @@ func NewLLMServiceServer(impl LLMProvider) proto.LLMServiceServer {
 	return &llmGRPCServer{impl: impl}
 }
 
-// convertLLMChatRequest 将 proto 请求转换为内部消息与工具列表
+// convertLLMChatRequest 将 proto 请求转换为内部消息与工具列表。
+//
+// 委托给 protoMessagesToPlugin：这两处曾是各写一份的等价转换，结果一处抄了
+// ToolCallId、一处没抄（tool 消息缺 tool_call_id 会让 OpenAI/DeepSeek 直接 422）。
+// 同一件事只留一份实现（AGENTS.md「重复逻辑必须抽取」），避免再次漂移。
 func convertLLMChatRequest(req *proto.ChatRequest) ([]Message, []Tool) {
-	messages := make([]Message, len(req.Messages))
-	for i, m := range req.Messages {
-		msg := Message{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallId, Images: m.Images}
-		if len(m.ToolCalls) > 0 {
-			msg.ToolCalls = make([]ToolCall, len(m.ToolCalls))
-			for j, tc := range m.ToolCalls {
-				var args map[string]interface{}
-				if err := json.Unmarshal([]byte(tc.ArgumentsJson), &args); err != nil {
-					args = map[string]interface{}{}
-				}
-				msg.ToolCalls[j] = ToolCall{ID: tc.Id, Name: tc.Name, Arguments: args}
-			}
-		}
-		messages[i] = msg
-	}
-	tools := make([]Tool, len(req.Tools))
-	for i, t := range req.Tools {
-		tools[i] = Tool{Name: t.Name, Description: t.Description, ParametersJSON: t.ParametersJson}
-	}
-	return messages, tools
+	return protoMessagesToPlugin(req)
 }
 
 // convertToolCallsToProto 将内部工具调用列表转换为 proto 形式
@@ -171,6 +156,7 @@ func UsageToProto(u *Usage) *proto.Usage {
 		TotalTokens:              u.TotalTokens,
 		CacheReadInputTokens:     u.CacheReadInputTokens,
 		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		ContextTokens:            u.ContextTokens,
 	}
 }
 
@@ -185,6 +171,7 @@ func UsageFromProto(u *proto.Usage) *Usage {
 		TotalTokens:              u.TotalTokens,
 		CacheReadInputTokens:     u.CacheReadInputTokens,
 		CacheCreationInputTokens: u.CacheCreationInputTokens,
+		ContextTokens:            u.ContextTokens,
 	}
 }
 

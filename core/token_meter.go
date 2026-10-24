@@ -40,6 +40,9 @@ type TokenMeasurement struct {
 	ContextWindow int `json:"context_window"`
 	// Pressure 上下文压力比（0.0 ~ 1.0+），= TotalTokens / ContextWindow。
 	Pressure float64 `json:"pressure"`
+	// ProjectedTokens 下一次请求的预计占用（实测锚点 + 自锚点以来的启发式增量）。
+	// 决策（裁剪/压缩）与提示文案一律用这个值，与 TUI 显示的实测值同源。
+	ProjectedTokens int `json:"projected_tokens"`
 	// Source 计量来源："usage"（provider 上报）或 "estimate"（启发式估算）。
 	Source string `json:"source"`
 }
@@ -52,6 +55,14 @@ type TokenMeter struct {
 	lastUsage     *Usage // 最近一次 provider 上报的用量（精确锚点）
 	contextWindow int    // 上下文窗口大小
 	totalTokens   int    // 当前估算的总 token（用于无 usage 时回退）
+
+	// 锚点与增量基线（对齐 DSH tokenMeter 的 pressureTokens / sampledSurfaceTokens）：
+	//   pressureTokens  服务端上报的 prompt 侧用量（prompt + cacheRead + cacheWrite）
+	//   sampledEstimate 取锚点那一刻「所发消息列表」的启发式估算
+	// 两者必须来自同一个请求，否则增量算错。projected = pressure + (当前估算 − sampled)。
+	pressureTokens  int
+	sampledEstimate int
+	hasSample       bool
 }
 
 // NewTokenMeter 创建 token 计量服务。contextWindow 为上下文窗口大小（token 数）。
@@ -72,13 +83,74 @@ func (tm *TokenMeter) UpdateUsage(usage *Usage) {
 		return
 	}
 	tm.lastUsage = usage
-	// 提示缓存感知：prompt_tokens + cache_read_input_tokens = 完整请求 token
-	// （对齐 DSC 既有的 llama.cpp 提示缓存感知逻辑）
-	fullPrompt := int(usage.PromptTokens)
-	if usage.CacheReadInputTokens > 0 {
-		fullPrompt += int(usage.CacheReadInputTokens)
-	}
+	fullPrompt := PromptSideTokens(usage)
 	tm.totalTokens = fullPrompt + int(usage.CompletionTokens)
+	// 只有用量、不掌握「当次所发消息的估算」时也建立锚点，但不设增量基线：
+	// 投影会退化为实测值（保守下界），而不是把整段估算加到实测上（那会重复计）。
+	tm.pressureTokens = fullPrompt
+	tm.sampledEstimate = 0
+	tm.hasSample = true
+}
+
+// SampleUsage 记录一次「实测锚点 + 增量基线」：promptSideTokens 是服务端为某个请求
+// 上报的 prompt 侧用量，sentEstimate 是**同一个请求**发出的消息列表的启发式估算。
+// 之后用 Project 回答「下一发大概多少」——启发式只承担增量，绝对误差在锚点处被实测抵消。
+func (tm *TokenMeter) SampleUsage(promptSideTokens, sentEstimate int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.pressureTokens = promptSideTokens
+	tm.sampledEstimate = sentEstimate
+	tm.hasSample = true
+	tm.totalTokens = promptSideTokens
+}
+
+// Reset 清空锚点（会话切换、压缩改写历史后调用）：此后 Project 退回纯估算，
+// 直到下一次服务端上报重新锚定。
+func (tm *TokenMeter) Reset() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.pressureTokens = 0
+	tm.sampledEstimate = 0
+	tm.hasSample = false
+	tm.totalTokens = 0
+	tm.lastUsage = nil
+}
+
+// Project 返回「即将发出的请求」的上下文占用估计：
+//   - 有锚点：实测 pressure + 自锚点以来的启发式增量
+//   - 无锚点（首次请求 / 重启恢复 / 刚压缩完）：退回 currentEstimate
+//
+// currentEstimate 为当前待发消息列表的启发式估算（core.EstimateProtoMessagesTokens）。
+func (tm *TokenMeter) Project(currentEstimate int) int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.projectLocked(currentEstimate)
+}
+
+// Window 返回当前上下文窗口大小。
+func (tm *TokenMeter) Window() int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.contextWindow
+}
+
+// PromptSideTokens 返回 usage 的 prompt 侧用量——上下文占用只算输入侧；输出已随历史
+// 进入下一发的 prompt，计进来会重复。
+//
+// **口径契约（改动前先读这段）**：Usage.PromptTokens 必须是**完整 prompt**（含命中缓存
+// 的全部输入），CacheRead/CacheCreation 只是其中「由缓存承担 / 写入缓存」的部分，用于
+// 显示命中率，**不得再加进总数**。各家上报语义本就不同（Anthropic 的 input_tokens 不含
+// 缓存、OpenAI 兼容端点的 prompt_tokens 含缓存），统一在 provider 的 usage 映射里归一
+// ——归一化只做一次，消费侧（本函数、压缩、裁剪、TUI）都按同一个数走。
+//
+// 曾经的 bug：这里写成 prompt + cacheRead + cacheCreation，而 OpenAI 兼容端点本就
+// prompt = miss + cached，于是变成 P + cached + (P-cached) = 2P。缓存命中 99.95% 的
+// 会话（服务端实测 498K）被算成 ~1.05M，误报「单轮内容超出上下文窗口」。
+func PromptSideTokens(usage *Usage) int {
+	if usage == nil {
+		return 0
+	}
+	return int(usage.PromptTokens)
 }
 
 // UpdateContextWindow 更新上下文窗口大小（模型探测后可能变化）。
@@ -98,19 +170,21 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 		ContextWindow: tm.contextWindow,
 	}
 
+	est := EstimateMessagesTokens(messages)
 	if tm.lastUsage != nil {
 		// 精确路径：provider 上报了 usage
 		m.PromptTokens = int(tm.lastUsage.PromptTokens)
 		m.CompletionTokens = int(tm.lastUsage.CompletionTokens)
 		m.CacheReadTokens = int(tm.lastUsage.CacheReadInputTokens)
 		m.CacheCreationTokens = int(tm.lastUsage.CacheCreationInputTokens)
-		// 提示缓存感知：完整请求 token = prompt + cache_read
-		fullPrompt := m.PromptTokens + m.CacheReadTokens
-		m.TotalTokens = fullPrompt + m.CompletionTokens
+		// PromptTokens 已含缓存部分（见 PromptSideTokens 的契约说明），不再相加
+		m.TotalTokens = m.PromptTokens + m.CompletionTokens
 		m.Source = "usage"
+		m.ProjectedTokens = tm.projectLocked(est)
 	} else {
 		// 回退路径：字节级启发式估算（对齐 DSH estimateMessage）
-		m.TotalTokens = EstimateMessagesTokens(messages)
+		m.TotalTokens = est
+		m.ProjectedTokens = est
 		m.Source = "estimate"
 	}
 
@@ -121,15 +195,34 @@ func (tm *TokenMeter) Measure(messages []*Message) TokenMeasurement {
 	return m
 }
 
-// ShouldCompact 判断当前压力是否超过阈值，需要触发压缩。
-// thresholdRatio 为触发比例（如 0.80）。
-func (tm *TokenMeter) ShouldCompact(thresholdRatio float64) bool {
+// ShouldCompact 判断「下一次请求」的预计占用是否超过阈值，需要触发压缩。
+// currentEstimate 为待发消息列表的启发式估算，thresholdRatio 为触发比例（如 0.80）。
+func (tm *TokenMeter) ShouldCompact(currentEstimate int, thresholdRatio float64) bool {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	if tm.contextWindow <= 0 || tm.totalTokens <= 0 {
+	if tm.contextWindow <= 0 {
 		return false
 	}
-	return float64(tm.totalTokens)/float64(tm.contextWindow) >= thresholdRatio
+	projected := tm.projectLocked(currentEstimate)
+	return projected > 0 && float64(projected)/float64(tm.contextWindow) >= thresholdRatio
+}
+
+// projectLocked 是 Project 的无锁实现（须已持有读锁）。
+func (tm *TokenMeter) projectLocked(currentEstimate int) int {
+	if currentEstimate < 0 {
+		currentEstimate = 0
+	}
+	if !tm.hasSample {
+		return currentEstimate
+	}
+	delta := 0
+	if tm.sampledEstimate > 0 {
+		delta = currentEstimate - tm.sampledEstimate
+	}
+	if p := tm.pressureTokens + delta; p > 0 {
+		return p
+	}
+	return 0
 }
 
 // EstimateMessagesTokens 估算消息列表的总 token 数（对齐 DSH estimateMessage）。
@@ -184,16 +277,58 @@ func EstimateMessageTokens(msg *Message) int {
 	return toks
 }
 
-// EstimateTextTokens 估算一段文本的 token 数。
-// 取「字节数/4」与「rune 数」的较大者——英文按 /4（约 4 字符 1 token）；
-// CJK（UTF-8 每字 3 字节）字节/4 会低估，故回调为 rune 数（每字按 1 token）。
+// EstimateTextTokens 估算一段文本的 token 数，**按字符分类累加**：
+//   - 宽字符（CJK 表意/假名/韩文/全角符号/emoji）：1 token/字
+//     （UTF-8 三字节，按字节/4 会低估到 0.75/字）
+//   - 其余（ASCII/拉丁/代码）：4 字节/token
+//
+// 旧实现取「整串字节/4」与「整串 rune 数」的**较大者**，意图是「英文按 /4、CJK 按字数」，
+// 但整串只能取一个规则：纯 ASCII/代码时 runes == bytes，于是按 1 token/字符计，是真实值的
+// 4~5 倍。后果是代码类会话被算到窗口之上，触发毫无必要的上下文裁剪与压缩
+// （实测同一份会话：估算 1,113,557，按本函数口径约 209,589，而服务端实际约 332K）。
 func EstimateTextTokens(s string) int {
-	bytes := len(s)
-	runes := utf8.RuneCountInString(s)
-	if byBytes := (bytes + 3) / 4; byBytes > runes {
-		return byBytes
+	if s == "" {
+		return 0
 	}
-	return runes
+	wide, narrow := 0, 0
+	for _, r := range s {
+		if isWideRune(r) {
+			wide++
+			continue
+		}
+		narrow += utf8.RuneLen(r)
+	}
+	return wide + (narrow+3)/4
+}
+
+// isWideRune 报告是否为「一字约一个 token」的宽字符。范围取 East Asian Wide/Fullwidth
+// 的常见区段 + emoji：宁可把这几个区段判宽（1/字），也不要让 CJK 按字节/4 低估。
+func isWideRune(r rune) bool {
+	switch {
+	case r < 0x1100:
+		return false // ASCII / 拉丁 / 希腊 / 西里尔等：按字节折 4
+	case r <= 0x115F:
+		return true // 韩文字母
+	case r == 0x2329 || r == 0x232A:
+		return true
+	case r >= 0x2E80 && r <= 0xA4CF:
+		return true // CJK 部首、假名、CJK 统一表意、彝文
+	case r >= 0xAC00 && r <= 0xD7A3:
+		return true // 韩文音节
+	case r >= 0xF900 && r <= 0xFAFF:
+		return true // CJK 兼容表意
+	case r >= 0xFE30 && r <= 0xFE6F:
+		return true // CJK 兼容形式
+	case r >= 0xFF00 && r <= 0xFF60:
+		return true // 全角字符
+	case r >= 0xFFE0 && r <= 0xFFE6:
+		return true // 全角符号
+	case r >= 0x1F300 && r <= 0x1FAFF:
+		return true // emoji
+	case r >= 0x20000 && r <= 0x3FFFD:
+		return true // CJK 扩展 B 及以后
+	}
+	return false
 }
 
 // EstimateProtoMessageTokens 估算单条 proto 消息的 token 数（proto 版

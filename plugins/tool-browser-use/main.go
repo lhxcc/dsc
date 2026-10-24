@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"dsc-sdk"
-	"dsc/core"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
@@ -765,7 +764,7 @@ func browserScreenshotImpl(sessionID, url string, fullPage bool) (string, error)
 	}
 
 	// 保存截圖到工作區目錄（沙箱限制寫入系統臨時目錄，如 %TEMP%，故存到 workspace 內）
-	downloadDir := dsc.PJoin(core.WorkspaceRoot, "screenshots")
+	downloadDir := dsc.PJoin(dsc.WorkspaceRoot(), "screenshots")
 	if err := dsc.MkdirAll(downloadDir); err != nil {
 		return fmt.Sprintf(`{"success":false,"error":"創建下載目錄失敗: %s"}`, err.Error()), nil
 	}

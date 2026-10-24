@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -80,7 +80,7 @@ var globalSessionManager = &SessionManager{
 const maxSessions = 64
 
 // activityWriter 活动信号 writer：包装会话输出缓冲，每次写入（输出到达）即向
-// 当前调用的活跃续命执行域上报活动（core.TouchActivity）。超时预算与看门狗由
+// 当前调用的活跃续命执行域上报活动（dsc.TouchActivity）。超时预算与看门狗由
 // timeout-policy 插件经宿主裁决安装（tool/execute 槽），本工具只供给活动信号——
 // 输出到达即活动，不感知预算与策略。回调随每次命令执行换绑；未换绑
 // （无进行中的命令）时 no-op。
@@ -108,7 +108,7 @@ func (a *activityWriter) bind(ctx context.Context) {
 		a.touch = nil
 		return
 	}
-	a.touch = func() { core.TouchActivity(ctx) }
+	a.touch = func() { dsc.TouchActivity(ctx) }
 }
 
 // main 以公共 SDK（dsc-sdk）声明式启动：SDK 自动提供 ToolService /
@@ -230,35 +230,89 @@ func main() {
 var exitCodeMarkRe = regexp.MustCompile(`\[exit_code\s*:\s*(-?\d+)\]`)
 
 // mapWorkspacePath 把模型书写的路径按「虚拟根 = 工作区根」契约映射为真实路径。
-// 实现已上收至 core.MapWorkspacePath（宿主与各插件进程同源，SDK 层有同名二次
+// 实现已上收至 dsc.MapWorkspacePath（宿主与各插件进程同源，SDK 层有同名二次
 // 封装供第三方插件，各插件不再各自实现归并转换）；此处仅保留 shell AST 字面量
 // 重写（mapWorkspacePaths）的接入点。规则与例外详见 core/workspace.go：
 // /workspace 前缀（全平台，前缀后必须是分隔符或结尾）、裸 POSIX 绝对路径保持
 // 原样（Windows 上经绝对化解析为当前盘根，与 Linux 真实根一致）、
 // /dev/null 与 // UNC 例外、WSL 风格 /mnt/<drive>/ 映射（仅 Windows）。
 func mapWorkspacePath(p string) string {
-	return core.MapWorkspacePath(p)
+	return dsc.MapWorkspacePath(p)
 }
 
-// mapWorkspacePaths 遍历 shell AST，把纯字面量词中的 /workspace 虚拟根前缀重写为真实路径。
-// 只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/命令替换等复杂词不改，
-// 避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b" 等均被覆盖。
+// mapWorkspacePaths 遍历 shell AST，把纯字面量词中的虚拟根前缀重写为真实路径：
+// 工作空间根 /workspace（跨平台，见 dsc.MapWorkspacePath）与临时目录 /tmp（仅 Windows，
+// 见 mapTempPath）。只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/
+// 命令替换等复杂词不改，避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b"、
+// cd /tmp、ls /tmp/x 等均被覆盖——包括 cd 内建（改 runner.Dir，不经文件操作的 res()），
+// 这正是此前 /tmp 在 cd 下失效而文件操作下正常的根因。
 func mapWorkspacePaths(node syntax.Node) {
+	mapWorkspacePathsFor(node, runtime.GOOS)
+}
+
+// mapWorkspacePathsFor 是 mapWorkspacePaths 的 goos 注入变体（便于跨平台测试）；
+// 生产路径使用真实 runtime.GOOS。
+func mapWorkspacePathsFor(node syntax.Node, goos string) {
 	syntax.Walk(node, func(n syntax.Node) bool {
 		switch v := n.(type) {
 		case *syntax.Lit:
-			v.Value = mapWorkspacePath(v.Value)
+			v.Value = mapShellLitFor(v.Value, goos)
 		case *syntax.SglQuoted:
-			v.Value = mapWorkspacePath(v.Value)
+			// SglQuoted 自身即内容（无独立 Lit 子节点），改写后不再下钻，
+			// 否则 Walk 会继续进入其子节点把已改写的值再映射一次（见 DblQuoted 注释）。
+			v.Value = mapShellLitFor(v.Value, goos)
+			return false
 		case *syntax.DblQuoted:
+			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会再被
+			// 上面的 *syntax.Lit 分支映射第二次。此前的 workspace 映射幂等（已映射值
+			// 不再以 /workspace 开头）而看不出问题，但 /tmp 映射不幂等——已映射的
+			// /tmp/myws/... 会被二次改写为临时目录，导致 cd /workspace 等被误伤。
 			for _, part := range v.Parts {
 				if lit, ok := part.(*syntax.Lit); ok {
-					lit.Value = mapWorkspacePath(lit.Value)
+					lit.Value = mapShellLitFor(lit.Value, goos)
 				}
 			}
+			return false
 		}
 		return true
 	})
+}
+
+// mapShellLitFor 合并两个虚拟根映射（goos 显式注入便于测试）：
+//   - /tmp → DSC 临时目录（仅 Windows；Unix 上 /tmp 是真实挂载点，原样）
+//   - /workspace → 工作空间根（跨平台，见 dsc.MapWorkspacePath）
+//
+// 次序关键：必须先做 /tmp 映射，再做 /workspace 映射。两者前缀互不相交，正常输入下
+// 次序无所谓；但若工作空间根自身落在 /tmp/... 下（用户从 /tmp 启动 dsc，或
+// DSC_WORKSPACE_ROOT=/tmp/...），先做 /workspace 映射会把根改写成 /tmp/...，再被 /tmp
+// 映射误伤成临时目录——此前 TestMapWorkspaceAST 的假根 /tmp/myws 就踩中此碰撞。
+// Windows 上 /tmp 会被 mvdan/sh 解析成当前盘根（如 E:\tmp），没有真实挂载点，故需在
+// AST 层就把 /tmp 字面量改写成临时目录，使 cd /tmp 与文件操作一致落到 DSC temp
+// （res() 仅对文件操作参数与重定向目标做同名映射，漏了 cd 内建）。
+func mapShellLitFor(p, goos string) string {
+	return mapWorkspacePath(mapTempPathFor(p, dsc.TempDir(), goos))
+}
+
+// mapTempPath 把模型的 /tmp 虚拟根字面量重写为 DSC 临时目录（Windows 专用）。
+func mapTempPath(p string) string {
+	return mapTempPathFor(p, dsc.TempDir(), runtime.GOOS)
+}
+
+// mapTempPathFor 是 mapTempPath 的纯函数本体（goos 显式注入便于测试），语义与 res()
+// 的 /tmp 分支（见 internalcmds.go）保持一致：/tmp 与 /tmp/... 映射到临时目录，
+// Unix 上 /tmp 是真实挂载点，原样不动。
+func mapTempPathFor(p, tempDir, goos string) string {
+	if goos != "windows" {
+		return p
+	}
+	if p == "/tmp" || strings.HasPrefix(p, "/tmp/") {
+		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
+		if rel == "" {
+			return tempDir
+		}
+		return dsc.PJoin(tempDir, rel)
+	}
+	return p
 }
 
 // shellView 为 shell 工具声明结构化视图：标题 Shell + 退出码徽标（0 绿 / 非 0 红）
@@ -345,7 +399,7 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 	stdoutBuf := &syncedBuilder{}
 	stderrBuf := &syncedBuilder{}
 	// 活动信号 writer 包在缓冲外：输出写入即向活跃续命执行域上报活动
-	//（core.TouchActivity）；执行域由 timeout-policy 插件经宿主裁决安装。
+	//（dsc.TouchActivity）；执行域由 timeout-policy 插件经宿主裁决安装。
 	stdoutSignal := &activityWriter{w: stdoutBuf}
 	stderrSignal := &activityWriter{w: stderrBuf}
 
@@ -387,7 +441,7 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 
 // execSessionCommand 在 session 中執行命令，返回輸出和退出碼。
 // ctx 用于传播调用方取消与活跃续命执行域（若有）：命令輸出每次寫入都經
-// activityWriter 上報活動（core.TouchActivity），看門狗與預算由 timeout-policy
+// activityWriter 上報活動（dsc.TouchActivity），看門狗與預算由 timeout-policy
 // 插件經宿主裁決安裝——持續無輸出達預算才取消，避免誤殺仍在產出的長編譯/測試。
 func execSessionCommand(ctx context.Context, session *Session, command string) (string, int32, error) {
 	session.mu.Lock()
@@ -410,7 +464,7 @@ func execSessionCommand(ctx context.Context, session *Session, command string) (
 	// `ls /workspace/x` 等探索不再报 no such file or directory（对齐 sandbox 语义）。
 	mapWorkspacePaths(file)
 
-	// 活动信号换绑到本次调用 ctx：输出到达 → core.TouchActivity（活跃续命）。
+	// 活动信号换绑到本次调用 ctx：输出到达 → dsc.TouchActivity（活跃续命）。
 	// 看门狗与预算由 timeout-policy 插件经宿主裁决安装（tool/execute 槽），
 	// 本工具只供给活动信号；ctx 未携带执行域时 TouchActivity 为 no-op。
 	session.stdoutSignal.bind(ctx)
@@ -438,7 +492,7 @@ func execSessionCommand(ctx context.Context, session *Session, command string) (
 	// 活跃续命看门狗触发：上抛取消错误，由工具流水线桥替换为裁决文案
 	//（timeout-policy 的 message）。其余路径保持既有语义：解释器错误计入
 	// 退出码、结果照常返回（非零退出不是 Go 错误），用户中断不在此上抛。
-	if err != nil && core.IdleDeadlineExceeded(ctx) {
+	if err != nil && dsc.IdleDeadlineExceeded(ctx) {
 		return output, exitCode, err
 	}
 	return output, exitCode, nil

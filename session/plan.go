@@ -25,7 +25,7 @@ func FoldPlanMode(events []*Event) bool {
 // 最后一条 history/limit 生效；返回该值以及是否存在记录（无记录时返回的值为 -1，
 // 调用方应回退部署默认）。
 func FoldHistoryLimit(events []*Event) (int, bool) {
-	limit := -1
+	limit := 0 // 0 = 未定义（按默认处理 = 不限制），与本字段的三值语义一致
 	found := false
 	for _, ev := range events {
 		if ev.Type == HistoryLimit {

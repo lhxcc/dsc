@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
+	"dsc-sdk"
 	"dsc/proto"
 )
 
@@ -35,7 +35,12 @@ func newTestCompactionBasicServer(t *testing.T, window int) *compactionBasicServ
 }
 
 // bigMsgs 生成 n 条约 tokensPer 条的大消息（user/assistant 交替）。
-func bigMsgs(n, charsPer int) []*proto.Message {
+//
+// 实现按 dsc.EstimateTextTokens 的口径构造：ASCII 约 4 字节/token，故每个 token 写 4 个
+// 字节。此前实现直接写 charsPer 个字节——那时估算把每个字符当 1 token，两者恰好相等；
+// 估算改成「按字符分类累加」后（修掉纯 ASCII 高估 4~5 倍的 bug），这里必须同步换算，
+// 否则夹具只有预期压力的 1/4，压缩阈值再也够不到。
+func bigMsgs(n, tokensPer int) []*proto.Message {
 	msgs := make([]*proto.Message, 0, n)
 	for i := 0; i < n; i++ {
 		role := "user"
@@ -44,7 +49,7 @@ func bigMsgs(n, charsPer int) []*proto.Message {
 		}
 		msgs = append(msgs, &proto.Message{
 			Role:    role,
-			Content: strings.Repeat("x", charsPer),
+			Content: strings.Repeat("x", tokensPer*4),
 		})
 	}
 	return msgs
@@ -367,7 +372,7 @@ func TestCompactionBasicSnapsToToolPairBoundary(t *testing.T) {
 		t.Fatalf("retain boundary not snapped to owning assistant (index 2 = %q, calls=%d)",
 			msgs[2].GetRole(), len(msgs[2].GetToolCalls()))
 	}
-	if err := core.ValidateToolPairing(msgs); err != nil {
+	if err := dsc.ValidateToolPairing(msgs); err != nil {
 		t.Fatalf("rewritten history violates tool pairing: %v", err)
 	}
 }
@@ -401,7 +406,7 @@ func TestCompactionBasicEmergencySnapsToToolPairBoundary(t *testing.T) {
 
 	// 下一次 pre-step 应用已记录：改写结果必须保持工具对完整。
 	rewritten := parseRewrite(t, mustPreStep(t, s, msgs))
-	if err := core.ValidateToolPairing(rewritten); err != nil {
+	if err := dsc.ValidateToolPairing(rewritten); err != nil {
 		t.Fatalf("emergency rewrite violates tool pairing: %v", err)
 	}
 	start := -1

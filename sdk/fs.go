@@ -39,6 +39,10 @@ func (e *posixPathErr) Unwrap() error { return e.err }
 // workspace_root 解析，工具插件等子进程经包 init 读宿主注入的 DSC_WORKSPACE_ROOT，
 // 无注入回退 cwd），SDK 层转发供第三方插件使用；所有插件默认输出路径推断统一用
 // 此函数。
+// SetWorkspaceRoot 覆盖统一工作区根。仅供测试与需要临时切换根的场景：正常启动时
+// 由宿主注入 DSC_WORKSPACE_ROOT（或取 cwd），插件不应改写它。
+func SetWorkspaceRoot(root string) { core.WorkspaceRoot = root }
+
 func WorkspaceRoot() string {
 	return core.WorkspaceRoot
 }

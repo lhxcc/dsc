@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	dsc "dsc-sdk"
-	"dsc/core"
+
 	"tool-sql-host/internal/bindings"
 	"tool-sql-host/internal/host"
 )
@@ -200,5 +200,5 @@ func main() {
 // creationMode 判断当前是否创造模式（未设置 DSC_MODE 的旧宿主默认允许创造）。
 func creationMode() bool {
 	mode := os.Getenv("DSC_MODE")
-	return mode == "" || mode == core.ModeCreation
+	return mode == "" || mode == dsc.ModeCreation
 }

@@ -37,7 +37,7 @@ import (
 	"os"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"dsc/proto"
 )
 
@@ -88,7 +88,7 @@ func main() {
 			if err != nil {
 				return "", err
 			}
-			if eventType != string(core.EventAgentPreStep) {
+			if eventType != string(dsc.EventAgentPreStep) {
 				return res, nil // request-error 结果（retry 等）原样透传，卸载不参与
 			}
 			// pre-step：压缩改写结果回拼载荷，交 image-offload 在改写后的列表上投影；

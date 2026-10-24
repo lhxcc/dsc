@@ -1,7 +1,7 @@
 package main
 
 import (
-	"dsc/core"
+	"dsc-sdk"
 	"dsc/proto"
 	"dsc/session"
 )
@@ -15,8 +15,8 @@ import (
 // 仍是 append-only 全量事实源。
 func (a *ReactLoopAgent) deriveMessages(sess *session.Session) []*proto.Message {
 	msgs := sess.DeriveMessagesLimited(a.historyInjection)
-	if err := core.ValidateToolPairing(msgs); err != nil {
-		fixed, n := core.RepairToolPairing(msgs)
+	if err := dsc.ValidateToolPairing(msgs); err != nil {
+		fixed, n := dsc.RepairToolPairing(msgs)
 		a.logger.Warn("repaired tool pairing in request history",
 			"session", sess.ID(), "repaired", n, "reason", err.Error())
 		return fixed

@@ -51,3 +51,5 @@ node_modules/
 bun.lock
 bun.lockb
 /dist/
+
+.DS_Store

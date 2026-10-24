@@ -195,6 +195,10 @@ type Session struct {
 	savedPath  string
 	savedCount int
 	savedSize  int64
+	// restoredThrough 从磁盘恢复来的事件数（seq < restoredThrough 的都是「历史」，
+	// 其后是本次运行新产生的）。历史注入上限只作用于这一段：同一会话内已经发生
+	// 的轮次属于当前上下文，不该被「带多少历史进来」这种设置裁掉。
+	restoredThrough int
 }
 
 // New 创建空会话。
@@ -322,14 +326,19 @@ func (s *Session) applySurfaceLocked(ev *Event) {
 // DeriveMessages 从 surface 投影派生模型消息历史（[]*proto.Message，兼容 LLM 调用）。
 // system prompt 由 surface node 0（system/message）派生，对齐 DSH v3。
 func (s *Session) DeriveMessages() []*proto.Message {
-	return s.DeriveMessagesLimited(-1)
+	// 0 = 未定义（按默认 = 不限制）：全量派生。
+	return s.DeriveMessagesLimited(0)
 }
 
-// DeriveMessagesLimited 派生模型消息历史，并限制历史注入条数（对齐 DSH 会话级
-// 运行时设置）：injectCount < 0 不限制；== 0 不注入先前轮次（仅保留当前轮，即
-// 最后一条 user 消息起，模型始终能看到本次输入）；> 0 保留最近 injectCount 条
-// surface 消息、并回退到最近的 user 边界——保证首条为 user（tool_use 与 tool_result
-// 配对完整，Anthropic 要求 messages 以 user 开头），且当前轮总是完整保留。
+// DeriveMessagesLimited 派生模型消息历史，并限制「从存档恢复的历史」注入条数。
+//
+// 取值沿用 DSC 全仓统一的三值语义：负值（-1 等）不注入恢复历史、0 未定义
+// （按默认 = 不限制）、N>0 只取恢复历史中最近 N 条。与 DSH 的「-1 不限制 / 0 不注入」
+// 相反——Go 体系的 0 值就是「未设置」，把 0 解释成「关闭」等于让零值陷阱成立。
+//
+// 无论取值如何，**本次运行内新产生的轮次始终完整保留**：那是当前上下文，
+// 不属于「注入多少历史」的范畴。截断后回退到最近的 user 边界，保证首条为 user
+// （tool_use 与 tool_result 配对完整，Anthropic 要求 messages 以 user 开头）。
 // 事件日志本身不受影响（append-only，历史始终可完整恢复）。
 //
 // system prompt 由 surface node 0（system/message）派生：空 content 节点投影为
@@ -352,17 +361,24 @@ func (s *Session) DeriveMessagesLimited(injectCount int) []*proto.Message {
 			// 也会返回 nil，重复 nil 不追加，安全）
 		}
 	}
-	if injectCount >= 0 {
-		// 起点：最近 injectCount 条消息的开头；injectCount==0 表示只保留当前轮。
-		start := len(s.surfaceNodes) - injectCount
-		if injectCount == 0 {
-			start = len(s.surfaceNodes) - 1
+	// 0 = 未定义，按默认处理（不限制），落到下方的全量派生分支
+	if injectCount != 0 {
+		// 只在「恢复来的历史」里截断：boundary 之后是本进程新产生的轮次，
+		// 它们属于当前上下文，与「带多少历史进来」无关，一律完整保留。
+		// 曾经的实现按整个 surface 倒数，等于让一个「会话级注入」的设置去删
+		// 掉同一会话里刚发生的对话——第二轮开始时模型就看不到第一轮了。
+		boundary := s.restoredBoundary()
+		start := 0
+		if injectCount < 0 {
+			start = boundary // 负值：不注入恢复历史，从边界起
+		} else if boundary > injectCount {
+			start = boundary - injectCount
 		}
-		if start < 0 {
-			start = 0
-		}
-		// 回退到最近的 user 边界（会话首条必为 user 或 system，故终止条件必然可达）。
-		for start > 0 && deriveMessageRole(s.events[s.surfaceNodes[start]]) != "user" {
+		// 回退到最近的 user 边界（tool_use 与 tool_result 必须配对，且 Anthropic
+		// 要求以 user 开头）。回退不越过最后一个 user 节点之外的历史段。
+		// 起点可能正好落在末尾（负值 = 一条恢复历史都不带），此时无需回退，
+		// 否则 s.surfaceNodes[start] 会越界。
+		for start > 0 && start < len(s.surfaceNodes) && deriveMessageRole(s.events[s.surfaceNodes[start]]) != "user" {
 			start--
 		}
 		for i := start; i < len(s.surfaceNodes); i++ {
@@ -384,6 +400,27 @@ func (s *Session) DeriveMessagesLimited(injectCount int) []*proto.Message {
 		}
 	}
 	return msgs
+}
+
+// restoredBoundary 返回 surface 节点里「恢复来的历史」与「本次运行」的分界下标：
+// 之前的节点来自存档，之后的是本次进程内 append 的。会话没有从存档恢复过时返回 0
+// （全部视为本次运行，注入上限因此不生效）。
+func (s *Session) restoredBoundary() int {
+	if s.restoredThrough <= 0 {
+		return 0
+	}
+	// 取「最后一个仍属于恢复历史的节点」之后的位置。
+	//
+	// 不能遇到第一个新节点就返回：surface node 0 是 system prompt，它每次重建
+	// 都会 replace 成新事件（seq 在恢复边界之后），若据此判定边界，整段恢复历史
+	// 会被当成「本次运行产生的」而全部保留——注入上限就完全不生效了。
+	boundary := 0
+	for i, seq := range s.surfaceNodes {
+		if seq < s.restoredThrough {
+			boundary = i + 1
+		}
+	}
+	return boundary
 }
 
 // ProjectSystemPrompt 决策当前渲染出的 system prompt 应以何种 surface 操作提交。

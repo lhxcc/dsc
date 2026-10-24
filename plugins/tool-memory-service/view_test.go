@@ -9,7 +9,7 @@ import (
 
 // TestMemorySearchView memory_search 视图：表格版式、徽标命中数、行数据与分数列。
 func TestMemorySearchView(t *testing.T) {
-	result := `{"results":[{"id":1,"content":"今天天气？","source":"preset","score":0.85},{"id":2,"content":"写周报","source":"tool","score":0.5}],"total":2}`
+	result := `{"results":[{"id":1,"content":"今天天气？","source":"preset","project":"global","score":0.85},{"id":2,"content":"写周报","source":"tool","project":"w--proj-1A2B3C4D","score":0.5}],"total":2}`
 	view, err := memorySearchView(result)
 	if err != nil {
 		t.Fatalf("memorySearchView err: %v", err)
@@ -24,8 +24,12 @@ func TestMemorySearchView(t *testing.T) {
 	if v.Kind != "table" || v.Title != "Memory" || v.Badge == nil || v.Badge.Text != "2 hit(s)" || v.Badge.Tone != "teal" {
 		t.Fatalf("view 头 = %+v", v)
 	}
-	if len(v.Columns) != 4 || len(v.Rows) != 2 {
+	if len(v.Columns) != 5 || len(v.Rows) != 2 {
 		t.Fatalf("columns/rows = %d/%d", len(v.Columns), len(v.Rows))
+	}
+	// 归属列直接展示存值：global 或项目键，不做标签转换
+	if v.Columns[4].Key != "project" || v.Rows[0]["project"] != "global" || v.Rows[1]["project"] != "w--proj-1A2B3C4D" {
+		t.Fatalf("project 列展示不符: cols=%+v rows=%+v", v.Columns, v.Rows)
 	}
 	if v.Columns[2].Key != "score" || v.Columns[2].Tone != "green" {
 		t.Fatalf("score 列应带绿色 tone: %+v", v.Columns)

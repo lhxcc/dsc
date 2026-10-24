@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"dsc/core"
 	"dsc/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -99,14 +99,14 @@ func TestRunLoopContinuesOnInjectedDuringStream(t *testing.T) {
 	a.toolClient = &mockToolClient{}
 
 	var mu sync.Mutex
-	var frames []*core.RunStreamResponse
-	emit := func(f *core.RunStreamResponse) {
+	var frames []*dsc.RunStreamResponse
+	emit := func(f *dsc.RunStreamResponse) {
 		mu.Lock()
 		frames = append(frames, f)
 		mu.Unlock()
 	}
 
-	done := make(chan *core.AgentResult, 1)
+	done := make(chan *dsc.AgentResult, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		res, err := a.runLoop(context.Background(), "初始问题", nil, emit)

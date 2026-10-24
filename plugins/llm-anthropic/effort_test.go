@@ -1,11 +1,10 @@
 package main
 
 import (
+	dsc "dsc-sdk"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
-
-	"dsc/core"
 )
 
 // TestAnthropicEffortForLevel 验证统一档位 → output_config.effort 映射。
@@ -36,7 +35,7 @@ func TestAnthropicEffortForLevel(t *testing.T) {
 // TestBuildMessageParamsNegativeMaxTokensMeansOmit 验证 -1 哨兵（明确不携带）不会以
 // "max_tokens":-1 上送；请求级参数仍优先。
 func TestBuildMessageParamsNegativeMaxTokensMeansOmit(t *testing.T) {
-	msgs := []core.Message{{Role: "user", Content: "hi"}}
+	msgs := []dsc.Message{{Role: "user", Content: "hi"}}
 	p := &AnthropicProvider{model: "m", maxTokens: -1}
 	if got := p.resolveMaxTokens(0); got != -1 {
 		t.Fatalf("插件级 -1 应原样返回（表示明确不携带），got %d", got)
@@ -52,7 +51,7 @@ func TestBuildMessageParamsNegativeMaxTokensMeansOmit(t *testing.T) {
 }
 
 func TestBuildMessageParamsEmitsOutputConfigEffort(t *testing.T) {
-	msgs := []core.Message{{Role: "user", Content: "hi"}}
+	msgs := []dsc.Message{{Role: "user", Content: "hi"}}
 
 	// high → effort=high
 	p := &AnthropicProvider{thinking: true, thinkingBudget: 16384, reasoningEffort: "high"}

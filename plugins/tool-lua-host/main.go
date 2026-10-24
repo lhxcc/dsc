@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"tool-lua-host/internal/bindings"
 	"tool-lua-host/internal/host"
 )
@@ -64,7 +64,7 @@ func main() {
 		// 非创造模式仍加载启动时已存在的脚本（运行已创建的工具），但禁用热加载
 		// 轮询——期间写入的新脚本不会生效，需重启宿主后才作为"已有脚本"加载。
 		mode := os.Getenv("DSC_MODE")
-		creation := mode == "" || mode == core.ModeCreation // 未设置（旧宿主）默认允许创造
+		creation := mode == "" || mode == dsc.ModeCreation // 未设置（旧宿主）默认允许创造
 
 		services := &bindings.Services{LLM: ic.LLM(), Tool: ic.Tool(), Notify: ic.Notifier()}
 		dirs := make([]string, 0, len(scriptsDirs))

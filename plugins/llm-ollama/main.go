@@ -10,12 +10,24 @@ import (
 	"strings"
 
 	"dsc-sdk"
-	"dsc/core"
+
 	"github.com/ollama/ollama/api"
 )
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// applyMaxTokens 将请求级 max_tokens 转为 ollama 的 num_predict 选项。
+//
+// 语义对齐 openai/anthropic 的 resolveMaxTokens：0 表示「用服务端默认」，此时
+// 不设置 Options，让 ollama 走自身默认——绝不能把 0 透传成 num_predict=0（ollama
+// 中 0 意为「无上限」，会覆盖服务端默认并破坏压缩路径的净余值上限）。
+// 仅当 maxTokens > 0 时才写入 num_predict。
+func applyMaxTokens(req *api.ChatRequest, maxTokens int) {
+	if maxTokens > 0 {
+		req.Options = map[string]any{"num_predict": maxTokens}
+	}
 }
 
 type OllamaProvider struct {
@@ -26,17 +38,17 @@ type OllamaProvider struct {
 	thinking bool
 }
 
-// toOllamaMessage 把 core.Message 转为 ollama 消息：Content 直接映射；对 user 消息，
+// toOllamaMessage 把 dsc.Message 转为 ollama 消息：Content 直接映射；对 user 消息，
 // @文本附件引用（dsc-txt://）解析为文本串并以「引用内容\n\n」前缀拼入 Content——ollama
 // 不接收多模态块，纯文本注入供模型直接读取；图像引用 ollama 不支持，跳过。assistant
 // 回带工具调用。Chat 与 ChatStream 共用。
-func toOllamaMessage(m core.Message) api.Message {
+func toOllamaMessage(m dsc.Message) api.Message {
 	content := m.Content
 	if m.Role == "user" {
 		var refs []string
 		for _, img := range m.Images {
-			if strings.HasPrefix(img, core.TextRefPrefix) {
-				if txt, err := core.ResolveTextRef(img); err == nil {
+			if strings.HasPrefix(img, dsc.TextRefPrefix) {
+				if txt, err := dsc.ResolveTextRef(img); err == nil {
 					refs = append(refs, txt)
 				}
 			}
@@ -65,7 +77,7 @@ func toOllamaMessage(m core.Message) api.Message {
 	return msg
 }
 
-func (p *OllamaProvider) Chat(ctx context.Context, messages []core.Message, tools []core.Tool, maxTokens int) (*core.ChatResponse, error) {
+func (p *OllamaProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
 	// 转换消息
 	ollamaMessages := make([]api.Message, len(messages))
 	for i, m := range messages {
@@ -125,6 +137,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, messages []core.Message, tool
 		Messages: ollamaMessages,
 		Tools:    ollamaTools,
 	}
+	applyMaxTokens(&req, maxTokens)
 	if p.thinking {
 		req.Think = &api.ThinkValue{Value: true}
 	}
@@ -139,14 +152,14 @@ func (p *OllamaProvider) Chat(ctx context.Context, messages []core.Message, tool
 	}
 
 	// 處理工具調用
-	var toolCalls []core.ToolCall
+	var toolCalls []dsc.ToolCall
 	if len(resp.Message.ToolCalls) > 0 {
 		for _, tc := range resp.Message.ToolCalls {
 			var args map[string]interface{}
 			if argsJSON, err := json.Marshal(tc.Function.Arguments); err == nil {
 				json.Unmarshal(argsJSON, &args)
 			}
-			toolCalls = append(toolCalls, core.ToolCall{
+			toolCalls = append(toolCalls, dsc.ToolCall{
 				ID:        tc.ID,
 				Name:      tc.Function.Name,
 				Arguments: args,
@@ -154,7 +167,7 @@ func (p *OllamaProvider) Chat(ctx context.Context, messages []core.Message, tool
 		}
 	}
 
-	return &core.ChatResponse{
+	return &dsc.ChatResponse{
 		Content:      resp.Message.Content,
 		FinishReason: "stop",
 		ToolCalls:    toolCalls,
@@ -167,7 +180,7 @@ func (p *OllamaProvider) VisionEnabled() bool                   { return false }
 func (p *OllamaProvider) HealthCheck(ctx context.Context) error { return nil }
 
 // ChatStream 實現 LLMProvider.ChatStream 接口
-func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message, tools []core.Tool) (<-chan *core.ChatStreamResponse, error) {
+func (p *OllamaProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
 	// 轉換消息
 	ollamaMessages := make([]api.Message, len(messages))
 	for i, m := range messages {
@@ -224,11 +237,14 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message
 		Tools:    ollamaTools,
 		Stream:   boolPtr(true),
 	}
+	// 流式路径不接收请求级 maxTokens（SDK LLM 接口 ChatStream 无该参数，
+	// 与 openai/anthropic 流式行为一致）；传 0 = 不设置 num_predict，走服务端默认。
+	applyMaxTokens(&req, 0)
 	if p.thinking {
 		req.Think = &api.ThinkValue{Value: true}
 	}
 
-	ch := make(chan *core.ChatStreamResponse)
+	ch := make(chan *dsc.ChatStreamResponse)
 	dsc.SafeGoroutine(func() {
 		defer close(ch)
 
@@ -241,7 +257,7 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message
 			// 与 llm-anthropic/openai 一致：思考作为 reasoning 帧单独发送）
 			if resp.Message.Thinking != "" {
 				fmt.Fprintf(os.Stderr, "[LLM-OLLAMA-REASONING] %s\n", resp.Message.Thinking)
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Reasoning: resp.Message.Thinking,
 				}
 			}
@@ -249,7 +265,7 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message
 			// 處理文本增量
 			if resp.Message.Content != "" {
 				textAccumulator.WriteString(resp.Message.Content)
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Content: resp.Message.Content,
 				}
 			}
@@ -287,21 +303,21 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message
 
 			// 處理完成原因
 			if resp.Done {
-				var toolCalls []core.ToolCall
+				var toolCalls []dsc.ToolCall
 				for _, key := range toolCallOrder {
 					acc := toolCallAccums[key]
 					var args map[string]interface{}
 					if acc.ArgumentsStr != "" {
 						json.Unmarshal([]byte(acc.ArgumentsStr), &args)
 					}
-					toolCalls = append(toolCalls, core.ToolCall{
+					toolCalls = append(toolCalls, dsc.ToolCall{
 						ID:        acc.ID,
 						Name:      acc.Name,
 						Arguments: args,
 					})
 				}
 
-				ch <- &core.ChatStreamResponse{
+				ch <- &dsc.ChatStreamResponse{
 					Content:      "",
 					FinishReason: "stop",
 					ToolCalls:    toolCalls,
@@ -313,7 +329,7 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []core.Message
 		})
 
 		if streamErr != nil {
-			ch <- &core.ChatStreamResponse{Error: streamErr.Error()}
+			ch <- &dsc.ChatStreamResponse{Error: streamErr.Error()}
 		}
 	})
 
@@ -352,7 +368,7 @@ func main() {
 		thinking: thinking,
 	}
 
-	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 core.LLMGRPCPlugin
+	// 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 dsc.LLMGRPCPlugin
 	// 自动提供 LLMService + 元数据（重写自旧的 plugin.Serve 样板）。
 	sdk := dsc.New(dsc.Config{Name: "ollama", Version: "1.0.0", Type: dsc.TypeLLM})
 	sdk.LLM(provider)

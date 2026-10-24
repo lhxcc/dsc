@@ -9,8 +9,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	dsc "dsc-sdk"
+	"gorm.io/gorm"
 )
 
 // 记忆采集策略（对齐「只留有用信息」的目标）：
@@ -177,7 +179,87 @@ func goalCompleted(data json.RawMessage) bool {
 	return d.Snapshot.Phase == "complete"
 }
 
-// recordReasoning 把模型推理完整写入记忆库。
+// ---- 异步落盘 ----
+//
+// 为什么异步：被动记录推理发生在 agent/pre-step——也就是每次 LLM 请求发出之前。在那个
+// 位置做 SQLite 写入等于给每个请求加固定延迟（WAL 化之前实测 8.3ms/条，之后 0.8ms），
+// 而推理记录不产生任何返回值给模型，完全可以推迟：入队即返回，后台协程按批（一个事务）
+// 落盘，把 N 次提交压成 1 次。
+//
+// 一致性保证：
+//   - 任何 memory_* 工具处理前先 flush，保证「模型刚写的、立刻搜得到」（write-then-read
+//     不会读出空）。
+//   - 工具执行结束后（AfterTool）顺手 flush：那时模型本来就在等工具结果，这笔开销免费。
+//   - 200ms 定时 flush + 批量阈值触发；进程被强杀最多丢最后一批推理记录（可接受）。
+//   - 去重仍由 addMemoryTx 的「同项目+同内容」查询保证：批量在同一事务里落盘，事务内
+//     可见本次已插入的行，故同批里的重复内容也只落一条。
+const (
+	memoryFlushInterval = 200 * time.Millisecond
+	memoryFlushBatch    = 32
+)
+
+// pendingMemory 一条待落盘的记忆。
+type pendingMemory struct {
+	content string
+	source  string
+	project string
+}
+
+var pendingWrites struct {
+	sync.Mutex
+	items []pendingMemory
+}
+
+var memoryWriterOnce sync.Once
+
+// enqueueMemory 把一条记忆放入待写队列（不阻塞）；攒够一批立即落盘。
+func enqueueMemory(content, source, project string) {
+	pendingWrites.Lock()
+	pendingWrites.items = append(pendingWrites.items, pendingMemory{content: content, source: source, project: project})
+	n := len(pendingWrites.items)
+	pendingWrites.Unlock()
+	if n >= memoryFlushBatch {
+		flushPendingMemories()
+	}
+}
+
+// flushPendingMemories 把队列里待写的记忆以单个事务落盘。可被多处并发调用（定时器、
+// 读工具入口、AfterTool）：先取出并清空，再各自落盘自己那批。
+func flushPendingMemories() {
+	pendingWrites.Lock()
+	batch := pendingWrites.items
+	pendingWrites.items = nil
+	pendingWrites.Unlock()
+	if len(batch) == 0 || DB == nil {
+		return
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		for _, m := range batch {
+			if _, _, err := addMemoryTx(tx, m.content, m.source, m.project); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memory-service: flush %d memories failed: %v\n", len(batch), err)
+	}
+}
+
+// startMemoryWriter 启动后台落盘协程（进程内只启动一次）。
+func startMemoryWriter() {
+	memoryWriterOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(memoryFlushInterval)
+			defer t.Stop()
+			for range t.C {
+				flushPendingMemories()
+			}
+		}()
+	})
+}
+
+// recordReasoning 把模型推理写入记忆库。
 // 只做内容去重（同一段推理可能因日志重读被再次看到），不截断、不按长度丢弃——
 // 推理的价值正在细节里，砍半条比不记更糟。
 func recordReasoning(text string) {
@@ -195,9 +277,10 @@ func recordReasoning(text string) {
 	seenReasoning.m[key] = true
 	seenReasoning.Unlock()
 
-	if _, _, err := addMemory(text, "reasoning"); err != nil {
-		fmt.Fprintf(os.Stderr, "memory-service: record reasoning failed: %v\n", err)
-	}
+	// 推理按当前项目归属：换项目后不该在另一个项目的记忆里翻到这些细节。
+	// 入队即返回（pre-step 在 LLM 请求前，不得在此做磁盘写入）；落盘由后台协程完成，
+	// 跨重启的重复仍由落盘时的「同项目+同内容」查询拦掉。
+	enqueueMemory(text, "reasoning", currentProjectKey())
 }
 
 // requestTaskRecord 登记一次「请模型写记忆」的请求；同一任务只登记一次
@@ -244,5 +327,7 @@ func takeTaskRecordNotice() string {
 		return ""
 	}
 	return "【记忆】" + reason + "，本次任务已收尾。请使用当前可用的记忆能力保存一次值得长期留存的内容：" +
-		"关键事实、结论、以及可复用的经验教训（不要复述过程、不要粘贴大段代码）。写完后无需再写第二次。"
+		"关键事实、结论、以及可复用的经验教训（不要复述过程、不要粘贴大段代码）。" +
+		"归属必须明确：本项目专属的经验教训归 current，跨项目通用的偏好/约定归 global。" +
+		"写完后无需再写第二次。"
 }

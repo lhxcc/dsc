@@ -60,6 +60,10 @@ type Manager struct {
 	toolNameToServiceID map[string]uint32                  // tool name -> serviceID
 	toolClients         map[string]proto.ToolServiceClient // tool core name -> 插件 ToolService 客户端（供 ListContext 聚合）
 	lastToolSync        time.Time                          // 聚合工具目录节流同步的时间戳（脚本热加载工具同步）
+	// ctxMeters 宿主侧的上下文计量实例集合（每会话一个，见 core/host_context.go）。
+	// 实例归宿主：TUI/cron/未来前端都从这里读同一个数；agent 进程内的实例只用于决策。
+	ctxMeters *HostContextMeters
+
 	// 互通机制 3：插件钩子回调客户端（toolHookClients，按加载顺序 toolHookOrder）。
 	// 宿主在工具流水线（BeforeTool/AfterTool）与事件广播（OnEvent）时回调插件，
 	// 使插件 A 无需通知主程序/其他插件即可钩子式改变插件 B 的工具行为。
@@ -222,6 +226,39 @@ type ManagerConfig struct {
 	LogFanout *LogFanout
 }
 
+// NoteContextUsage 记录一帧 agent 上报的用量与投影值（宿主侧计量实例的入口）。
+// 前端（TUI）收到 usage 帧时调用；reportedContextTokens 为 Usage.ContextTokens。
+func (m *Manager) NoteContextUsage(sessionID string, u *Usage, reportedContextTokens int) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.NoteUsage(sessionID, u, reportedContextTokens)
+}
+
+// ContextTokens 返回某会话展示用的上下文占用（agent 投影值优先，退回实测 prompt）。
+func (m *Manager) ContextTokens(sessionID string) int {
+	if m == nil || m.ctxMeters == nil {
+		return 0
+	}
+	return m.ctxMeters.ContextTokens(sessionID)
+}
+
+// ResetContextMeters 清空某会话的计量（切会话 / 压缩改写历史后）。
+func (m *Manager) ResetContextMeters(sessionID string) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.Reset(sessionID)
+}
+
+// SetContextWindow 更新上下文窗口（模型切换后同步给宿主计量实例）。
+func (m *Manager) SetContextWindow(window int) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.SetWindow(window)
+}
+
 func NewManager(cfg *ManagerConfig) *Manager {
 	logger := cfg.Logger
 	if logger == nil {
@@ -238,6 +275,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		})
 	}
 	m := &Manager{
+		ctxMeters:           NewHostContextMeters(0),
 		clients:             make(map[string]*plugin.Client),
 		plugins:             make(map[string]DSCPlugin),
 		agents:              make(map[string]Agent),

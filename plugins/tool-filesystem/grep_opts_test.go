@@ -144,3 +144,100 @@ func TestTmpMapsToDSC(t *testing.T) {
 		t.Fatalf("读回内容不符: out=%q err=%v", out, err)
 	}
 }
+
+// TestGrepQuietFlag -q 是谓词用法：只以退出码表态，一律不输出；命中即停（不再读
+// 后续目标/剩余行）。与 -l/-c 同给时输出仍被抑制（GNU 亦然），且 -qc 无命中退 1
+// （-c 平时退 0 的例外不适用于 -q）。
+func TestGrepQuietFlag(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		"a.txt": "foo\nfoobar\n",
+		"b.txt": "nothing\n",
+	})
+
+	// 命中：无输出、退出 0
+	out, errb, err := runShellIO(t, dir, `grep -q foobar a.txt`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("-q 命中应退 0: exit=%d out=%q stderr=%q", got, out, errb)
+	}
+	if out != "" {
+		t.Fatalf("-q 不应输出: %q", out)
+	}
+
+	// 无命中：退出 1
+	out, _, err = runShellIO(t, dir, `grep -q zzz a.txt`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("-q 无命中应退 1: exit=%d out=%q", got, out)
+	}
+
+	// 与 -c/-l 同给：输出仍被抑制（对齐 GNU）
+	for _, flag := range []string{"-qc", "-ql"} {
+		out, _, err = runShellIO(t, dir, `grep `+flag+` foo a.txt`)
+		if got := exitCode(t, err); got != 0 {
+			t.Fatalf("grep %s 命中应退 0: exit=%d out=%q", flag, got, out)
+		}
+		if out != "" {
+			t.Fatalf("grep %s 不应输出: %q", flag, out)
+		}
+	}
+
+	// -qc 无命中仍退 1（-c 的「输出 0 且退 0」例外不适用于 -q）
+	out, _, err = runShellIO(t, dir, `grep -qc zzz a.txt`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("grep -qc 无命中应退 1: exit=%d out=%q", got, out)
+	}
+
+	// 递归谓词用法：多文件时一旦命中即停，不因未命中文件而整体失败
+	out, _, err = runShellIO(t, dir, `grep -rq foo .`)
+	if got := exitCode(t, err); got != 0 {
+		t.Fatalf("grep -rq 命中应退 0: exit=%d out=%q", got, out)
+	}
+	if out != "" {
+		t.Fatalf("grep -rq 不应输出: %q", out)
+	}
+}
+
+// TestGrepLineRegexpFlag -x 只匹配整行（`grep -x foo` 不命中 foobar）；与 -w 同给时
+// 以 -x 为准（GNU：-w 在 -x 下不起作用）。实测 GNU 对照：
+//
+//	$ grep -x foo      → foo
+//	$ grep -xw 'foo bar' → foo bar
+func TestGrepLineRegexpFlag(t *testing.T) {
+	dir := t.TempDir()
+	writeTree(t, dir, map[string]string{
+		"a.txt": "foo\nfoobar\nfoo bar\n",
+	})
+
+	out, errb, err := runShellIO(t, dir, `grep -x foo a.txt`)
+	if err != nil {
+		t.Fatalf("-x 失败: stderr=%q err=%v", errb, err)
+	}
+	if out != "foo\n" {
+		t.Fatalf("-x 应只命中整行 foo: %q", out)
+	}
+
+	// -x 下 -w 不干扰：整行匹配必然蕴含整词匹配，不能再套 \b（行首尾非词字符会误判）
+	out, _, err = runShellIO(t, dir, `grep -xw 'foo bar' a.txt`)
+	if err != nil {
+		t.Fatalf("-xw 失败: %v", err)
+	}
+	if out != "foo bar\n" {
+		t.Fatalf("-xw 应命中整行: %q", out)
+	}
+
+	// 无整行命中：退 1
+	out, _, err = runShellIO(t, dir, `grep -x oo a.txt`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("-x 无整行命中应退 1: exit=%d out=%q", got, out)
+	}
+
+	// -x 与 -E/-F 组合：-F 时整行按字面匹配
+	writeTree(t, dir, map[string]string{"b.txt": "a.b\naxb\n"})
+	out, _, err = runShellIO(t, dir, `grep -xF 'a.b' b.txt`)
+	if err != nil {
+		t.Fatalf("-xF 失败: %v", err)
+	}
+	if out != "a.b\n" {
+		t.Fatalf("-xF 应只按字面匹配整行: %q", out)
+	}
+}

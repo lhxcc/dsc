@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	dsc "dsc-sdk"
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 
@@ -15,12 +14,12 @@ import (
 )
 
 // assertView 校验工具结果经完整 gRPC 链路透传的 ViewJson。
-func assertView(t *testing.T, resp *proto.ExecuteToolResponse) core.ToolView {
+func assertView(t *testing.T, resp *proto.ExecuteToolResponse) dsc.ToolView {
 	t.Helper()
 	if resp.ViewJson == "" {
 		t.Fatalf("ViewJson 为空（ViewFn 未生效或 gRPC 透传缺失）: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}
@@ -40,7 +39,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	}
 
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              exec.Command(exe),

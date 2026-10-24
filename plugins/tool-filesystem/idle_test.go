@@ -2,15 +2,14 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"strings"
 	"testing"
 	"time"
-
-	"dsc/core"
 )
 
 // TestShellOutputTouchesKeepsAlive 活动信号链路端到端（插件侧）：命令持续产生
-// 输出时，每次写入经 activityWriter 上报活动（core.TouchActivity）——总运行
+// 输出时，每次写入经 activityWriter 上报活动（dsc.TouchActivity）——总运行
 // 时长（~1s）远超空闲预算（500ms），全程有输出故能跑完不被看门狗取消。
 //
 // 预算与写入间隔的余量：写入间隔 50ms、预算 500ms（10× 余量，高负载下调度抖动亦不至于
@@ -21,7 +20,7 @@ func TestShellOutputTouchesKeepsAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getOrCreateSession: %v", err)
 	}
-	ctx, cancel := core.WithIdleDeadline(context.Background(), 500*time.Millisecond)
+	ctx, cancel := dsc.WithIdleDeadline(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	out, code, err := execSessionCommand(ctx, sess, "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do echo tick-$i; sleep 0.05; done")
@@ -34,7 +33,7 @@ func TestShellOutputTouchesKeepsAlive(t *testing.T) {
 	if !strings.Contains(out, "tick-20") {
 		t.Fatalf("output 缺失末尾输出: %q", out)
 	}
-	if core.IdleDeadlineExceeded(ctx) {
+	if dsc.IdleDeadlineExceeded(ctx) {
 		t.Fatal("看门狗不应触发")
 	}
 }
@@ -47,7 +46,7 @@ func TestShellSilentCommandHitsIdleDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getOrCreateSession: %v", err)
 	}
-	ctx, cancel := core.WithIdleDeadline(context.Background(), 150*time.Millisecond)
+	ctx, cancel := dsc.WithIdleDeadline(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
@@ -58,7 +57,7 @@ func TestShellSilentCommandHitsIdleDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("看门狗触发过晚: %v", elapsed)
 	}
-	if !core.IdleDeadlineExceeded(ctx) {
+	if !dsc.IdleDeadlineExceeded(ctx) {
 		t.Fatal("取消 cause 应为空闲看门狗触发")
 	}
 }

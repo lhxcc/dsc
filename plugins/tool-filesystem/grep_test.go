@@ -104,6 +104,36 @@ func TestInternalGrepRecursiveInvertCountAndExit(t *testing.T) {
 	if got := exitCode(t, err); got != 1 {
 		t.Fatalf("无命中应退出码 1: exit=%d out=%q", got, out)
 	}
+
+	// -l 无命中同样退 1（GNU grep 亦然）。这条是 `find -exec grep -l` 的语义基础：
+	// 退出码即 -exec 的谓词真假，退 0 会把「含 X 的文件」退化成「全部文件」。
+	out, err = runShell(t, dir, `grep -rl zzznotfound src`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("grep -rl 无命中应退出码 1: exit=%d out=%q", got, out)
+	}
+	if out != "" {
+		t.Fatalf("grep -rl 无命中不应有输出: %q", out)
+	}
+
+	// -c 无命中：照样打印 0，但退出码 1（GNU 口径：`grep -c zzz f` → 0 且 exit 1）。
+	// 取数不受影响（`n=$(grep -c …)` 不看退出码），而 `grep -c x f && …` 这类写法
+	// 才能与 GNU 同结论。
+	out, err = runShell(t, dir, `grep -c zzznotfound src/a.js`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("grep -c 无命中应退出码 1: exit=%d out=%q", got, out)
+	}
+	if strings.TrimSpace(out) != "0" {
+		t.Fatalf("grep -c 无命中仍应输出 0: %q", out)
+	}
+
+	// -rc 全零：逐文件打印 0，整体退出 1（与 GNU 一致；有任一命中则退 0）
+	out, err = runShell(t, dir, `grep -rc zzznotfound src`)
+	if got := exitCode(t, err); got != 1 {
+		t.Fatalf("grep -rc 全零应退出码 1: exit=%d out=%q", got, out)
+	}
+	if !strings.Contains(out, "src/a.js:0") {
+		t.Fatalf("grep -rc 全零仍应逐文件打印 0: %q", out)
+	}
 }
 
 // TestInternalGrepDirectoryWithoutRecursive 目录参数未给 -r 时按 POSIX 报

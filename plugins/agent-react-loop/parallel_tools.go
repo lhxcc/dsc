@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"dsc/core"
+	"dsc-sdk"
 	"dsc/proto"
 )
 
@@ -61,7 +61,7 @@ func (a *ReactLoopAgent) prefetchReadOnlyBatch(
 		if tc == nil || isLocalTool(tc.Name) {
 			return nil
 		}
-		if !core.ToolCallReadOnly(caps[tc.Name], tc.ArgumentsJson) {
+		if !dsc.ToolCallReadOnly(caps[tc.Name], tc.ArgumentsJson) {
 			return nil
 		}
 	}

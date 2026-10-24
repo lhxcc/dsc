@@ -17,9 +17,9 @@ default_llm: llm-anthropic
 # dsc-billion-context；删空则 agent 走内联压缩兜底（presets 缺省已启用同款）
 compaction: dsc-system
 
-# 历史注入持久化编码（/settings history 写回）：-1 禁止（不注入历史）、0 未定义（默认不限制）、
-
-# >0 启用并注入最近 N 条。
+# 恢复历史注入（/settings history 写回）：-1 禁止（不注入从存档恢复的历史）、
+# 0 未定义（未设置，按默认处理 = 不限制）、N>0 只注入恢复历史中最近 N 条。
+# 它只影响「从存档恢复的历史」：同一会话内已经发生的轮次始终完整保留。
 
 #history_injection: -1
 plugins:

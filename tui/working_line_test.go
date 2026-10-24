@@ -13,7 +13,8 @@ import (
 	"dsc/core"
 )
 
-// TestThinkingLineShowsElapsedHintAndDownstream 思考中行显示耗时、取消快捷键与下行数据。
+// TestThinkingLineShowsElapsedHintAndDownstream 工作行显示动画文字、耗时、取消快捷键与下行数据。
+// 文案随本轮随机选中的动画语种变化，故断言「两者之一 + 尾部提示」，不锁死某一语种。
 func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -21,12 +22,24 @@ func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m.elapsed = 5
 	m.turnTokens = 2048
 
+	// 动画文字随帧变化（第 0 帧中文全是占位下划线），故固定到已揭示若干字的帧
+	m.thinkAnim = thinkAnim{kind: thinkAnimZh, frame: 4 * zhFramesPerStep}
 	content := ansi.Strip(m.View().Content)
-	if !strings.Contains(content, "思考中... (5 秒 · Ctrl+C 取消)") {
-		t.Fatalf("思考中行应含耗时与取消提示: %q", content)
+	if !strings.Contains(content, "(5 秒 · Ctrl+C 取消)") {
+		t.Fatalf("工作行应含耗时与取消提示: %q", content)
+	}
+	if !strings.Contains(content, "深度求索") {
+		t.Fatalf("中文动画应显示已揭示的文字: %q", content)
+	}
+
+	// 英文语种走同一行：全大写帧应出现整句
+	m.thinkAnim = thinkAnim{kind: thinkAnimEn, frame: enWaveFrames}
+	content = ansi.Strip(m.View().Content)
+	if !strings.Contains(content, "DEEP SEEKING..") {
+		t.Fatalf("英文动画应显示整句: %q", content)
 	}
 	if !strings.Contains(content, "↓2K") {
-		t.Fatalf("思考中行应含下行数据: %q", content)
+		t.Fatalf("工作行应含下行数据: %q", content)
 	}
 }
 
@@ -142,22 +155,27 @@ func TestStepStartFrameAnchorsTTFT(t *testing.T) {
 	}
 }
 
-// TestTrackTurnUsage 累计下行生成 token；缓存字段按最近一次请求覆盖。
+// TestTrackTurnUsage 累计下行生成 token；缓存命中率两侧按最近一次请求覆盖。
+//
+// 命中率的分母口径：miss = PromptTokens - CacheReadInputTokens（PromptTokens 按契约
+// 已含缓存部分，见 core.PromptSideTokens）。不再拿 CacheCreationInputTokens 当 miss——
+// 那是「写入缓存」的原义，OpenAI 兼容端点为 0，会让命中率恒显示 100%。
 func TestTrackTurnUsage(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 
-	m.trackTurnUsage(&core.Usage{CompletionTokens: 100, CacheReadInputTokens: 80, CacheCreationInputTokens: 20}, 1, 0)
-	if m.turnTokens != 100 || m.cacheHit != 80 || m.cacheMiss != 20 {
-		t.Fatalf("trackTurnUsage 后: turn=%d hit=%d miss=%d", m.turnTokens, m.cacheHit, m.cacheMiss)
+	m.trackTurnUsage(&core.Usage{PromptTokens: 1000, CompletionTokens: 100, CacheReadInputTokens: 800}, 1, 0)
+	if m.turnTokens != 100 || m.cacheHit != 800 || m.cacheMiss != 200 {
+		t.Fatalf("trackTurnUsage 后: turn=%d hit=%d miss=%d（期望 100/800/200）",
+			m.turnTokens, m.cacheHit, m.cacheMiss)
 	}
 
 	// 第二步：下行累计，缓存覆盖
-	m.trackTurnUsage(&core.Usage{CompletionTokens: 50, CacheReadInputTokens: 95, CacheCreationInputTokens: 5}, 2, 0)
+	m.trackTurnUsage(&core.Usage{PromptTokens: 2000, CompletionTokens: 50, CacheReadInputTokens: 1900}, 2, 0)
 	if m.turnTokens != 150 {
 		t.Fatalf("turnTokens 应累计为 150, got %d", m.turnTokens)
 	}
-	if m.cacheHit != 95 || m.cacheMiss != 5 {
-		t.Fatalf("cache 应覆盖为 hit=95 miss=5, got hit=%d miss=%d", m.cacheHit, m.cacheMiss)
+	if m.cacheHit != 1900 || m.cacheMiss != 100 {
+		t.Fatalf("cache 应覆盖为 hit=1900 miss=100, got hit=%d miss=%d", m.cacheHit, m.cacheMiss)
 	}
 }
 
@@ -293,5 +311,29 @@ func TestFormatTokensPerSecond(t *testing.T) {
 		if got := formatTokensPerSecond(c.in); got != c.want {
 			t.Fatalf("formatTokensPerSecond(%v) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestNoteContextUsageUsesHostMeter TUI 的「已用」必须来自宿主计量实例（与决策同源），
+// agent 上报了投影值（Usage.ContextTokens）就用它，没有才退回实测 prompt。
+func TestNoteContextUsageUsesHostMeter(t *testing.T) {
+	manager := core.NewManager(&core.ManagerConfig{})
+	m := New(&stubAgent{}, manager, context.Background(), "Agentic-Turbo-Coder", "minimal", 1000000)
+
+	// agent 上报投影值 512000（实测 prompt 498000）：已用取投影
+	m.noteContextUsage(&core.Usage{PromptTokens: 498000, ContextTokens: 512000})
+	if m.usedTokens != 512000 {
+		t.Fatalf("已用应取宿主计量实例的投影值 512000，got %d", m.usedTokens)
+	}
+	if got := manager.ContextTokens(m.currentSessionID); got != 512000 {
+		t.Fatalf("宿主实例应保管 512000，got %d", got)
+	}
+
+	// 旧 agent 不带上报值：退回实测 prompt
+	m2 := New(&stubAgent{}, manager, context.Background(), "Agentic-Turbo-Coder", "minimal", 1000000)
+	m2.currentSessionID = "other-session"
+	m2.noteContextUsage(&core.Usage{PromptTokens: 1234})
+	if m2.usedTokens != 1234 {
+		t.Fatalf("无上报值时应退回实测 prompt 1234，got %d", m2.usedTokens)
 	}
 }

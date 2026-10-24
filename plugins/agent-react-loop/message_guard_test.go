@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"dsc/core"
+	"dsc-sdk"
 	"dsc/proto"
 	"dsc/session"
 
@@ -26,7 +26,7 @@ func TestDeriveMessagesRepairsOrphanToolResult(t *testing.T) {
 	a := &ReactLoopAgent{logger: hclog.NewNullLogger(), historyInjection: -1}
 	msgs := a.deriveMessages(sess)
 
-	if err := core.ValidateToolPairing(msgs); err != nil {
+	if err := dsc.ValidateToolPairing(msgs); err != nil {
 		t.Fatalf("derived history still invalid: %v", err)
 	}
 	for _, m := range msgs {
@@ -51,7 +51,7 @@ func TestDeriveMessagesKeepsValidPairing(t *testing.T) {
 
 	a := &ReactLoopAgent{logger: hclog.NewNullLogger(), historyInjection: -1}
 	msgs := a.deriveMessages(sess)
-	if err := core.ValidateToolPairing(msgs); err != nil {
+	if err := dsc.ValidateToolPairing(msgs); err != nil {
 		t.Fatalf("valid history reported error: %v", err)
 	}
 	if msgs[len(msgs)-1].GetToolCallId() != "call-1" {

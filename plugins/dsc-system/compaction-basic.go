@@ -44,7 +44,6 @@ import (
 
 	dsc "dsc-sdk"
 
-	"dsc/core"
 	"dsc/core/llmclient"
 	"dsc/proto"
 )
@@ -145,9 +144,9 @@ func (s *compactionBasicServer) attachLLM(c *llmclient.Client) {
 // handleHostEvent 事件入口（main.go 的 hook 多路复用之一）。
 func (s *compactionBasicServer) handleHostEvent(ctx context.Context, eventType, dataJSON string) (string, error) {
 	switch eventType {
-	case string(core.EventAgentPreStep):
+	case string(dsc.EventAgentPreStep):
 		return s.handlePreStep(ctx, dataJSON)
-	case string(core.EventAgentRequestError):
+	case string(dsc.EventAgentRequestError):
 		return s.handleRequestError(ctx, dataJSON)
 	default:
 		return "", nil
@@ -166,7 +165,7 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		fmt.Fprintf(os.Stderr, "dsc-system: compaction-basic window=%d threshold=%.2f retain_ratio=%.2f\n",
 			s.window, s.threshold, s.retainRatio)
 	})
-	var ev core.AgentPreStepEvent
+	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("compaction-basic: parse pre-step event: %w", err)
 	}
@@ -198,9 +197,9 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	//（不含工具定义、CJK 每字 3 字节被 /4 低估）会把真实用量显著估低——实测
 	// 真实已用 83.56% 而插件估算仅 60.08%，压缩因此不触发。无上报记录（首次
 	// 请求/重启恢复）时退回纯启发式兜底。
-	pressure := core.EstimateProtoMessagesTokens(rewritten)
+	pressure := dsc.EstimateProtoMessagesTokens(rewritten)
 	if ev.LastUsageTokens > 0 && prevSession == sess && len(prevMsgs) > 0 {
-		delta := pressure - core.EstimateProtoMessagesTokens(applyRecords(prevMsgs, records))
+		delta := pressure - dsc.EstimateProtoMessagesTokens(applyRecords(prevMsgs, records))
 		if delta < 0 {
 			delta = 0
 		}
@@ -238,7 +237,7 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	}
 	// 工具对边界：保留区不得以 tool 消息开头，否则请求历史出现孤立 tool 消息
 	// （OpenAI 兼容端点直接拒绝）。无法吸附时放弃本次新增压缩，仅沿用既有记录改写。
-	if snapped, ok := core.SnapRetainStart(msgs, retainIdx, base); ok {
+	if snapped, ok := dsc.SnapRetainStart(msgs, retainIdx, base); ok {
 		retainIdx = snapped
 	} else {
 		if len(records) > 0 {
@@ -252,7 +251,7 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		UpTo:     retainIdx,
 		HeadHash: fingerprint(msgs[:retainIdx]),
 		Summary:  summary,
-		Shadowed: core.EstimateProtoMessagesTokens(msgs[base:retainIdx]),
+		Shadowed: dsc.EstimateProtoMessagesTokens(msgs[base:retainIdx]),
 		ID:       id,
 	}
 	s.mu.Lock()
@@ -269,7 +268,7 @@ func (s *compactionBasicServer) handleRequestError(ctx context.Context, dataJSON
 	if s.window <= 0 {
 		return "", nil
 	}
-	var ev core.AgentRequestErrorEvent
+	var ev dsc.AgentRequestErrorEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("compaction-basic: parse request-error event: %w", err)
 	}
@@ -303,7 +302,7 @@ func (s *compactionBasicServer) handleRequestError(ctx context.Context, dataJSON
 	}
 	// 工具对边界：保留区（[end, len)）不得以 tool 消息开头。最后一条若是工具结果，
 	// 吸附到其所属 assistant（整对保留）；无法吸附则不压缩——重试同样的坏切分无意义。
-	snapped, ok := core.SnapRetainStart(msgs, end, base)
+	snapped, ok := dsc.SnapRetainStart(msgs, end, base)
 	if !ok || snapped <= base {
 		return "", nil
 	}
@@ -313,7 +312,7 @@ func (s *compactionBasicServer) handleRequestError(ctx context.Context, dataJSON
 		UpTo:      end,
 		HeadHash:  fingerprint(msgs[:end]),
 		Summary:   summary,
-		Shadowed:  core.EstimateProtoMessagesTokens(msgs[base:end]),
+		Shadowed:  dsc.EstimateProtoMessagesTokens(msgs[base:end]),
 		ID:        id,
 		Emergency: true,
 	}
@@ -391,7 +390,7 @@ func (s *compactionBasicServer) retainBudget() int {
 
 // retainBoundary 保留尾部边界：从末尾向前累积，返回前段可压缩的上界
 // （[retainIdx, len) 为保留区）。全部落在保留区时返回 len(msgs)。
-// 用量估算复用 core 公用启发式（core.EstimateProtoMessageTokens，CJK 感知
+// 用量估算复用 core 公用启发式（dsc.EstimateProtoMessageTokens，CJK 感知
 // + 角色开销 + 图像 + 工具参数），与压力判定同一估算口径。
 func (s *compactionBasicServer) retainBoundary(msgs []*proto.Message) int {
 	budget := s.retainBudget()
@@ -403,7 +402,7 @@ func (s *compactionBasicServer) retainBoundary(msgs []*proto.Message) int {
 		lower = 1
 	}
 	for i := len(msgs) - 1; i >= lower; i-- {
-		acc += core.EstimateProtoMessageTokens(msgs[i])
+		acc += dsc.EstimateProtoMessageTokens(msgs[i])
 		if acc > budget {
 			return i + 1
 		}

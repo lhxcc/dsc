@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"os"
 	osexec "os/exec"
@@ -9,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"dsc/core"
 	"dsc/proto"
 	"dsc/proto/metadata"
 	plugin "github.com/hashicorp/go-plugin"
@@ -35,12 +35,12 @@ func TestJoinMatchTerms(t *testing.T) {
 }
 
 // assertView 校验工具结果经完整 gRPC 链路透传的 ViewJson：非空且可解析为合法视图。
-func assertView(t *testing.T, resp *proto.ExecuteToolResponse) core.ToolView {
+func assertView(t *testing.T, resp *proto.ExecuteToolResponse) dsc.ToolView {
 	t.Helper()
 	if resp.ViewJson == "" {
 		t.Fatalf("ViewJson 为空（ViewFn 未生效或 gRPC 透传缺失）: %+v", resp)
 	}
-	var v core.ToolView
+	var v dsc.ToolView
 	if err := json.Unmarshal([]byte(resp.ViewJson), &v); err != nil {
 		t.Fatalf("ViewJson 非法: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	cmd.Dir = hostDir
 	cmd.Env = os.Environ()
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  core.Handshake,
+		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		Cmd:              cmd,
@@ -124,19 +124,20 @@ func TestE2EWithHostClient(t *testing.T) {
 		}
 		return resp
 	}
-	if resp := run("memory_add", `{"content":"用户偏好：用粤语交流","source":"user"}`); resp.Error != "" {
+	if resp := run("memory_add", `{"content":"用户偏好：用粤语交流","source":"user","scope":"global"}`); resp.Error != "" {
 		t.Fatalf("memory_add = %+v", resp)
 	} else if v := assertView(t, resp); v.Kind != "card" || v.Title != "Memory" || v.Badge == nil || v.Badge.Text != "saved" {
 		t.Fatalf("memory_add view = %+v", v)
 	}
-	if resp := run("memory_search", `{"query":"粤语"}`); resp.Error != "" || !strings.Contains(resp.Content, "粤语") {
+	// 全局层需要显式 scope=global 才检索（默认只查当前项目）
+	if resp := run("memory_search", `{"query":"粤语","scope":"global"}`); resp.Error != "" || !strings.Contains(resp.Content, "粤语") {
 		t.Fatalf("memory_search = %+v", resp)
 	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "Memory" || len(v.Rows) == 0 || v.Rows[0]["content"] == "" {
 		t.Fatalf("memory_search view = %+v", v)
 	}
 	// 回归：带标点的检索词（如文件名 config.yaml、README.md）不应触发 FTS5 语法错误
 	//（裸词中的 '.' 会被 FTS5 当作语法字符）。修复前此类查询报 "fts5: syntax error near '.'"。
-	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user"}`); resp.Error != "" {
+	if resp := run("memory_add", `{"content":"项目约定：使用 config.yaml 与 README.md 描述规范","source":"user","scope":"current"}`); resp.Error != "" {
 		t.Fatalf("memory_add(punct) = %+v", resp)
 	}
 	if resp := run("memory_search", `{"query":"config.yaml"}`); resp.Error != "" {

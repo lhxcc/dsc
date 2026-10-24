@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,12 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"dsc/core"
 )
 
 // newTestWS 建立带臨時 workspace 的測試環境（統一工作空間根：handler 讀
-// core.WorkspaceRoot，宿主經 DSC_WORKSPACE_ROOT 注入；測試直接置變數指到臨時 ws）
+// dsc.WorkspaceRoot，宿主經 DSC_WORKSPACE_ROOT 注入；測試直接置變數指到臨時 ws）
 func newTestWS(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -22,7 +21,7 @@ func newTestWS(t *testing.T) string {
 	if err := os.MkdirAll(ws, 0755); err != nil {
 		t.Fatal(err)
 	}
-	core.WorkspaceRoot = ws
+	dsc.SetWorkspaceRoot(ws)
 	oldCwd, _ := os.Getwd()
 	t.Cleanup(func() { os.Chdir(oldCwd) })
 	if err := os.Chdir(dir); err != nil {
@@ -180,7 +179,7 @@ func TestInsert(t *testing.T) {
 }
 
 // TestNormalizeWorkspacePath 已随 normalizeWorkspacePath 删除：/workspace 前缀
-// 剥离与裸 / 锚定统一由 core.MapWorkspacePath 承担（规则矩阵见 core/workspace_test.go，
+// 剥离与裸 / 锚定统一由 dsc.MapWorkspacePath 承担（规则矩阵见 core/workspace_test.go，
 // 入口接线见 TestVirtualRootMappedToWorkspaceRoot），插件内不再保留第二份实现。
 
 // TestViewDirectoryRejected 对齐 DSH：view 目录时列出 2 层深度的文件/目录（而非报错）。
@@ -201,7 +200,7 @@ func TestViewDirectoryRejected(t *testing.T) {
 }
 
 // TestSlashErr 断言文件系统错误的路径字段被归一为正斜杆（Windows 上 os.* 错误
-// 内嵌反斜杆路径，透传前须统一展示风格）。实现已委托 core.SlashErr（公共实现
+// 内嵌反斜杆路径，透传前须统一展示风格）。实现已委托 dsc.SlashErr（公共实现
 // 见 core/errslash.go），此处保留行为级断言防止委托链回退。
 func TestSlashErr(t *testing.T) {
 	err := &os.PathError{Op: "read", Path: `D:\a\b.txt`, Err: errors.New("Incorrect function.")}
@@ -241,7 +240,7 @@ func TestTopLevelSlashErrOnMissingPath(t *testing.T) {
 
 // TestWithinBaseForwardSlash 回归测试：withinBase 必须用 "/" 而非
 // string(os.PathSeparator) 作为路径分隔符。safePath 的入参来自 dsc.PAbs /
-// dsc.PJoin / dsc.PClean / core.CanonicalPath，这些 P* 函数在 Windows 上
+// dsc.PJoin / dsc.PClean / dsc.CanonicalPath，这些 P* 函数在 Windows 上
 // 也返回正斜杆结果。若 withinBase 用 string(os.PathSeparator)（Windows 上
 // 是反斜杆），前缀检查永远失败，导致所有相对路径都被拒绝（报
 // "permission denied"）。此测试在所有平台上断言正斜杆路径的前缀检查生效。
@@ -301,7 +300,7 @@ func TestViewByAbsolutePathInsideWorkspace(t *testing.T) {
 // 文件须显式 /workspace 前缀，此处验证入口接线。
 func TestVirtualRootMappedToWorkspaceRoot(t *testing.T) {
 	newTestWS(t)
-	ws := core.WorkspaceRoot
+	ws := dsc.WorkspaceRoot()
 
 	dir := filepath.Join(ws, "docs")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

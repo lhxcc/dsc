@@ -339,5 +339,8 @@ func Load(path string) (*Session, error) {
 	s.savedPath = path
 	s.savedCount = len(s.events)
 	s.savedSize = int64(len(data))
+	// 标记「历史到此为止」：从文件读进来的是历史，之后 append 的是本次运行。
+	// 历史注入上限据此划界（见 DeriveMessagesLimited）。
+	s.restoredThrough = len(s.events)
 	return s, nil
 }

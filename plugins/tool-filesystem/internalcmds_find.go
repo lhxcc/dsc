@@ -15,9 +15,16 @@ package main
 //   - 谓词：-name/-iname/-path（fnmatch：* 可跨分隔符）、-type f|d|l|c|b|p|s（可逗号并列）
 //   - 全局选项：-maxdepth N、-mindepth N
 //   - 逻辑：隐式 AND、-a/-and、-o/-or、!/-not、括号（shell 中写作 \( \)）
-//   - 动作：-print（默认即 print：谓词为真即输出路径）、-prune（求值命中后不再下探该目录）
+//   - 动作：-print（默认即 print：谓词为真即输出路径）、-prune（求值命中后不再下探该目录）、
+//     -exec CMD ... {} \;（每个条目执行一次）与 -exec CMD ... {} +（收集后批量执行，
+//     恒为真）
 //
-// 不支持（报 `find: unsupported predicate: X` 并列出支持清单，退出码 2）：-exec、
+// -exec 的子命令走与本 shell 相同的分派：内部命令表（grep/rm/wc/...）→ shell 内建
+// （echo/printf/test/...）→ PATH 外部程序。否则 Windows 上 PATH 被宿主过滤时
+// `-exec rm {} \;` 必然退出码 127，等于没支持。{} 在参数中按子串替换（对齐 GNU：
+// `sh -c 'echo {}'` 也替换）。
+//
+// 不支持（报 `find: unsupported predicate: X` 并列出支持清单，退出码 2）：-execdir、
 // -delete、-print0、-size、-newer、-mtime、-perm、-user、-empty、-quit、-regex 等。
 //
 // 与 grep -r 的差别：find 不跳过 .git/node_modules 等目录——其输出只是路径，不构成
@@ -28,17 +35,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	dsc "dsc-sdk"
+	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 )
 
 // findSupported 错误文案里列出的受支持谓词清单，供模型自我纠正。
-const findSupported = "-name -iname -path -type -maxdepth -mindepth -print -prune -a -o ! ( )"
+const findSupported = "-name -iname -path -type -maxdepth -mindepth -print -prune " +
+	"-exec CMD ... {} \\; -exec CMD ... {} + -a -o ! ( )"
 
 // findLimits -maxdepth/-mindepth 解析结果（maxdepth 为 -1 表示未限制）。
 type findLimits struct {
@@ -110,11 +122,15 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
-	x, lim, err := parseFindExpr(args[i:])
+	x, pe, err := parseFindExpr(ctx, hc, args[i:])
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "find: %s\n", err)
 		return interp.NewExitStatus(2)
 	}
+	// 隐式 -print：表达式里出现过 -print/-exec 等动作时不再补（对齐 GNU，否则
+	// `find . -name '*.go' -exec rm {} \;` 会在执行之外再吐一串路径，`{} +` 的批量
+	// 用法尤其会被污染）。-prune 是谓词不是动作，单独出现仍补 -print。
+	print := !pe.hasAction
 
 	status := 0
 	for _, arg := range paths {
@@ -130,9 +146,13 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		}
 		display := findDisplayPath(arg)
 		e := findEntry{display: display, path: p, name: filepath.Base(display), fi: fi}
-		if err := findWalk(ctx, hc, e, 0, x, lim); err != nil {
+		if err := findWalk(ctx, hc, e, 0, x, *pe.lim, print); err != nil {
 			return err
 		}
+	}
+	// `{} +` 形式：遍历结束后统一执行（GNU 亦为「攒够一批就跑」）
+	for _, b := range pe.batches {
+		b.flush(ctx, hc)
 	}
 	if status != 0 {
 		return interp.NewExitStatus(uint8(status))
@@ -141,13 +161,16 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 }
 
 // findWalk 深度优先遍历：条目按名升序（os.ReadDir 已排序），故输出确定。
-// 谓词为真即输出（-print 默认开启，见 cmdFind 注释）；-prune 命中的目录不下探。
-func findWalk(ctx context.Context, hc interp.HandlerContext, e findEntry, depth int, x *findExpr, lim findLimits) error {
+// 谓词为真且 print 为真时输出（print 为「无显式动作」时的隐式 -print，见 cmdFind）；
+// -prune 命中的目录不下探。
+func findWalk(ctx context.Context, hc interp.HandlerContext, e findEntry, depth int, x *findExpr, lim findLimits, print bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if depth >= lim.mindepth && x.eval(&e) {
-		fmt.Fprintln(hc.Stdout, e.display)
+		if print {
+			fmt.Fprintln(hc.Stdout, e.display)
+		}
 	}
 	if !e.fi.IsDir() || e.pruned {
 		return nil
@@ -169,7 +192,7 @@ func findWalk(ctx context.Context, hc interp.HandlerContext, e findEntry, depth 
 			continue
 		}
 		next := findEntry{display: findJoin(e.display, ent.Name()), path: child, name: ent.Name(), fi: fi}
-		if err := findWalk(ctx, hc, next, depth+1, x, lim); err != nil {
+		if err := findWalk(ctx, hc, next, depth+1, x, lim, print); err != nil {
 			return err
 		}
 	}
@@ -179,27 +202,35 @@ func findWalk(ctx context.Context, hc interp.HandlerContext, e findEntry, depth 
 // ---------- 表达式解析（GNU find 子集） ----------
 
 // parseFindExpr 解析表达式：隐式 AND、-a/-and、-o/-or、!/-not、括号；无表达式时
-// 等价于恒真（即 -print 全部）。
-func parseFindExpr(args []string) (*findExpr, findLimits, error) {
+// 等价于恒真（即 -print 全部）。返回解析器本身（含 -maxdepth/-mindepth 限制、
+// `{} +` 的待执行批次、是否已有显式动作），供 cmdFind 收尾。
+func parseFindExpr(ctx context.Context, hc interp.HandlerContext, args []string) (*findExpr, *findParser, error) {
 	lim := findLimits{maxdepth: -1}
+	p := &findParser{args: args, lim: &lim, ctx: ctx, hc: hc}
 	if len(args) == 0 {
-		return &findExpr{kind: 't', test: func(*findEntry) bool { return true }}, lim, nil
+		return &findExpr{kind: 't', test: func(*findEntry) bool { return true }}, p, nil
 	}
-	p := &findParser{args: args, lim: &lim}
 	x, err := p.parseOr()
 	if err != nil {
-		return nil, lim, err
+		return nil, p, err
 	}
 	if tok := p.peek(); tok != "" {
-		return nil, lim, fmt.Errorf("unexpected token: %s", tok)
+		return nil, p, fmt.Errorf("unexpected token: %s", tok)
 	}
-	return x, lim, nil
+	return x, p, nil
 }
 
 type findParser struct {
 	args []string
 	pos  int
 	lim  *findLimits
+	ctx  context.Context
+	hc   interp.HandlerContext
+
+	// hasAction 表达式里出现过显式动作（-print/-exec）：为真则不再补隐式 -print。
+	hasAction bool
+	// batches `{} +` 形式的 -exec 动作，遍历结束后统一 flush。
+	batches []*findExecAction
 }
 
 func (p *findParser) peek() string {
@@ -353,7 +384,15 @@ func (p *findParser) testFor(pred string) (func(*findEntry) bool, error) {
 		}
 		return func(*findEntry) bool { return true }, nil
 	case "-print":
-		return func(*findEntry) bool { return true }, nil
+		// 显式 -print 必须自己输出：一旦表达式里有 -exec 等动作，cmdFind 就不再补
+		// 隐式 -print，`-exec ... \; -print` 得靠这里出路径。
+		p.hasAction = true
+		return func(e *findEntry) bool {
+			fmt.Fprintln(p.hc.Stdout, e.display)
+			return true
+		}, nil
+	case "-exec":
+		return p.compileExec()
 	case "-prune":
 		return func(e *findEntry) bool {
 			e.pruned = true
@@ -362,6 +401,166 @@ func (p *findParser) testFor(pred string) (func(*findEntry) bool, error) {
 	default:
 		return nil, fmt.Errorf("unsupported predicate: %s (supported here: %s)", pred, findSupported)
 	}
+}
+
+// ---------- -exec 动作 ----------
+
+// findExecAction 一次 -exec 动作。batch 为 `{} +` 形式：不逐条执行，先累积路径，
+// 遍历结束（或攒够一批）后再一次性传给子命令——模型最常用的 `-exec grep -l pat {} +`
+// 靠它把开销从「每文件一进程」降到「一批一进程」。
+type findExecAction struct {
+	argv  []string // 模板参数（其中 {} 待替换）
+	batch bool
+	files []string // batch 模式下累积的路径（书写形态，与 -print 的输出一致）
+}
+
+// compileExec 解析 `-exec CMD ... {} \;` / `-exec CMD ... {} +`（shell 已把 `;` 作为
+// 独立参数传入）。`+` 要求 {} 是最后一个参数（GNU 同样如此，否则无法确定插入位置）。
+func (p *findParser) compileExec() (func(*findEntry) bool, error) {
+	var argv []string
+	term := ""
+	for {
+		tok := p.next()
+		if tok == "" {
+			return nil, fmt.Errorf("-exec: missing ';' or '+' terminator")
+		}
+		if tok == ";" || tok == "+" {
+			term = tok
+			break
+		}
+		argv = append(argv, tok)
+	}
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("-exec: missing command")
+	}
+	a := &findExecAction{argv: argv, batch: term == "+"}
+	if a.batch {
+		if last := argv[len(argv)-1]; last != "{}" {
+			return nil, fmt.Errorf("-exec ... + : '{}' must be the last argument")
+		}
+		p.batches = append(p.batches, a)
+	}
+	p.hasAction = true
+	if a.batch {
+		return func(e *findEntry) bool {
+			a.files = append(a.files, e.display)
+			return true // `{} +` 恒为真（对齐 GNU：结果取决于批量命令，而非单条）
+		}, nil
+	}
+	return func(e *findEntry) bool {
+		return a.runNow(p.ctx, p.hc, e.display)
+	}, nil
+}
+
+// runNow 以单个路径执行子命令，退出码 0 即谓词为真。
+func (a *findExecAction) runNow(ctx context.Context, hc interp.HandlerContext, path string) bool {
+	argv := make([]string, len(a.argv))
+	for i, s := range a.argv {
+		argv[i] = strings.ReplaceAll(s, "{}", path)
+	}
+	return findRunCommand(ctx, hc, argv) == 0
+}
+
+// findExecBatch 单次 `{} +` 调用携带的路径上限。批量的本意是少起进程，但命令行长度
+// 有硬上限（Windows CreateProcess 约 32K 字符），长路径工作区下必须截断分批。
+const findExecBatch = 100
+
+// flush 执行 `{} +` 累积的全部路径；无命中时一次也不执行（对齐 GNU）。
+func (a *findExecAction) flush(ctx context.Context, hc interp.HandlerContext) {
+	for start := 0; start < len(a.files); start += findExecBatch {
+		end := start + findExecBatch
+		if end > len(a.files) {
+			end = len(a.files)
+		}
+		argv := make([]string, 0, len(a.argv)-1+end-start)
+		argv = append(argv, a.argv[:len(a.argv)-1]...) // 末尾的 {} 由本批路径取代
+		argv = append(argv, a.files[start:end]...)
+		findRunCommand(ctx, hc, argv)
+	}
+	a.files = nil
+}
+
+// findExecBuiltins -exec 里允许调用的 shell 内建：只列「纯输出 / 纯判据、不触碰 shell
+// 状态」的几个。exit/return/cd/exec/set/read/export 等一律不放行——GNU find 的 -exec
+// 起的是外部进程，天然改不到父 shell；而这里若直接调内建，`-exec exit \;` 会掐掉整个
+// 会话、`-exec cd` 会把 find 的遍历上下文搬走。未列出者按外部程序处理（通常报找不到，
+// 模型据此改用可用的写法）。
+var findExecBuiltins = map[string]bool{
+	"echo":   true,
+	"printf": true,
+	"test":   true,
+	"[":      true,
+	"true":   true,
+	"false":  true,
+	"pwd":    true,
+}
+
+// findRunCommand 执行 -exec 的子命令，返回退出码。
+//
+// 分派次序与 shell 自身一致：内部命令表 → 安全内建 → PATH 外部程序。
+//
+// 前两级都必须走进程内：Windows 上插件子进程的 PATH 被宿主过滤，`-exec rm {} \;`
+// 若按外部程序解析必然 127；而 grep/rm 与 echo/printf/test 恰恰是模型在 -exec 里
+// 最常调的命令。Stdio/Dir 沿用当前 shell，使内建命令的相对路径与重定向语义一致。
+func findRunCommand(ctx context.Context, hc interp.HandlerContext, argv []string) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(hc.Stderr, "find: -exec: missing command")
+		return 1
+	}
+	if fn, ok := internalCommands[argv[0]]; ok {
+		// HandlerContext 是值类型，复制后仅替换 stdio 即可复用同一套内建实现
+		// （内建命令只读 Dir/Env/Stdin/Stdout/Stderr）。
+		return findExitCode(hc, argv[0], fn(ctx, hc, argv[1:]))
+	}
+	if findExecBuiltins[argv[0]] && interp.IsBuiltin(argv[0]) {
+		return findExitCode(hc, argv[0], hc.Builtin(ctx, argv))
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// 与其余派生点一致：Windows 上以 CREATE_NO_WINDOW 启动，避免 TUI 中弹出控制台
+	// 窗口（core/proc_attr_regression_test.go 会扫描所有 exec 派生点，漏接即失败）。
+	dsc.ConfigureChildProcessAttrs(cmd)
+	cmd.Dir = hc.Dir
+	if env := findEnvList(hc.Env); len(env) > 0 {
+		cmd.Env = env
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = hc.Stdin, hc.Stdout, hc.Stderr
+	if err := cmd.Run(); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		fmt.Fprintf(hc.Stderr, "find: %s: %s\n", argv[0], slashErr(err))
+		return 1
+	}
+	return 0
+}
+
+// findExitCode 把内建/内部命令的执行结果折算成退出码：退出状态原样透出，其余错误
+// 报一行并记 1（-exec 只看退出码判定谓词真假）。
+func findExitCode(hc interp.HandlerContext, name string, err error) int {
+	if err == nil {
+		return 0
+	}
+	if code, isExit := interp.IsExitStatus(err); isExit {
+		return int(code)
+	}
+	fmt.Fprintf(hc.Stderr, "find: %s: %s\n", name, slashErr(err))
+	return 1
+}
+
+// findEnvList 把解释器环境里已导出的变量转成 exec.Cmd 需要的 KEY=VALUE 列表。
+func findEnvList(env expand.Environ) []string {
+	if env == nil {
+		return nil
+	}
+	var out []string
+	env.Each(func(name string, vr expand.Variable) bool {
+		if vr.IsSet() && vr.Exported {
+			out = append(out, name+"="+vr.String())
+		}
+		return true
+	})
+	return out
 }
 
 // findTypeChar 返回 -type 判据的条目类型字符（对齐 GNU find）：f 普通文件、d 目录、

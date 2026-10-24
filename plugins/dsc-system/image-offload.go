@@ -21,13 +21,13 @@ package main
 
 import (
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
-	"dsc/core"
 	"dsc/proto"
 
 	pbproto "google.golang.org/protobuf/proto"
@@ -109,7 +109,7 @@ func newImageOffloadServer() *imageOffloadServer { return &imageOffloadServer{} 
 // handleHostEvent 事件入口（main.go 的 hook 多路复用之一）。
 func (s *imageOffloadServer) handleHostEvent(ctx context.Context, eventType, dataJSON string) (string, error) {
 	switch eventType {
-	case string(core.EventAgentPreStep):
+	case string(dsc.EventAgentPreStep):
 		return s.handlePreStep(dataJSON)
 	default:
 		return "", nil
@@ -119,7 +119,7 @@ func (s *imageOffloadServer) handleHostEvent(ctx context.Context, eventType, dat
 // handlePreStep 预算卸载投影（agent/pre-step 拦截）。
 // 返回 {"messages": [...]}（卸载后列表）或 ""（预算内，零拷贝零开销）。
 func (s *imageOffloadServer) handlePreStep(dataJSON string) (string, error) {
-	var ev core.AgentPreStepEvent
+	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("image-offload: parse pre-step event: %w", err)
 	}
@@ -149,7 +149,7 @@ func (s *imageOffloadServer) handlePreStep(dataJSON string) (string, error) {
 // 载荷，供本驻留在「压缩改写后的列表」上继续投影——多驻留共享单 Hook 的链式
 // 改写（宿主对每插件只收一个结果，链内拼接是共享 Hook 的接缝）。
 func chainPreStep(dataJSON, upstreamResult string) (string, error) {
-	var ev core.AgentPreStepEvent
+	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
 		return "", fmt.Errorf("image-offload: parse pre-step event: %w", err)
 	}

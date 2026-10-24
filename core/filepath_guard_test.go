@@ -26,6 +26,47 @@ import (
 // 豁免（skipDirs）仅限第三方非直管 vendored 代码与仓库内非运行时产物；本仓直管
 // 模块（core、sdk、plugin fork、libs/sh fork、libs/cron、session、tui、各 plugins）
 // 一律无豁免权。确属合法内部调用点须登记 fileAllowlist 并注明理由。
+// bannedPathFuncs 是「违背一律正斜杆」的函数黑名单：
+//   - filepath 族：Windows 上把结果归一化为原生反斜杆；
+//   - path.Clean：只认 "/" 作分隔符，反斜杆当普通字符原样保留（只清理不转换），
+//     需要清理时用 core.PClean / 包内 posixClean。
+//
+// 前置 `\b` 不可省：否则 posixpath.Clean（libs/sh 的本地等价实现）会被误捕。
+var bannedPathFuncs = regexp.MustCompile(
+	`filepath\.(Join|Abs|Clean|Rel|Split|FromSlash|EvalSymlinks|Glob|WalkDir|Walk|Dir|Separator)\b` +
+		`|\bpath\.Clean\b`)
+
+// TestBannedPathFuncsPattern 锁定黑名单正则的边界：命中两类禁用调用，不误捕
+// posixpath 这类名字以 path 结尾的本地等价实现（它们在白名单里，本就是正确用法）。
+func TestBannedPathFuncsPattern(t *testing.T) {
+	banned := []string{
+		`x := path.Clean(p)`,
+		"p = path.Clean(p)",
+		`core.PClean(path.Clean(x))`,
+		`filepath.Clean(p)`,
+		`filepath.Join(a, b)`,
+		"\tfilepath.Dir(p)",
+	}
+	for _, src := range banned {
+		if !bannedPathFuncs.MatchString(src) {
+			t.Errorf("应判为禁用: %s", src)
+		}
+	}
+	allowed := []string{
+		`p := posixpath.Clean(x)`,
+		`p := pathx.Clean(x)`,
+		`p := core.PClean(x)`,
+		`p := posixClean(x)`,
+		`p := filepath.ToSlash(x)`,
+		`base := path.Base(p)`,
+	}
+	for _, src := range allowed {
+		if bannedPathFuncs.MatchString(src) {
+			t.Errorf("不应判为禁用: %s", src)
+		}
+	}
+}
+
 func TestFilepathBlacklistGuard(t *testing.T) {
 	// 本测试文件位于 core/ 下，仓库根即其上一级。
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -91,12 +132,16 @@ func TestFilepathBlacklistGuard(t *testing.T) {
 		"session/posix.go": "session 包本地 P* 等价实现（core 引用 session，import 环）",
 	}
 
-	// 黑名单：Windows 上会把结果归一化为原生反斜杆的 filepath 函数。
+	// 黑名单：两类函数都违背「一律正斜杆」——
+	//   ① filepath 族：Windows 上会把结果归一化为原生反斜杆；
+	//   ② path.Clean：只认 "/" 作分隔符，反斜杆被当作普通字符**原样保留**
+	//      （实测 `path.Clean(O://a//b)` 结果仍含反斜杆），它只清理不转换。
+	//      需要清理时用 core.PClean / 包内 posixClean（先按平台语义清、再强制正斜杆）。
 	// 安全不在此列：ToSlash / IsAbs / Base / Ext / Match / VolumeName / SplitList /
 	// ListSeparator / SkipDir / SkipAll / ErrBadPattern（不返回路径或返回正斜杆）。
-	// WalkDir 须排在 Walk 前；\b 防误捕 SplitList / ToSlash 等。
-	blacklist := regexp.MustCompile(
-		`filepath\.(Join|Abs|Clean|Rel|Split|FromSlash|EvalSymlinks|Glob|WalkDir|Walk|Dir|Separator)\b`)
+	// WalkDir 须排在 Walk 前；\b 防误捕 SplitList / ToSlash 等，也防误捕 posixpath.Clean
+	// （libs/sh 的本地等价实现在白名单里，名字以 path 结尾）。
+	blacklist := bannedPathFuncs
 
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
@@ -137,7 +182,7 @@ func TestFilepathBlacklistGuard(t *testing.T) {
 			}
 		}
 		violations = append(violations,
-			relSlash+":"+strconv.Itoa(lines[0])+" 使用了被禁 filepath 函数（Windows 下返回反斜杆路径）；修复：改用 core.P* / dsc.P* / 模块内 posixpath 等价实现（确属合法内部调用点则登记 fileAllowlist 并注明理由）")
+			relSlash+":"+strconv.Itoa(lines[0])+" 使用了被禁路径函数（filepath 族在 Windows 返回反斜杆；path.Clean 不做反斜杆转换）；修复：改用 core.P* / dsc.P* / 模块内 posixpath 等价实现（确属合法内部调用点则登记 fileAllowlist 并注明理由）")
 		return nil
 	})
 	if err != nil {

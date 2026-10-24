@@ -219,7 +219,7 @@ type Model struct {
 
 	// 当前轮运行指标（对齐 REX working 行）：runStart 记录启动时刻，elapsed 为
 	// 已耗时秒数（每秒 elapsedTick 刷新）；turnTokens 为本轮累计下行生成 token；
-	// cacheHit/cacheMiss 为最近一次请求的 prompt 缓存命中/写入 token。
+	// cacheHit/cacheMiss 为最近一次请求的 prompt 缓存命中 / 未命中 token（miss = prompt - hit）。
 	runStart   time.Time
 	elapsed    int
 	turnTokens int
@@ -278,6 +278,10 @@ type Model struct {
 	viewport viewport.Model
 	input    textarea.Model
 	spinner  spinner.Model
+
+	// 工作行文字动画（见 thinking.go）：每轮随机中/英文案，帧号随 spinner 的
+	// tick 推进——不另开定时器，spinner 的启停即动画的启停。
+	thinkAnim thinkAnim
 
 	ready     bool // viewport 在收到首个窗口尺寸后初始化
 	thinking  bool // 正在等待 agent 响应
@@ -367,8 +371,16 @@ type Model struct {
 
 // New 创建一个聊天界面模型
 func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) *Model {
+	// 宿主侧计量实例需要窗口换算百分比；模型切换后由 SwitchModel 再同步
+	if manager != nil && contextWindow > 0 {
+		manager.SetContextWindow(contextWindow)
+	}
 	input := textarea.New()
-	input.Placeholder = "输入消息，回车发送，Shift+Enter/Ctrl+J 换行，Ctrl+Q 退出"
+	// 占位符只讲「在这里能做什么」，不重复按键提示：按键（Enter 发送 / Ctrl+J 换行 /
+	// Ctrl+Q 退出）统一由底部状态栏承担一处即可，两处都写既冗长又容易互相漂移
+	// （此前一处写「回车发送」、另一处写「Enter 发送」）。腾出的位置改为提示 @ 引用，
+	// 那是输入框独有的能力，看着占位符就能发现。
+	input.Placeholder = "输入消息；@ 引用文件或图片"
 	input.CharLimit = 4096
 	input.ShowLineNumbers = false
 	// 对齐 REX：关闭虚拟光标，改用真实终端光标。虚拟光标在消息区动态重排时无法
@@ -414,6 +426,7 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		contextWindow:    contextWindow,
 		input:            input,
 		spinner:          s,
+		thinkAnim:        thinkAnim{kind: randThinkKind()},
 		currentSessionID: defaultSessionID(manager),
 		wakeBudget:       maxConsecutiveWakes,
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
@@ -982,6 +995,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.thinking || m.streaming {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
+			m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
 			return m, cmd
 		}
 		return m, nil
@@ -1161,11 +1175,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// （对齐 REX 每步 usage 事件即时更新统计行），不必等轮末 success 帧。
 			// 已用容量以 prompt_tokens 为准（反映当前上下文总长度），而非 TotalTokens。
 			if f.Usage != nil {
-				if f.Usage.PromptTokens > 0 {
-					m.usedTokens = int(f.Usage.PromptTokens)
-				} else if f.Usage.TotalTokens > 0 {
-					m.usedTokens = int(f.Usage.TotalTokens)
-				}
+				m.noteContextUsage(f.Usage)
 				m.trackTurnUsage(f.Usage, msg.frame.Turn, msg.frame.Step)
 				m.settleStepMetrics(f.Usage)
 			}
@@ -1215,12 +1225,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamOpen = false
 			m.clearStream() // 成功/失敗後清理流通道狀態，避免後續 pumpStreamIfOpen 誤判「流進行中」
 			if f.Status == "success" && f.Usage != nil {
-				// 已用容量以 prompt_tokens 為準（反映當前上下文總長度），而非 TotalTokens。
-				if f.Usage.PromptTokens > 0 {
-					m.usedTokens = int(f.Usage.PromptTokens)
-				} else if f.Usage.TotalTokens > 0 {
-					m.usedTokens = int(f.Usage.TotalTokens)
-				}
+				m.noteContextUsage(f.Usage)
 				m.trackTurnUsage(f.Usage, f.Turn, f.Step)
 				m.settleStepMetrics(f.Usage)
 			}
@@ -2449,7 +2454,7 @@ var slashGroups = []slashGroup{
 	{
 		entry: compItem{label: "/settings", insert: "/settings ", hint: "设置子命令（history），选中进入后展开", descend: true},
 		subs: []compItem{
-			{label: "/settings history", insert: "/settings history ", hint: "历史注入条数（如 10 / off / unlimited）：控制模型预填充长度"},
+			{label: "/settings history", insert: "/settings history ", hint: "恢复历史注入条数（如 10 / off / unlimited）：只影响从存档恢复的历史"},
 		},
 	},
 }
@@ -2645,7 +2650,7 @@ func (m *Model) buildHelpText() string {
 		"  /cron on|off <id>  启用/停用定时任务",
 		"  /plan       进入 plan 模式（先探索与设计，再经 exit_plan_mode 呈现完整计划）",
 		"  /plan off   退出 plan 模式",
-		"  /settings history <N|off|unlimited>  历史注入条数：控制模型预填充长度",
+		"  /settings history <N|off|unlimited>  恢复历史注入条数：只影响从存档恢复的历史，当前会话内的轮次始终保留",
 		"    （N 为注入最近 N 条；off 不注入历史；unlimited/on 不限制，默认）",
 		"  /settings mouse on|off  切换鼠标捕获（on 恢复应用内捕获；off 释放给终端原生选中/复制）",
 		"  /session <id>  切换到指定会话（如 /session session-3）",
@@ -2911,8 +2916,10 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
-	// /settings history <N|off|unlimited>：控制历史注入条数（模型预填充长度）。
-	// off/0 不注入历史；N 注入最近 N 条；unlimited/on/-1 不限制（默认）。
+	// /settings history <N|off|unlimited>：控制从存档恢复的历史注入条数。
+	// off / -1（任意负值）不注入恢复历史；unlimited / on / 0（缺省）不限制，即全部
+	// 注入；N>0 只取恢复历史中最近 N 条。无论取值如何，本次运行内已经发生的轮次
+	// 都完整保留。
 	// 鼠标捕获为自动行为：模型工作期间释放给终端原生选中、空闲恢复应用内捕获，
 	// 不再提供显式开关；需永久释放用环境变量 DSC_DISABLE_MOUSE=1。
 	if strings.HasPrefix(cmd, "/settings") {
@@ -3314,19 +3321,28 @@ func (m *Model) capacityTag() string {
 	return shortTokens(m.usedTokens)
 }
 
-// parseHistoryInjection 解析 /settings history 的参数：
-// off/0 → 0（不注入历史）；unlimited/on/-1 → -1（不限制，缺省）；正整数 N → 注入最近 N 条。
+// parseHistoryInjection 解析 /settings history 的参数，沿用 DSC 三值语义：
+//
+//	off / -1 / 任意负数 → -1（不注入恢复历史）
+//	unlimited / on / default / 0 / 缺省 → 0（未定义，按默认处理 = 不限制）
+//	正整数 N → 注入恢复历史中最近 N 条
+//
+// 0 表示「未定义」而不是「关闭」：Go 体系的零值就是未设置，把 0 解释成关闭，
+// 会让漏写/清空配置这类情况意外关掉历史。
 func parseHistoryInjection(arg string) (int, error) {
 	arg = strings.TrimSpace(strings.ToLower(arg))
 	switch arg {
-	case "", "on", "unlimited", "-1":
-		return -1, nil
-	case "off", "0":
+	case "", "on", "unlimited", "default", "0":
 		return 0, nil
+	case "off", "-1":
+		return -1, nil
 	}
 	n, err := strconv.Atoi(arg)
-	if err != nil || n < 0 {
+	if err != nil {
 		return 0, fmt.Errorf("invalid history injection count %q", arg)
+	}
+	if n < 0 {
+		return -1, nil // 任意负值都表示不注入
 	}
 	return n, nil
 }
@@ -3390,13 +3406,14 @@ func (m *Model) runJobsCommand(rest string) {
 	}
 }
 
-// historyInjectionLabel 渲染历史注入设置的可读描述。
+// historyInjectionLabel 渲染历史注入设置的可读描述（DSC 三值语义：
+// 负值=不注入、0=未定义即默认不限制、N 条）。
 func historyInjectionLabel(count int) string {
 	switch {
 	case count < 0:
-		return "不限制（unlimited）"
+		return "不注入恢复历史（off）"
 	case count == 0:
-		return "不注入历史（off）"
+		return "不限制（默认）"
 	default:
 		return fmt.Sprintf("最近 %d 条", count)
 	}
@@ -3454,6 +3471,30 @@ func (m *Model) runInfoLine() string {
 	return "  " + dimSty.Render(info)
 }
 
+// noteContextUsage 把一帧 usage 交宿主计量实例保管，并回读"已用容量"。
+//
+// 为什么不再直接取 f.Usage.PromptTokens：已用容量要与 agent 的裁剪/压缩判定同源。
+// 实例归宿主（core.Manager.ctxMeters），agent 随帧上报它算出的投影值
+// （Usage.ContextTokens），宿主只保管与发布、不重算——这样 TUI、cron、将来的
+// 前端读到的是同一个数。没有上报值（旧 agent / 首帧）时退回实测 prompt 侧用量。
+func (m *Model) noteContextUsage(u *core.Usage) {
+	if u == nil {
+		return
+	}
+	if m.manager != nil {
+		m.manager.NoteContextUsage(m.currentSessionID, u, int(u.ContextTokens))
+		if v := m.manager.ContextTokens(m.currentSessionID); v > 0 {
+			m.usedTokens = v
+			return
+		}
+	}
+	if u.PromptTokens > 0 {
+		m.usedTokens = int(u.PromptTokens)
+	} else if u.TotalTokens > 0 {
+		m.usedTokens = int(u.TotalTokens)
+	}
+}
+
 // trackTurnUsage 累計當前輪的運行指標：下行生成 token 與 prompt 緩存命中/寫入。
 // 避免同一 step 的 CompletionTokens 被 tool 調用/結果幀和 success 幀重複累加：
 // 僅在 Turn/Step 變化時才累加 turnTokens。
@@ -3469,9 +3510,16 @@ func (m *Model) trackTurnUsage(u *core.Usage, turn, step int32) {
 		m.lastUsageTurn = turn
 		m.lastUsageStep = step
 	}
-	if u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
+	// 命中率两侧：hit = 命中缓存的部分，miss = prompt - hit。
+	// 不再用 CacheCreationInputTokens 充当 miss——那是「写入缓存」的原义（Anthropic 才有），
+	// OpenAI 兼容端点为 0，拿它当 miss 会让命中率恒显示 100%。
+	if u.PromptTokens > 0 || u.CacheReadInputTokens > 0 {
 		m.cacheHit = u.CacheReadInputTokens
-		m.cacheMiss = u.CacheCreationInputTokens
+		miss := u.PromptTokens - u.CacheReadInputTokens
+		if miss < 0 {
+			miss = 0
+		}
+		m.cacheMiss = miss
 	}
 }
 
@@ -3607,11 +3655,15 @@ func (m *Model) View() tea.View {
 		parts = append(parts, q)
 	}
 	if m.thinking || m.streaming {
-		line := "  " + m.spinner.View() + fmt.Sprintf(" 思考中... (%d 秒 · Ctrl+C 取消)", m.elapsed)
+		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
+		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
+		// 所以只有尾部提示用 dim。
+		line := "  " + m.spinner.View() + " " + m.thinkAnim.text() +
+			dimSty.Render(fmt.Sprintf(" (%d 秒 · Ctrl+C 取消)", m.elapsed))
 		if m.turnTokens > 0 {
-			line += " · ↓" + shortTokens(m.turnTokens)
+			line += dimSty.Render(" · ↓" + shortTokens(m.turnTokens))
 		}
-		parts = append(parts, dimSty.Render(line))
+		parts = append(parts, line)
 	}
 	if tp := m.renderTodoPanel(); tp != "" {
 		parts = append(parts, tp)
