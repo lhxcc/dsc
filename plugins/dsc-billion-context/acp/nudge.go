@@ -35,6 +35,74 @@ type CompressibleRange struct {
 	Chars    int    `json:"chars"` // 真实字符量（minCompressRange 记账单位，对齐 #309）
 }
 
+// blocksSummaryTokens 汇总一组块的可回收摘要质量（tokens）。
+//
+// 用「摘要本身的大小」而不是 CompressedTokens（原文被压掉的量）：蒸馏一层是把
+// N 条摘要换成 1 条，能省下的就是这些摘要的体积——原文那部分早已在上一轮省掉了，
+// 拿它当判据会立刻超阈值、把蒸馏变成无条件动作。
+func blocksSummaryTokens(blocks []CompressionBlock) int {
+	total := 0
+	for _, b := range blocks {
+		total += estimateTokensForText(b.Summary)
+	}
+	return total
+}
+
+// NudgeGrowthTokens 返回本轮「算得上增长」的 token 量（对齐 acp-kernel
+// resolveAdaptiveGrowth）：与窗口成比例并夹在 [GrowthFloor, GrowthCap] 内。
+//
+// 为什么不能写死：128K 窗口的 1000 token 增长值得提示，1M 窗口的 1000 token
+// 只是噪声；反过来，把 1M 的 50K 要求套到 128K 上则几乎永不触发。
+func NudgeGrowthTokens(config Config) int {
+	limit := config.ModelContextLimit
+	floor := config.GrowthFloor
+	cap := config.GrowthCap
+	if floor <= 0 {
+		floor = 1000
+	}
+	if cap <= 0 {
+		cap = floor
+	}
+	if limit <= 0 {
+		return floor
+	}
+	v := int(float64(limit) * config.GrowthRatio)
+	if v < floor {
+		v = floor
+	}
+	if v > cap {
+		v = cap
+	}
+	return v
+}
+
+// GrowthFloorTokens 返回「自上次 nudge 之后至少涨多少才再提示」的门槛
+// （对齐 acp-kernel growthFloor = max(minGrowthFloor, minGrowthRatio × growth)）。
+func GrowthFloorTokens(config Config) int {
+	floor := int(config.MinGrowthRatio * float64(NudgeGrowthTokens(config)))
+	if floor < config.MinGrowthFloor {
+		floor = config.MinGrowthFloor
+	}
+	if floor < 1 {
+		floor = 1
+	}
+	return floor
+}
+
+// TierMassThreshold 返回「这一层值得蒸馏」的可回收摘要质量门槛
+// （对齐 acp-kernel tier2GrowthMultiplier × nudgeGrowthTokens）。
+func TierMassThreshold(config Config) int {
+	m := config.TierGrowthMultiplier
+	if m <= 0 {
+		m = 1.5
+	}
+	th := int(m * float64(NudgeGrowthTokens(config)))
+	if th < 1 {
+		th = 1
+	}
+	return th
+}
+
 // DecideNudge 决策是否注入 nudge 提示（对齐 acp-kernel decideNudge）。
 //
 // 触发条件：
@@ -66,8 +134,8 @@ func DecideNudge(messages []CoreMessage, state *CompressionState, config Config,
 		return decision
 	}
 
-	// 增长门控：自上次 nudge/baseline 后必须有增长
-	growthFloor := 1000 // 至少增长 1000 token 才重新 nudge
+	// 增长门控：自上次 nudge/baseline 后必须有增长（门槛随窗口缩放）
+	growthFloor := GrowthFloorTokens(config)
 	if state.Nudge.BaselineTokens > 0 {
 		if tokenCount-state.Nudge.BaselineTokens < growthFloor {
 			decision.Reason = fmt.Sprintf("insufficient growth since baseline (%d - %d < %d)",
@@ -104,25 +172,44 @@ func DecideNudge(messages []CoreMessage, state *CompressionState, config Config,
 	decision.Breakdown["t1Count"] = t1Count
 	decision.Breakdown["t2Count"] = t2Count
 
-	// T3 蒸馏优先（更高层级，更经济）：T2 块数达 Tier3Trigger
-	if config.Tiers.Tier3Trigger > 0 && t2Count >= config.Tiers.Tier3Trigger {
+	// 两条触发路径取「或」（对齐 acp-kernel）：
+	//   a) 计数：显式配置了较小的 Tier2/3Trigger（默认 1000/2000 = 关）；
+	//   b) 质量：目标块的可回收摘要 tokens 达到 TierMassThreshold——
+	//      这才是需求信号。只数块数会在上下文还宽裕时把细节蒸干。
+	massThreshold := TierMassThreshold(config)
+	t1Mass := blocksSummaryTokens(t1Blocks)
+	t2Mass := blocksSummaryTokens(t2Blocks)
+	decision.Breakdown["t1Mass"] = t1Mass
+	decision.Breakdown["t2Mass"] = t2Mass
+	decision.Breakdown["tierMassThreshold"] = massThreshold
+	t3CountReady := config.Tiers.Tier3Trigger > 0 && t2Count >= config.Tiers.Tier3Trigger
+	t2CountReady := config.Tiers.Tier2Trigger > 0 && t1Count >= config.Tiers.Tier2Trigger
+	// T3 需要「T2 块本身的质量」达标；T2 需要「T1 块的质量」达标。
+	// 高层级还要压过低层级（T3 的待压质量必须大于 T2），否则没必要往上蒸。
+	t3MassReady := t2Mass >= massThreshold && t2Mass > t1Mass
+	t2MassReady := t1Mass >= massThreshold
+
+	// T3 蒸馏优先（更高层级，更经济）
+	if t3CountReady || t3MassReady {
 		tier := Tier3
 		decision.Tier = &tier
 		decision.TierTargetBlocks = t2Blocks
 		decision.ShouldInject = true
 		// 不暴露使用率百分比（对齐 ACP 设计：模型不应知道总上下文大小，
 		// 避免模型"认为还很健康就懒得压缩"）
-		decision.Reason = fmt.Sprintf("T3 condense: %d tier-2 blocks accumulated", t2Count)
+		decision.Reason = fmt.Sprintf("T3 condense: %d tier-2 blocks (%d tokens of summaries, threshold %d)",
+			t2Count, t2Mass, massThreshold)
 		return decision
 	}
 
-	// T2 蒸馏：T1 块数达 Tier2Trigger
-	if config.Tiers.Tier2Trigger > 0 && t1Count >= config.Tiers.Tier2Trigger {
+	// T2 蒸馏：T1 块的质量达标，或显式配置的计数达标
+	if t2CountReady || t2MassReady {
 		tier := Tier2
 		decision.Tier = &tier
 		decision.TierTargetBlocks = t1Blocks
 		decision.ShouldInject = true
-		decision.Reason = fmt.Sprintf("T2 distill: %d tier-1 blocks accumulated", t1Count)
+		decision.Reason = fmt.Sprintf("T2 distill: %d tier-1 blocks (%d tokens of summaries, threshold %d)",
+			t1Count, t1Mass, massThreshold)
 		return decision
 	}
 

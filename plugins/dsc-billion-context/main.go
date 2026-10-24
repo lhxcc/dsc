@@ -546,15 +546,13 @@ func (bc *BillionContext) setSessionID(id string) {
 }
 
 // estimateTokens 估算 proto.Message 列表的总 token 数。
+// estimateTokens 估算消息列表 token（转调 SDK 的唯一实现）。
+//
+// 本地曾写 len(content)/4：对 CJK 低估 4 倍（UTF-8 一个汉字 3 字节），与 acp 包
+// 里另一份「max(bytes/4, runes)」（对 ASCII 高估 4~5 倍）方向相反——同一个插件里
+// 两个口径打架，阈值到底偏哪边取决于走哪条路径。统一由 SDK 计算。
 func estimateTokens(msgs []*proto.Message) int {
-	total := 0
-	for _, m := range msgs {
-		total += len(m.Content) / 4
-		if len(m.ToolCalls) > 0 {
-			total += 8 // tool-call 结构开销
-		}
-	}
-	return total
+	return dsc.EstimateProtoMessagesTokens(msgs)
 }
 
 // containsStr 报告 s 是否包含 sub（轻量实现，避免引入 strings 包）。

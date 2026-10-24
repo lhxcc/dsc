@@ -137,9 +137,13 @@ type ProcessTurnResult struct {
 //	→ hide-compress-calls → absorb(hide+prompt) → decide-nudge → emergency-truncate
 //
 // 仍未实现：merge-blocks（old-gen 块批合并；acp 包内只有范围合并 mergeBatch，
-// 不是块合并）、filter/ccr-store（acp_retrieve 内容仓库）。缺失 merge 的后果是
-// 块数量随压缩次数线性增长，每个块每轮都渲染 summary——压缩收益会被自身开销
-// 逐步吃掉，属后续待补项。
+// 不是块合并）、filter/ccr-store（acp_retrieve 内容仓库）、crush（确定性工具结果
+// 压缩）、output-steering（冗长度分级）。缺失 merge 的后果是块数量随压缩次数线性
+// 增长，每个块每轮都渲染 summary——压缩收益会被自身开销逐步吃掉，属下一项待补。
+//
+// 已对齐（勿重复实现）：assign-refs / 存活升级 / sync-blocks / prune /
+// hide-compress-calls / absorb(hide+prompt) / decide-nudge（计数+质量双路径）/
+// emergency-truncate / 孤儿配对清理。
 //
 // 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
 // 消息文本。原因：tokens 属性每轮估算会变化（消息文本可能改变），导致前缀缓存

@@ -1,6 +1,10 @@
 package acp
 
-import "fmt"
+import (
+	"fmt"
+
+	dsc "dsc-sdk"
+)
 
 // PruneRange 一个待压缩的范围（对齐 acp-kernel CompressRangeSpec）。
 type PruneRange struct {
@@ -304,10 +308,10 @@ func resolveRange(startRef, endRef string, messages []CoreMessage, state *Compre
 //
 // 角色用 system 而非 assistant：system 消息稳定，provider 不会因角色变化重排缓存。
 //
-// 缺少 orphaned tool-call/result 配对清理的 MVP 限制：压缩边界若切断
-// tool-call ↔ tool-result 配对，某些 provider 会报错。原版 acp-kernel 经
-// stripOrphanedToolResults / stripOrphanedToolCalls 清理——MVP 暂未实现，
-// 依赖模型压缩时选择"完整工具回合"作为范围（推荐在 system prompt 中引导）。
+// 孤儿配对清理：压缩边界若切断 tool-call ↔ tool-result 配对（或 reasoning ↔
+// assistant），某些 provider 会直接报错。渲染前经 stripOrphanedToolResults /
+// stripOrphanedToolCalls / stripOrphanedReasoning 清理（对齐 acp-kernel 同名步骤），
+// 见本函数末尾的三次调用。
 func RenderMessages(messages []CoreMessage, state *CompressionState, config Config, renderTags bool) []CoreMessage {
 	if len(messages) == 0 {
 		return messages
@@ -677,20 +681,14 @@ func renderTaggedMessage(msg CoreMessage, state *CompressionState, renderTags bo
 // estimateTokensForText 字节/CJK 启发式 token 估算（对齐 acp-kernel estimateTokensFast）。
 // 取「字节数/4」与「rune 数」的较大者——英文按 /4（约 4 字符 1 token）；
 // CJK（UTF-8 每字 3 字节）字节/4 会低估，故回调为 rune 数（每字按 1 token）。
+// estimateTokensForText 估算文本 token（转调 SDK 的唯一实现）。
+//
+// 本包曾自带一份 max(bytes/4, runes)：纯 ASCII/代码时 runes 就是字节数，等于按
+// 1 token/字符算，是真实值的 4~5 倍——nudge/absorb/截断阈值全被这几倍误差放大，
+// 上下文还很宽裕就提示压缩。口径统一由 SDK（dsc.EstimateTextTokens）负责，
+// 插件不再各自造公式。
 func estimateTokensForText(s string) int {
-	if s == "" {
-		return 0
-	}
-	bytes := len(s)
-	runes := 0
-	for range s {
-		runes++
-	}
-	byBytes := (bytes + 3) / 4
-	if byBytes > runes {
-		return byBytes
-	}
-	return runes
+	return dsc.EstimateTextTokens(s)
 }
 
 // nowMillis 当前时间戳（毫秒）。

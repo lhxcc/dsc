@@ -154,6 +154,24 @@ type Config struct {
 	ProtectedTools     []string   `json:"protectedTools"`     // 受保护工具名（其 tool-call/result 不被压缩）
 	PromotionThreshold int        `json:"promotionThreshold"` // young→old 升级所需存活次数
 	Tiers              TierConfig `json:"tiers"`              // 多层蒸馏触发阈值
+
+	// 以下为 nudge 的「增长/蒸馏」口径（对齐 acp-kernel config.nudge.*）。把绝对值
+	// 换成与窗口成比例的量：小窗口不会要求离谱的增量，大窗口也不会因为攒了几个
+	// 小摘要就反复提示蒸馏。
+	//
+	//   nudgeGrowthTokens = clamp(limit × GrowthRatio, GrowthFloor, GrowthCap)
+	//   growthFloorTokens = max(MinGrowthFloor, MinGrowthRatio × nudgeGrowthTokens)
+	//   tierMassThreshold = TierGrowthMultiplier × nudgeGrowthTokens
+	//
+	// tierMassThreshold 是「蒸馏一个层级值不值得」的判据：T1 摘要被压到 ~10:1，
+	// 光数块数会在上下文还很宽裕时就把细节蒸干；按可回收的摘要质量（tokens）算，
+	// 才与"这一层真的占地方了吗"对得上。
+	GrowthRatio          float64 `json:"growthRatio"`          // 增长率（默认 0.05）
+	GrowthFloor          int     `json:"growthFloor"`          // nudgeGrowthTokens 下限（默认 1000）
+	GrowthCap            int     `json:"growthCap"`            // nudgeGrowthTokens 上限（默认 50000）
+	MinGrowthFloor       int     `json:"minGrowthFloor"`       // growthFloorTokens 的下限（默认 1000）
+	MinGrowthRatio       float64 `json:"minGrowthRatio"`       // growthFloorTokens 占 nudgeGrowthTokens 的比例（默认 0.45）
+	TierGrowthMultiplier float64 `json:"tierGrowthMultiplier"` // 蒸馏质量阈值倍数（默认 1.5）
 	// MinCompressRangeChars 推荐范围的最小字符量（对齐 acp-kernel
 	// compress.minCompressRange，默认 5000）——mergeRangesToThreshold 把相邻范围
 	// 批量合并到该阈值之上，低于阈值的尾部并入前一批，整段低于阈值则不出推荐
@@ -181,10 +199,14 @@ type AbsorbConfig struct {
 // TierConfig 多层蒸馏配置（对齐 acp-kernel TierConfig）。
 type TierConfig struct {
 	// Tier2Trigger 当 active T1 块数达到此值时，nudge 提示模型蒸馏为 T2。
-	// 默认 5（ summaries ~10:1 condensed，5 个 T1 ~10K token，达到蒸馏经济性）。
+	//
+	// **计数不是需求信号**（acp-kernel #379）：摘要已被压到 ~10:1，攒 5 个块可能只
+	// 占几千 token，此时提示蒸馏纯属把细节白烧掉，还会重写 wire 前缀（缓存失效）。
+	// 故计数路径默认关（1000 = 实际不触发）；真正的需求信号是「可回收的摘要质量」，
+	// 由 Config.TierGrowthMultiplier × nudgeGrowthTokens 判定，两条路径取「或」。
+	// 显式配置较小值仍可按纯计数触发（no usage gate，与内核一致）。
 	Tier2Trigger int `json:"tier2Trigger"`
-	// Tier3Trigger 当 active T2 块数达到此值时，nudge 提示模型凝结为 T3。
-	// 默认 10。
+	// Tier3Trigger 当 active T2 块数达到此值时，nudge 提示模型凝结为 T3。默认关（2000）。
 	Tier3Trigger int `json:"tier3Trigger"`
 }
 
@@ -197,9 +219,15 @@ func DefaultConfig(modelContextLimit int) Config {
 		ProtectedTools:     []string{},
 		PromotionThreshold: 3,
 		Tiers: TierConfig{
-			Tier2Trigger: 5,  // T1 块数达 5 时蒸馏为 T2
-			Tier3Trigger: 10, // T2 块数达 10 时凝结为 T3
+			Tier2Trigger: 1000, // 计数路径默认关（质量路径才是需求信号）
+			Tier3Trigger: 2000,
 		},
+		GrowthRatio:            0.05,
+		GrowthFloor:            1000,
+		GrowthCap:              50000,
+		MinGrowthFloor:         1000,
+		MinGrowthRatio:         0.45,
+		TierGrowthMultiplier:   1.5,
 		MinCompressRangeChars:  5000,
 		TruncateThreshold:      0.95,
 		PreserveRecentMessages: 5,

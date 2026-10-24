@@ -1061,3 +1061,107 @@ func TestRebuildStateFromMessages(t *testing.T) {
 		t.Fatalf("plain history must not carry trace")
 	}
 }
+
+// TestNudgeThresholdsScaleWithWindow 增长/蒸馏门槛随窗口缩放并夹在下限与上限之间。
+// 写死绝对值会在小窗口要求离谱增量、在大窗口被噪声触发（acp-kernel 用
+// growthRatio/growthFloor/growthCap 三件套解决）。
+func TestNudgeThresholdsScaleWithWindow(t *testing.T) {
+	small := DefaultConfig(128_000)
+	large := DefaultConfig(1_000_000)
+
+	if got, want := NudgeGrowthTokens(small), 6400; got != want {
+		t.Errorf("128K 窗口 nudgeGrowthTokens = %d, want %d (5%%)", got, want)
+	}
+	if got, want := NudgeGrowthTokens(large), 50000; got != want {
+		t.Errorf("1M 窗口 nudgeGrowthTokens = %d, want %d (封顶)", got, want)
+	}
+	if GrowthFloorTokens(large) <= GrowthFloorTokens(small) {
+		t.Errorf("增长门槛应随窗口变大：128K=%d, 1M=%d",
+			GrowthFloorTokens(small), GrowthFloorTokens(large))
+	}
+	if got := GrowthFloorTokens(small); got < small.MinGrowthFloor {
+		t.Errorf("增长门槛 %d 低于下限 %d", got, small.MinGrowthFloor)
+	}
+	if TierMassThreshold(large) != 75000 {
+		t.Errorf("1M 窗口蒸馏质量门槛 = %d, want 75000 (1.5×50000)", TierMassThreshold(large))
+	}
+	// 极小窗口也不至于把门槛压到 0
+	if TierMassThreshold(DefaultConfig(1000)) < 1 {
+		t.Error("质量门槛不应为 0")
+	}
+}
+
+// TestDefaultTierCountPathIsOff 计数不是需求信号（acp-kernel #379）：默认计数阈值
+// 应高到实际不触发，真正的需求信号是可回收的摘要质量。
+func TestDefaultTierCountPathIsOff(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	if cfg.Tiers.Tier2Trigger < 1000 || cfg.Tiers.Tier3Trigger < 2000 {
+		t.Fatalf("默认计数阈值应实际关闭: tier2=%d tier3=%d", cfg.Tiers.Tier2Trigger, cfg.Tiers.Tier3Trigger)
+	}
+}
+
+// TestTierNudgeIgnoresSmallBlockCount 攒了几个小摘要不该触发蒸馏：块数够了但质量
+// 不够时，T2 nudge 不得发出（此前默认 5 个块就蒸，白烧细节）。
+func TestTierNudgeIgnoresSmallBlockCount(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	cfg.NudgeThresholdPct = 0.30
+	state := CreateInitialState()
+	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 50 token，合计 ~500 token
+	for i := 0; i < 10; i++ {
+		state.Blocks = append(state.Blocks, CompressionBlock{
+			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
+			Summary: strings.Repeat("x", 200), CompressedTokens: 5000,
+		})
+	}
+	state.NextBlockID = 10
+
+	msgs := longTailMessages(3)
+	AssignRefs(msgs, state)
+
+	decision := DecideNudge(msgs, state, cfg, 500_000) // 50% > 30%
+	if decision.Tier != nil {
+		t.Fatalf("质量未达阈值时不应蒸馏: tier=%v reason=%s", *decision.Tier, decision.Reason)
+	}
+	if decision.Breakdown["t1Mass"] >= TierMassThreshold(cfg) {
+		t.Fatalf("夹具质量 %d 不该 >= 阈值 %d", decision.Breakdown["t1Mass"], TierMassThreshold(cfg))
+	}
+}
+
+// TestTierNudgeFiresOnSummaryMass 摘要质量达到门槛时要蒸馏（哪怕块数没到计数阈值）。
+func TestTierNudgeFiresOnSummaryMass(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	cfg.NudgeThresholdPct = 0.30
+	state := CreateInitialState()
+	// 40 条摘要、每条 8000 字节 ASCII ≈ 2000 token，合计 ~80K > 75000 门槛
+	for i := 0; i < 40; i++ {
+		state.Blocks = append(state.Blocks, CompressionBlock{
+			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
+			Summary: strings.Repeat("y", 8000), CompressedTokens: 20000,
+		})
+	}
+	state.NextBlockID = 40
+
+	msgs := longTailMessages(3)
+	AssignRefs(msgs, state)
+
+	decision := DecideNudge(msgs, state, cfg, 500_000)
+	if !decision.ShouldInject || decision.Tier == nil || *decision.Tier != Tier2 {
+		t.Fatalf("质量达标应触发 T2 蒸馏: inject=%v tier=%v reason=%s",
+			decision.ShouldInject, decision.Tier, decision.Reason)
+	}
+	if len(decision.TierTargetBlocks) != 40 {
+		t.Errorf("目标块数 = %d, want 40", len(decision.TierTargetBlocks))
+	}
+}
+
+// longTailMessages 造 n 条较长的可压缩消息（配合低阈值触发 nudge 路径）。
+func longTailMessages(n int) []CoreMessage {
+	msgs := make([]CoreMessage, 0, n+4)
+	for i := 0; i < n; i++ {
+		msgs = append(msgs, CoreMessage{ID: fmt.Sprintf("m%d", i), Role: RoleUser, Text: strings.Repeat("z", 6000)})
+	}
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs, CoreMessage{ID: fmt.Sprintf("t%d", i), Role: RoleAssistant, Text: "tail"})
+	}
+	return msgs
+}
