@@ -185,6 +185,9 @@ type Config struct {
 	TerminalEscapeAfter int `json:"terminalEscapeAfter"`
 	// Absorb 即时工具结果吸收配置（默认关闭，DSC_ACP_ABSORB=1 开启）
 	Absorb AbsorbConfig `json:"absorb"`
+	// Crush 工具结果的确定性压缩（absorb 两段式的第一段，默认关闭）。
+	// 只在 Absorb.Enabled 时生效：没有第二段兜底时压一半没有意义。
+	Crush CrushConfig `json:"crush"`
 }
 
 // AbsorbConfig 吸收配置（对齐 acp-kernel AbsorbConfig）。

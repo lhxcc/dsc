@@ -136,14 +136,18 @@ type ProcessTurnResult struct {
 //	assign-refs → advance-survival → sync-blocks → prune(render)
 //	→ hide-compress-calls → absorb(hide+prompt) → decide-nudge → emergency-truncate
 //
-// 仍未实现：merge-blocks（old-gen 块批合并；acp 包内只有范围合并 mergeBatch，
-// 不是块合并）、filter/ccr-store（acp_retrieve 内容仓库）、crush（确定性工具结果
-// 压缩）、output-steering（冗长度分级）。缺失 merge 的后果是块数量随压缩次数线性
-// 增长，每个块每轮都渲染 summary——压缩收益会被自身开销逐步吃掉，属下一项待补。
+// 仍未实现：ccr-store（acp_retrieve 无损内容仓库）、filter（可插拔过滤框架）、
+// output-steering（冗长度分级）、packs（提示面/工具面定制）。
+//
+// 关于 merge-blocks（old-gen 块批合并）：acp-kernel 的 README/DESIGN 仍写着这个
+// 节点与 mergeMarkedBlocks，但**当前源码的 pipeline 里已经没有它**（节点表见
+// src/compress.ts 的 buildNodes）。块膨胀在上游是靠「蒸馏」（模型用 bN 引用把
+// T1 折成 T2/T3）解决的，不是靠自动批合并——这里也不实现它，而是把蒸馏的触发
+// 条件做对（按摘要质量而非块数，见 nudge.go）。
 //
 // 已对齐（勿重复实现）：assign-refs / 存活升级 / sync-blocks / prune /
-// hide-compress-calls / absorb(hide+prompt) / decide-nudge（计数+质量双路径）/
-// emergency-truncate / 孤儿配对清理。
+// crush（确定性压缩）/ hide-compress-calls / absorb(hide+prompt) /
+// decide-nudge（计数+质量双路径）/ emergency-truncate / 孤儿配对清理。
 //
 // 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
 // 消息文本。原因：tokens 属性每轮估算会变化（消息文本可能改变），导致前缀缓存
@@ -174,6 +178,11 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	// absorb 工具只写记录、原文照旧发送——等于不生效。
 	if config.Absorb.Enabled {
 		rendered = HideAbsorbedMessages(rendered, state)
+		// crush：absorb 的第一段——先用纯确定性策略把大结果压下去，压到阈值下
+		// 就不必再让模型蒸馏（省一次往返，也就省一次可能塞不进窗口的调用）。
+		if cr, crushed, distilled := ApplyCrush(rendered, state, config, tokenCount); crushed+distilled > 0 {
+			rendered = cr
+		}
 		if ap := AppendAbsorbPrompts(rendered, state, config, tokenCount); ap.PromptedCount > 0 {
 			rendered = ap.Messages
 		}
