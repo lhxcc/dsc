@@ -356,11 +356,6 @@ type Model struct {
 
 	// 当前会话 id（初始 default；/session 切换或新建时更新，供 /export 使用）
 	currentSessionID string
-	// ctxStatus 上下文管理后端最近一次上报的状态（宿主协议 core.EventContextStatus）。
-	// 前端只依赖协议结构，不依赖任何插件名或插件的私有字段；有上报才置 hasCtxStatus。
-	ctxStatus    core.ContextStatusEvent
-	hasCtxStatus bool
-
 	// 用户评审通道：program 供 askProvider 把问题送进事件循环；question 为待回答的问题
 	program  *tea.Program
 	question *pendingQuestion
@@ -429,17 +424,6 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		wakeBudget:       maxConsecutiveWakes,
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
-	}
-	// 订阅上下文管理状态：事件名与载荷都是宿主协议（core.EventContextStatus），
-	// 发布方是当期生效的压缩后端——前端不认识它，也不该认识。
-	// 回调可能来自插件 goroutine，改状态一律经事件循环（program.Send）。
-	if manager != nil {
-		manager.OnEvent(core.EventContextStatus, func(ec core.EventContext) (any, error) {
-			if st, ok := ec.Data.(core.ContextStatusEvent); ok && m.program != nil {
-				m.program.Send(ctxStatusMsg{status: st})
-			}
-			return nil, nil
-		})
 	}
 	return m
 }
@@ -772,9 +756,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.render()
 		return m, nil
 
-	case ctxStatusMsg:
-		m.ctxStatus = msg.status
-		m.hasCtxStatus = true
+	case pluginCommandMsg:
+		// 插件命令的输出：插件给什么就显示什么，前端不做语义解释。
+		header := assistantNameSty.Render(assistantMark + " DSC · /" + msg.name)
+		switch {
+		case msg.err != nil && msg.text == "":
+			m.appendMessage(header + "\n" + errorSty.Render(msg.err.Error()))
+		case msg.err != nil:
+			m.appendMessage(header + "\n" + msg.text + "\n" + errorSty.Render(msg.err.Error()))
+		default:
+			m.appendMessage(header + "\n" + msg.text)
+		}
+		m.render()
+		m.virtualGotoBottom()
 		return m, nil
 
 	case jobDoneMsg:
@@ -2324,7 +2318,24 @@ func (m *Model) slashCommandItems() []compItem {
 	if !inserted {
 		out = append(out, modeItems...)
 	}
+	// 插件声明的命令：菜单内容来自宿主的声明汇总，前端不认识任何具体命令。
+	if plugins := m.pluginCommands(); len(plugins) > 0 {
+		items := make([]compItem, 0, len(plugins))
+		for _, c := range plugins {
+			items = append(items, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
+		}
+		// 插到 "/export" 之前，保持内置命令的收尾顺序（/export、/exit 在最后）
+		out = append(out, items...)
+	}
 	return out
+}
+
+// pluginCommands 返回宿主侧汇总的插件命令声明（无 manager 时为空）。
+func (m *Model) pluginCommands() []core.PluginCommandInfo {
+	if m.manager == nil {
+		return nil
+	}
+	return m.manager.Commands()
 }
 
 // availableModes 返回可用模式名（presets 目录下 <name>.yaml 去扩展名）。
@@ -2587,9 +2598,19 @@ func (m *Model) buildHelpText() string {
 		"  /session new  新建会话并切换",
 		"  /session delete <id>  删除指定会话",
 		"  /export    导出当前会话为 Markdown 文件",
-		"  /context   查看上下文管理状态（占用/已压/可回收），别名 /acp",
 		"  /exit        退出聊天",
 	)
+	// 插件声明的命令由宿主动态汇总：核心不认识这些名字，也不内置任何一个。
+	if cmds := m.pluginCommands(); len(cmds) > 0 {
+		lines = append(lines, "", "插件命令:")
+		for _, c := range cmds {
+			summary := c.Summary
+			if summary == "" {
+				summary = c.Usage
+			}
+			lines = append(lines, "  "+c.Usage+"   "+summary)
+		}
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -2659,28 +2680,6 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			m.virtualGotoBottom()
 			return true, nil
 		}
-	case "/context", "/acp":
-		// 上下文管理的运行面板（/acp 为旧别名）：这些过程对用户不可见，只能靠一组
-		// 累计数字判断
-		// "压缩到底有没有在省、回取有没有在白白导出"。
-		if !m.hasCtxStatus {
-			// 注意 typed-nil：把 (*core.Manager)(nil) 塞进接口后 != nil，
-			// 会在方法里解引用空指针直接 panic——所以显式判空后再赋值。
-			var backend compactionBackendReporter
-			if m.manager != nil {
-				backend = m.manager
-			}
-			m.appendMessage(dimSty.Render(noACPStatusText(backend)))
-		} else {
-			m.appendMessage(renderContextStatus(m.ctxStatus))
-		}
-		m.input.SetValue("")
-		m.completion = completion{}
-		m.syncInputHeight()
-		m.render()
-		m.virtualGotoBottom()
-		return true, nil
-
 	case "/sessions":
 		if m.manager != nil {
 			summaries, err := m.manager.ListSessions()
@@ -3022,8 +3021,47 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
+
+	// 不是内置命令：看有没有插件**声明**过这个名字。有则转发给该插件执行，
+	// 没有才当作普通输入。命令名不写在核心/TUI 里——声明在插件，转发在宿主。
+	if name, args, ok := splitSlashCommand(cmd); ok && m.manager != nil && m.manager.HasCommand(name) {
+		return true, m.runPluginCommand(name, args)
+	}
 	return false, nil
 }
+
+// splitSlashCommand 拆分 "/name rest" → (name, rest)。
+func splitSlashCommand(cmd string) (name, args string, ok bool) {
+	t := strings.TrimPrefix(strings.TrimSpace(cmd), "/")
+	if t == "" {
+		return "", "", false
+	}
+	if i := strings.IndexAny(t, " \t"); i >= 0 {
+		return t[:i], strings.TrimSpace(t[i+1:]), true
+	}
+	return t, "", true
+}
+
+// runPluginCommand 异步转发命令（插件可能在另一个进程里跑，不能阻塞 UI 循环）。
+func (m *Model) runPluginCommand(name, args string) tea.Cmd {
+	manager := m.manager
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), pluginCommandTimeout)
+		defer cancel()
+		text, err := manager.RunCommand(ctx, name, args)
+		return pluginCommandMsg{name: name, text: text, err: err}
+	}
+}
+
+// pluginCommandMsg 插件命令的执行结果（从 tea.Cmd 回到事件循环）。
+type pluginCommandMsg struct {
+	name string
+	text string
+	err  error
+}
+
+// pluginCommandTimeout 插件命令的超时：命令是同步 RPC，卡住不能拖死界面。
+const pluginCommandTimeout = 20 * time.Second
 
 // appendCronList 输出定时任务列表（/crons 与 /cron list 共用）。
 func (m *Model) appendCronList() {
@@ -3704,103 +3742,4 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	}
 	_, err := p.Run()
 	return err
-}
-
-// ctxStatusMsg 把后端上报的状态送进 bubbletea 事件循环（回调在别的 goroutine）。
-type ctxStatusMsg struct{ status core.ContextStatusEvent }
-
-// renderContextStatus 把宿主协议里的上下文管理状态渲染成一段可读文本。
-//
-// **这里不认识任何插件**：只有 core.ContextStatusEvent 的字段，加上后端自述的
-// Metrics（标签、次数、token 量、说明）。前端因此不需要随压缩插件更换而改代码。
-//
-// 展示口径：占了多少 → 压了多少 → 还有什么可压；Metrics 逐条照抄标签，
-// 不猜语义（「确定性压缩」「可回取」这些名字只有发布方懂，前端只管排版）。
-func renderContextStatus(st core.ContextStatusEvent) string {
-	short := func(n int) string {
-		switch {
-		case n >= 1_000_000:
-			return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
-		case n >= 1_000:
-			return fmt.Sprintf("%dK", n/1_000)
-		}
-		return fmt.Sprintf("%d", n)
-	}
-
-	var b strings.Builder
-	b.WriteString(assistantNameSty.Render(assistantMark + " DSC · 上下文压缩\n"))
-	if st.Limit > 0 {
-		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n", short(st.Tokens), short(st.Limit), pctOf(st.Tokens, st.Limit))
-	} else {
-		fmt.Fprintf(&b, "  占用: %s\n", short(st.Tokens))
-	}
-	if st.BlocksTotal > 0 || st.BlocksActive > 0 {
-		fmt.Fprintf(&b, "  块: %d active / %d total", st.BlocksActive, st.BlocksTotal)
-		if st.BlocksNote != "" {
-			fmt.Fprintf(&b, "（%s）", st.BlocksNote)
-		}
-		b.WriteString("\n")
-	}
-	if st.TokensReclaimed > 0 || st.Compressions > 0 {
-		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", short(st.TokensReclaimed), st.Compressions)
-	}
-	for _, m := range st.Metrics {
-		b.WriteString("  " + m.Label + ":")
-		if m.Value > 0 {
-			fmt.Fprintf(&b, " %d 次", m.Value)
-		}
-		if m.Tokens > 0 {
-			if m.Value > 0 {
-				b.WriteString("，")
-			} else {
-				b.WriteString(" ")
-			}
-			b.WriteString(short(m.Tokens))
-		}
-		if m.Note != "" {
-			fmt.Fprintf(&b, "（%s）", m.Note)
-		}
-		b.WriteString("\n")
-	}
-	if st.CompressibleRanges > 0 {
-		fmt.Fprintf(&b, "  可压范围: %d 段\n", st.CompressibleRanges)
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// noACPStatusText 没有压缩状态时要说清"为什么没有"，而不是笼统地说"未启用"。
-//
-// 三种情况在用户眼里长得一样，原因和修法却完全不同：
-//   - 配置指定了后端但插件没加载 → 改 config.yaml 的 plugins 列表
-//   - 根本没配后端            → 配 compaction 字段
-//   - 配好了、插件也在跑       → 只是还没跑过一个回合，等下一轮
-//
-// compactionBackendReporter 只依赖"能报后端状态"这一项能力——测试可给假实现，
-// 也让这里不必知道 Manager 的其余部分。
-type compactionBackendReporter interface {
-	CompactionBackendState() (string, bool)
-}
-
-func noACPStatusText(manager compactionBackendReporter) string {
-	if manager == nil {
-		return "（暂无压缩状态：未连接宿主管理器）"
-	}
-	configured, active := manager.CompactionBackendState()
-	switch {
-	case configured == "":
-		return "（暂无压缩状态：config.yaml 未指定 compaction 后端，当前走 agent 内联压缩）"
-	case !active:
-		return "（压缩后端 " + configured + " 已配置但未生效：插件未加载或未声明 Provides compaction）\n" +
-			"  检查 config.yaml：plugins 列表里要有该项且 enabled: true（Windows 的 binary_path 需带 .exe）"
-	default:
-		return "（压缩后端 " + configured + " 已在运行，但还没有状态上报——跑一个回合后再看）"
-	}
-}
-
-// pctOf 计算百分比（limit<=0 时返回 0）。
-func pctOf(v, limit int) float64 {
-	if limit <= 0 {
-		return 0
-	}
-	return float64(v) * 100 / float64(limit)
 }

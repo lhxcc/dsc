@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"dsc/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Hook 插件钩子（语义化封装宿主 proto.PluginHookService）：
@@ -47,6 +49,15 @@ type Hook struct {
 	// 的贡献，拼接到 agent 的 system prompt。返回空串表示无贡献。
 	// 每次调用求值（动态内容如技能索引安装后即时反映）。
 	ContextFn func() string
+
+	// RunCommand 执行本插件声明的斜杆命令（见 Config.Commands）。
+	//
+	// 宿主把用户输入的 /<name> 按**声明清单**转发到这里；name 已去掉前导 "/"，
+	// args 是剩余原文（未解析，语义由插件决定）。返回的 text 原样展示给用户，
+	// 多行文本由界面自行排版；err 非 nil 视为执行失败。
+	//
+	// 未声明任何命令的插件不必实现（宿主只转发声明过的名字）。
+	RunCommand func(ctx context.Context, name, args string) (text string, err error)
 }
 
 // hookServiceServer 实现宿主 PluginHookService 的适配层。
@@ -102,6 +113,21 @@ func (s *hookServiceServer) OnEvent(ctx context.Context, req *proto.OnEventReque
 
 // ListContext 贡献 system prompt 片段（对齐 DSH ctx.systemPrompt.section）。
 // 任何插件类型均可实现。未实现 ContextFn 时返回空串（无贡献）。
+// RunCommand 实现宿主侧命令转发（见 Hook.RunCommand）。
+//
+// 未实现该钩子的插件返回 Unimplemented：宿主据此报「该命令不可用」，而不是
+// 把空字符串当成命令的正常输出——否则用户会看到一条空白回复。
+func (s *hookServiceServer) RunCommand(ctx context.Context, req *proto.RunCommandRequest) (*proto.RunCommandResponse, error) {
+	if s.hook == nil || s.hook.RunCommand == nil {
+		return nil, status.Error(codes.Unimplemented, "plugin does not implement RunCommand")
+	}
+	text, err := s.hook.RunCommand(ctx, req.GetName(), req.GetArgs())
+	if err != nil {
+		return &proto.RunCommandResponse{Text: text, Error: err.Error()}, nil
+	}
+	return &proto.RunCommandResponse{Text: text}, nil
+}
+
 func (s *hookServiceServer) ListContext(ctx context.Context, req *proto.ListContextRequest) (*proto.ListContextResponse, error) {
 	if s.hook == nil || s.hook.ContextFn == nil {
 		return &proto.ListContextResponse{}, nil

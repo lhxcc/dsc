@@ -24,4 +24,16 @@ message PluginInfo {
   // 宿主对通用（dsc）类型按此声明桥接对应服务（如 "policy" → PolicyService
   // 桥接到工具流水线），无需副作用探测。旧插件未填充时宿主保持既有探测行为。
   repeated string services = 6;
+  // 本插件提供的斜杆命令声明（**声明式**：宿主不内置任何命令名）。
+  // 用户在界面输入 /<name> 时，宿主按本清单找到声明它的插件并把请求转发到
+  // PluginHookService.RunCommand，由插件返回要展示的文本。
+  // 命令属于外部能力：核心与前端都不得硬编码任何插件的命令名。
+  repeated PluginCommand commands = 7;
+}
+
+// PluginCommand 一条命令声明。
+message PluginCommand {
+  string name = 1;     // 命令名，不含前导 "/"（如 "context"）
+  string summary = 2;  // 补全菜单里的一行说明
+  string usage = 3;    // 用法提示（可选，如 "/context [--json]"）
 }

@@ -161,3 +161,49 @@ func TestCCRPersistFailureRestoresBody(t *testing.T) {
 		t.Fatalf("落盘失败应回滚原文，实际 %q", persisted[0].Text[:40])
 	}
 }
+
+// TestRunCommandRendersStatus 命令由插件自己渲染：宿主只转发、只展示，
+// 不认识这些指标。没有状态时也要给一句人话，而不是空输出。
+func TestRunCommandRendersStatus(t *testing.T) {
+	bc := &BillionContext{config: bcacp.DefaultConfig(1_000_000)}
+
+	out, err := bc.runCommand(context.Background(), "context", "")
+	if err != nil {
+		t.Fatalf("runCommand: %v", err)
+	}
+	if !strings.Contains(out, "尚未建立") {
+		t.Fatalf("无状态时应说明原因，实际：%q", out)
+	}
+
+	state := bcacp.CreateInitialState()
+	state.Blocks = []bcacp.CompressionBlock{
+		{BlockID: "b0", Tier: bcacp.Tier1, Active: true, CompressedTokens: 40_000},
+		{BlockID: "b1", Tier: bcacp.Tier2, Active: true, CompressedTokens: 70_000},
+	}
+	state.Stats.TokensCompressed = 110_000
+	state.Stats.CompressionCount = 2
+	state.Stats.CrushCount = 3
+	state.Stats.CrushTokensSaved = 9_500
+	state.Stats.CCRStored = 4
+	state.Stats.CCRStoredTokens = 31_000
+	state.Stats.CCRRetrieved = 2
+	state.Stats.CCRExported = 1
+	bc.state = state
+	bc.lastTokenCount = 420_000
+
+	out, err = bc.runCommand(context.Background(), "acp", "") // 别名走同一分支
+	if err != nil {
+		t.Fatalf("runCommand(acp): %v", err)
+	}
+	for _, want := range []string{"420K / 1.00M", "42%", "T1=1 T2=1 T3=0", "110K", "确定性压缩: 3 次",
+		"已卸载可回取: 4 条", "回取: 2 次（导出 1 · 落空 0）"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("输出应包含 %q，实际：\n%s", want, out)
+		}
+	}
+
+	// 未声明的名字：报错（宿主的转发只应出现在声明清单里）
+	if _, err := bc.runCommand(context.Background(), "nope", ""); err == nil {
+		t.Fatal("未知命令应返回错误")
+	}
+}

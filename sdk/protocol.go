@@ -45,12 +45,6 @@ type (
 	AgentPreStepEvent = core.AgentPreStepEvent
 	// UserQuestionAskedEvent userquestion/asked 载荷：问题数量与首个标题。
 	UserQuestionAskedEvent = core.UserQuestionAskedEvent
-	// ContextStatusEvent context/status 载荷：上下文管理后端自报的运行状态。
-	// 载荷结构由**宿主**定义（core/context_status.go），插件按结构填写、前端按结构
-	// 渲染——插件不得自定义该事件名或另起一套字段。
-	ContextStatusEvent = core.ContextStatusEvent
-	// ContextMetric context/status 里的一条后端专有指标（标签与语义由后端自述）。
-	ContextMetric = core.ContextMetric
 
 	// AgentRequestErrorEvent agent/request-error 载荷：请求失败码（如
 	// context_window_exceeded），插件可返回 retry 让宿主重走 pre-step。
@@ -83,11 +77,8 @@ const (
 	// EventUserQuestionAsked 宿主即将向用户提问（ask_user_question / 计划评审）。
 	// 通知类插件订阅它提醒用户「需要你处理」——agent 此时阻塞等待回答。
 	EventUserQuestionAsked = core.EventUserQuestionAsked
-	// EventContextStatus 上下文管理后端上报运行状态（事件名与载荷均由宿主定义）。
-	// 发布方是当期生效的压缩后端，消费者是前端；双方只依赖这个协议，不依赖插件名。
-	EventContextStatus   = core.EventContextStatus
-	EventApprovalDecided = core.EventApprovalDecided
-	EventApprovalPolicy  = core.EventApprovalPolicy
+	EventApprovalDecided   = core.EventApprovalDecided
+	EventApprovalPolicy    = core.EventApprovalPolicy
 )
 
 // ---- LLM 协议 ----

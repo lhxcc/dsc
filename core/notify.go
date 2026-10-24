@@ -60,16 +60,6 @@ func (s *coreNotifyServer) Notify(ctx context.Context, req *proto.NotifyRequest)
 		s.m.events.Emit(JobDoneEvent, EventContext{Data: snap})
 		return &proto.NotifyResponse{}, nil
 	}
-	// 上下文状态是**宿主协议**（core/context_status.go）：按结构解码后分发，
-	// 前端拿到的就是类型化载荷，不必自己去猜某个插件的 kv 结构。
-	if req.GetName() == string(EventContextStatus) {
-		var st ContextStatusEvent
-		if err := json.Unmarshal([]byte(req.GetData()), &st); err != nil {
-			return nil, fmt.Errorf("notify: invalid %s data: %w", EventContextStatus, err)
-		}
-		s.m.events.Emit(EventContextStatus, EventContext{Data: st})
-		return &proto.NotifyResponse{}, nil
-	}
 	data := any(req.GetData())
 	if req.GetData() != "" {
 		var v any
@@ -103,8 +93,8 @@ func (m *Manager) compactionBackendName() string {
 //
 // 给前端/诊断用：config.yaml 里写了 `compaction: X` 但插件没加载（plugins 列表里
 // 注释掉、enabled: false、二进制缺失）时，宿主会静默回落到 agent 内联压缩——
-// 用户看到的是"新压缩没生效"，却没有任何地方说明原因。这个入口让 /acp 之类
-// 的面板能把话说明白。
+// 用户看到的是"新压缩没生效"，却没有任何地方说明原因。这个入口让状态类
+// 命令/面板能把话说明白。
 func (m *Manager) CompactionBackendState() (configured string, active bool) {
 	if m == nil {
 		return "", false

@@ -62,6 +62,13 @@ type Config struct {
 	// "agentic-bench-runner"}] —— 这里它本身是 bench runner，自己依赖另一
 	// 个具 cron 能力的插件时，可改声明 [{Type: "tool", Capability: "cron"}]，
 	// 宿主据此自动绑定到首个声明了 cron 能力的 tool 插件。
+	// Commands 声明本插件提供的斜杆命令（**声明式**）。
+	//
+	// 命令属于外部能力：核心与前端都不内置任何插件的命令名。界面把 /<name>
+	// 交给声明了它的插件（经 PluginHookService.RunCommand），插件返回要展示的
+	// 文本。卸载插件 = 命令消失，无需改宿主。
+	Commands []Command
+
 	Requires []CapabilityRequirement
 	// Provides 声明本插件**提供**的能力（capability）——对齐 DSH/Cordis 的 provide
 	// 模型（见 vendor/cordis/src/registry.ts Plugin.Base.provide）。

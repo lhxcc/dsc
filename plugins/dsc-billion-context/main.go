@@ -39,10 +39,6 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
-	// interconnect 互通句柄（宿主挂载聚合服务后回调注入）；用于向宿主事件总线
-	// 用于上报宿主协议的 context/status。未连接时为 nil，发布静默跳过。
-	interconnect *dsc.Interconnect
-
 	// lastTokenCount 最近一次 pre-step 观测到的上下文占用（宿主估算或本地兜底）。
 	lastTokenCount int
 
@@ -128,6 +124,12 @@ func main() {
 		// 不硬编码插件名，任何声明 Provides compaction 的插件都接管。
 		Provides: map[string]string{
 			"compaction": "true",
+		},
+		// 命令是声明出来的能力：核心/前端不认识这些名字，只按声明清单把
+		// /<name> 转发回本插件（PluginHookService.RunCommand）。
+		Commands: []dsc.Command{
+			{Name: "context", Summary: "上下文压缩状态（占用 / 已压 / 可回收）", Usage: "/context"},
+			{Name: "acp", Summary: "同 /context（旧名别名）", Usage: "/acp"},
 		},
 	})
 
@@ -240,17 +242,10 @@ func main() {
 		})
 	}
 
-	// 互通：拿到宿主的事件发布句柄（context/status 走它）
-	sdkInst.SetInterconnect(func(ctx context.Context, ic *dsc.Interconnect) error {
-		bc.mu.Lock()
-		bc.interconnect = ic
-		bc.mu.Unlock()
-		return nil
-	})
-
 	// Hook: 拦截 agent/pre-step 改写消息列表 + ContextFn 贡献 ACP system prompt
 	sdkInst.Hook(dsc.Hook{
-		OnEvent: bc.onEvent,
+		OnEvent:    bc.onEvent,
+		RunCommand: bc.runCommand,
 		ContextFn: func() string {
 			if bc.config.Absorb.Enabled {
 				return bcacp.ACPSystemPrompt + "\n\n" + bcacp.BuildAbsorbSystemPrompt(bc.config.Absorb.ToolName)
@@ -433,9 +428,6 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	bc.state = result.State
 	bc.lastTokenCount = tokenCount
 	bc.mu.Unlock()
-
-	// 可观测性：把压缩/卸载/回取的累计数据发布到宿主事件总线，TUI 的 /acp 面板读它。
-	bc.publishContextStatus(result.State)
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -842,49 +834,69 @@ func (bc *BillionContext) noteRetrieval(hit, exported bool) {
 	}
 }
 
-// publishContextStatus 把压缩运行状态按**宿主协议**上报（core.ContextStatusEvent）。
-//
-// 事件名与载荷结构都由宿主定义：本插件只是「当前生效的压缩后端」这一角色的实现，
-// 不该让前端认识自己的名字或内部字段。专有指标（确定性压缩、可回取条目、回取/导出
-// 次数）走 Metrics 自述——标签由这里给，前端只按「标签/次数/token 量/说明」排版。
-func (bc *BillionContext) publishContextStatus(state *bcacp.CompressionState) {
-	if bc.interconnect == nil || state == nil {
-		return
+// runCommand 执行宿主转发过来的斜杆命令（命令名由本插件在 metadata.commands 里
+// 声明，宿主不认识这些名字）。多行文本由界面自行排版。
+func (bc *BillionContext) runCommand(ctx context.Context, name, args string) (string, error) {
+	switch name {
+	case "context", "acp":
+		return bc.renderContextStatus(), nil
 	}
-	report := bcacp.BuildStatus(nil, state, bc.config, bc.lastTokenCount)
+	return "", fmt.Errorf("unknown command: %s", name)
+}
+
+// renderContextStatus 生成状态面板文本（/context 与 /acp 共用）。
+//
+// 排版放在插件里是有意的：这些指标（分层块、确定性压缩、可回取条目）是 ACP 的
+// 概念，核心与前端不该认识它们；插件只负责产出一段给人看的文本。
+func (bc *BillionContext) renderContextStatus() string {
+	bc.mu.Lock()
+	state := bc.state
+	tokenCount := bc.lastTokenCount
+	bc.mu.Unlock()
+
+	if state == nil {
+		return "（压缩状态尚未建立：本会话还没跑过一个回合）"
+	}
+	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
 	bd := report.Breakdown
 
-	st := dsc.ContextStatusEvent{
-		Tokens:             report.TokenCount,
-		Limit:              report.ModelContextLimit,
-		BlocksActive:       report.ActiveBlocks,
-		BlocksTotal:        report.TotalBlocks,
-		BlocksNote:         fmt.Sprintf("T1=%d T2=%d T3=%d", bd["tier1"], bd["tier2"], bd["tier3"]),
-		TokensReclaimed:    bd["tokensCompressed"],
-		Compressions:       bd["compressionCount"],
-		CompressibleRanges: len(report.CompressibleRanges),
+	short := func(n int) string {
+		switch {
+		case n >= 1_000_000:
+			return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
+		case n >= 1_000:
+			return fmt.Sprintf("%dK", n/1_000)
+		}
+		return fmt.Sprintf("%d", n)
+	}
+
+	var b strings.Builder
+	b.WriteString("DSC · 上下文压缩\n")
+	if report.ModelContextLimit > 0 {
+		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n",
+			short(report.TokenCount), short(report.ModelContextLimit),
+			float64(report.TokenCount)*100/float64(report.ModelContextLimit))
+	} else {
+		fmt.Fprintf(&b, "  占用: %s\n", short(report.TokenCount))
+	}
+	fmt.Fprintf(&b, "  块: %d active / %d total（T1=%d T2=%d T3=%d）\n",
+		report.ActiveBlocks, report.TotalBlocks, bd["tier1"], bd["tier2"], bd["tier3"])
+	if bd["tokensCompressed"] > 0 || bd["compressionCount"] > 0 {
+		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", short(bd["tokensCompressed"]), bd["compressionCount"])
 	}
 	if v := bd["absorbedTokens"]; v > 0 {
-		st.Metrics = append(st.Metrics, dsc.ContextMetric{Label: "absorb 蒸馏", Tokens: v})
+		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", short(v))
 	}
 	if bd["crushCount"] > 0 {
-		st.Metrics = append(st.Metrics, dsc.ContextMetric{
-			Label: "确定性压缩", Value: bd["crushCount"], Tokens: bd["crushTokensSaved"],
-		})
+		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], short(bd["crushTokensSaved"]))
 	}
 	if bd["ccrStored"] > 0 {
-		st.Metrics = append(st.Metrics, dsc.ContextMetric{
-			Label: "已卸载可回取", Value: bd["ccrStored"], Tokens: bd["ccrStoredTokens"],
-		})
-		st.Metrics = append(st.Metrics, dsc.ContextMetric{
-			Label: "回取", Value: bd["ccrRetrieved"],
-			Note: fmt.Sprintf("导出 %d · 落空 %d", bd["ccrExported"], bd["retrievalMisses"]),
-		})
+		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], short(bd["ccrStoredTokens"]))
+		fmt.Fprintf(&b, "  回取: %d 次（导出 %d · 落空 %d）\n",
+			bd["ccrRetrieved"], bd["ccrExported"], bd["retrievalMisses"])
 	}
-	payload, err := json.Marshal(st)
-	if err != nil {
-		return
+	if n := len(report.CompressibleRanges); n > 0 {
+		fmt.Fprintf(&b, "  可压范围: %d 段\n", n)
 	}
-	// 发布失败不影响主流程：可观测性坏了不能挡住压缩
-	_ = bc.interconnect.Notify(string(dsc.EventContextStatus), string(payload))
+	return strings.TrimRight(b.String(), "\n")
 }
