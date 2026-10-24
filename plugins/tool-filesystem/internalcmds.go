@@ -326,9 +326,22 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
-	multi := len(paths) > 1
+	// 先按 GNU ls 的规则把参数分成「条目」与「目录清单」两段：只有目录清单印
+	// "dir:" 标题，而标题只在存在多段清单时出现（多个目录，或文件段与目录段并存）。
+	// 多个普通文件参数（`ls -t a/x b/x c/x`）属于同一段，不印任何标题。
+	//
+	// 这条规则不是洁癖：此前实现按「参数个数 > 1」一律印 `参数:` 标题，于是
+	// `ls -t build-*/x.exe | head -1` 拿到的是「路径:」（带冒号、不是有效路径），
+	// 而脚本里经外部 sh 运行时走的是系统 ls、行为正常——同一条命令两种结果，
+	// 模型据此得出的结论完全相反。
+	type target struct {
+		display string
+		path    string
+		fi      os.FileInfo
+	}
+	var entries, dirs []target
 	exit := 0
-	for idx, p0 := range paths {
+	for _, p0 := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -339,18 +352,36 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			exit = 2
 			continue
 		}
+		t := target{display: p0, path: p, fi: fi}
+		if fi.IsDir() && !listSelf {
+			dirs = append(dirs, t)
+		} else {
+			entries = append(entries, t)
+		}
+	}
+
+	// 条目段：与目录内条目同样参与 -t/-S/-r 排序（GNU 对命令行上的文件也排序）
+	sort.SliceStable(entries, func(i, j int) bool {
+		return lsLess(entries[i].display, entries[i].fi, entries[j].display, entries[j].fi, byTime, bySize, reverse)
+	})
+	for _, e := range entries {
+		lsEntry(hc, e.fi, e.display, long, classify)
+	}
+
+	// 目录段：多段清单才印标题（单个目录参数不印，与 GNU 一致）
+	sort.SliceStable(dirs, func(i, j int) bool {
+		return lsLess(dirs[i].display, dirs[i].fi, dirs[j].display, dirs[j].fi, byTime, bySize, reverse)
+	})
+	multi := len(dirs) > 1 || (len(dirs) > 0 && len(entries) > 0)
+	for i, d := range dirs {
 		if multi {
-			if idx > 0 {
+			if i > 0 || len(entries) > 0 {
 				fmt.Fprintln(hc.Stdout)
 			}
-			fmt.Fprintln(hc.Stdout, p0+":")
+			fmt.Fprintln(hc.Stdout, d.display+":")
 		}
-		if fi.IsDir() && !listSelf {
-			if err := lsDir(ctx, hc, p, showAll || showAlmostAll, long, singleCol, classify, byTime, bySize, reverse); err != nil {
-				return err
-			}
-		} else {
-			lsEntry(hc, fi, p0, long, classify)
+		if err := lsDir(ctx, hc, d.path, showAll || showAlmostAll, long, singleCol, classify, byTime, bySize, reverse); err != nil {
+			return err
 		}
 	}
 	if exit != 0 {
@@ -365,22 +396,27 @@ type lsItem struct {
 	fi   os.FileInfo
 }
 
-// sortLsItems 对目录项排序：默认按名升序；-t 按修改时间新在前；-S 按大小大在前；
-// -r 整体逆序。Stable 保证同键（如同 mtime）时保持目录序，输出确定。
+// lsLess 是 ls 的排序比较器：默认按名升序；-t 按修改时间新在前；-S 按大小大在前；
+// -r 整体逆序。目录内条目与命令行参数共用同一套规则（GNU 对命令行上的文件也排序）。
+func lsLess(aName string, aFi os.FileInfo, bName string, bFi os.FileInfo, byTime, bySize, reverse bool) bool {
+	if reverse {
+		aName, bName = bName, aName
+		aFi, bFi = bFi, aFi
+	}
+	switch {
+	case byTime:
+		return aFi.ModTime().After(bFi.ModTime())
+	case bySize:
+		return aFi.Size() > bFi.Size()
+	default:
+		return aName < bName
+	}
+}
+
+// sortLsItems 对目录项排序。Stable 保证同键（如同 mtime）时保持目录序，输出确定。
 func sortLsItems(items []lsItem, byTime, bySize, reverse bool) {
 	sort.SliceStable(items, func(i, j int) bool {
-		a, b := items[i], items[j]
-		if reverse {
-			a, b = b, a
-		}
-		switch {
-		case byTime:
-			return a.fi.ModTime().After(b.fi.ModTime())
-		case bySize:
-			return a.fi.Size() > b.fi.Size()
-		default:
-			return a.name < b.name
-		}
+		return lsLess(items[i].name, items[i].fi, items[j].name, items[j].fi, byTime, bySize, reverse)
 	})
 }
 
