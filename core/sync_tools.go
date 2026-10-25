@@ -9,11 +9,11 @@ import (
 )
 
 // syncMinInterval 聚合工具目录同步的最小间隔（节流）。模型每回合频繁取工具目录，
-// 且 tool-lua-host 脚本热加载轮询为 2s，故 800ms 节流足够即时也不至于高频拉全量插件。
+// 且 LUA 宿主插件的脚本热加载轮询为 2s，故 800ms 节流足够即时也不至于高频拉全量插件。
 const syncMinInterval = 800 * time.Millisecond
 
 // syncPluginTools 节流地重新拉取各 tool 插件的最新工具并同步到共享 registry。
-// tool-lua-host 等脚本插件在运行中热加载新增/删除脚本工具后，宿主聚合工具目录
+// LUA 宿主插件 等脚本插件在运行中热加载新增/删除脚本工具后，宿主聚合工具目录
 // （模型可直接调用的工具）随本同步更新，使新脚本工具无需重启即可被模型直接调用。
 // 幂等：对工具集无变化的插件不产生任何 registry 变动。
 func (m *Manager) syncPluginTools() {

@@ -13,7 +13,7 @@ import (
 // 插件进程外传播导致 LLM 连接中断）。路径规范化（AbsPath）与工作空间根
 // （WorkspaceRoot）亦集中于此，消除各插件重复实现。
 //
-// 错误呈现对齐内部 POSIX shell（tool-filesystem 的 mvdan/sh）约定：错误信息
+// 错误呈现对齐内部 POSIX shell（文件系统插件的 mvdan/sh）约定：错误信息
 // 里的路径一律正斜杆（filepath.ToSlash）——Windows 上 os.* 错误内嵌反斜杆
 // 路径，直接回显给模型会与 shell 工具的 POSIX 风格不一致、造成混乱。底层
 // 错误仍经 Unwrap 保留，插件可照常 errors.Is/As。

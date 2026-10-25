@@ -1,6 +1,6 @@
 // Package llmclient 插件侧 LLM 服务适配器（宿主互通机制）：
 // 插件进程经 DSC_LLM_SERVICE_ID 环境变量（宿主 coreEnv 注入）+ broker 连接
-// 宿主聚合 LLM 服务，复用 llm-openai / llm-anthropic / llm-ollama 三个 LLM
+// 宿主聚合 LLM 服务，复用 LLM provider 插件 / LLM provider 插件 / LLM provider 插件 三个 LLM
 // 插件的能力（含多 provider 聚合路由），无需自带 LLM client。
 package llmclient
 

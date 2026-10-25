@@ -10,7 +10,7 @@ import (
 // DSC_* 环境变量（见 main.go / core/manager.go），插件在 OnStart 或
 // 工具执行时读取，无需关心注入细节。
 type Env struct {
-	// Mode 当前模式：minimal | standard | creation（tool-lua-host 据此限制脚本创造）。
+	// Mode 当前模式：minimal | standard | creation（LUA 宿主插件 据此限制脚本创造）。
 	Mode string
 	// WorkspaceRoot 统一工作空间根（sandbox 边界；默认启动目录，可被绝对路径覆盖）。
 	WorkspaceRoot string

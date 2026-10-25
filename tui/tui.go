@@ -2359,7 +2359,7 @@ func modeHint(mode string) string {
 	case core.ModeStandard:
 		return "切换至标准模式"
 	case core.ModeCreation:
-		return "切换至创造模式（可经 tool-lua-host 创造 LUA 插件）"
+		return "切换至创造模式（可经宿主内脚本插件创造 LUA 插件）"
 	case core.ModePTC:
 		return "引导用 run_code 写 Lua 一把过组合多步"
 	}
@@ -2540,7 +2540,7 @@ func modeSwitchMessage(mode string) string {
 	case core.ModeStandard:
 		return "已切換至標準模式 (standard)。"
 	case core.ModeCreation:
-		return "已切換至創造模式 (creation)：可經 tool-lua-host 跨寫 LUA 插件（參考 lua-core-creator 技能）。"
+		return "已切換至創造模式 (creation)：可經宿主內腳本插件跨寫 LUA 插件（參考 lua-core-creator 技能）。"
 	case core.ModePTC:
 		return "已切換至 PTC 模式 (ptc)：引导用 run_code 写 Lua 一把过组合多步。"
 	}

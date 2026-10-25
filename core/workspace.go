@@ -4,8 +4,8 @@ package core
 //
 // 模型可见的文件系统是「以工作空间根为 / 的 POSIX 虚拟根」，所有平台所有输入输出
 // 统一正斜杆。模型书写的路径（相对路径、/workspace 前缀、裸 / 前缀、WSL 风格、
-// Windows 盘符路径）到真实路径的归并映射原先散落各插件（tool-filesystem 的
-// mapWorkspacePath、tool-str-replace-editor 的 normalizeWorkspacePath/makeAbsPath），
+// Windows 盘符路径）到真实路径的归并映射原先散落各插件（文件系统插件的
+// mapWorkspacePath、文本替换插件的 normalizeWorkspacePath/makeAbsPath），
 // 语义漂移且覆盖不全（报告案例：str_replace_editor 把 /docs/architecture.md 经
 // 绝对化解析落到进程 cwd 所在盘的盘根 D:/docs，而非 <workspace>/docs/architecture.md）。
 //
@@ -99,7 +99,7 @@ func ResolveWorkspacePath(p string) (string, error) {
 }
 
 // mapWorkspacePathFor 是 MapWorkspacePath 的纯函数本体（root 与 goos 显式注入，
-// 便于跨平台测试全部规则分支）。语义逐条对齐 tool-filesystem 既有实现并扩展
+// 便于跨平台测试全部规则分支）。语义逐条对齐文件系统插件的既有实现并扩展
 // 反斜杆形态识别：规则匹配在显式正斜杆副本上进行，映射结果一律正斜杆。
 func mapWorkspacePathFor(p, root, goos string) string {
 	// 规则匹配统一在正斜杆副本上进行（模型可能传入 \workspace、\x 等 Windows 风格）。

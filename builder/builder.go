@@ -47,6 +47,8 @@ var platforms = []platform{
 	{Name: "freebsd-amd64", GOOS: "freebsd", GOARCH: "amd64", HostDir: "dsc"},
 }
 
+//dsc:plugin-names-ok 发布包清单：构建期必须逐个枚举要打包的插件目录（分发决策，非运行时调用）
+
 // publicPlugins 发布于发布包内的对外插件；目录缺失时自动跳过。
 var publicPlugins = []string{
 	"agent-react-loop",

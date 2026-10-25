@@ -37,8 +37,8 @@ func containsEnvKey(env []string, key string) bool {
 }
 
 // TestBuildEnvStripsSecretsForNonLLM 验证非 LLM 插件：宿主环境里的凭据（含
-// DSC_<P>_API_KEY 这类 LLM 凭据）一律滤除；插件专属凭据只放行给登记的插件；
-// config.yaml 为该插件显式声明的 env 不受过滤。
+// DSC_<P>_API_KEY 这类 LLM 凭据）一律滤除；插件凭据只能经 config.yaml 的 `env:`
+// 块显式授予（核心不维护任何「按插件名放行」的白名单）。
 func TestBuildEnvStripsSecretsForNonLLM(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-secret")
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "tok-secret")
@@ -61,14 +61,19 @@ func TestBuildEnvStripsSecretsForNonLLM(t *testing.T) {
 		t.Fatalf("非机密宿主变量应保留，got %v", env)
 	}
 
-	// 插件专属放行：仅 tool-harness-webui 能读到 admin token（其 admin 代理转发需要），
-	// 但它同样不应看到 LLM 凭据。
-	webuiEnv := buildEnv("tool-harness-webui", nil, false)
-	if !containsEnvKey(webuiEnv, "DSC_ADMIN_TOKEN") {
-		t.Fatalf("tool-harness-webui 应能读取 DSC_ADMIN_TOKEN，got %v", webuiEnv)
+	// 凭据只能经配置显式授予：即使某个插件「需要」admin token，核心也不按名字放行
+	// （核心不认识插件名，这类白名单会随插件增减腐化）。
+	strictEnv := buildEnv("any-plugin", nil, false)
+	if containsEnvKey(strictEnv, "DSC_ADMIN_TOKEN") {
+		t.Fatalf("未在 config.yaml 声明 env 时不得继承 admin token，got %v", strictEnv)
 	}
-	if containsEnvKey(webuiEnv, "DSC_ANTHROPIC_API_KEY") {
-		t.Fatalf("tool-harness-webui 不应读取 LLM 凭据，got %v", webuiEnv)
+	// 显式授予后可用，且仍不夹带 LLM 凭据。
+	granted := buildEnv("any-plugin", map[string]string{"DSC_ADMIN_TOKEN": "admin-token"}, false)
+	if !containsEnvKey(granted, "DSC_ADMIN_TOKEN") {
+		t.Fatalf("config.yaml 显式授予的凭据应注入，got %v", granted)
+	}
+	if containsEnvKey(granted, "DSC_ANTHROPIC_API_KEY") {
+		t.Fatalf("显式授予单个凭据不应连带 LLM 凭据，got %v", granted)
 	}
 
 	// 显式注入（config.yaml 的 env: 块）不受过滤——那是「给这个插件的配置」。

@@ -17,7 +17,7 @@ var toolNamePartRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // QualifyToolName 把「来源单元名 + 单元内注册名」合成为最终工具名：`<unit>_<name>`。
 //
-// 脚本载体（tool-lua-host 的脚本、tool-sql-host 的 .dsp 插件）各自可注册多个工具，
+// 脚本载体（LUA 宿主插件的脚本、SQL 宿主插件的 .dsp 载体）各自可注册多个工具，
 // 工具名必须带**来源**：插件一多，模型看到 `mytool` 无从判断它出自谁，多个载体注册
 // 同名工具时也无法归因。约定：
 //

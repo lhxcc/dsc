@@ -308,7 +308,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	// 事件总线监听器 panic 恢复时用宿主主 logger 记录调用栈（定位根因）。
 	m.events.SetLogger(m.logger)
 	m.ptc = cfg.PTC
-	// 註冊內置工具（現已遷移至獨立插件 tool-str-replace-editor）
+	// 註冊內置工具（現已遷移至獨立插件 文本替换插件）
 	// 後續可註冊更多工具
 	// 内建 subagent 工具（宿主侧子代理，委派任务给独立小循环）
 	_ = m.toolRegistry.Register(&subagentTool{m: m})
@@ -1893,7 +1893,7 @@ func (m *Manager) serveAggregateToolLocked() (uint32, error) {
 // serveAggregateToolOnBroker 在指定 broker 上挂载「聚合 Tool 服务」（NewToolGRPCServer，
 // 请求经宿主 ExecuteTool 流水线转发到任意工具插件）；返回 serviceID。互通机制 4 中，
 // 该服务须挂在本插件 client 的 broker 上（插件进程经自身 broker.Dial 访问），而不仅是
-// agent broker——供 tool-lua-host 等「宿主内工具」经 dsc.tool.call 调用其他工具插件。
+// agent broker——供 LUA 宿主插件 等「宿主内工具」经 dsc.tool.call 调用其他工具插件。
 func (m *Manager) serveAggregateToolOnBroker(broker *plugin.GRPCBroker) (uint32, error) {
 	if broker == nil {
 		return 0, fmt.Errorf("broker not available, cannot serve aggregate tool service")
@@ -2127,7 +2127,7 @@ func (m *Manager) stageToolPlugin(name string, grpcClient *plugin.GRPCClient, to
 		proto.RegisterToolServiceServer(s, proxy)
 		return s
 	})
-	// 互通注入须先于列工具：宿主内工具（如 tool-lua-host）的脚本在握手时加载，先握手再列工具。
+	// 互通注入须先于列工具：宿主内工具（如 LUA 宿主插件）的脚本在握手时加载，先握手再列工具。
 	m.interconnectToolPlugin(name, grpcClient, toolClient, refs)
 	defs, names, err := listStagedTools(toolClient)
 	if err != nil {
@@ -2404,25 +2404,18 @@ var envSecretKeys = map[string]bool{
 	"AWS_SESSION_TOKEN":   true,
 }
 
-// envPluginSecretAllowKeys 按插件名放行必需的宿主凭据（最小权限原则）。
-// 只有确实要读该凭据的插件才登记，其余插件一律滤除——避免「一个凭据放行全局」。
-// 目前仅 tool-harness-webui 需要 DSC_ADMIN_TOKEN 做 admin API 代理转发。
-var envPluginSecretAllowKeys = map[string]map[string]bool{
-	"tool-harness-webui": {"DSC_ADMIN_TOKEN": true},
-}
-
 // isSecretEnvKey 判断「从宿主环境继承」的变量键是否为不应注入非 LLM 插件的凭据。
 //
-// 判定顺序：插件专属放行（envPluginSecretAllowKeys）→ 精确键 → 后缀规则。
+// 判定顺序：精确键 → 后缀规则。插件若确实需要某个宿主凭据，应在自己的
+// config.yaml `env:` 块里显式声明（entry.Env 不经过本过滤，见 buildEnv）：
+// 「这个插件能拿到什么」由配置表达，而不是在核心里维护一张插件名白名单
+// ——核心不该认识任何插件名，白名单也会随插件增减而腐化。
 // 注意：这里不再对 DSC_ 前缀整体豁免——DSC_<P>_API_KEY 等 LLM 凭据同样属于凭据，
 // 必须拦下（历史问题：整体豁免导致 shell 等 tool 插件能读到模型 API key）。
 // 需要给某个插件凭据时，应写进该插件的 config.yaml `env:` 块（entry.Env 不受本过滤
 // 影响，见 buildEnv），而不是依赖宿主环境继承。
 func isSecretEnvKey(pluginName, k string) bool {
 	u := strings.ToUpper(k)
-	if allow := envPluginSecretAllowKeys[strings.ToLower(pluginName)]; allow[u] {
-		return false
-	}
 	if envSecretKeys[u] {
 		return true
 	}
@@ -2737,7 +2730,7 @@ func (m *Manager) SwitchMode(mode string) error {
 	for _, entry := range cfg.Plugins {
 		if (entry.Type == "tool" || entry.Type == "policy") && entry.Enabled {
 			if !currentTools[entry.Name] {
-				// 注入当前模式（DSC_MODE）：tool-lua-host 据此限制插件创造仅在创造模式下允许；
+				// 注入当前模式（DSC_MODE）：LUA 宿主插件 据此限制插件创造仅在创造模式下允许；
 				// 同时注入統一工作空間根（对齐 main.go 启动路径，避免运行期 /mode 切换
 				// 加载的插件与宿主沙箱边界漂移）。
 				if entry.Env == nil {

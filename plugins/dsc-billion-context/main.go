@@ -129,7 +129,6 @@ func main() {
 		// /<name> 转发回本插件（PluginHookService.RunCommand）。
 		Commands: []dsc.Command{
 			{Name: "context", Summary: "上下文压缩状态（占用 / 已压 / 可回收）", Usage: "/context"},
-			{Name: "acp", Summary: "同 /context（旧名别名）", Usage: "/acp"},
 		},
 	})
 
@@ -838,13 +837,13 @@ func (bc *BillionContext) noteRetrieval(hit, exported bool) {
 // 声明，宿主不认识这些名字）。多行文本由界面自行排版。
 func (bc *BillionContext) runCommand(ctx context.Context, name, args string) (string, error) {
 	switch name {
-	case "context", "acp":
+	case "context":
 		return bc.renderContextStatus(), nil
 	}
 	return "", fmt.Errorf("unknown command: %s", name)
 }
 
-// renderContextStatus 生成状态面板文本（/context 与 /acp 共用）。
+// renderContextStatus 生成状态面板文本（/context 命令的输出）。
 //
 // 排版放在插件里是有意的：这些指标（分层块、确定性压缩、可回取条目）是 ACP 的
 // 概念，核心与前端不该认识它们；插件只负责产出一段给人看的文本。

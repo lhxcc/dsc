@@ -10,7 +10,7 @@ import (
 )
 
 // versionedBinaryRe 匹配「<基名>-v<major>.<minor>[.<patch>[.<build>]]<扩展名>」形式的版本化二进制文件名。
-// 基名本身可含连字符（如 llm-openai），故前缀采用贪婪匹配到最后一个「-v…」。
+// 基名本身可含连字符（如 LLM provider 插件），故前缀采用贪婪匹配到最后一个「-v…」。
 var versionedBinaryRe = regexp.MustCompile(`^(.+)-v(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?(\..+)?$`)
 
 // parseVersionedFileName 从版本化文件名解析出「去版本后的基名」与语义版本。
@@ -42,7 +42,7 @@ func binaryVersion(path string) *version.Version {
 }
 
 // versionedCandidatesInDir 返回目录 dir 中、以 base 为基名的最高版本化二进制路径（存在则伴随版本号）。
-// 目录缺失或不存在候选时返回空串。base 即目录基名（如 llm-openai），
+// 目录缺失或不存在候选时返回空串。base 即目录基名（如 LLM provider 插件），
 // 与「目录基名 + -vN + 扩展名」的版本化文件约定对齐。
 func versionedCandidatesInDir(dir, base string) (string, *version.Version) {
 	entries, err := os.ReadDir(dir)

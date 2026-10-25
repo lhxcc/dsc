@@ -1,7 +1,7 @@
 // Package toolclient 插件侧聚合 Tool 服务适配器（宿主互通机制 4）：
 // 插件进程经 ToolService.SetInterconnect 传入的 serviceID + broker 连接宿主
 // 聚合 Tool 服务，经宿主 ExecuteTool 流水线转发到任意工具插件（含策略/钩子），
-// 使「宿主内工具」（如 tool-lua-host 的 dsc.tool.call）可以调用其他工具插件。
+// 使「宿主内工具」（如 LUA 宿主插件的 dsc.tool.call）可以调用其他工具插件。
 package toolclient
 
 import (

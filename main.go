@@ -346,7 +346,7 @@ func main() {
 		os.Setenv("DSC_SESSION_DIR", session.Dir(execDir))
 	}
 
-	// 记忆库目录（tool-memory-service 写入 memory.db）：未显式配置
+	// 记忆库目录（记忆库插件 写入 memory.db）：未显式配置
 	// DSC_MEMORY_DIR 时注入 <ExecDir>/memory，插件经 dsc.MemoryDir() 读取同一值。
 	if os.Getenv("DSC_MEMORY_DIR") == "" {
 		os.Setenv("DSC_MEMORY_DIR", core.PJoin(execDir, core.MemoryDirName))
@@ -742,7 +742,7 @@ func main() {
 	if baseURL := groupEnv(activeLLMEnv, "OPENAI", envGroupPreferDSC(activeLLMEnv, "OPENAI"), "BASE_URL"); baseURL != "" {
 		probeWindow = probeContextWindow(baseURL)
 	} else if baseURL := groupEnv(activeLLMEnv, "ANTHROPIC", envGroupPreferDSC(activeLLMEnv, "ANTHROPIC"), "BASE_URL"); baseURL != "" {
-		// llm-anthropic 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
+		// LLM provider 插件 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
 		// OPENAI 组 BASE_URL 缺席时回退探测 anthropic 端点（两组均优先 DSC_ 前缀、旧名回退）。
 		probeWindow = probeContextWindow(baseURL)
 	}
@@ -787,7 +787,7 @@ func main() {
 			"hint", "edit the preset's compaction field, or clear it there, to use the config value")
 	}
 
-	// 注入当前模式 + 工作根 + 沙箱档到所有插件进程（DSC_MODE）：tool-lua-host 据此限制
+	// 注入当前模式 + 工作根 + 沙箱档到所有插件进程（DSC_MODE）：LUA 宿主插件 据此限制
 	// 「插件创造」仅在创造模式（creation）下允许。
 	injectRuntimeEnv(merged, mode, core.WorkspaceRoot, sandboxPolicyEnv())
 
@@ -907,7 +907,7 @@ func main() {
 		}
 
 		// 启动管理 API（管理能力）：
-		// 管理能力是一种「可选能力」——只有需要它的插件（如 tool-harness-webui）
+		// 管理能力是一种「可选能力」——只有需要它的插件（如 管理界面插件）
 		// 才声明依赖。宿主按以下优先级决定是否启动管理 API：
 		//   1. 用户显式 -admin <addr>：强制启动
 		//   2. DSC_ADMIN_ADDR 环境变量：强制启动
@@ -952,7 +952,7 @@ func main() {
 	agentName := mgr.GetMainAgentName()
 	if agentName == "" {
 		// 发现机制兜底：扫描 plugins/agent-* 目录取首个（与 assembleMerged 一致），
-		// 不再硬编码 "agent-react-loop"（对齐 AGENTS.md §8）。
+		// 不再硬编码具体的 agent 插件名（对齐 AGENTS.md §8）。
 		agentName = "agent-" + discoverFirstAgentPlugin()
 	}
 	agent, ok := mgr.EventAgent()

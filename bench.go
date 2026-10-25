@@ -13,8 +13,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+//dsc:plugin-names-ok 本文件是某个基准插件的预置脚本（go:build ignore），必须知道它自己的目录名
+
 // ensureAgenticBenchInConfig 确保 <workDir>/config/config.yaml 的 plugins 里注册了
-// tool-agentic-bench。若不预置，模型只能在会话里靠 load_dsc_plugin 加载，而在
+// 基准测试插件。若不预置，模型只能在会话里靠 load_dsc_plugin 加载，而在
 // DSC_APPROVAL=never（无人值守）下该操作会被审批拦截自动拒绝，bench 工具将永远
 // 不可用。已存在同名条目时保持不变，避免覆盖既有插件配置。
 func ensureAgenticBenchInConfig(configPath string) error {
@@ -51,7 +53,7 @@ func ensureAgenticBenchInConfig(configPath string) error {
 			}
 		}
 	}
-	// 末尾追加 tool-agentic-bench 条目
+	// 末尾追加 基准测试插件 条目
 	entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
 		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
 		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "tool-agentic-bench"},
@@ -86,7 +88,7 @@ func main() {
 	}
 	dscPath := core.PJoin(workDir, dscName)
 
-	// 3. 把 tool-agentic-bench 预置进同级的 config/config.yaml，绕开运行时 load 被
+	// 3. 把 基准测试插件 预置进同级的 config/config.yaml，绕开运行时 load 被
 	//    DSC_APPROVAL=never 拦截的问题（详见 ensureAgenticBenchInConfig）。
 	configPath := core.PJoin(workDir, "config", "config.yaml")
 	if err := ensureAgenticBenchInConfig(configPath); err != nil {

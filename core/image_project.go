@@ -25,7 +25,7 @@ import (
 
 // DefaultProjectionMaxSide 投影默认最长边（Anthropic 视觉文档推荐的最优分辨率：
 // 更大的图先等比降采样到最长边 1568 再喂模型，token 与延迟双优）。CU 截图出图
-// 上限与此一致（见 tool-computer-use 插件），投影链路对截图零二次缩放。
+// 上限与此一致（见 桌面操作插件 插件），投影链路对截图零二次缩放。
 const DefaultProjectionMaxSide = 1568
 
 // projectionJPEGQuality 缩放重编码时 JPEG 质量档（对齐 DSH 编码阶梯的实用单档；

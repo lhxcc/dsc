@@ -81,7 +81,7 @@ func assembleMerged(llmEntries []core.PluginEntry, agentEntry *core.PluginEntry,
 	if ag == nil {
 		ext := modelExt()
 		// 发现机制：扫描 plugins/ 目录取首个 agent-* 目录（按名升序），
-		// 不再硬编码 "agent-react-loop"（对齐 AGENTS.md §8）。
+		// 不再硬编码具体的 agent 插件名（对齐 AGENTS.md §8）。
 		agentName := discoverFirstAgentPlugin()
 		if agentName == "" {
 			// 与 main.go LLM 兜底同款 fail-loud：log.Fatal 退出。
@@ -140,7 +140,7 @@ func assembleMerged(llmEntries []core.PluginEntry, agentEntry *core.PluginEntry,
 	}
 	// 压缩后端选择（配置层）：preset 显式声明的 compaction 优先（preset 是具体
 	// 预设、主导行为，与插件条目同规），config.yaml 仅在 preset 未声明时兜底。
-	// preset 缺省启用 compaction: dsc-system——「无配置时按能力依赖启动不因压缩
+	// preset 缺省启用某个压缩后端——「无配置时按能力依赖启动不因压缩
 	// 后端缺席而阻塞」；merged 经 LoadFromConfig 交 Manager，m.compactionBackend
 	// 据此验证 Provides compaction 能力声明（registerDscCoreLocked）。
 	if presetCfg != nil && presetCfg.Compaction != "" {

@@ -191,7 +191,7 @@ func TestRunCommandRendersStatus(t *testing.T) {
 	bc.state = state
 	bc.lastTokenCount = 420_000
 
-	out, err = bc.runCommand(context.Background(), "acp", "") // 别名走同一分支
+	out, err = bc.runCommand(context.Background(), "context", "")
 	if err != nil {
 		t.Fatalf("runCommand(acp): %v", err)
 	}
@@ -202,8 +202,12 @@ func TestRunCommandRendersStatus(t *testing.T) {
 		}
 	}
 
-	// 未声明的名字：报错（宿主的转发只应出现在声明清单里）
+	// 未声明的名字：报错（宿主的转发只应出现在声明清单里）。
+	// 顺带锚定「一个命令一个名字」：别名会让补全菜单出现两条同义项。
 	if _, err := bc.runCommand(context.Background(), "nope", ""); err == nil {
 		t.Fatal("未知命令应返回错误")
+	}
+	if _, err := bc.runCommand(context.Background(), "acp", ""); err == nil {
+		t.Fatal("已移除的别名不应再被当作有效命令")
 	}
 }
