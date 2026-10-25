@@ -55,9 +55,11 @@ func ApplyCompression(ranges []PruneRange, messages []CoreMessage, state *Compre
 		applyStandardCompression(r, messages, state, &result, runID, covered)
 	}
 
-	// 压缩成功后重置 nudge baseline（防反馈循环：避免压缩后立即重新 nudge）
+	// 压缩成功后**不清** nudge baseline：增长门控要拿「上次提示时的规模」作参照，
+	// 压缩后上下文回落，正好需要重新长够 growthFloor 才值得再打扰模型。此前这里把
+	// baseline 置 0，等于把门控关掉——压缩后下一轮立刻又能提示，正是「每几步就压」
+	// 的来源之一（另一处缺口见 ProcessTurn 写入 baseline 的位置）。
 	if result.BlocksCreated > 0 {
-		state.Nudge.BaselineTokens = 0
 		state.TerminalStreak = 0 // 成功压缩即 viable progress，重启逃逸连击（#300）
 	}
 	return state, result

@@ -256,6 +256,16 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 
 	// 7. decide-nudge：决策是否注入压缩提示（注入由 adapter 追加为尾部 user 消息）
 	nudge := DecideNudge(messages, state, config, tokenCount)
+	// 记下这次提示发生时的上下文规模：下一次提示必须在此基础上再涨够
+	// growthFloor（见 DecideNudge 的增长门控）。
+	//
+	// 这一步以前是缺的——baseline 只会被置 0、从不被写入真实规模，于是
+	// `if BaselineTokens > 0` 的增长门控恒不成立：只要越过使用率阈值，之后每一轮
+	// 都会再提示一次「该压缩了」，模型于是每隔几步就压一次，把细节反复蒸干。增长
+	// 门控才是「攒够一段再压」的唯一实现，留空等于没有。
+	if nudge.ShouldInject {
+		state.Nudge.BaselineTokens = tokenCount
+	}
 
 	// 8. emergency-truncate：最后安全阀——上下文接近满且模型未主动压缩时，截断
 	// 超大工具输出，避免直接撞窗口（DESIGN 的 LAST safety valve）。

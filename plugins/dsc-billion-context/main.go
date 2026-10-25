@@ -403,11 +403,8 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// （hide-compress-calls 依此区分已消费调用与孤儿调用）
 	backfillCompressCallIDs(coreMsgs, state)
 
-	// token 计数：优先用事件携带的宿主估算值（含工具结构开销），回退本地估算
-	tokenCount := ev.TokenCount
-	if tokenCount <= 0 {
-		tokenCount = estimateTokens(protoMsgs)
-	}
+	// 本次决策用的上下文用量（口径见 usageTokens）
+	tokenCount := usageTokens(ev, protoMsgs)
 
 	// 跑 pipeline（renderTags=false：不注入 <acp> 标签到消息文本——标签的 tokens
 	// 属性每轮估算会变化，破坏前缀缓存。改为仅用 mNNNNN ref 映射，标签信息经
@@ -444,6 +441,13 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	if result.Nudge != nil && result.Nudge.ShouldInject {
 		nudgeText := bcacp.FormatNudgeText(*result.Nudge)
 		if nudgeText != "" {
+			// 每次提示都留一行数字：窗口、触发线、当前用量、下次需要的增量。
+			// 这些值此前只在首个 pre-step 打一次窗口，出现「怎么老提示压缩」时无法
+			// 判断是窗口取错了、还是用量真的到了，只能靠猜。
+			fmt.Fprintf(os.Stderr, "[billion-context] nudge: reason=%q tokens=%d limit=%d threshold=%d growthFloor=%d baseline=%d\n",
+				result.Nudge.Reason, result.Nudge.Breakdown["usage"], bc.config.ModelContextLimit,
+				result.Nudge.Breakdown["thresholdTokens"], bcacp.GrowthFloorTokens(bc.config),
+				result.Nudge.Breakdown["baselineTokens"])
 			renderedMsgs = append(renderedMsgs, bcacp.CoreMessage{
 				ID:          "acp_nudge",
 				Role:        bcacp.RoleUser,
@@ -628,6 +632,28 @@ func (bc *BillionContext) setSessionID(id string) {
 // 两个口径打架，阈值到底偏哪边取决于走哪条路径。统一由 SDK 计算。
 func estimateTokens(msgs []*proto.Message) int {
 	return dsc.EstimateProtoMessagesTokens(msgs)
+}
+
+// usageTokens 选本次压缩决策用的上下文用量。
+//
+// 优先级：**上一轮 provider 上报的 prompt 用量** > 宿主对原始历史的估算 > 本地估算。
+//
+// 为什么不能直接用 ev.TokenCount：它是宿主对 req.Messages 的估算，而那是 agent 的
+// append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent 侧「有后端时
+// 跳过内联 compactHistory」）。于是原始历史只增不减：一旦越过使用率阈值，压缩再怎么
+// 压都不会让它回落，插件便每一轮都提示「该压缩了」，模型只能每隔几步压一小段，而
+// 主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`（上一轮
+// provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
+//
+// provider 不报用量时退回旧口径（原始历史估算）——行为不变，不会比现在更差。
+func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
+	if ev.LastUsageTokens > 0 {
+		return ev.LastUsageTokens
+	}
+	if ev.TokenCount > 0 {
+		return ev.TokenCount
+	}
+	return estimateTokens(msgs)
 }
 
 // containsStr 报告 s 是否包含 sub（轻量实现，避免引入 strings 包）。

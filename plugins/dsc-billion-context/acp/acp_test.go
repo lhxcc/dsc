@@ -1165,3 +1165,71 @@ func longTailMessages(n int) []CoreMessage {
 	}
 	return msgs
 }
+
+// nudgeFixture 造一份「用量已过阈值、且有可压缩范围」的会话，供增长门控用例共用。
+func nudgeFixture(t *testing.T) ([]CoreMessage, *CompressionState, Config) {
+	t.Helper()
+	config := DefaultConfig(10000) // 10K 窗口：45% = 4500
+	config.NudgeThresholdPct = 0.45
+	config.MinCompressRangeChars = 0 // 本测关注门控，不关注范围大小门
+	longText := strings.Repeat("x", 2500)
+	msgs := []CoreMessage{
+		{ID: "a", Role: RoleUser, Text: longText},
+		{ID: "b", Role: RoleAssistant, Text: longText},
+		{ID: "c", Role: RoleUser, Text: longText},
+		{ID: "d", Role: RoleAssistant, Text: "short tail"},
+		{ID: "e", Role: RoleUser, Text: "short tail 2"},
+	}
+	state := CreateInitialState()
+	AssignRefs(msgs, state)
+	return msgs, state, config
+}
+
+// TestNudgeGrowthGateStopsRepeating 增长门控必须真的生效：同一规模不得反复提示。
+//
+// 以前 BaselineTokens 只会被置 0、从不写入真实规模，`if BaselineTokens > 0` 恒不成立，
+// 于是只要越过使用率阈值，之后每一轮都再提示一次「该压缩了」——模型便每隔几步压一次，
+// 把细节反复蒸干。这条用例钉住「提示时记下规模、未增长不再提示、长够才再提示」。
+func TestNudgeGrowthGateStopsRepeating(t *testing.T) {
+	msgs, state, config := nudgeFixture(t)
+
+	first := ProcessTurn(msgs, state, config, 5000) // 50% > 45%
+	if first.Nudge == nil || !first.Nudge.ShouldInject {
+		t.Fatalf("首次应提示压缩，reason=%v", first.Nudge)
+	}
+	if state.Nudge.BaselineTokens != 5000 {
+		t.Fatalf("提示后应记下本次规模 5000，实际 %d", state.Nudge.BaselineTokens)
+	}
+
+	// 规模没变：不得再提示
+	second := ProcessTurn(msgs, state, config, 5000)
+	if second.Nudge.ShouldInject {
+		t.Fatalf("用量未增长时不应再提示，reason=%q", second.Nudge.Reason)
+	}
+	if !strings.Contains(second.Nudge.Reason, "insufficient growth") {
+		t.Fatalf("应因增长不足而拒绝，reason=%q", second.Nudge.Reason)
+	}
+
+	// 长够 growthFloor：可以再提示
+	floor := GrowthFloorTokens(config)
+	third := ProcessTurn(msgs, state, config, 5000+floor)
+	if !third.Nudge.ShouldInject {
+		t.Fatalf("增长 %d 后应再提示，reason=%q", floor, third.Nudge.Reason)
+	}
+}
+
+// TestCompressionKeepsNudgeBaseline 压缩成功不得把 baseline 清零——清零等于关掉增长
+// 门控，压缩完下一轮又会立刻提示，正是「每几步压一次」的另一半原因。
+func TestCompressionKeepsNudgeBaseline(t *testing.T) {
+	msgs, state, config := nudgeFixture(t)
+	state.Nudge.BaselineTokens = 5000
+
+	ranges := []PruneRange{{StartRef: "m00000", EndRef: "m00001", Summary: strings.Repeat("s", 120)}}
+	_, res := ApplyCompression(ranges, msgs, state, config)
+	if res.BlocksCreated == 0 {
+		t.Fatalf("前置条件：应产生压缩块，errors=%v", res.Errors)
+	}
+	if state.Nudge.BaselineTokens != 5000 {
+		t.Fatalf("压缩后 baseline 不应清零，实际 %d", state.Nudge.BaselineTokens)
+	}
+}
