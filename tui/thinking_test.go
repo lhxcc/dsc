@@ -214,23 +214,24 @@ func TestThinkAnimKindIsRandomPerTurn(t *testing.T) {
 	}
 }
 
-// TestThinkAnimFrameAdvancesWithSpinnerTick 帧号由 spinner 的 tick 推进：
-// 不另开时钟，spinner 停则动画停。
-func TestThinkAnimFrameAdvancesWithSpinnerTick(t *testing.T) {
+// TestThinkAnimFrameAdvancesWithClock 帧号由工作行时钟推进：
+// 不另开定时器，时钟停则动画停（并整行消失）。
+func TestThinkAnimFrameAdvancesWithClock(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	before := m.thinkAnim.frame
 	m.thinking = true
-	model, _ := m.Update(m.spinner.Tick())
+	m.armAnim()
+	model, _ := m.Update(animTickMsg{gen: m.animGen})
 	if got := model.(*Model).thinkAnim.frame; got != before+1 {
-		t.Fatalf("spinner tick 应推进一帧: %d → %d", before, got)
+		t.Fatalf("时钟一拍应推进一帧: %d → %d", before, got)
 	}
 
 	// 空闲时（无 thinking/streaming）不推进
 	idle := model.(*Model)
 	idle.thinking, idle.streaming = false, false
 	f := idle.thinkAnim.frame
-	model2, _ := idle.Update(idle.spinner.Tick())
+	model2, _ := idle.Update(animTickMsg{gen: idle.animGen})
 	if got := model2.(*Model).thinkAnim.frame; got != f {
 		t.Fatalf("空闲时不应推进动画帧: %d → %d", f, got)
 	}

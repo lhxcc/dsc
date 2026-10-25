@@ -426,7 +426,7 @@ func (m *Model) questionBoxWidth() int {
 // 与 vpHeight 的其余扣减项保持一致（标题/状态/提示/边框/输入框/思考行/待办面板）。
 func (m *Model) questionChromeRows() int {
 	h := titleRows + statusRows + infoRows + boxBorder + m.input.Height()
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		h += thinkingRow
 	}
 	return h + m.todoPanelRows()

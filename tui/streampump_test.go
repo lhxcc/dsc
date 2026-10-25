@@ -6,11 +6,11 @@ import (
 
 // submitAndDrain 提交一条输入，并把流式帧按 bubbletea 的真实语义泵完。
 //
-// 这里必须展开 tea.BatchMsg：模型一次返回里可能同时给出「继续泵流」和「点火动画
-// tick」两条命令（见 keepAnimAlive），旧写法只取第一条会让泵流断掉——测试于是
+// 这里必须展开 tea.BatchMsg：模型一次返回里可能同时给出「继续泵流」和「点亮工作行
+// 时钟」两条命令（见 armAnim），旧写法只取第一条会让泵流断掉——测试于是
 // 在「内容永远不会累积」的假状态下断言，反而掩盖问题。
-// 动画节拍消息（spinner.TickMsg / elapsedTickMsg）与会话内容无关，且其续链命令
-// 带真实延时（tea.Tick），回灌只会让测试白等，故跳过且不续链。
+// 时钟节拍消息（animTickMsg / elapsedTickMsg）与会话内容无关，且其续链命令带真实
+// 延时（tea.Tick），回灌只会让测试白等，故跳过且不续链。
 func submitAndDrain(m *Model, text string, maxFrames int) tea.Model {
 	var model tea.Model = m
 	queue := []tea.Cmd{m.submitCmd(text, nil)}

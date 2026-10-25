@@ -209,14 +209,16 @@ type Model struct {
 	contextWindow int
 	usedTokens    int
 
-	// animTicking 表示 spinner/elapsed 这两条自续链**当前是否在跑**。
+	// 工作行的时钟（见 animTick/armAnim）。animTicking 表示**时钟当前是否在跑**，
+	// animGen 是时钟的代次：每次点火换代，换代即作废所有在途的旧 tick。
 	//
-	// spinner 的 Tick 是一次性命令：处理时若不在工作态就返回 nil，链就此断掉。
-	// 因此「工作中」必须与「链在跑」严格同步——任何一条把状态置为工作中的路径
-	// （提交、唤醒、迟到帧）只要漏了重启链，工作行就会停在中途帧且永不恢复：
-	// 行还在（thinking/streaming 为真），帧不动，直到本轮结束才消失。keepAnimAlive
-	// 用这个标志把两者的对应关系收敛成一个入口。
+	// 工作行是否出现只取决于 workingLineVisible()：时钟在跑 && 工作中。两者必须
+	// 同时成立——只有其一时画出来的都是谎话：时钟停了却把某一帧冻在屏幕上（看到
+	// 的「动画停在扫到一半的蒙版块」），或者本轮已结束却还留着一行。
 	animTicking bool
+	animGen     int
+	// spinnerFrame 为 spinner 字形帧号，由同一个时钟推进（不再用 spinner.Tick）。
+	spinnerFrame int
 
 	// 当前轮运行指标（对齐 REX working 行）：runStart 记录启动时刻，elapsed 为
 	// 已耗时秒数（每秒 elapsedTick 刷新）；turnTokens 为本轮累计下行生成 token；
@@ -278,7 +280,9 @@ type Model struct {
 
 	viewport viewport.Model
 	input    textarea.Model
-	spinner  spinner.Model
+	// spinner 只提供字形帧与样式：节拍由工作行时钟（animTick）统一推进，
+	// 不再使用 spinner.Tick/Update 的 tag 自续链（那条链会静默断掉，见 animTick）。
+	spinner spinner.Model
 
 	// 工作行文字动画（见 thinking.go）：每轮随机中/英文案，帧号随 spinner 的
 	// tick 推进——不另开定时器，spinner 的启停即动画的启停。
@@ -451,10 +455,9 @@ func mouseCaptureOffByDefault() bool {
 
 // Init 返回初始化命令
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.input.Focus(),
-		m.spinner.Tick,
-	)
+	// 工作行时钟不在这里点火：它由 armAnim 在进入工作态时点火、离场时停止
+	// （见 workingLineVisible），启动时没有工作行可画。
+	return m.input.Focus()
 }
 
 // submitCmd 发起一次 agent.RunStream，结果通过 streamFrame 消息返回
@@ -534,6 +537,8 @@ func (m *Model) interruptTurn() (tea.Model, tea.Cmd) {
 	m.streamCancelled = true
 	m.thinking = false
 	m.streaming = false
+	// 中断同样属于「本轮结束」：停表，工作行立即整行消失；不等下一拍 tick 自己发现
+	m.disarmAnim()
 	m.streamOpen = false
 	m.clearStream()
 	m.viewport.SetHeight(m.vpHeight())
@@ -547,7 +552,7 @@ func (m *Model) interruptTurn() (tea.Model, tea.Cmd) {
 // 输入区高度随内容行数变化（1~composerMin 行），这里以当前实际高度为准。
 func (m *Model) vpHeight() int {
 	h := m.high - titleRows - statusRows - infoRows - boxBorder - m.input.Height()
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		h -= thinkingRow
 	}
 	if rows := m.questionRows(); rows > 0 {
@@ -917,25 +922,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmd, m.pumpStreamIfOpen())
 		}
 
-	case spinner.TickMsg:
-		if m.thinking || m.streaming {
-			var cmd tea.Cmd
-			m.spinner, cmd = m.spinner.Update(msg)
-			m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
-			return m, cmd
+	case animTickMsg:
+		// 工作行时钟的一拍（唯一驱动 spinner 字形与文字动画的节拍源）。
+		//
+		// 旧代 tick 一律丢弃：换代说明已有新链在跑，这条不应再续，否则同一时刻
+		// 会有两条链并行、帧走得比时钟快。
+		if msg.gen != m.animGen {
+			return m, nil
 		}
-		// 空闲：链到此终止，标志同步归位（下次进入工作态由 keepAnimAlive 重新点火）
-		m.animTicking = false
-		return m, nil
+		if !m.working() {
+			// 本轮已结束：时钟到此终止，工作行随之从视图里消失（见 View）。
+			// 这里不再有任何「停在中途帧」的中间态——行要么在动，要么不在。
+			m.animTicking = false
+			return m, nil
+		}
+		m.spinnerFrame++
+		m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
+		return m, animTick(m.animGen)
 
 	case elapsedTickMsg:
 		// 每秒刷新「思考中」行的耗时（对齐 REX elapsed tick）
-		if m.thinking || m.streaming {
+		if m.working() {
 			m.elapsed = int(time.Since(m.runStart).Seconds())
 			m.render()
 			return m, elapsedTick()
 		}
-		m.animTicking = false
 		return m, nil
 
 	case streamFrame:
@@ -974,15 +985,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamBuffer = ""
 			// 創建助手消息佔位符（僅身份頭）；新建块时重置思考/答案状态
 			m.openAssistantBlock()
+			// 先点火再渲染：行是否出现取决于时钟在跑，晚一步就会先画一帧无工作行
+			anim := m.armAnim()
 			m.render()
 			m.virtualGotoBottom()
 			if msg.ch == nil {
 				m.streaming = false
+				m.disarmAnim()
 				m.streamOpen = false
 				m.clearStream()
 				if msg.err != nil {
 					m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
 				}
+				m.viewport.SetHeight(m.vpHeight())
+				m.render()
 				m.input.Focus()
 				m.virtualGotoBottom()
 				return m, nil
@@ -992,12 +1008,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancelled = false
 			m.streamInput = msg.input
 			m.streamCh = msg.ch
-			return m, tea.Batch(m.pumpStream(msg.input, msg.ch), m.keepAnimAlive())
+			return m, tea.Batch(m.pumpStream(msg.input, msg.ch), anim)
 		}
 		if msg.done {
 			m.thinking = false
 			m.streaming = false
-			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream()
 			if msg.err != nil {
@@ -1017,7 +1033,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.thinking = false
 			m.streaming = false
-			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream()
 			m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
@@ -1153,7 +1169,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "success", "error":
 			m.thinking = false
 			m.streaming = false
-			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream() // 成功/失敗後清理流通道狀態，避免後續 pumpStreamIfOpen 誤判「流進行中」
 			if f.Status == "success" && f.Usage != nil {
@@ -3565,6 +3581,58 @@ func elapsedTick() tea.Cmd {
 	return tea.Tick(time.Second, func(_ time.Time) tea.Msg { return elapsedTickMsg{} })
 }
 
+// ---- 工作行时钟 ----
+
+// animFPS 工作行时钟的节拍（与 spinner.Dot 的 FPS 一致：每秒 10 帧）。
+const animFPS = 100 * time.Millisecond
+
+// animTickMsg 工作行时钟的一拍；gen 为发起时的代次。
+type animTickMsg struct{ gen int }
+
+// animTick 排下一拍。自续：每条 tick 处理完都排同代的下一拍，直到本轮结束。
+//
+// 这条链由 DSC 自己持有，而不是复用 spinner.Tick：bubbles 的 spinner 会给每个
+// tick 打 tag，tag 不匹配的 tick 被**静默丢弃**并返回 nil 命令——链就此断掉，而
+// thinking/streaming 仍是 true，工作行于是永久冻在某一帧上（扫到一半的蒙版块）。
+// 自持链按代次编号：换代后旧 tick 一律作废，同一时刻只可能有一条链，断链也就
+// 只可能是「本轮结束」这一种预期原因。
+func animTick(gen int) tea.Cmd {
+	return tea.Tick(animFPS, func(time.Time) tea.Msg { return animTickMsg{gen: gen} })
+}
+
+// working 本轮的「工作态」：正在等 agent 响应或正在流式输出。
+func (m *Model) working() bool { return m.thinking || m.streaming }
+
+// workingLineVisible 工作行是否应当出现在屏幕上：时钟在跑**且**处于工作态。
+//
+// 两个条件缺一不可，否则画出来的都是谎话——时钟停了却把某一帧冻着（「动画停在
+// 扫到一半」），或本轮已结束却还留着一行（模型已离开）。用户的判据很简单：模型
+// 走了，这一行就该整行消失，不是停在动画中途。
+func (m *Model) workingLineVisible() bool { return m.animTicking && m.working() }
+
+// armAnim 点燃工作行时钟。幂等：每次调用换代重启，旧链因代次不符自然终止，
+// 所以同一时刻只会有一条链（重复点火不会让动画走快，也不会出现两条链互相打架）。
+func (m *Model) armAnim() tea.Cmd {
+	m.animGen++
+	m.animTicking = true
+	return tea.Batch(animTick(m.animGen), elapsedTick())
+}
+
+// disarmAnim 停止工作行时钟：工作行立即从视图消失，在途 tick 因代次不符作废。
+func (m *Model) disarmAnim() {
+	m.animTicking = false
+	m.animGen++
+}
+
+// spinnerGlyph 当前 spinner 字形（帧号由工作行时钟推进）。
+func (m *Model) spinnerGlyph() string {
+	frames := m.spinner.Spinner.Frames
+	if len(frames) == 0 {
+		return ""
+	}
+	return m.spinner.Style.Render(frames[m.spinnerFrame%len(frames)])
+}
+
 // statusBar 渲染底部状态栏（两行）：首行一条通栏分隔线，次行容纳模型/复制提示与快捷键。
 // 采用 REX 风格的缩进 + 分隔线布局，把交互信息与模型信息区分开，营造呼吸感。
 func (m *Model) statusBar() string {
@@ -3635,11 +3703,15 @@ func (m *Model) View() tea.View {
 	if q := m.questionView(); q != "" {
 		parts = append(parts, q)
 	}
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
 		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
 		// 所以只有尾部提示用 dim。
-		line := "  " + m.spinner.View() + " " + m.thinkAnim.text() +
+		//
+		// 只在时钟推进时出现：时钟停（本轮结束／模型离开）就整行消失，绝不把某一
+		// 帧冻在屏幕上——中文动画未扫到的字是实心遮罩块，冻住半帧看起来像渲染
+		// 到一半被打断（见 workingLineVisible）。
+		line := "  " + m.spinnerGlyph() + " " + m.thinkAnim.text() +
 			dimSty.Render(fmt.Sprintf(" (%d 秒 · Ctrl+C 取消)", m.elapsed))
 		if m.turnTokens > 0 {
 			line += dimSty.Render(" · ↓" + shortTokens(m.turnTokens))
@@ -3704,7 +3776,7 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 	if q := m.questionView(); q != "" {
 		y += strings.Count(q, "\n") + 1
 	}
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		y += thinkingRow
 	}
 	y += m.todoPanelRows()

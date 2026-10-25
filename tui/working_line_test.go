@@ -19,6 +19,7 @@ func TestThinkingLineShowsElapsedHintAndDownstream(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.thinking = true
+	m.armAnim() // 工作行只在时钟推进时出现（见 workingLineVisible）
 	m.elapsed = 5
 	m.turnTokens = 2048
 
@@ -48,6 +49,7 @@ func TestThinkingLineWithoutDownstream(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.thinking = true
+	m.armAnim()
 
 	content := ansi.Strip(m.View().Content)
 	if strings.Contains(content, "↓") {
@@ -60,6 +62,7 @@ func TestElapsedTickIncrements(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.thinking = true
+	m.armAnim()
 	m.runStart = time.Now().Add(-3 * time.Second)
 
 	model, cmd := m.Update(elapsedTickMsg{})
