@@ -373,6 +373,17 @@ type Model struct {
 	pendingWakeups []string
 }
 
+// 输入行几何常量：提示符 2 列（"❯ "）、composer 左侧 padding 1 列。
+//
+// 这两个数是真实光标算式（inputCursorAbs）里唯一写死的部分——其余列宽都从已输入
+// 文字量出来。改动提示符文案或 composer 内边距时必须同步改这里，否则整行文字会
+// 相对光标模型偏移（中文输入时表现为「只选中半个字」）。cursor_prompt_width_test
+// 盯住提示符那一侧。
+const (
+	composerPromptWidth = 2
+	composerPadLeft     = 1
+)
+
 // New 创建一个聊天界面模型
 func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) *Model {
 	// 宿主侧计量实例需要窗口换算百分比；模型切换后由 SwitchModel 再同步
@@ -391,6 +402,14 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	// 稳定跟随输入位置，会导致中文输入法候选窗/文字光标随上方输出横向漂移；
 	// 真实光标由 View 显式锚定到输入插入点（见 View 末尾的 v.Cursor 设置）。
 	input.SetVirtualCursor(false)
+	// 输入框选区高亮（bubbles v2.2.1 起 textarea 自带选区：Shift+←/→ 逐字、
+	// Shift+↑/↓ 跨行、Ctrl+Shift+←/→ 按词、Ctrl+Shift+C 复制；Ctrl+A 全选由宿主
+	// 在键处理里补绑）。
+	// 用反色，与正文拖选（selStyle）保持同一种视觉语言。
+	inputStyles := input.Styles()
+	inputStyles.Focused.Selection = selStyle
+	inputStyles.Blurred.Selection = selStyle
+	input.SetStyles(inputStyles)
 	// 对齐 REX：动态高度让输入区随内容自动增长（1~composerMax 行），多行输入不再被
 	// 压扁到固定 3 行；回车在宿主层拦截用于发送，换行交给 Shift+Enter/Ctrl+J/Alt+Enter。
 	input.DynamicHeight = true
@@ -525,6 +544,33 @@ func (m *Model) copySelected() tea.Cmd {
 	text := m.selectedText()
 	m.sel = selection{}
 	m.render()
+	if text == "" {
+		return nil
+	}
+	_ = clipboard.WriteAll(text)
+	m.copyNotice = fmt.Sprintf("已复制 %d 字符", runeCount(text))
+	m.copyNoticeSeq++
+	return copyNoticeExpire(m.copyNoticeSeq)
+}
+
+// takeInputSelection 取出输入框里 Shift+←/→ 选中的文字，并收起选区。
+//
+// 收起是刻意的：Ctrl+C 在没有选区时承担「中断本轮 / 清空输入」，若复制后选区还留着，
+// 这个键就永远停在复制语义上，用户没法再用它中断或清空。复制完即回到常态更可预期。
+// 与真正的剪贴板写入分开，便于测试只验「取到什么、有没有收起」而不碰系统剪贴板。
+func (m *Model) takeInputSelection() string {
+	text := m.input.SelectedText()
+	if text == "" {
+		return ""
+	}
+	m.input.ClearSelection()
+	m.render()
+	return text
+}
+
+// copyInputSelection 复制输入框选区到剪贴板并弹出提示；无选区则不处理。
+func (m *Model) copyInputSelection() tea.Cmd {
+	text := m.takeInputSelection()
 	if text == "" {
 		return nil
 	}
@@ -838,9 +884,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if inRunning {
 				return m.interruptTurn()
 			}
-			// 恢复复制语义（参考 rex）：有选区则复制；否则清空输入；都无则忽略（退出已移交给 Ctrl+Q）
+			// 恢复复制语义（参考 rex）：正文有选区则复制正文；否则输入框有选区则复制
+			// 输入框选区（Shift+←/→ 选的文字）；都没有才清空输入。
 			if m.sel.active {
 				return m, m.copySelected()
+			}
+			if m.input.HasSelection() {
+				return m, m.copyInputSelection()
 			}
 			if strings.TrimSpace(m.input.Value()) != "" {
 				m.input.SetValue("")
@@ -848,6 +898,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateCompletion()
 			}
 			return m, nil
+		case "ctrl+a":
+			// 全选输入框内容（终端里 Ctrl+A 是 0x01，与 shell 的「行首」不冲突——
+			// 输入框是 DSC 自己的行编辑，取 Windows/编辑器习惯）。textarea 上游只
+			// 绑了 Ctrl+G，这里补齐用户最常用的那个。
+			m.input.SelectAll()
+			return m, m.pumpStreamIfOpen()
+		case "esc":
+			// 有选区时 Esc 取消选区（与编辑器一致）；无选区时 Esc 不做任何事，
+			// 避免抢走终端/输入法可能用到的键。
+			if m.input.HasSelection() {
+				m.input.ClearSelection()
+				m.render()
+			}
+			return m, m.pumpStreamIfOpen()
 		case "up", "down":
 			// 正在翻阅历史（histPos 未到末尾）时 ↑/↓ 都继续翻，直到回到草稿位置；
 			// 正常编辑位仅单行输入允许 ↑ 进入历史（多行输入仍交给输入框移动光标）。
@@ -2303,7 +2367,6 @@ var slashCommands = []compItem{
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
 	{label: "/session default", insert: "/session default", hint: "切换到指定会话（如 /session session-3）"},
 	{label: "/session delete", insert: "/session delete ", hint: "删除指定会话（如 /session delete session-3）"},
-	{label: "/caret", insert: "/caret", hint: "诊断输入行宽度（光标压字时定位可疑字符）"},
 	{label: "/export", insert: "/export", hint: "导出当前会话为 Markdown 文件"},
 	{label: "/exit", insert: "/exit", hint: "退出聊天"},
 }
@@ -2574,6 +2637,8 @@ func (m *Model) buildHelpText() string {
 		"  Enter        发送消息",
 		"  Ctrl+J       换行（终端协议不区分 Ctrl+Enter 与 Enter，故用 LF 键）",
 		"  ↑/↓          翻阅历史命令（单行输入时）",
+		"  Shift+←/→    选中输入框文字（Shift+↑/↓ 跨行、Ctrl+Shift+←/→ 按词）",
+		"  Ctrl+A       全选输入框内容；Ctrl+C 复制选区（无选区时清空输入）",
 		"  Ctrl+V       粘贴剪贴板内容",
 		"  /            在输入框首字符唤起命令菜单",
 		"  Ctrl+C       有选区复制 / 运行中中断 / 否则清空输入",
@@ -2602,7 +2667,6 @@ func (m *Model) buildHelpText() string {
 		"  /jobs        列出后台任务（含 workflow）与状态",
 		"  /jobs output <id>  读取后台任务输出（如 /jobs output workflow-1）",
 		"  /jobs kill <id> [reason]  取消后台任务",
-		"  /caret       诊断输入行宽度：逐字符列出可能让光标偏移的可疑字符（零宽/变体选择符/星光平面等）",
 		"  /sessions    列出所有会话",
 		"  /crons       列出所有定时任务",
 		"  /cron add <cron> <prompt>  添加定时任务（cron 为 5 段表达式，如 0 8 * * *）",
@@ -2671,16 +2735,6 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 技能") + "\n" + strings.Join(skills, "\n"))
 		}
 		m.input.SetValue("")
-		m.completion = completion{}
-		m.syncInputHeight()
-		m.render()
-		m.virtualGotoBottom()
-		return true, nil
-	case "/caret":
-		// 输入行宽度诊断：光标压在汉字半格上时，用它把输入逐字符反查一遍
-		// （零宽字符、变体选择符、星光平面字符等肉眼看不见的元凶会列出来）。
-		// 诊断期间保留输入内容，方便用户对照删除后再次自查。
-		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 输入行诊断") + "\n" + m.caretDiagnostic())
 		m.completion = completion{}
 		m.syncInputHeight()
 		m.render()
