@@ -1,10 +1,10 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"bufio"
 	"context"
 	"crypto/sha1"
+	dsc "dsc-sdk"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"

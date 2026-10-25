@@ -144,7 +144,7 @@ func TestShortVersion(t *testing.T) {
 	for in, want := range map[string]string{
 		"Chrome/155.0.0.0":  "155",
 		"Edg/141.0.3537.71": "141",
-		"155.0.0.0":         "155.0.0.0", // 没有斜杠：原样（避免猜）
+		"155.0.0.0":         "155.0.0.0", // 没有斜杆：原样（避免猜）
 		"":                  "",
 	} {
 		if got := shortVersion(in); got != want {
