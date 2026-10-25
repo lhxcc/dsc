@@ -116,3 +116,22 @@ func TestHardenLauncherFlags(t *testing.T) {
 		t.Fatalf("离屏模式应把窗口挪到 -32000，实际 %q", pos)
 	}
 }
+
+// TestSessionNote 只有「请求了复用登录态、实际却是隔离会话」才提示；其余情况不打扰模型。
+func TestSessionNote(t *testing.T) {
+	isolated := &BrowserSession{UserMode: false}
+	user := &BrowserSession{UserMode: true}
+
+	if got := sessionNote(true, isolated); got == "" {
+		t.Fatal("请求复用登录态却拿到隔离会话时，应说明原因")
+	}
+	if got := sessionNote(true, user); got != "" {
+		t.Fatalf("复用成功不该有提示：%q", got)
+	}
+	if got := sessionNote(false, isolated); got != "" {
+		t.Fatalf("模型显式要求隔离时不该提示：%q", got)
+	}
+	if got := sessionNote(true, nil); got != "" {
+		t.Fatalf("会话缺失时不该提示：%q", got)
+	}
+}

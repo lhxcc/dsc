@@ -633,13 +633,30 @@ type WebFetchResult struct {
 	URL     string `json:"url"`
 	Content string `json:"content,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// Note 说明本次会话的「隐性前提」：最常见的是请求了 user_mode 却没能复用登录态
+	// （默认 profile 被运行中的 Chrome 占用），此时拿到的是隔离会话，页面要登录属正常。
+	// 不告诉模型的话，它会把「需要登录」误判成站点反爬或页面结构问题。
+	Note string `json:"note,omitempty"`
+}
+
+// sessionNote 说明本次会话的隐性前提，供模型判断「为什么页面要登录」。
+//
+// 请求了 user_mode（复用 Chrome 登录态）却拿到隔离会话，通常是因为默认 profile 正被
+// 用户自己开着的 Chrome 占用——这是自动降级，不是失败；但不说明的话，模型只会看到一张
+// 登录页，然后猜「站点反爬」。返回空串表示一切符合预期。
+func sessionNote(userMode bool, sess *BrowserSession) string {
+	if !userMode || sess == nil || sess.UserMode {
+		return ""
+	}
+	return "未能复用 Chrome 登录态（默认 profile 正被占用或不可用），本次使用隔离会话；" +
+		"页面要求登录属正常现象。关闭正在运行的 Chrome 后重试，或显式传 user_mode=false 以消除该提示。"
 }
 
 // webFetchImpl 抓取网页内容。plainText 为真时返回剥离结构的纯文本（默认，
 // 便于模型直接阅读、避免对大量 HTML 产生抗拒），为假时返回原始 HTML 供需要
 // 结构化内容的场景使用。结果用 json.Marshal 序列化，避免手拼字符串破坏转义。
 func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, error) {
-	page, _, err := getOrCreatePage(sessionID, "default", url, userMode)
+	page, sess, err := getOrCreatePage(sessionID, "default", url, userMode)
 	if err != nil {
 		e := WebFetchResult{Success: false, URL: url, Error: err.Error()}
 		b, _ := json.Marshal(e)
@@ -664,7 +681,7 @@ func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, erro
 		content = page.MustEval("() => document.documentElement.outerHTML").Str()
 	}
 
-	e := WebFetchResult{Success: true, URL: url, Content: content}
+	e := WebFetchResult{Success: true, URL: url, Content: content, Note: sessionNote(userMode, sess)}
 	b, _ := json.Marshal(e)
 	return string(b), nil
 }
@@ -981,6 +998,9 @@ func webFetchView(result string) (json.RawMessage, error) {
 	body := r.Content
 	if !r.Success {
 		body = r.Error
+	}
+	if r.Note != "" {
+		body = "⚠️ " + r.Note + "\n\n" + body
 	}
 	badge := &dsc.ViewBadge{Text: "ok", Tone: "green"}
 	if !r.Success {

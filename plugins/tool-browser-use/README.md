@@ -77,8 +77,12 @@ CDP 客户端接管就会被打开。删 `--enable-automation` 是为了另一�
 
 优先级：`HEADLESS` > `HEADED` > `OFFSCREEN` > 默认（无头）。
 
-启动失败会逐级降级：用户 profile + 有头 → 用户 profile + 无头 → 隔离 profile（无登录态）。
-每次命中的组合都记在插件日志里（`user-mode session ... headed=true/false`）。
+启动失败会逐级降级：用户 profile（当前模式）→ 无头 → 隔离 profile（无登录态）。每次命中的组合
+都记在插件日志里（`user-mode session ... headed=true/false`）。
+
+**降级会告知模型**：请求了 `user_mode`、实际却拿到隔离会话时（典型是默认 profile 被运行中的
+Chrome 占用），`web_fetch` 结果里会带 `note` 字段说明「本次为隔离会话，页面要求登录属正常」。
+否则模型只会看到一张登录页，然后把原因误判成站点反爬。
 
 ## 测试
 
