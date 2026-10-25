@@ -238,23 +238,18 @@ func main() {
 // exitCodeMarkRe 匹配结果里追加的退出码标记（[exit_code: N]，见 formatShellResult）。
 var exitCodeMarkRe = regexp.MustCompile(`\[exit_code\s*:\s*(-?\d+)\]`)
 
-// mapWorkspacePath 把模型书写的路径按「虚拟根 = 工作区根」契约映射为真实路径。
-// 实现已上收至 dsc.MapWorkspacePath（宿主与各插件进程同源，SDK 层有同名二次
-// 封装供第三方插件，各插件不再各自实现归并转换）；此处仅保留 shell AST 字面量
-// 重写（mapWorkspacePaths）的接入点。规则与例外详见 core/workspace.go：
-// /workspace 前缀（全平台，前缀后必须是分隔符或结尾）、裸 POSIX 绝对路径保持
-// 原样（Windows 上经绝对化解析为当前盘根，与 Linux 真实根一致）、
-// /dev/null 与 // UNC 例外、WSL 风格 /mnt/<drive>/ 映射（仅 Windows）。
+// mapWorkspacePath 把模型书写的路径按虚拟根表映射为真实路径（实现在 core，SDK 转发）。
+// shell 侧只保留 AST 字面量重写这一个接入点——本插件不再持有任何虚拟根知识。
 func mapWorkspacePath(p string) string {
 	return dsc.MapWorkspacePath(p)
 }
 
 // mapWorkspacePaths 遍历 shell AST，把纯字面量词中的虚拟根前缀重写为真实路径：
-// 工作空间根 /workspace（跨平台，见 dsc.MapWorkspacePath）与临时目录 /tmp（仅 Windows，
-// 见 mapTempPath）。只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/
-// 命令替换等复杂词不改，避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b"、
-// cd /tmp、ls /tmp/x 等均被覆盖——包括 cd 内建（改 runner.Dir，不经文件操作的 res()），
-// 这正是此前 /tmp 在 cd 下失效而文件操作下正常的根因。
+// /workspace（跨平台）、/tmp 与 /mnt/<drive>（仅 Windows）——规则全在 core 的虚拟根
+// 表里，这里只负责「在解释执行前改写字面量」。只改写词首的路径形状词（裸词 / 单双引号
+// 内无变量展开），变量展开/命令替换等复杂词不改，避免误伤。cd /workspace、cd /tmp、
+// ls -la /workspace/x、cat "/workspace/a b" 都被覆盖——包括 cd 内建（改 runner.Dir，
+// 不经文件操作的 res()），这正是当年 /tmp 在 cd 下失效、而文件操作下正常的根因。
 func mapWorkspacePaths(node syntax.Node) {
 	mapWorkspacePathsFor(node, runtime.GOOS)
 }
@@ -272,10 +267,9 @@ func mapWorkspacePathsFor(node syntax.Node, goos string) {
 			v.Value = mapShellLitFor(v.Value, goos)
 			return false
 		case *syntax.DblQuoted:
-			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会再被
-			// 上面的 *syntax.Lit 分支映射第二次。此前的 workspace 映射幂等（已映射值
-			// 不再以 /workspace 开头）而看不出问题，但 /tmp 映射不幂等——已映射的
-			// /tmp/myws/... 会被二次改写为临时目录，导致 cd /workspace 等被误伤。
+			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会被
+			// *syntax.Lit 分支再映射一次。映射表本身「首次命中即返回」，对已映射
+			// 的结果再跑一遍也只会落到「不匹配任何前缀」，但双重遍历没有意义。
 			for _, part := range v.Parts {
 				if lit, ok := part.(*syntax.Lit); ok {
 					lit.Value = mapShellLitFor(lit.Value, goos)
@@ -287,41 +281,13 @@ func mapWorkspacePathsFor(node syntax.Node, goos string) {
 	})
 }
 
-// mapShellLitFor 合并两个虚拟根映射（goos 显式注入便于测试）：
-//   - /tmp → DSC 临时目录（仅 Windows；Unix 上 /tmp 是真实挂载点，原样）
-//   - /workspace → 工作空间根（跨平台，见 dsc.MapWorkspacePath）
+// mapShellLitFor 用虚拟根表映射一个字面量（goos 显式注入便于跨平台测试）。
 //
-// 次序关键：必须先做 /tmp 映射，再做 /workspace 映射。两者前缀互不相交，正常输入下
-// 次序无所谓；但若工作空间根自身落在 /tmp/... 下（用户从 /tmp 启动 dsc，或
-// DSC_WORKSPACE_ROOT=/tmp/...），先做 /workspace 映射会把根改写成 /tmp/...，再被 /tmp
-// 映射误伤成临时目录——此前 TestMapWorkspaceAST 的假根 /tmp/myws 就踩中此碰撞。
-// Windows 上 /tmp 会被 mvdan/sh 解析成当前盘根（如 E:\tmp），没有真实挂载点，故需在
-// AST 层就把 /tmp 字面量改写成临时目录，使 cd /tmp 与文件操作一致落到 DSC temp
-// （res() 仅对文件操作参数与重定向目标做同名映射，漏了 cd 内建）。
+// 表内已按「具体前缀在前」排好序，且**首次命中即返回**，因此不存在旧实现
+// 「先 /tmp 后 /workspace」那种两段串联的顺序陷阱（工作区根落在 /tmp/... 下时
+// 会被二次改写）。
 func mapShellLitFor(p, goos string) string {
-	return mapWorkspacePath(mapTempPathFor(p, dsc.TempDir(), goos))
-}
-
-// mapTempPath 把模型的 /tmp 虚拟根字面量重写为 DSC 临时目录（Windows 专用）。
-func mapTempPath(p string) string {
-	return mapTempPathFor(p, dsc.TempDir(), runtime.GOOS)
-}
-
-// mapTempPathFor 是 mapTempPath 的纯函数本体（goos 显式注入便于测试），语义与 res()
-// 的 /tmp 分支（见 internalcmds.go）保持一致：/tmp 与 /tmp/... 映射到临时目录，
-// Unix 上 /tmp 是真实挂载点，原样不动。
-func mapTempPathFor(p, tempDir, goos string) string {
-	if goos != "windows" {
-		return p
-	}
-	if p == "/tmp" || strings.HasPrefix(p, "/tmp/") {
-		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
-		if rel == "" {
-			return tempDir
-		}
-		return dsc.PJoin(tempDir, rel)
-	}
-	return p
+	return dsc.MapWorkspacePathFor(p, dsc.WorkspaceRoot(), dsc.TempDir(), goos)
 }
 
 // shellView 为 shell 工具声明结构化视图：标题 Shell + 退出码徽标（0 绿 / 非 0 红）
@@ -421,7 +387,7 @@ func resolveSessionWorkdir(w string) string {
 		}
 		return os.TempDir()
 	}
-	mapped := dsc.MapWorkspacePath(w)
+	mapped := dsc.MapModelPath(w) // 设备名 + 虚拟根，与命令里的路径同一套表
 	if !filepath.IsAbs(mapped) {
 		if ws := dsc.WorkspaceRoot(); ws != "" {
 			mapped = dsc.PJoin(ws, mapped)

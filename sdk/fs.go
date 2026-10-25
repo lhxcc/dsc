@@ -56,6 +56,27 @@ func MapWorkspacePath(p string) string {
 	return core.MapWorkspacePath(p)
 }
 
+// MapModelPath 映射模型书写的完整路径：设备名表（如 Windows 的 /dev/null → NUL）
+// → 虚拟根表（/workspace、Windows 的 /tmp 与 /mnt/<drive>）。
+//
+// 插件在文件参数、重定向目标、工作目录等入口**只调这一个**：虚拟根与设备名各有一张
+// 表、都在 core 里，插件不应再自己写一条 /tmp 或 /dev/null 规则（此前四处实现各自
+// 覆盖不同前缀，`workdir: /tmp` 就是这么漏掉的）。
+func MapModelPath(p string) string {
+	return core.MapModelPath(p)
+}
+
+// MapDevicePath 只映射设备名（/dev/null），不碰路径根。
+func MapDevicePath(p string) string {
+	return core.MapDevicePath(p)
+}
+
+// MapWorkspacePathFor 显式注入 root/temp/goos 的映射本体，供跨平台测试与需要
+// 指定根的调用方使用；生产路径一律用 MapWorkspacePath。
+func MapWorkspacePathFor(p, root, temp, goos string) string {
+	return core.MapWorkspacePathFor(p, root, temp, goos)
+}
+
 // ResolveWorkspacePath 把模型书写的路径映射后解析为真实绝对路径：相对路径一律
 // 锚定工作空间根（非插件进程 cwd——插件 cwd 是 ExecDir，锚 cwd 会把工作空间
 // 相对路径落到安装目录）。错误统一包装为 "resolve path <p>: <err>"（路径正斜杆

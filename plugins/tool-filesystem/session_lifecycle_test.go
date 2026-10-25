@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -204,4 +205,30 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// TestWorkdirUsesVirtualRootTable workdir 与命令里的路径走同一张表：
+// Windows 上 /tmp 映射到临时目录（此前 workdir 走的是只认 /workspace 的旧入口，
+// /tmp 直接落到当前盘根）。
+func TestWorkdirUsesVirtualRootTable(t *testing.T) {
+	temp := t.TempDir()
+	t.Setenv("DSC_TEMP_DIR", temp)
+
+	got := resolveSessionWorkdir("/tmp")
+	if runtime.GOOS == "windows" {
+		if !samePath(got, temp) {
+			t.Fatalf("windows workdir=/tmp 应落到临时目录 %q，got %q", temp, got)
+		}
+	} else if got != "/tmp" {
+		t.Fatalf("POSIX 上 /tmp 是真实挂载点，应原样，got %q", got)
+	}
+
+	// /workspace 仍然映射到工作区根
+	setRoot := dsc.WorkspaceRoot()
+	ws := t.TempDir()
+	dsc.SetWorkspaceRoot(ws)
+	t.Cleanup(func() { dsc.SetWorkspaceRoot(setRoot) })
+	if got := resolveSessionWorkdir("/workspace/sub"); !samePath(got, filepath.Join(ws, "sub")) {
+		t.Fatalf("/workspace/sub 应映射到工作区根下，got %q", got)
+	}
 }

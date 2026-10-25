@@ -272,6 +272,11 @@ func TestSandboxIgnoresNonWriteTools(t *testing.T) {
 }
 
 func TestSandboxDynamicSwitch(t *testing.T) {
+	// /tmp 现在由虚拟根表映射到临时目录（Windows 上没有真实 /tmp）。本用例要表达的
+	// 是「工作区外的写入被拦」，所以把临时目录钉在工作区之外；否则临时目录恰好落在
+	// 工作区内（测试进程 cwd 就是仓库根）时，判定为「工作区内写」反而是正确的。
+	t.Setenv("DSC_TEMP_DIR", t.TempDir())
+
 	m := newRouterManager()
 	m.sandboxPolicyVal.Store(int32(SandboxWorkspaceWrite))
 	m.events.OnWaterfall(EventToolPreExecute, sandboxPolicy(m.GetSandboxPolicy))
