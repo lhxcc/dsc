@@ -165,7 +165,9 @@ func TestCCRPersistFailureRestoresBody(t *testing.T) {
 // TestRunCommandRendersStatus 命令由插件自己渲染：宿主只转发、只展示，
 // 不认识这些指标。没有状态时也要给一句人话，而不是空输出。
 func TestRunCommandRendersStatus(t *testing.T) {
-	bc := &BillionContext{config: bcacp.DefaultConfig(1_000_000)}
+	// 窗口取 DSC 的真实 1M 口径（1024 底）：1048576 必须显示成 1.0M，
+	// 而不是按 1000 折算出来的 1.05M。
+	bc := &BillionContext{config: bcacp.DefaultConfig(1_048_576)}
 
 	out, err := bc.runCommand(context.Background(), "context", "")
 	if err != nil {
@@ -189,17 +191,21 @@ func TestRunCommandRendersStatus(t *testing.T) {
 	state.Stats.CCRRetrieved = 2
 	state.Stats.CCRExported = 1
 	bc.state = state
-	bc.lastTokenCount = 420_000
+	bc.lastTokenCount = 430_080 // 420K（1024 底）
 
 	out, err = bc.runCommand(context.Background(), "context", "")
 	if err != nil {
 		t.Fatalf("runCommand(acp): %v", err)
 	}
-	for _, want := range []string{"420K / 1.00M", "42%", "T1=1 T2=1 T3=0", "110K", "确定性压缩: 3 次",
+	for _, want := range []string{"420K / 1.0M", "41%", "T1=1 T2=1 T3=0", "107K", "确定性压缩: 3 次",
 		"已卸载可回取: 4 条", "回取: 2 次（导出 1 · 落空 0）"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("输出应包含 %q，实际：\n%s", want, out)
 		}
+	}
+	// 1000 进制会把 1048576 写成 1.05M，与 DSC 其它地方（1024 底）不一致
+	if strings.Contains(out, "1.05M") {
+		t.Fatalf("容量应按 1024 底显示（1.0M），不该出现 1.05M：\n%s", out)
 	}
 
 	// 未声明的名字：报错（宿主的转发只应出现在声明清单里）。

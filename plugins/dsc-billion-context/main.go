@@ -885,38 +885,28 @@ func (bc *BillionContext) renderContextStatus() string {
 	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
 	bd := report.Breakdown
 
-	short := func(n int) string {
-		switch {
-		case n >= 1_000_000:
-			return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
-		case n >= 1_000:
-			return fmt.Sprintf("%dK", n/1_000)
-		}
-		return fmt.Sprintf("%d", n)
-	}
-
 	var b strings.Builder
 	b.WriteString("DSC · 上下文压缩\n")
 	if report.ModelContextLimit > 0 {
 		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n",
-			short(report.TokenCount), short(report.ModelContextLimit),
+			bcacp.FormatTokenCount(report.TokenCount), bcacp.FormatTokenCount(report.ModelContextLimit),
 			float64(report.TokenCount)*100/float64(report.ModelContextLimit))
 	} else {
-		fmt.Fprintf(&b, "  占用: %s\n", short(report.TokenCount))
+		fmt.Fprintf(&b, "  占用: %s\n", bcacp.FormatTokenCount(report.TokenCount))
 	}
 	fmt.Fprintf(&b, "  块: %d active / %d total（T1=%d T2=%d T3=%d）\n",
 		report.ActiveBlocks, report.TotalBlocks, bd["tier1"], bd["tier2"], bd["tier3"])
 	if bd["tokensCompressed"] > 0 || bd["compressionCount"] > 0 {
-		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", short(bd["tokensCompressed"]), bd["compressionCount"])
+		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", bcacp.FormatTokenCount(bd["tokensCompressed"]), bd["compressionCount"])
 	}
 	if v := bd["absorbedTokens"]; v > 0 {
-		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", short(v))
+		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", bcacp.FormatTokenCount(v))
 	}
 	if bd["crushCount"] > 0 {
-		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], short(bd["crushTokensSaved"]))
+		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], bcacp.FormatTokenCount(bd["crushTokensSaved"]))
 	}
 	if bd["ccrStored"] > 0 {
-		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], short(bd["ccrStoredTokens"]))
+		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], bcacp.FormatTokenCount(bd["ccrStoredTokens"]))
 		fmt.Fprintf(&b, "  回取: %d 次（导出 %d · 落空 %d）\n",
 			bd["ccrRetrieved"], bd["ccrExported"], bd["retrievalMisses"])
 	}
