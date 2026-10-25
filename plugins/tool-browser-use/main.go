@@ -34,6 +34,8 @@ type BrowserSession struct {
 	LastUsed   time.Time
 	UserMode   bool   // 是否命中用户模式（复用默认 Chrome 登录态）
 	Headless   bool   // 是否无头会话（无头时 UA 里会带 HeadlessChrome，建页时替换掉）
+	Engine     string // 本次用的内核 + 版本 + 是否登录态（随结果告知模型）
+	Switched   string // 中途换了浏览器/profile 的原因，非空时一并告知
 	kill       func() // 结束浏览器进程（本地启动的会话才有；CDP 复用为 nil）
 	mu         sync.Mutex
 }
@@ -105,123 +107,146 @@ func cleanupOldBrowserData(exeDir string) error {
 	return nil
 }
 
-// browserBin 选择要启动的浏览器可执行文件，空串表示交给 rod 自己找（找不到会下载）。
+// browserCandidate 一个可用的浏览器及其默认（带登录态的）profile 目录。
 //
-// 为什么必须显式指定：rod 找不到系统浏览器时会下载**它自己那份 Chromium**（版本往往比
-// 系统 Chrome 老很多）。拿旧 Chromium 去开用户 Chrome 的 user-data-dir，profile 会因为
-// 「由更新版本创建」而打不开，user_mode 于是静默降级成隔离 profile——表现就是「明明设了
-// 复用登录态，结果还是要重新登录」。所以优先用系统装的 Chrome/Edge。
-func browserBin() string {
-	for _, p := range candidateBrowsers() {
-		if p == "" {
-			continue
-		}
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
-	}
-	return ""
+// 为什么要成对出现：profile 必须和浏览器内核匹配——拿 Chrome 的 user-data-dir 去开
+// Edge 会直接报错，反之亦然。所以候选是「二进制 + 它自己的 profile」而不是两个独立列表。
+type browserCandidate struct {
+	Name       string // Chrome / Edge / Chromium，用于告诉模型「这次用的是哪个内核」
+	Bin        string
+	ProfileDir string // 默认为空表示该浏览器没有可复用的 profile（例如自定义二进制）
 }
 
-// candidateBrowsers 按优先级列出本机可能存在的浏览器可执行文件。
-// DSC_BROWSER_BIN 永远排第一（显式指定优先）。
-func candidateBrowsers() []string {
-	var out []string
-	if p := strings.TrimSpace(os.Getenv("DSC_BROWSER_BIN")); p != "" {
-		out = append(out, p)
+// browserCandidates 按优先级列出现存的浏览器：显式指定的 DSC_BROWSER_BIN 最高，
+// 其次系统 Chrome，再次 Edge。
+//
+// 顺序即降级顺序：Chrome 的 profile 被占用时就该去试 Edge 的 profile——多数人不会同时
+// 开着两个浏览器，这一步往往就能拿到登录态，比直接退回隔离会话好得多。
+func browserCandidates() []browserCandidate {
+	var out []browserCandidate
+	add := func(c browserCandidate) {
+		if c.Bin == "" {
+			return
+		}
+		if st, err := os.Stat(c.Bin); err != nil || st.IsDir() {
+			return
+		}
+		for _, seen := range out {
+			if seen.Bin == c.Bin {
+				return
+			}
+		}
+		out = append(out, c)
 	}
+
+	if p := strings.TrimSpace(os.Getenv("DSC_BROWSER_BIN")); p != "" {
+		name, profile := classifyBrowser(p)
+		add(browserCandidate{Name: name, Bin: p, ProfileDir: profile})
+	}
+
 	switch runtime.GOOS {
 	case "windows":
-		for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"} {
-			base := os.Getenv(env)
-			if base == "" {
-				continue
+		la := os.Getenv("LOCALAPPDATA")
+		for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+			if base := os.Getenv(env); base != "" {
+				add(browserCandidate{Name: "Chrome", Bin: dsc.PJoin(base, "Google", "Chrome", "Application", "chrome.exe"), ProfileDir: chromeProfileDir()})
 			}
-			out = append(out, dsc.PJoin(base, "Google", "Chrome", "Application", "chrome.exe"))
+		}
+		if la != "" {
+			add(browserCandidate{Name: "Chrome", Bin: dsc.PJoin(la, "Google", "Chrome", "Application", "chrome.exe"), ProfileDir: chromeProfileDir()})
 		}
 		for _, env := range []string{"ProgramFiles(x86)", "ProgramFiles"} {
-			base := os.Getenv(env)
-			if base == "" {
-				continue
+			if base := os.Getenv(env); base != "" {
+				add(browserCandidate{Name: "Edge", Bin: dsc.PJoin(base, "Microsoft", "Edge", "Application", "msedge.exe"), ProfileDir: edgeProfileDir()})
 			}
-			out = append(out, dsc.PJoin(base, "Microsoft", "Edge", "Application", "msedge.exe"))
 		}
 	case "darwin":
-		out = append(out,
-			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-			"/Applications/Chromium.app/Contents/MacOS/Chromium",
-		)
+		add(browserCandidate{Name: "Chrome", Bin: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", ProfileDir: chromeProfileDir()})
+		add(browserCandidate{Name: "Edge", Bin: "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", ProfileDir: edgeProfileDir()})
+		add(browserCandidate{Name: "Chromium", Bin: "/Applications/Chromium.app/Contents/MacOS/Chromium"})
 	default:
-		out = append(out, "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge")
+		for _, p := range []string{"/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"} {
+			add(browserCandidate{Name: "Chrome", Bin: p, ProfileDir: chromeProfileDir()})
+		}
+		add(browserCandidate{Name: "Edge", Bin: "/usr/bin/microsoft-edge", ProfileDir: edgeProfileDir()})
 	}
 	return out
 }
 
-// defaultUserDataDir 返回默认 Chrome 用户数据目录（内含用户登录态）。
-// Windows 下为 %LOCALAPPDATA%\Google\Chrome\User Data；不存在或未知平台返回空串。
-func defaultUserDataDir() string {
-	if runtime.GOOS == "windows" {
+// classifyBrowser 由可执行文件路径推断内核名与它的默认 profile 目录。
+func classifyBrowser(bin string) (name, profileDir string) {
+	lower := strings.ToLower(bin)
+	switch {
+	case strings.Contains(lower, "msedge") || strings.Contains(lower, "microsoft edge"):
+		return "Edge", edgeProfileDir()
+	case strings.Contains(lower, "chromium"):
+		return "Chromium", ""
+	default:
+		return "Chrome", chromeProfileDir()
+	}
+}
+
+// chromeProfileDir / edgeProfileDir 各浏览器默认 user-data-dir（含登录态）；不存在返回空。
+func chromeProfileDir() string {
+	switch runtime.GOOS {
+	case "windows":
 		if la := os.Getenv("LOCALAPPDATA"); la != "" {
-			p := dsc.PJoin(la, "Google", "Chrome", "User Data")
-			if st, err := os.Stat(p); err == nil && st.IsDir() {
-				return p
-			}
+			return existingDir(dsc.PJoin(la, "Google", "Chrome", "User Data"))
+		}
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return existingDir(dsc.PJoin(home, "Library", "Application Support", "Google", "Chrome"))
+		}
+	default:
+		if home, err := os.UserHomeDir(); err == nil {
+			return existingDir(dsc.PJoin(home, ".config", "google-chrome"))
 		}
 	}
 	return ""
 }
 
-// browserHeaded 决定本次启动有没有窗口（有头）。默认**无头**。
-//
-// 早先的直觉是「复用用户 profile 就该有头，否则容易被反爬」。实测（本机 Chrome 155，
-// --headless=new）否掉了这个直觉：无头与有头在常用指纹上完全一致——
-//
-//	plugins=5、WebGL 渲染器是真实显卡（ANGLE/NVIDIA RTX 3060 Ti，不是 SwiftShader）、
-//	window.chrome=object、outer 1280x900 / inner 1264x805（连窗口边框都被模拟了）、
-//	visibilityState=visible、webdriver=false、UA 是真实 Windows Chrome。
-//
-// 差别只剩「有没有一个窗口」，所以默认无头：不弹窗，且不可见性本身就是体验。
-//
-// 真要更保险时有两条路：
-//
-//	DSC_BROWSER_OFFSCREEN=1  真·有头浏览器，但窗口挪到屏幕外（看不见，任务栏有图标）；
-//	DSC_BROWSER_HEADED=1     看得见的有头窗口（排查问题时用）。
-//
-// 优先级：HEADLESS > HEADED > OFFSCREEN > 默认（无头）。
-func browserHeaded() bool {
-	if truthy(os.Getenv("DSC_BROWSER_HEADLESS")) {
-		return false
+func edgeProfileDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		if la := os.Getenv("LOCALAPPDATA"); la != "" {
+			return existingDir(dsc.PJoin(la, "Microsoft", "Edge", "User Data"))
+		}
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return existingDir(dsc.PJoin(home, "Library", "Application Support", "Microsoft Edge"))
+		}
+	default:
+		if home, err := os.UserHomeDir(); err == nil {
+			return existingDir(dsc.PJoin(home, ".config", "microsoft-edge"))
+		}
 	}
-	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
-		return true
-	}
-	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
+	return ""
 }
 
-// browserOffscreen 有头时是否把窗口挪到屏幕外（DSC_BROWSER_HEADED=1 显式要窗口时不挪）。
-func browserOffscreen() bool {
-	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
-		return false
+// existingDir 目录存在则原样返回，否则空串（调用方据此跳过该候选的 user mode）。
+func existingDir(p string) string {
+	if p == "" {
+		return ""
 	}
-	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
+	if st, err := os.Stat(p); err == nil && st.IsDir() {
+		return p
+	}
+	return ""
 }
 
-// truthy 宽松解析开关型环境变量：1/true/yes/on 都算开。
-func truthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
+// browserBin 返回第一个现存的浏览器二进制（隔离会话用；不需要匹配 profile）。
+func browserBin() string {
+	if cs := browserCandidates(); len(cs) > 0 {
+		return cs[0].Bin
 	}
-	return false
+	return ""
 }
 
 // newBrowser 以关闭「默认设备模拟」的方式建控制器。
 //
 // rod.New() 默认会把每个页面模拟成 MacBook（devices.LaptopWithMDPIScreen）：UA 变成
 // Macintosh + Chrome/114、视口固定 1440x900。在 Windows 上跑却报 Mac UA，是反爬最爱
-// 抓的自相矛盾特征之一（UA 与 platform/字体/时区对不上）。NoDefaultDevice 关掉它，
-// UA 与视口就回到浏览器自己的真实值。
+// 抓的自相矛盾特征之一。NoDefaultDevice 关掉它，UA 与视口回到浏览器自己的真实值。
 func newBrowser(controlURL string) *rod.Browser {
 	return rod.New().NoDefaultDevice().ControlURL(controlURL).MustConnect()
 }
@@ -260,13 +285,62 @@ func hardenLauncher(l *launcher.Launcher, headed, offscreen bool) *launcher.Laun
 	return l.HeadlessNew(true)
 }
 
-// tryLaunch 用给定 user-data-dir 启动浏览器并连接。
-// headed 决定有没有窗口（见 browserHeaded），offscreen 表示有头但窗口挪出屏幕。
-// 返回的 kill 用于会话关闭时真正结束浏览器进程（rod 的 launcher 不管这件事）。
+// browserHeaded 决定本次启动有没有窗口（有头）。默认**无头**。
 //
-// 环境变量 DSC_BROWSER_CDP_URL 指向现有 CDP 端点时跳过本地启动，直接连接该端点
-// （供 mock chromium 集成测试等场景复用）——那条路径的进程不归我们管，kill 为 nil。
-func tryLaunch(userDataDir string, headed, offscreen bool) (b *rod.Browser, kill func(), ok bool) {
+// 早先的直觉是「复用用户 profile 就该有头，否则容易被反爬」。实测（Chrome 155，
+// --headless=new）否掉了这个直觉：无头与有头在常用指纹上完全一致——
+//
+//	plugins=5、WebGL 渲染器是真实显卡、window.chrome=object、
+//	outer/inner 1280x900 / 1264x805、visibilityState=visible、webdriver=false。
+//
+// 差别只剩「有没有一个窗口」，所以默认无头：不弹窗。
+//
+// 真要更保险时有两条路：
+//
+//	DSC_BROWSER_OFFSCREEN=1  真·有头浏览器，但窗口挪到屏幕外（看不见，任务栏有图标）；
+//	DSC_BROWSER_HEADED=1     看得见的有头窗口（排查问题时用）。
+//
+// 优先级：HEADLESS > HEADED > OFFSCREEN > 默认（无头）。
+func browserHeaded() bool {
+	if truthy(os.Getenv("DSC_BROWSER_HEADLESS")) {
+		return false
+	}
+	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
+		return true
+	}
+	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
+}
+
+// browserOffscreen 有头时是否把窗口挪到屏幕外（DSC_BROWSER_HEADED=1 显式要窗口时不挪）。
+func browserOffscreen() bool {
+	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
+		return false
+	}
+	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
+}
+
+// truthy 宽松解析开关型环境变量：1/true/yes/on 都算开。
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// launchResult 一次成功启动的结果。
+type launchResult struct {
+	browser  *rod.Browser
+	userMode bool   // 是否复用了某个浏览器的登录态
+	headless bool   // 是否无头（决定建页时是否要改 UA）
+	engine   string // 例 "Chrome 155（用户登录态）"，随结果告知模型
+	kill     func() // 结束浏览器进程
+	switched string // 非空：中途换了浏览器或 profile，附原因
+}
+
+// tryLaunch 用指定浏览器与 profile 启动并连接。
+// 返回 product（如 "Chrome/155.0.0.0"，取自 /json/version）用于拼 engine 标签。
+func tryLaunch(cand browserCandidate, profileDir string, headed, offscreen bool) (b *rod.Browser, kill func(), product string, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			ok = false
@@ -274,73 +348,156 @@ func tryLaunch(userDataDir string, headed, offscreen bool) (b *rod.Browser, kill
 			kill = nil
 		}
 	}()
-	if u := os.Getenv("DSC_BROWSER_CDP_URL"); u != "" {
-		return newBrowser(u), nil, true
+	l := launcher.New()
+	if profileDir != "" {
+		l = l.UserDataDir(profileDir)
 	}
-	l := launcher.New().UserDataDir(userDataDir)
-	if bin := browserBin(); bin != "" {
-		l = l.Bin(bin)
+	if cand.Bin != "" {
+		l = l.Bin(cand.Bin)
 	}
 	l = hardenLauncher(l, headed, offscreen)
 
-	controlURL, stop, err := launchChrome(l)
+	controlURL, prod, stop, err := launchChrome(l)
 	if err != nil {
-		log.Printf("[BrowserSessionManager] 启动浏览器失败: %v%s", err, chromeRunningHint(err))
-		return nil, nil, false
+		log.Printf("[BrowserSessionManager] 启动 %s 失败: %v%s", cand.Name, err, chromeRunningHint(err))
+		return nil, nil, "", false
 	}
-	return newBrowser(controlURL), stop, true
+	return newBrowser(controlURL), stop, prod, true
 }
 
-// launchBrowserRod 启动浏览器实例。userMode 为真时优先复用默认 Chrome 用户数据
-// 目录（携带登录态）；该目录不可用（如用户 Chrome 已在运行、profile 被锁）时
-// 自动降级到按 session 隔离的临时目录。返回浏览器与是否命中了用户模式。
-func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool, func(), error) {
-	headed := browserHeaded()
-	off := headed && browserOffscreen()
+// 测试缝：把「怎么找候选」和「怎么起浏览器」做成可替换的变量，好单测降级链
+// （真实实现分别是 browserCandidates / tryLaunch）。
+var (
+	browserCandidatesFn = browserCandidates
+	tryLaunchFn         = tryLaunch
+)
 
-	// 用户模式：复用默认用户数据目录以保留登录态；失败则逐级降级
+// launchBrowserRod 逐个候选浏览器尝试复用登录态，全部失败才退回隔离 profile。
+//
+// 降级顺序（每一档都先试当前模式、起不来再试无头）：
+//  1. Chrome 的登录 profile；
+//  2. Edge 的登录 profile——多数人不会同时开着两个浏览器，Chrome 被占用时这一步
+//     往往就能拿到登录态，比直接退回隔离会话好得多；
+//  3. 隔离 profile（无登录态）。
+func launchBrowserRod(sessionID string, userMode bool) (*launchResult, error) {
+	cands := browserCandidatesFn()
+	if len(cands) == 0 {
+		return nil, fmt.Errorf("找不到可用的浏览器（安装 Chrome/Edge，或用 DSC_BROWSER_BIN 指定）")
+	}
+	headed := browserHeaded()
+	offscreen := headed && browserOffscreen()
+
+	// 外部 CDP 端点（用户自己起的 Chrome）：不启动、不干预，UA/指纹由那边决定。
+	// mock 集成测试也走这条路径。
+	if u := strings.TrimSpace(os.Getenv("DSC_BROWSER_CDP_URL")); u != "" {
+		log.Printf("[BrowserSessionManager] session %s 连接外部 CDP：%s", sessionID, u)
+		return &launchResult{
+			browser:  newBrowser(u),
+			userMode: false,
+			headless: false, // 外部浏览器 UA 是它自己的，不要改
+			engine:   "外部浏览器（DSC_BROWSER_CDP_URL）",
+		}, nil
+	}
+
 	if userMode {
-		if dir := defaultUserDataDir(); dir != "" {
-			if b, kill, ok := tryLaunch(dir, headed, off); ok {
-				log.Printf("[BrowserSessionManager] user-mode session %s using default Chrome profile %s (headed=%v)", sessionID, dir, headed)
-				return b, true, !headed, kill, nil
+		var tried []string
+		for _, cand := range cands {
+			if cand.ProfileDir == "" {
+				continue // 没有可复用的 profile（例如自定义二进制），只在最后作隔离用途
 			}
-			// 有头起不来（无桌面会话 / profile 被运行中的 Chrome 占用）时先退化到无头，
-			// 再退化到隔离 profile——降级顺序按「反爬风险」从小到大排。
+			if b, kill, prod, ok := tryLaunchFn(cand, cand.ProfileDir, headed, offscreen); ok {
+				log.Printf("[BrowserSessionManager] user-mode session %s using %s profile %s (headed=%v)", sessionID, cand.Name, cand.ProfileDir, headed)
+				res := &launchResult{
+					browser:  b,
+					userMode: true,
+					headless: !headed,
+					engine:   engineLabel(cand.Name, prod, true),
+					kill:     kill,
+				}
+				if len(tried) > 0 {
+					res.switched = fmt.Sprintf("%s 的登录态被占用，已改用 %s 的登录态", strings.Join(tried, "、"), cand.Name)
+					log.Printf("[BrowserSessionManager] %s", res.switched)
+				}
+				return res, nil
+			}
 			if headed {
-				if b, kill, ok := tryLaunch(dir, false, false); ok {
-					log.Printf("[BrowserSessionManager] user-mode session %s: headed launch failed, using default profile headless", sessionID)
-					return b, true, true, kill, nil
+				// 有头起不来（无桌面会话等）再试一次无头，别急着换浏览器
+				if b, kill, prod, ok := tryLaunchFn(cand, cand.ProfileDir, false, false); ok {
+					log.Printf("[BrowserSessionManager] user-mode session %s using %s profile %s (headed launch failed, falling back to headless)", sessionID, cand.Name, cand.ProfileDir)
+					res := &launchResult{
+						browser:  b,
+						userMode: true,
+						headless: true,
+						engine:   engineLabel(cand.Name, prod, true),
+						kill:     kill,
+					}
+					if len(tried) > 0 {
+						res.switched = fmt.Sprintf("%s 的登录态被占用，已改用 %s 的登录态", strings.Join(tried, "、"), cand.Name)
+					}
+					return res, nil
 				}
 			}
-			log.Printf("[BrowserSessionManager] user-mode profile unavailable for %s (likely locked), falling back to isolated temp profile", sessionID)
+			tried = append(tried, cand.Name)
 		}
+		log.Printf("[BrowserSessionManager] 所有浏览器的登录 profile 都不可用（%s），session %s 退回隔离 profile", strings.Join(tried, "、"), sessionID)
 	}
 
-	// 获取可执行文件所在目录
+	// 隔离 profile：不需要匹配浏览器，用第一个可用的
 	exeDir, err := getExeDir()
 	if err != nil {
-		return nil, false, false, nil, fmt.Errorf("failed to get executable dir: %w", err)
+		return nil, fmt.Errorf("failed to get executable dir: %w", err)
 	}
-
-	// 浏览器数据目录：程序可执行路径下的 temp/browser-data/<sessionID>
-	// 避免与 workspace 混雜，並通過 sessionID 區分不同實例
 	browserDataDir := dsc.PJoin(exeDir, "temp", "browser-data", sessionID)
 	if err := dsc.MkdirAll(browserDataDir); err != nil {
-		return nil, false, false, nil, fmt.Errorf("failed to create browser data directory: %w", err)
+		return nil, fmt.Errorf("failed to create browser data directory: %w", err)
 	}
-
-	// 清理24小時前的臨時瀏覽器數據
 	if err := cleanupOldBrowserData(exeDir); err != nil {
 		log.Printf("[BrowserSessionManager] warning: failed to clean up old browser data: %v", err)
 	}
 
-	isolatedHeaded := browserHeaded()
-	b, kill, ok := tryLaunch(browserDataDir, isolatedHeaded, isolatedHeaded && browserOffscreen())
-	if !ok {
-		return nil, false, false, nil, fmt.Errorf("failed to launch browser for session %s", sessionID)
+	cand := cands[0]
+	b, kill, prod, ok := tryLaunchFn(cand, browserDataDir, headed, offscreen)
+	if !ok && headed {
+		b, kill, prod, ok = tryLaunchFn(cand, browserDataDir, false, false)
 	}
-	return b, false, !isolatedHeaded, kill, nil
+	if !ok {
+		return nil, fmt.Errorf("failed to launch browser for session %s", sessionID)
+	}
+	res := &launchResult{
+		browser:  b,
+		userMode: false,
+		headless: !headed,
+		engine:   engineLabel(cand.Name, prod, false),
+		kill:     kill,
+	}
+	if userMode {
+		res.switched = "所有浏览器的登录 profile 都被占用或不可用，本次使用隔离会话（无登录态）"
+	}
+	return res, nil
+}
+
+// engineLabel 拼「哪个内核 + 什么版本 + 有没有登录态」，随每次结果告知模型。
+func engineLabel(name, product string, userMode bool) string {
+	ver := shortVersion(product)
+	kind := "隔离会话"
+	if userMode {
+		kind = "用户登录态"
+	}
+	if ver == "" {
+		return fmt.Sprintf("%s（%s）", name, kind)
+	}
+	return fmt.Sprintf("%s %s（%s）", name, ver, kind)
+}
+
+// shortVersion 从 "Chrome/155.0.0.0" 取主版本号 "155"。
+func shortVersion(product string) string {
+	if _, ver, ok := strings.Cut(product, "/"); ok {
+		if major, _, ok := strings.Cut(ver, "."); ok {
+			return major
+		}
+		return ver
+	}
+	return product
 }
 
 // CreateSession 創建新的瀏覽器會話
@@ -358,7 +515,7 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 	}
 
 	// 啟動瀏覽器
-	browser, usedUserMode, headless, killBrowser, err := launchBrowserRod(sessionID, userMode)
+	res, err := launchBrowserRod(sessionID, userMode)
 	if err != nil {
 		return nil, fmt.Errorf("啟動瀏覽器失敗: %w", err)
 	}
@@ -366,17 +523,19 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 	now := time.Now()
 	sess := &BrowserSession{
 		ID:        sessionID,
-		Browser:   browser,
+		Browser:   res.browser,
 		Pages:     make(map[string]*rod.Page),
 		CreatedAt: now,
 		LastUsed:  now,
-		UserMode:  usedUserMode,
-		Headless:  headless,
-		kill:      killBrowser,
+		UserMode:  res.userMode,
+		Headless:  res.headless,
+		Engine:    res.engine,
+		Switched:  res.switched,
+		kill:      res.kill,
 	}
 
 	m.sessions[sessionID] = sess
-	log.Printf("[BrowserSessionManager] Created session %s (userMode=%v)", sessionID, usedUserMode)
+	log.Printf("[BrowserSessionManager] Created session %s (userMode=%v, engine=%s)", sessionID, res.userMode, res.engine)
 	return sess, nil
 }
 
@@ -651,19 +810,31 @@ type WebFetchResult struct {
 	// Format 回显实际使用的取文形态（layout/text/html）。诊断「模型以为拿到版面、
 	// 实际拿到 innerText」这类问题时，没有它就只能靠猜。
 	Format string `json:"format,omitempty"`
+	// Engine 本次用的内核与版本，如 "Chrome 155（用户登录态）"/"Edge 141（隔离会话）"
+	Engine string `json:"engine,omitempty"`
 }
 
-// sessionNote 说明本次会话的隐性前提，供模型判断「为什么页面要登录」。
+// sessionNote 说明本次会话的隐性前提（换了浏览器 / 退回了隔离会话）。
 //
-// 请求了 user_mode（复用 Chrome 登录态）却拿到隔离会话，通常是因为默认 profile 正被
-// 用户自己开着的 Chrome 占用——这是自动降级，不是失败；但不说明的话，模型只会看到一张
-// 登录页，然后猜「站点反爬」。返回空串表示一切符合预期。
-func sessionNote(userMode bool, sess *BrowserSession) string {
-	if !userMode || sess == nil || sess.UserMode {
+// 这些话由启动阶段写进 sess.Switched：Chrome 的登录态被占用时我们改用了 Edge，
+// 或者两个浏览器的 profile 都不可用、退回隔离会话。不告诉模型的话，它只会看到一张
+// 登录页，然后把原因误判成站点反爬或页面结构问题。
+func sessionNote(sess *BrowserSession) string {
+	if sess == nil {
 		return ""
 	}
-	return "未能复用 Chrome 登录态（默认 profile 正被占用或不可用），本次使用隔离会话；" +
-		"页面要求登录属正常现象。关闭正在运行的 Chrome 后重试，或显式传 user_mode=false 以消除该提示。"
+	return sess.Switched
+}
+
+// sessionEngine 返回本次会话的内核标签（如 "Chrome 155（用户登录态）"）。
+//
+// 同一台机器可能因为 profile 占用而换过浏览器，所以每次工具结果都带上它，模型才知道
+// 自己在跟哪个内核/哪份登录态打交道。
+func sessionEngine(sessionID string) string {
+	if sess, ok := GetBrowserSessionManager().GetSession(sessionID); ok && sess != nil {
+		return sess.Engine
+	}
+	return ""
 }
 
 // fetchFormat 决定 web_fetch 返回哪种形态的内容。三种需求互斥，用一个枚举表达，
@@ -769,7 +940,8 @@ func webFetchImpl(sessionID, url string, format fetchFormat, userMode bool) (str
 		URL:     url,
 		Content: content,
 		Format:  string(used),
-		Note:    composeNotes(sessionNote(userMode, sess), fallbackNote(used)),
+		Engine:  sessionEngine(sessionID),
+		Note:    composeNotes(sessionNote(sess), fallbackNote(used)),
 	}
 	b, _ := json.Marshal(e)
 	return string(b), nil
@@ -779,6 +951,7 @@ func webFetchImpl(sessionID, url string, format fetchFormat, userMode bool) (str
 type WebSearchResult struct {
 	Success bool               `json:"success"`
 	Query   string             `json:"query"`
+	Engine  string             `json:"engine,omitempty"`
 	Results []SearchResultItem `json:"results"`
 	Errors  []string           `json:"errors,omitempty"`
 	Sources []string           `json:"sources,omitempty"`
@@ -941,6 +1114,7 @@ func webSearchImpl(sessionID, query string, engines []string, userMode bool) (st
 	res := WebSearchResult{
 		Success: len(aggregated) > 0,
 		Query:   query,
+		Engine:  sessionEngine(sessionID),
 		Results: aggregated,
 		Errors:  errors,
 		Sources: sources,
@@ -954,6 +1128,7 @@ type BrowserClickResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	URL     string `json:"url,omitempty"`
+	Engine  string `json:"engine,omitempty"`
 }
 
 func browserClickImpl(sessionID, url, selector string) (string, error) {
@@ -979,6 +1154,7 @@ func browserClickImpl(sessionID, url, selector string) (string, error) {
 		Success: true,
 		Message: fmt.Sprintf("成功點擊元素: %s", selector),
 		URL:     info.URL,
+		Engine:  sessionEngine(sessionID),
 	}
 
 	jsonData, _ := json.Marshal(result)
@@ -990,6 +1166,7 @@ type BrowserTypeResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Value   string `json:"value,omitempty"`
+	Engine  string `json:"engine,omitempty"`
 }
 
 func browserTypeImpl(sessionID, url, selector, text string, submit bool) (string, error) {
@@ -1016,6 +1193,7 @@ func browserTypeImpl(sessionID, url, selector, text string, submit bool) (string
 		Success: true,
 		Message: fmt.Sprintf("成功輸入文本到: %s", selector),
 		Value:   text,
+		Engine:  sessionEngine(sessionID),
 	}
 
 	jsonData, _ := json.Marshal(result)

@@ -103,12 +103,24 @@ CDP 客户端接管就会被打开。删 `--enable-automation` 是为了另一�
 
 优先级：`HEADLESS` > `HEADED` > `OFFSCREEN` > 默认（无头）。
 
-启动失败会逐级降级：用户 profile（当前模式）→ 无头 → 隔离 profile（无登录态）。每次命中的组合
-都记在插件日志里（`user-mode session ... headed=true/false`）。
+**启动链（`user_mode` 为真时）**，按「反爬风险」从低到高逐档尝试：
 
-**降级会告知模型**：请求了 `user_mode`、实际却拿到隔离会话时（典型是默认 profile 被运行中的
-Chrome 占用），`web_fetch` 结果里会带 `note` 字段说明「本次为隔离会话，页面要求登录属正常」。
+1. **Chrome 的登录 profile**；
+2. **Edge 的登录 profile** —— 多数人不会同时开着两个浏览器，Chrome 被占用时这一步往往
+   就能拿到登录态，比直接退回隔离会话好得多；
+3. 隔离 profile（无登录态）。
+
+每一档内部还是「先按当前模式（默认无头）起，起不来再试无头」。全部失败才落到第 3 档。
+
+**每次都告诉模型用的是哪个内核**：所有工具的结果里都带 `engine` 字段，例如
+`"Chrome 155（用户登录态）"` / `"Edge 141（用户登录态）"` / `"Chrome 155（隔离会话）"` /
+`"外部浏览器（DSC_BROWSER_CDP_URL）"`。中途换过浏览器，或两个 profile 都不可用而退回隔离，
+`web_fetch` 的 `note` 会说明原因（`web_search`/`browser_*` 的 `engine` 同样可见）。
 否则模型只会看到一张登录页，然后把原因误判成站点反爬。
+
+`engine` 的版本号来自浏览器自己的 `/json/version`（`Browser: "Chrome/155.0.0.0"`），
+不是我们编的；profile 必须与内核匹配——Chrome 的 user-data-dir 开不了 Edge，反之亦然，
+所以候选是「二进制 + 它自己的 profile」成对出现。
 
 ## 测试
 

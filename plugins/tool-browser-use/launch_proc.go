@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,18 +31,18 @@ import (
 // 附带好处：进程句柄归我们管，会话关闭时能真正结束浏览器，而不是留一堆僵尸 chrome。
 
 // launchChrome 启动浏览器并返回 CDP 端点，以及一个结束进程的函数。
-func launchChrome(l *launcher.Launcher) (controlURL string, kill func(), err error) {
+func launchChrome(l *launcher.Launcher) (controlURL, product string, kill func(), err error) {
 	bin := l.Get(flags.Bin) // rod 把浏览器路径存在自定义 flag 里，FormatArgs 会过滤它
 	if bin == "" {
 		bin = browserBin()
 	}
 	if bin == "" {
-		return "", nil, fmt.Errorf("找不到可用的浏览器（用 DSC_BROWSER_BIN 指定 chrome.exe 路径）")
+		return "", "", nil, fmt.Errorf("找不到可用的浏览器（用 DSC_BROWSER_BIN 指定 chrome.exe 路径）")
 	}
 
 	port, err := freePort()
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	l = l.Set(flags.RemoteDebuggingPort, strconv.Itoa(port))
 	args := l.FormatArgs()
@@ -57,16 +58,16 @@ func launchChrome(l *launcher.Launcher) (controlURL string, kill func(), err err
 		cmd.Dir = dir
 	}
 	if err := cmd.Start(); err != nil {
-		return "", nil, fmt.Errorf("启动浏览器失败（%s）: %w", bin, err)
+		return "", "", nil, fmt.Errorf("启动浏览器失败（%s）: %w", bin, err)
 	}
 
 	httpURL := "http://127.0.0.1:" + strconv.Itoa(port)
-	wsURL, err := waitCDP(httpURL, 20*time.Second, cmd)
+	wsURL, product, err := waitCDP(httpURL, 20*time.Second, cmd)
 	if err != nil {
 		_ = cmd.Process.Kill()
-		return "", nil, err
+		return "", "", nil, err
 	}
-	return wsURL, func() { _ = cmd.Process.Kill() }, nil
+	return wsURL, product, func() { killProcessTree(cmd) }, nil
 }
 
 // waitCDP 轮询 /json/version，直到调试端点就绪；子进程提前退出则立刻报错（不必等满超时）。
@@ -75,7 +76,7 @@ func launchChrome(l *launcher.Launcher) (controlURL string, kill func(), err err
 // 之前用 rod 的 launcher 时这类失败会等到它自己的超时，慢且看不出原因。
 // 返回 webSocketDebuggerUrl：rod 的 ControlURL 需要 ws 地址，直接给 http 地址会在
 // websocket 握手时 404。
-func waitCDP(baseURL string, timeout time.Duration, cmd *exec.Cmd) (string, error) {
+func waitCDP(baseURL string, timeout time.Duration, cmd *exec.Cmd) (wsURL, product string, err error) {
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
@@ -87,27 +88,46 @@ func waitCDP(baseURL string, timeout time.Duration, cmd *exec.Cmd) (string, erro
 	for {
 		select {
 		case <-exited:
-			return "", fmt.Errorf("浏览器进程提前退出（profile 被占用或参数不被接受）")
+			return "", "", fmt.Errorf("浏览器进程提前退出（profile 被占用或参数不被接受）")
 		default:
 		}
 
 		resp, err := client.Get(baseURL + "/json/version")
 		if err == nil {
 			var v struct {
-				WS string `json:"webSocketDebuggerUrl"`
+				WS      string `json:"webSocketDebuggerUrl"`
+				Browser string `json:"Browser"`
 			}
 			if resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&v) == nil && v.WS != "" {
 				_ = resp.Body.Close()
-				return v.WS, nil
+				return v.WS, v.Browser, nil
 			}
 			_ = resp.Body.Close()
 		}
 
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("等待浏览器调试端口超时（%s）", baseURL)
+			return "", "", fmt.Errorf("等待浏览器调试端口超时（%s）", baseURL)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// killProcessTree 结束浏览器及其所有子进程。
+//
+// 只 kill 主进程不够：Chrome 的渲染/网络子进程会多活一会儿，仍占着 user-data-dir 里的
+// 文件（临时 profile 目录因此删不掉）。Windows 用 taskkill /T 整棵结束，同样带上
+// HideWindow——taskkill 自己是控制台程序，不隐藏就会闪一下黑框（正是要避免的东西）。
+func killProcessTree(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if runtime.GOOS == "windows" {
+		k := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
+		k.SysProcAttr = hiddenProcAttr()
+		_ = k.Run()
+	}
+	_ = cmd.Process.Kill()
 }
 
 // freePort 让内核分配一个空闲端口并立刻释放，交给浏览器监听。

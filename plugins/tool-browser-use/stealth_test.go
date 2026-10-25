@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -55,32 +57,20 @@ func TestTruthy(t *testing.T) {
 	}
 }
 
-// TestCandidateBrowsersPreferExplicitBin DSC_BROWSER_BIN 必须排第一（显式指定的优先），
-// 其余候选按「系统 Chrome 优先于 Edge」排列，且都指向可执行文件路径。
-func TestCandidateBrowsersPreferExplicitBin(t *testing.T) {
-	t.Setenv("DSC_BROWSER_BIN", "/opt/custom/chrome")
-	list := candidateBrowsers()
-	if len(list) == 0 || list[0] != "/opt/custom/chrome" {
-		t.Fatalf("DSC_BROWSER_BIN 应排第一：%v", list)
+// TestCandidateBrowsersExplicitBinFirst DSC_BROWSER_BIN 指定的二进制必须排第一，
+// 并按路径推断内核（msedge → Edge），profile 目录随之匹配。
+func TestCandidateBrowsersExplicitBinFirst(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "msedge.exe")
+	if err := os.WriteFile(bin, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	chromeAt, edgeAt := -1, -1
-	for i, p := range list {
-		if strings.Contains(p, "Chrome") || strings.Contains(p, "chrome") {
-			if chromeAt < 0 {
-				chromeAt = i
-			}
-		}
-		if strings.Contains(p, "Edge") || strings.Contains(p, "msedge") || strings.Contains(p, "edge") {
-			if edgeAt < 0 {
-				edgeAt = i
-			}
-		}
+	t.Setenv("DSC_BROWSER_BIN", bin)
+	cands := browserCandidates()
+	if len(cands) == 0 || cands[0].Bin != bin {
+		t.Fatalf("DSC_BROWSER_BIN 应排第一：%+v", cands)
 	}
-	if chromeAt < 0 {
-		t.Fatalf("候选里应有 Chrome：%v", list)
-	}
-	if edgeAt >= 0 && edgeAt < chromeAt {
-		t.Fatalf("Chrome 应排在 Edge 之前（profile 目录按 Chrome 找）：%v", list)
+	if cands[0].Name != "Edge" {
+		t.Fatalf("按路径应识别为 Edge，实际 %q", cands[0].Name)
 	}
 }
 
@@ -117,21 +107,82 @@ func TestHardenLauncherFlags(t *testing.T) {
 	}
 }
 
-// TestSessionNote 只有「请求了复用登录态、实际却是隔离会话」才提示；其余情况不打扰模型。
+// TestSessionNote 只有启动阶段写了 Switched（换浏览器 / 退回隔离会话）才提示模型。
 func TestSessionNote(t *testing.T) {
-	isolated := &BrowserSession{UserMode: false}
-	user := &BrowserSession{UserMode: true}
+	if got := sessionNote(nil); got != "" {
+		t.Fatalf("无会话时不该提示：%q", got)
+	}
+	if got := sessionNote(&BrowserSession{}); got != "" {
+		t.Fatalf("正常复用登录态时不该提示：%q", got)
+	}
+	switched := &BrowserSession{Switched: "Chrome 的登录态被占用，已改用 Edge 的登录态"}
+	if got := sessionNote(switched); got != switched.Switched {
+		t.Fatalf("应转达启动阶段的说明，实际 %q", got)
+	}
+}
 
-	if got := sessionNote(true, isolated); got == "" {
-		t.Fatal("请求复用登录态却拿到隔离会话时，应说明原因")
+// TestEngineLabel 引擎标签要讲清楚「哪个内核 + 主版本 + 有没有登录态」。
+func TestEngineLabel(t *testing.T) {
+	cases := []struct {
+		name, product string
+		userMode      bool
+		want          string
+	}{
+		{"Chrome", "Chrome/155.0.0.0", true, "Chrome 155（用户登录态）"},
+		{"Edge", "Edg/141.0.3537.71", false, "Edge 141（隔离会话）"},
+		{"Chrome", "", false, "Chrome（隔离会话）"},
 	}
-	if got := sessionNote(true, user); got != "" {
-		t.Fatalf("复用成功不该有提示：%q", got)
+	for _, c := range cases {
+		if got := engineLabel(c.name, c.product, c.userMode); got != c.want {
+			t.Fatalf("engineLabel(%q,%q,%v) = %q, want %q", c.name, c.product, c.userMode, got, c.want)
+		}
 	}
-	if got := sessionNote(false, isolated); got != "" {
-		t.Fatalf("模型显式要求隔离时不该提示：%q", got)
+}
+
+// TestShortVersion 从 "Chrome/155.0.0.0" 取主版本；异常输入原样返回。
+func TestShortVersion(t *testing.T) {
+	for in, want := range map[string]string{
+		"Chrome/155.0.0.0":  "155",
+		"Edg/141.0.3537.71": "141",
+		"155.0.0.0":         "155.0.0.0", // 没有斜杠：原样（避免猜）
+		"":                  "",
+	} {
+		if got := shortVersion(in); got != want {
+			t.Fatalf("shortVersion(%q) = %q, want %q", in, got, want)
+		}
 	}
-	if got := sessionNote(true, nil); got != "" {
-		t.Fatalf("会话缺失时不该提示：%q", got)
+}
+
+// TestBrowserCandidatesPairProfile 每个候选都带「与自身内核匹配」的 profile 目录，
+// 且 Chrome 排在 Edge 前面——顺序即降级顺序：Chrome 被占用时先试 Edge，而不是直接隔离。
+func TestBrowserCandidatesPairProfile(t *testing.T) {
+	t.Setenv("DSC_BROWSER_BIN", "")
+	cands := browserCandidates()
+	if len(cands) == 0 {
+		t.Skip("本机未安装 Chrome/Edge")
+	}
+	firstEdge, firstChrome := -1, -1
+	for i, c := range cands {
+		if c.Bin == "" {
+			t.Fatalf("候选不该有空路径：%+v", c)
+		}
+		if c.ProfileDir != "" && c.Name == "Edge" && strings.Contains(strings.ToLower(c.ProfileDir), "google") {
+			t.Fatalf("Edge 不能用 Chrome 的 profile：%+v", c)
+		}
+		if c.ProfileDir != "" && c.Name == "Chrome" && strings.Contains(strings.ToLower(c.ProfileDir), "edge") {
+			t.Fatalf("Chrome 不能用 Edge 的 profile：%+v", c)
+		}
+		if c.Name == "Edge" && firstEdge < 0 {
+			firstEdge = i
+		}
+		if c.Name == "Chrome" && firstChrome < 0 {
+			firstChrome = i
+		}
+	}
+	if firstChrome < 0 {
+		t.Fatalf("候选里应有 Chrome：%+v", cands)
+	}
+	if firstEdge >= 0 && firstEdge < firstChrome {
+		t.Fatalf("Chrome 应排在 Edge 之前：%+v", cands)
 	}
 }
