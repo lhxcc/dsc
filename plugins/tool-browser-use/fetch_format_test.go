@@ -48,3 +48,28 @@ func TestParseFetchFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestComposeNotes 多条提示拼接；空提示略去，避免出现「；；」或孤零零的分号。
+func TestComposeNotes(t *testing.T) {
+	if got := composeNotes("", "b", ""); got != "b" {
+		t.Fatalf("空提示应略去，实际 %q", got)
+	}
+	if got := composeNotes("a", "b"); got != "a；b" {
+		t.Fatalf("应以中文分号连接，实际 %q", got)
+	}
+	if got := composeNotes(); got != "" {
+		t.Fatalf("全空应返回空串，实际 %q", got)
+	}
+}
+
+// TestFallbackNote 只有「请求 layout、实际降级成 text」时才提示；显式要 text/html 不该提示。
+func TestFallbackNote(t *testing.T) {
+	if got := fallbackNote("text(fallback)"); got == "" {
+		t.Fatal("降级必须有提示，否则模型会把并排结构当成缺失")
+	}
+	for _, f := range []fetchFormat{formatLayout, formatText, formatHTML} {
+		if got := fallbackNote(f); got != "" {
+			t.Fatalf("%s 不该有降级提示：%q", f, got)
+		}
+	}
+}

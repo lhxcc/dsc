@@ -648,6 +648,9 @@ type WebFetchResult struct {
 	// （默认 profile 被运行中的 Chrome 占用），此时拿到的是隔离会话，页面要登录属正常。
 	// 不告诉模型的话，它会把「需要登录」误判成站点反爬或页面结构问题。
 	Note string `json:"note,omitempty"`
+	// Format 回显实际使用的取文形态（layout/text/html）。诊断「模型以为拿到版面、
+	// 实际拿到 innerText」这类问题时，没有它就只能靠猜。
+	Format string `json:"format,omitempty"`
 }
 
 // sessionNote 说明本次会话的隐性前提，供模型判断「为什么页面要登录」。
@@ -697,6 +700,27 @@ func parseFetchFormat(format string, legacyReturnHTML bool) (fetchFormat, error)
 	return "", fmt.Errorf("invalid format %q: use layout (default), text, or html", format)
 }
 
+// composeNotes 把几条提示拼成一句（用「；」分隔），空提示自动略去。
+func composeNotes(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "；")
+}
+
+// fallbackNote 说明「请求的是版面文本、实际拿到的是 innerText」——这种降级必须让模型
+// 知道：它可能因此把并排的导航/表格当成一句话，或者反过来以为页面缺内容。
+func fallbackNote(used fetchFormat) string {
+	if !strings.HasPrefix(string(used), string(formatText)+"(") {
+		return ""
+	}
+	return "版面还原未成功（页面结构异常或脚本未就绪），本次返回的是原始 innerText：并排的导航/表格会被拆成多行；" +
+		"如需版面可稍后重试 format=layout"
+}
+
 // webFetchImpl 抓取网页内容。format 决定返回形态（见 fetchFormat）：
 //   - layout：按视觉版面还原的文本（默认，便于模型理解表格/卡片等并排结构）；
 //   - text  ：原始 innerText（紧凑，丢失并排关系）；
@@ -717,6 +741,7 @@ func webFetchImpl(sessionID, url string, format fetchFormat, userMode bool) (str
 	}
 
 	var content string
+	used := format
 	switch format {
 	case formatHTML:
 		content = page.MustEval("() => document.documentElement.outerHTML").Str()
@@ -728,11 +753,24 @@ func webFetchImpl(sessionID, url string, format fetchFormat, userMode bool) (str
 		// 「谁和谁在同一行」。排版失败（页面异常/脚本被禁）才退回 innerText。
 		content, _ = renderLayout(page.MustEval(layoutExtractJS).Str())
 		if content == "" {
+			// SPA 首屏还没渲染完时测量结果可能是空的：等一下再试一次，别急着降级
+			time.Sleep(400 * time.Millisecond)
+			content, _ = renderLayout(page.MustEval(layoutExtractJS).Str())
+		}
+		if content == "" {
+			log.Printf("web_fetch: 版面还原失败，退回 innerText（url=%s）", url)
 			content = page.MustEval("() => document.body.innerText").Str()
+			used = fetchFormat("text(fallback)")
 		}
 	}
 
-	e := WebFetchResult{Success: true, URL: url, Content: content, Note: sessionNote(userMode, sess)}
+	e := WebFetchResult{
+		Success: true,
+		URL:     url,
+		Content: content,
+		Format:  string(used),
+		Note:    composeNotes(sessionNote(userMode, sess), fallbackNote(used)),
+	}
 	b, _ := json.Marshal(e)
 	return string(b), nil
 }
@@ -1052,6 +1090,9 @@ func webFetchView(result string) (json.RawMessage, error) {
 	}
 	if r.Note != "" {
 		body = "⚠️ " + r.Note + "\n\n" + body
+	}
+	if r.Format != "" {
+		body = "format: " + r.Format + "\n" + body
 	}
 	badge := &dsc.ViewBadge{Text: "ok", Tone: "green"}
 	if !r.Success {
