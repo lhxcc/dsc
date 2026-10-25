@@ -32,8 +32,9 @@ type BrowserSession struct {
 	ActivePage string
 	CreatedAt  time.Time
 	LastUsed   time.Time
-	UserMode   bool // 是否命中用户模式（复用默认 Chrome 登录态）
-	Headless   bool // 是否无头会话（无头时 UA 里会带 HeadlessChrome，建页时替换掉）
+	UserMode   bool   // 是否命中用户模式（复用默认 Chrome 登录态）
+	Headless   bool   // 是否无头会话（无头时 UA 里会带 HeadlessChrome，建页时替换掉）
+	kill       func() // 结束浏览器进程（本地启动的会话才有；CDP 复用为 nil）
 	mu         sync.Mutex
 }
 
@@ -259,52 +260,57 @@ func hardenLauncher(l *launcher.Launcher, headed, offscreen bool) *launcher.Laun
 	return l.HeadlessNew(true)
 }
 
-// tryLaunch 用给定 user-data-dir 启动浏览器并连接，返回是否成功。
-// headed 决定有没有窗口（见 browserHeaded）。
-// 用 recover 捕获启动/连接异常（如 profile 被锁），供用户模式失败降级。
-// 环境变量 DSC_BROWSER_CDP_URL 指向现有 CDP 端点时跳过本地 chromium 启动，
-// 直接连接该端点（供 mock chromium 集成测试等场景复用，避免依赖本机浏览器）——
-// 这条路径由调用方自备浏览器，反爬策略也由那边负责。
-func tryLaunch(userDataDir string, headed, offscreen bool) (b *rod.Browser, ok bool) {
+// tryLaunch 用给定 user-data-dir 启动浏览器并连接。
+// headed 决定有没有窗口（见 browserHeaded），offscreen 表示有头但窗口挪出屏幕。
+// 返回的 kill 用于会话关闭时真正结束浏览器进程（rod 的 launcher 不管这件事）。
+//
+// 环境变量 DSC_BROWSER_CDP_URL 指向现有 CDP 端点时跳过本地启动，直接连接该端点
+// （供 mock chromium 集成测试等场景复用）——那条路径的进程不归我们管，kill 为 nil。
+func tryLaunch(userDataDir string, headed, offscreen bool) (b *rod.Browser, kill func(), ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			ok = false
 			b = nil
+			kill = nil
 		}
 	}()
 	if u := os.Getenv("DSC_BROWSER_CDP_URL"); u != "" {
-		b = newBrowser(u)
-		return b, true
+		return newBrowser(u), nil, true
 	}
 	l := launcher.New().UserDataDir(userDataDir)
 	if bin := browserBin(); bin != "" {
 		l = l.Bin(bin)
 	}
 	l = hardenLauncher(l, headed, offscreen)
-	b = newBrowser(l.MustLaunch())
-	return b, true
+
+	controlURL, stop, err := launchChrome(l)
+	if err != nil {
+		log.Printf("[BrowserSessionManager] 启动浏览器失败: %v%s", err, chromeRunningHint(err))
+		return nil, nil, false
+	}
+	return newBrowser(controlURL), stop, true
 }
 
 // launchBrowserRod 启动浏览器实例。userMode 为真时优先复用默认 Chrome 用户数据
 // 目录（携带登录态）；该目录不可用（如用户 Chrome 已在运行、profile 被锁）时
 // 自动降级到按 session 隔离的临时目录。返回浏览器与是否命中了用户模式。
-func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool, error) {
+func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool, func(), error) {
 	headed := browserHeaded()
 	off := headed && browserOffscreen()
 
 	// 用户模式：复用默认用户数据目录以保留登录态；失败则逐级降级
 	if userMode {
 		if dir := defaultUserDataDir(); dir != "" {
-			if b, ok := tryLaunch(dir, headed, off); ok {
+			if b, kill, ok := tryLaunch(dir, headed, off); ok {
 				log.Printf("[BrowserSessionManager] user-mode session %s using default Chrome profile %s (headed=%v)", sessionID, dir, headed)
-				return b, true, !headed, nil
+				return b, true, !headed, kill, nil
 			}
 			// 有头起不来（无桌面会话 / profile 被运行中的 Chrome 占用）时先退化到无头，
 			// 再退化到隔离 profile——降级顺序按「反爬风险」从小到大排。
 			if headed {
-				if b, ok := tryLaunch(dir, false, false); ok {
+				if b, kill, ok := tryLaunch(dir, false, false); ok {
 					log.Printf("[BrowserSessionManager] user-mode session %s: headed launch failed, using default profile headless", sessionID)
-					return b, true, true, nil
+					return b, true, true, kill, nil
 				}
 			}
 			log.Printf("[BrowserSessionManager] user-mode profile unavailable for %s (likely locked), falling back to isolated temp profile", sessionID)
@@ -314,14 +320,14 @@ func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool
 	// 获取可执行文件所在目录
 	exeDir, err := getExeDir()
 	if err != nil {
-		return nil, false, false, fmt.Errorf("failed to get executable dir: %w", err)
+		return nil, false, false, nil, fmt.Errorf("failed to get executable dir: %w", err)
 	}
 
 	// 浏览器数据目录：程序可执行路径下的 temp/browser-data/<sessionID>
 	// 避免与 workspace 混雜，並通過 sessionID 區分不同實例
 	browserDataDir := dsc.PJoin(exeDir, "temp", "browser-data", sessionID)
 	if err := dsc.MkdirAll(browserDataDir); err != nil {
-		return nil, false, false, fmt.Errorf("failed to create browser data directory: %w", err)
+		return nil, false, false, nil, fmt.Errorf("failed to create browser data directory: %w", err)
 	}
 
 	// 清理24小時前的臨時瀏覽器數據
@@ -330,11 +336,11 @@ func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool
 	}
 
 	isolatedHeaded := browserHeaded()
-	b, ok := tryLaunch(browserDataDir, isolatedHeaded, isolatedHeaded && browserOffscreen())
+	b, kill, ok := tryLaunch(browserDataDir, isolatedHeaded, isolatedHeaded && browserOffscreen())
 	if !ok {
-		return nil, false, false, fmt.Errorf("failed to launch browser for session %s", sessionID)
+		return nil, false, false, nil, fmt.Errorf("failed to launch browser for session %s", sessionID)
 	}
-	return b, false, !isolatedHeaded, nil
+	return b, false, !isolatedHeaded, kill, nil
 }
 
 // CreateSession 創建新的瀏覽器會話
@@ -352,7 +358,7 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 	}
 
 	// 啟動瀏覽器
-	browser, usedUserMode, headless, err := launchBrowserRod(sessionID, userMode)
+	browser, usedUserMode, headless, killBrowser, err := launchBrowserRod(sessionID, userMode)
 	if err != nil {
 		return nil, fmt.Errorf("啟動瀏覽器失敗: %w", err)
 	}
@@ -366,6 +372,7 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 		LastUsed:  now,
 		UserMode:  usedUserMode,
 		Headless:  headless,
+		kill:      killBrowser,
 	}
 
 	m.sessions[sessionID] = sess
@@ -405,6 +412,10 @@ func (m *BrowserSessionManager) CloseSession(sessionID string) error {
 	if sess.Browser != nil {
 		log.Printf("[BrowserSessionManager] Closing browser session %s", sessionID)
 		sess.Browser.Close()
+	}
+	if sess.kill != nil {
+		sess.kill() // 断连不会带走进程，得自己收
+		sess.kill = nil
 	}
 	return nil
 }

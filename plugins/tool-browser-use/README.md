@@ -77,6 +77,20 @@ CDP 客户端接管就会被打开。删 `--enable-automation` 是为了另一�
 无头会话的 UA 里 Chrome 会写 `HeadlessChrome/xx`，建页时用页面自身 UA 去掉该标记再回设
 （版本号与平台保持真实，不另编 UA）。
 
+## 进程启动（Windows 弹窗问题）
+
+浏览器由插件自己 `exec` 起，不走 `rod` 的 `launcher.MustLaunch`。原因在 Windows 上：
+
+- rod 给子进程只设 `CREATE_NEW_PROCESS_GROUP`，**不设 `HideWindow` / `CREATE_NO_WINDOW`**。
+  当 DSC 从「没有控制台」的上下文（快捷方式、GUI 宿主、某些终端分屏）拉起时，Windows 会给
+  控制台子系统子进程新建一个控制台窗口，屏幕上一闪而过一个黑框；
+- rod 默认开 leakless：把浏览器二进制复制到临时目录、经一个 Go 小进程转启，退出时再调
+  `taskkill`——都是控制台进程，闪烁概率更高。
+
+现在 `launch_proc.go` 自己起进程：`SysProcAttr{HideWindow: true, CreationFlags: CREATE_NO_WINDOW}`
+（Linux/macOS 用 `Setpgid`），参数仍由 rod 的 `FormatArgs()` 生成（flag 集合不变），leakless 彻底不用。
+附带一个修复：进程句柄归我们管，会话关闭时 `CloseSession` 会真正结束浏览器，不再残留 chrome 进程。
+
 ## 环境变量
 
 | 变量 | 作用 |
