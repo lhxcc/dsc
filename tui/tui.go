@@ -3478,6 +3478,9 @@ func (m *Model) displayMode() string {
 }
 
 // shortTokens 把 token 数格式化为以 1024 为底的短单位（如 128K），小于 1024 显示原数。
+//
+// 插件侧的同口径实现见 dsc-billion-context/acp.FormatTokenCount——两处必须一致：
+// 曾经那边按 1000 折算，同一个 1M 窗口在状态面板显示成 1.05M、在标题显示成 1.0M。
 func shortTokens(n int) string {
 	switch {
 	case n >= 999*1024:

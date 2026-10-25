@@ -26,15 +26,19 @@ var ACPManagedTools = map[string]bool{
 	"absorb":         true,
 }
 
-// FormatTokenCount token 数的紧凑展示（990 / 1.2K / 34K）。
+// FormatTokenCount token 数的紧凑展示（990 / 1.2K / 34K），**以 1024 为底**。
+//
+// 底数必须与 DSC 全局一致（tui.shortTokens 同样是 n/1024、n/1024/1024）：
+// 用 1000 会在 1M 窗口上打出「1.05M」这种与别处对不上的数（1048576/1000/1000），
+// 也会让 420K 显示成 420 而实际是 410K（1024 底）——同一个会话在两处看到不同的量。
 func FormatTokenCount(tokens int) string {
 	switch {
-	case tokens < 1000:
-		return itoa(tokens)
-	case tokens < 10000:
-		return fmt.Sprintf("%.1fK", float64(tokens)/1000)
+	case tokens >= 999*1024:
+		return fmt.Sprintf("%.1fM", float64(tokens)/1024/1024)
+	case tokens >= 1024:
+		return itoa(tokens/1024) + "K"
 	default:
-		return itoa((tokens+500)/1000) + "K"
+		return itoa(tokens)
 	}
 }
 
