@@ -48,9 +48,11 @@ func TestInternalGrepRecursive(t *testing.T) {
 	if got := exitCode(t, err); got != 0 {
 		t.Fatalf("grep -rn 应成功（报告中被拒为 unsupported option: -rn）: exit=%d out=%q", got, out)
 	}
-	want := "src/a.js:1:needme a\n" +
-		"src/nested/b.txt:1:needme b\n" +
-		"top.txt:1:needme top\n"
+	// 前缀保留参数的书写形态：`grep -rn PAT .` 在 GNU 下输出 `./src/a.js:1:…`。
+	// 顺序仍按路径升序（工具结果进模型上下文，顺序不得随文件系统返回序漂移）。
+	want := "./src/a.js:1:needme a\n" +
+		"./src/nested/b.txt:1:needme b\n" +
+		"./top.txt:1:needme top\n"
 	if out != want {
 		t.Fatalf("grep -rn 输出不符:\n got %q\nwant %q", out, want)
 	}
@@ -168,13 +170,13 @@ func TestInternalGrepRecursiveBinaryFile(t *testing.T) {
 	if got := exitCode(t, err); got != 0 {
 		t.Fatalf("含二进制文件的递归搜索应成功: exit=%d out=%q", got, out)
 	}
-	if !strings.Contains(out, "Binary file blob.bin matches") {
+	if !strings.Contains(out, "Binary file ./blob.bin matches") {
 		t.Fatalf("二进制命中应报 Binary file ... matches: %q", out)
 	}
 	if strings.Contains(out, "\x00") || strings.Contains(out, "head") {
 		t.Fatalf("二进制内容不得进入输出: %q", out)
 	}
-	if !strings.Contains(out, "text.txt:1:needme text") {
+	if !strings.Contains(out, "./text.txt:1:needme text") {
 		t.Fatalf("文本文件仍应逐行回显: %q", out)
 	}
 }

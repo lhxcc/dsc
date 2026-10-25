@@ -1,12 +1,11 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"strings"
 	"testing"
-
 )
 
 // TestShellView 校验 shell 工具的结构化视图：退出码徽标（0 绿 / 非 0 红）

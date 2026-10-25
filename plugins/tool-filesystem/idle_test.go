@@ -1,12 +1,11 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"strings"
 	"testing"
 	"time"
-
 )
 
 // TestShellOutputTouchesKeepsAlive 活动信号链路端到端（插件侧）：命令持续产生

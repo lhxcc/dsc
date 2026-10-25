@@ -49,13 +49,23 @@ type grepOpts struct {
 	before, after int  // -B/-A/-C 上下文行数
 	maxCount      int  // -m N：每个文件最多命中 N 行（0 = 不限）
 
+	// filenameMode -h/-H 的显式要求：-1 强制不带文件名，+1 强制带，0 由目标数决定。
+	// 两者同时出现时后写者生效（GNU 亦然），故用三位状态而不是两个布尔。
+	filenameMode int
+	// noMessages -s：不打印读文件/找目录的错误信息（退出码仍按 GNU：2）。
+	noMessages bool
+	// patterns 由 -e/--regexp 给出的模式列表。GNU 允许重复，语义是「任一命中」；
+	// 此前每个 -e 都覆盖上一个，`grep -e foo -e bar` 只剩 bar——静默少匹配，
+	// 比报错更危险（模型会以为文件里没有 foo）。
+	patterns []string
+
 	includes    []string // --include=GLOB
 	excludes    []string // --exclude=GLOB
 	excludeDirs []string // --exclude-dir=GLOB
 }
 
 // grepSupported 报错时列出的受支持旗标（缺旗标时报错要能指引模型改用可用写法）。
-const grepSupported = "-i -v -n -c -l -o -q -x -F -E -w -r/-R -m N -A N -B N -C N " +
+const grepSupported = "-i -v -n -c -l -o -q -x -F -E -w -h -H -s -r/-R -m N -A N -B N -C N " +
 	"--include=GLOB --exclude=GLOB --exclude-dir=GLOB"
 
 func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
@@ -72,9 +82,13 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintf(hc.Stderr, "grep: %v\n", cerr)
 		return interp.NewExitStatus(2)
 	}
+	// 无路径参数时默认搜当前目录，但与显式写 `.` 有别：GNU 的 `grep -r PAT` 打印
+	// `a.txt`，`grep -r PAT .` 打印 `./a.txt`。implicitRoot 记住这个差别。
+	implicitRoot := false
 	if len(files) == 0 {
 		if opts.recursive {
 			files = []string{"."}
+			implicitRoot = true
 		} else {
 			files = []string{"-"}
 		}
@@ -90,7 +104,9 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		p := res(hc, f)
 		fi, statErr := os.Stat(p)
 		if statErr != nil {
-			fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", f, slashErr(statErr))
+			if !opts.noMessages {
+				fmt.Fprintf(hc.Stderr, "grep: %s: %s\n", f, slashErr(statErr))
+			}
 			exit = 2
 			continue
 		}
@@ -99,15 +115,28 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 			continue
 		}
 		if !opts.recursive {
-			fmt.Fprintf(hc.Stderr, "grep: %s: Is a directory (use -r to search recursively)\n", f)
+			if !opts.noMessages {
+				fmt.Fprintf(hc.Stderr, "grep: %s: Is a directory (use -r to search recursively)\n", f)
+			}
 			exit = 2
 			continue
 		}
-		grepCollect(ctx, hc, p, dsc.PClean(f), &opts, &targets)
+		display := f
+		if implicitRoot {
+			display = "" // 见上：无参数时不带 "./"
+		}
+		grepCollect(ctx, hc, p, display, &opts, &targets)
 	}
 
-	// 多目标或 -r 时每行带文件名前缀（对齐 grep -r 的 path:line:text）
+	// 多目标或 -r 时每行带文件名前缀（对齐 grep -r 的 path:line:text）；
+	// -h 强制去掉、-H 强制带上（GNU 语义，后写者生效）。
 	showName := opts.recursive || len(targets) > 1
+	switch opts.filenameMode {
+	case -1:
+		showName = false
+	case 1:
+		showName = true
+	}
 	matchedTotal := 0
 	for _, tg := range targets {
 		if err := ctx.Err(); err != nil {
@@ -204,6 +233,16 @@ func parseGrepArgs(hc interp.HandlerContext, args []string) (grepOpts, string, b
 				}
 			case "color", "colour", "line-buffered", "binary-files", "no-messages":
 				// 输出修饰类选项：不影响匹配结果，接受即忽略
+			case "regexp":
+				v := val
+				if !hasVal {
+					var err error
+					if v, err = needVal(&i, "", name); err != nil {
+						return opts, "", false, nil, interp.NewExitStatus(2)
+					}
+				}
+				opts.patterns = append(opts.patterns, v)
+				patSet = true
 			case "fixed-strings":
 				opts.fixed = true
 			case "extended-regexp":
@@ -287,14 +326,19 @@ func parseGrepArgs(hc interp.HandlerContext, args []string) (grepOpts, string, b
 					opts.quiet = true
 				case 'r', 'R':
 					opts.recursive = true
-				case 'h', 'H', 's':
-					// 文件名前缀/错误输出修饰：接受即忽略（前缀由目标数决定）
+				case 'h':
+					opts.filenameMode = -1
+				case 'H':
+					opts.filenameMode = 1
+				case 's':
+					opts.noMessages = true
 				case 'e':
 					v, err := needVal(&i, a[j+1:], "e")
 					if err != nil {
 						return opts, "", false, nil, interp.NewExitStatus(2)
 					}
-					pat, patSet = v, true
+					opts.patterns = append(opts.patterns, v)
+					patSet = true
 					j = len(a)
 				case 'm', 'A', 'B', 'C':
 					v, err := needVal(&i, a[j+1:], string(f))
@@ -332,11 +376,28 @@ func parseGrepArgs(hc interp.HandlerContext, args []string) (grepOpts, string, b
 // compileGrepPattern 按选项把模式编译为 RE2：-F 走字面文本，默认按 POSIX BRE
 // 语义转换（见 breToERE），-E 直接用 ERE。
 func compileGrepPattern(pat string, opts grepOpts) (*regexp.Regexp, error) {
-	switch {
-	case opts.fixed:
-		pat = regexp.QuoteMeta(pat)
-	case !opts.extended:
-		pat = breToERE(pat)
+	translate := func(p string) string {
+		switch {
+		case opts.fixed:
+			return regexp.QuoteMeta(p)
+		case !opts.extended:
+			return breToERE(p)
+		}
+		return p
+	}
+	// -e/--regexp 可重复：GNU 语义是「任一模式命中即算命中」。单模式仍走原路径，
+	// 保持错误信息（如 BRE 反向引用不受支持）指向用户写的那个模式。
+	switch n := len(opts.patterns); {
+	case n == 1:
+		pat = translate(opts.patterns[0])
+	case n > 1:
+		parts := make([]string, 0, n)
+		for _, p := range opts.patterns {
+			parts = append(parts, "(?:"+translate(p)+")")
+		}
+		pat = strings.Join(parts, "|")
+	default:
+		pat = translate(pat)
 	}
 	// -x 与 -w 同时给出时以 -x 为准（GNU：-w 在 -x 下不起作用）——整行匹配必然
 	// 蕴含整词匹配，再套 \b 只会因行首尾非词字符而误判。
@@ -442,7 +503,7 @@ func grepCollect(ctx context.Context, hc interp.HandlerContext, dir, display str
 			if grepSkipDirs[name] || matchAnyGlob(opts.excludeDirs, name) {
 				continue
 			}
-			grepCollect(ctx, hc, dsc.PJoin(dir, name), dsc.PJoin(display, name), opts, out)
+			grepCollect(ctx, hc, dsc.PJoin(dir, name), joinDisplay(display, name), opts, out)
 			continue
 		}
 		if !e.Type().IsRegular() {
@@ -451,8 +512,22 @@ func grepCollect(ctx context.Context, hc interp.HandlerContext, dir, display str
 		if !grepFileWanted(name, display, opts) {
 			continue
 		}
-		*out = append(*out, grepTarget{display: dsc.PJoin(display, name), path: dsc.PJoin(dir, name)})
+		*out = append(*out, grepTarget{display: joinDisplay(display, name), path: dsc.PJoin(dir, name)})
 	}
+}
+
+// joinDisplay 把「目录的显示名」与条目名拼成输出里看到的路径。
+//
+// 不能复用 dsc.PJoin：它做路径归一（清掉开头的 "./"），于是 `grep -r PAT .`
+// 打印 a.txt 而 GNU 打印 ./a.txt。这里只做字面拼接，保留参数的书写形态。
+func joinDisplay(dir, name string) string {
+	switch {
+	case dir == "":
+		return name
+	case strings.HasSuffix(dir, "/"), strings.HasSuffix(dir, "\\"):
+		return dir + name
+	}
+	return dir + "/" + name
 }
 
 // grepFileWanted 依 --include/--exclude 判定文件是否参与搜索。
