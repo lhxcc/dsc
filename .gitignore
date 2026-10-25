@@ -53,3 +53,4 @@ bun.lockb
 /dist/
 
 .DS_Store
+git-dev.md
