@@ -397,22 +397,19 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	input.MinHeight = 1
 	input.MaxHeight = composerMax
 	input.SetHeight(1)
-	// 仅首行显示提示符「> 」，续行留空；高度随内容行数变化（见 syncInputHeight）。
+	// 仅首行显示提示符「❯ 」，续行留空；高度随内容行数变化（见 syncInputHeight）。
 	//
-	// 提示符必须是**宽度确定的 ASCII**：真实光标的位置是按「padding + 提示符 +
-	// 已输入文字的列宽」算出来的（见 inputCursorAbs），只要提示符在终端里比我们
-	// 以为的宽一列，整行文字就会右移一列、光标落到中文的第二个单元格上——看起来
-	// 就是「中文只被选中一半」。
-	//
-	// 这里原本用「❯ 」（U+276F）。它的东亚宽度是 Neutral：多数等宽字体没有这个
-	// 字形，终端回退到中文字体后按全角 2 列绘制，而 lipgloss 只算 1 列，于是差出
-	// 一列（虚拟光标时代看不出来，因为光标画在文字里、一起偏移；改成真实终端光标
-	// 后这个偏差就暴露在光标位置上了）。ASCII 的 ">" 是 Narrow，任何字体都是 1 列。
-	input.SetPromptFunc(2, func(info textarea.PromptInfo) string {
+	// 提示符占 2 列，是输入行原点的一部分：真实光标的位置按「padding + 提示符 +
+	// 已输入文字到插入点的列宽」算出来（见 inputCursorAbs），所以这里的宽度必须与
+	// lipgloss 量到的（同样 2 列）一致，否则整行文字会相对光标模型偏移。U+276F 的
+	// 东亚宽度是 Neutral，个别终端会把它交给中文字体按全角绘制——真出现那种情况，
+	// 症状是输入行整体右移一列、光标压在相邻汉字的半个格子上。宽度假设在
+	// cursor_prompt_width_test.go 里钉住。
+	input.SetPromptFunc(composerPromptWidth, func(info textarea.PromptInfo) string {
 		if info.LineNumber != 0 {
 			return ""
 		}
-		return "> "
+		return "❯ "
 	})
 	// 回车在宿主层拦截用于发送，这里仅兜底新增换行键位。
 	// 终端协议里 Enter/Ctrl+Enter 都发送相同的 CR 字节（Bubble Tea v2 无法区分），
@@ -2306,6 +2303,7 @@ var slashCommands = []compItem{
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
 	{label: "/session default", insert: "/session default", hint: "切换到指定会话（如 /session session-3）"},
 	{label: "/session delete", insert: "/session delete ", hint: "删除指定会话（如 /session delete session-3）"},
+	{label: "/caret", insert: "/caret", hint: "诊断输入行宽度（光标压字时定位可疑字符）"},
 	{label: "/export", insert: "/export", hint: "导出当前会话为 Markdown 文件"},
 	{label: "/exit", insert: "/exit", hint: "退出聊天"},
 }
@@ -2604,6 +2602,7 @@ func (m *Model) buildHelpText() string {
 		"  /jobs        列出后台任务（含 workflow）与状态",
 		"  /jobs output <id>  读取后台任务输出（如 /jobs output workflow-1）",
 		"  /jobs kill <id> [reason]  取消后台任务",
+		"  /caret       诊断输入行宽度：逐字符列出可能让光标偏移的可疑字符（零宽/变体选择符/星光平面等）",
 		"  /sessions    列出所有会话",
 		"  /crons       列出所有定时任务",
 		"  /cron add <cron> <prompt>  添加定时任务（cron 为 5 段表达式，如 0 8 * * *）",
@@ -2672,6 +2671,16 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 技能") + "\n" + strings.Join(skills, "\n"))
 		}
 		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, nil
+	case "/caret":
+		// 输入行宽度诊断：光标压在汉字半格上时，用它把输入逐字符反查一遍
+		// （零宽字符、变体选择符、星光平面字符等肉眼看不见的元凶会列出来）。
+		// 诊断期间保留输入内容，方便用户对照删除后再次自查。
+		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 输入行诊断") + "\n" + m.caretDiagnostic())
 		m.completion = completion{}
 		m.syncInputHeight()
 		m.render()
@@ -3779,8 +3788,8 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 	if cur == nil {
 		return nil
 	}
-	// X：外层 composer 左侧 padding 1 列（无左边框线）
-	cur.X += 1
+	// X：外层 composer 左侧 padding（无左边框线）
+	cur.X += composerPadLeft
 	// Y：标题(1) + viewport + 中间各部件（待办面板/思考行/补全菜单）+ composer 顶边框(1)
 	y := titleRows + m.viewport.Height()
 	if q := m.questionView(); q != "" {

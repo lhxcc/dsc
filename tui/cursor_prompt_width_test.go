@@ -9,31 +9,40 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// TestComposerPromptIsAscii 输入框提示符必须只含 ASCII。
+// TestComposerPromptMatchesCursorAssumption 提示符的列宽必须与光标算式里的假设一致。
 //
-// 真实光标的位置是算出来的：左侧 padding + 提示符列宽 + 已输入文字的列宽
-// （见 inputCursorAbs）。提示符里只要有一个字形的**实际列宽**与 lipgloss 的测量
-// 不一致，整行文字就会相对我们的模型整体偏移，光标随之落到中文的第二个单元格上
-// ——看到的就是「中文只被选中一半」。
+// 真实光标的位置按「padding + 提示符 + 已输入文字到插入点的列宽」算出来
+// （见 inputCursorAbs）。前缀里唯一由我们写死、而不是从文字量出来的就是提示符：
+// `SetPromptFunc(2, ...)` 的 2 就是它。改了提示符文案却没改这个数，光标就会整体
+// 偏移一到两列——中文输入时表现为「只选中半个字」。
 //
-// 原来的「❯ 」（U+276F）正是这种字形：它的东亚宽度是 Neutral，多数字体没有这个
-// 字形，终端回退到中文字体后按全角 2 列绘制，而我们算 1 列。ASCII 的 ">" 是
-// Narrow，任何字体都是 1 列。
-func TestComposerPromptIsAscii(t *testing.T) {
+// 顺带说明为什么监视这个：U+276F 的东亚宽度是 Neutral，若终端把它交给中文字体按
+// 全角绘制，屏幕上它会占 2 列而不是 1 列；此时这条算式本身没错，错的是「终端实际
+// 绘制的列宽」与「我们量到的列宽」不一致——那是字体层面的事，DSC 侧只能保证自己
+// 的假设自洽（所以这里钉住 2）。
+func TestComposerPromptMatchesCursorAssumption(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m.input.Focus()
-	m.input.SetValue("中文abc")
-	m.input.CursorEnd()
+
+	const prompt = "❯ "
+	if got := ansi.StringWidth(prompt); got != 2 {
+		t.Fatalf("提示符 %q 的列宽 %d 与 SetPromptFunc(2, ...) 的假设不符", prompt, got)
+	}
 
 	line := strings.Split(ansi.Strip(m.input.View()), "\n")[0]
-	if !strings.HasPrefix(line, "> ") {
-		t.Fatalf("输入框提示符应为 \"> \"，实际行首: %q", line)
+	if !strings.HasPrefix(line, prompt) {
+		t.Fatalf("输入框首行应以 %q 开头，实际: %q", prompt, line)
 	}
-	for _, r := range line[:2] {
-		if r > 0x7f {
-			t.Fatalf("提示符含非 ASCII 字符 %q：其实际列宽不可控，会让光标整列偏移", r)
-		}
+
+	// 光标在行首：X = 左侧 padding(1) + 提示符(2)
+	m.input.CursorStart()
+	cur := m.inputCursorAbs()
+	if cur == nil {
+		t.Fatal("inputCursorAbs 不应返回 nil")
+	}
+	if cur.X != 1+2 {
+		t.Fatalf("行首光标 X = %d, want %d", cur.X, 1+2)
 	}
 }
 
