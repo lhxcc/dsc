@@ -32,8 +32,8 @@ func TestRenderLayoutKeepsSameRowTogether(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("同一行的三块应产出 1 行，实际 %d 行：%q", len(lines), out)
 	}
-	// 列位：0 / 20 / 40 列（x÷8），每块 2 个全角字
-	want := "首页" + strings.Repeat(" ", 18) + "关于" + strings.Repeat(" ", 18) + "联系"
+	// 列位：0 / 20 / 40 列（x÷8）；"首页" 占 4 列（全角按 2 列计），故补 16 空格到第 20 列
+	want := "首页" + strings.Repeat(" ", 16) + "关于" + strings.Repeat(" ", 16) + "联系"
 	if lines[0] != want {
 		t.Fatalf("行内容不对\n got=%q\nwant=%q", lines[0], want)
 	}
@@ -115,7 +115,7 @@ func TestRenderLayoutTable(t *testing.T) {
 		if i < 0 {
 			t.Fatalf("%q 中找不到 %q", line, want)
 		}
-		return len([]rune(line[:i]))
+		return cellWidth(line[:i]) // 列位按显示宽度比，汉字占两列
 	}
 	if colOf(lines[0], "年龄") != colOf(lines[1], "28") {
 		t.Fatalf("同一列应对齐：%q / %q", lines[0], lines[1])
@@ -156,7 +156,57 @@ func TestRenderLayoutCharWFallback(t *testing.T) {
 	if !strings.Contains(out, "甲") || !strings.Contains(out, "乙") {
 		t.Fatalf("两块都应保留：%q", out)
 	}
-	if strings.Count(out, " ") != 9 {
-		t.Fatalf("按默认 8px 应有 9 个空格，实际：%q", out)
+	if strings.Count(out, " ") != 8 {
+		t.Fatalf("按默认 8px、汉字占 2 列，应有 8 个空格，实际：%q", out)
 	}
 }
+
+// TestRenderLayoutJoinsInlineRuns 同一位置起头的两块（<b>、<span> 把一个词拆成两个
+// 文本节点）必须直接拼接，不能插空格——否则 "PDI" 会被写成 "PD I"。
+func TestRenderLayoutJoinsInlineRuns(t *testing.T) {
+	cont := item("I造假", 15, 0, 20) // 15px ÷ 8 ≈ 2 列，而 "PD" 已占 2 列
+	cont.Cont = true               // 测量侧判定「接着上一段写的」
+	payload := mkPayload(8, item("PD", 0, 0, 20), cont)
+	out, _ := renderLayout(payload)
+	if out != "PDI造假" {
+		t.Fatalf("内联片段应直接拼接，实际：%q", out)
+	}
+}
+
+// TestRenderLayoutSeparatesAdjacentBlocks 两个独立块即使矩形贴在一起（页面上没有栏距）
+// 也必须隔开：把两条互不相干的标题粘成一句，比多一个空格危险得多。
+func TestRenderLayoutSeparatesAdjacentBlocks(t *testing.T) {
+	next := item("2027款坦克500正式上市", 108, 0, 20) // 紧贴上一块右缘
+	payload := mkPayload(8, item("售价33.5万元", 0, 0, 20), next)
+	out, _ := renderLayout(payload)
+	if strings.Contains(out, "万元2027") {
+		t.Fatalf("相邻的独立块被粘在一起了：%q", out)
+	}
+	// 具体补几个空格由列位决定（这里是 2 个），只要隔开且两块都完整即可
+	if !strings.HasPrefix(out, "售价33.5万元 ") || !strings.HasSuffix(out, "2027款坦克500正式上市") {
+		t.Fatalf("两块之间应有空格，实际：%q", out)
+	}
+}
+
+// TestRenderLayoutDoesNotMergeBeyondPageWidth 超出页宽的块不参与行内合并：
+// 两个隔着大半页的东西（绝对定位残余、横向溢出）并成一行只会得到一长串空格。
+func TestRenderLayoutDoesNotMergeBeyondPageWidth(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{
+		"charW": 8.0,
+		"cols":  12, // 页宽 12 列
+		"items": []layoutItem{item("左", 0, 0, 20), item("右", 4000, 0, 20)},
+	})
+	out, ok := renderLayout(string(payload))
+	if !ok {
+		t.Fatal("应能还原版面")
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Fatalf("超出页宽的两块应各占一行，实际：%q", out)
+	}
+	if strings.Contains(out, "          ") {
+		t.Fatalf("不该出现超长补白：%q", out)
+	}
+}
+
+// TestRenderLayoutJoinsInlineRuns 同一位置起头的两块（<b>、<span> 把一个词拆成两个
+// 文本节点）必须直接拼接，不能插空格——否则 "PDI" 会被写成 "PD I"。

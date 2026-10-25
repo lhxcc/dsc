@@ -103,10 +103,13 @@ func TestLayoutOnRealPage(t *testing.T) {
 		if i < 0 {
 			t.Fatalf("%q 里没有 %q", line, sub)
 		}
-		return len([]rune(line[:i]))
+		return cellWidth(line[:i]) // 按显示列比：汉字占两列
 	}
-	if col(header, "年龄") != col(row, "28") || col(header, "城市") != col(row, "广州") {
-		t.Fatalf("表格列未对齐：\n%s\n%s", header, row)
+	if a, b := col(header, "年龄"), col(row, "28"); a != b {
+		t.Fatalf("第二列未对齐（年龄@%d, 28@%d）：\n%q\n%q", a, b, header, row)
+	}
+	if a, b := col(header, "城市"), col(row, "广州"); a != b {
+		t.Fatalf("第三列未对齐（城市@%d, 广州@%d）：\n%q\n%q", a, b, header, row)
 	}
 	// 4. 被自动换行的段落：拆成多行（不是压成一行），内联链接与它前面那句话在同一行
 	if first, last := lineOf("这是一段比较长的说明文字"), lineOf("整段挤成一行"); last-first < 2 {
