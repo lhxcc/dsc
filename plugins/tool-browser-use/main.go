@@ -33,6 +33,7 @@ type BrowserSession struct {
 	CreatedAt  time.Time
 	LastUsed   time.Time
 	UserMode   bool // 是否命中用户模式（复用默认 Chrome 登录态）
+	Headless   bool // 是否无头会话（无头时 UA 里会带 HeadlessChrome，建页时替换掉）
 	mu         sync.Mutex
 }
 
@@ -103,6 +104,59 @@ func cleanupOldBrowserData(exeDir string) error {
 	return nil
 }
 
+// browserBin 选择要启动的浏览器可执行文件，空串表示交给 rod 自己找（找不到会下载）。
+//
+// 为什么必须显式指定：rod 找不到系统浏览器时会下载**它自己那份 Chromium**（版本往往比
+// 系统 Chrome 老很多）。拿旧 Chromium 去开用户 Chrome 的 user-data-dir，profile 会因为
+// 「由更新版本创建」而打不开，user_mode 于是静默降级成隔离 profile——表现就是「明明设了
+// 复用登录态，结果还是要重新登录」。所以优先用系统装的 Chrome/Edge。
+func browserBin() string {
+	for _, p := range candidateBrowsers() {
+		if p == "" {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// candidateBrowsers 按优先级列出本机可能存在的浏览器可执行文件。
+// DSC_BROWSER_BIN 永远排第一（显式指定优先）。
+func candidateBrowsers() []string {
+	var out []string
+	if p := strings.TrimSpace(os.Getenv("DSC_BROWSER_BIN")); p != "" {
+		out = append(out, p)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"} {
+			base := os.Getenv(env)
+			if base == "" {
+				continue
+			}
+			out = append(out, dsc.PJoin(base, "Google", "Chrome", "Application", "chrome.exe"))
+		}
+		for _, env := range []string{"ProgramFiles(x86)", "ProgramFiles"} {
+			base := os.Getenv(env)
+			if base == "" {
+				continue
+			}
+			out = append(out, dsc.PJoin(base, "Microsoft", "Edge", "Application", "msedge.exe"))
+		}
+	case "darwin":
+		out = append(out,
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		)
+	default:
+		out = append(out, "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge")
+	}
+	return out
+}
+
 // defaultUserDataDir 返回默认 Chrome 用户数据目录（内含用户登录态）。
 // Windows 下为 %LOCALAPPDATA%\Google\Chrome\User Data；不存在或未知平台返回空串。
 func defaultUserDataDir() string {
@@ -117,11 +171,66 @@ func defaultUserDataDir() string {
 	return ""
 }
 
+// browserHeaded 决定本次启动有没有窗口（有头）。
+//
+// 默认规则：复用用户 profile 时有头，隔离 profile 时无头。理由是反爬：有头浏览器在
+// 站点眼里与用户自己打开的 Chrome 没有区别；无头再像，也总是差几项（插件、WebGL、
+// 字体、窗口尺寸）。代价是多一个窗口，所以服务器 / 无桌面环境用 DSC_BROWSER_HEADLESS=1
+// 强制无头；反过来 DSC_BROWSER_HEADED=1 可强制有头（含隔离会话，便于人工看现场）。
+// 有头启动失败（没有桌面会话、profile 被占用）时调用方会自动退化到无头。
+func browserHeaded(userMode bool) bool {
+	if truthy(os.Getenv("DSC_BROWSER_HEADLESS")) {
+		return false
+	}
+	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
+		return true
+	}
+	return userMode
+}
+
+// truthy 宽松解析开关型环境变量：1/true/yes/on 都算开。
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// newBrowser 以关闭「默认设备模拟」的方式建控制器。
+//
+// rod.New() 默认会把每个页面模拟成 MacBook（devices.LaptopWithMDPIScreen）：UA 变成
+// Macintosh + Chrome/114、视口固定 1440x900。在 Windows 上跑却报 Mac UA，是反爬最爱
+// 抓的自相矛盾特征之一（UA 与 platform/字体/时区对不上）。NoDefaultDevice 关掉它，
+// UA 与视口就回到浏览器自己的真实值。
+func newBrowser(controlURL string) *rod.Browser {
+	return rod.New().NoDefaultDevice().ControlURL(controlURL).MustConnect()
+}
+
+// hardenLauncher 抹掉最容易被反爬识别的自动化痕迹。
+//
+// rod 默认会带 --enable-automation：它让 navigator.webdriver === true，并在页面顶部挂
+// 一条「Chrome 正受自动测试软件控制」的提示条——这是最廉价也最致命的指纹，不少站点
+// 据此直接 403。这里删掉它并抑制 AutomationControlled。无头模式改用 --headless=new：
+// UA 与真机一致（老的 --headless 会把 UA 写成 HeadlessChrome/xx）。
+func hardenLauncher(l *launcher.Launcher, headed bool) *launcher.Launcher {
+	l = l.Delete("enable-automation")
+	l = l.Set("disable-blink-features", "AutomationControlled")
+	l = l.Set("lang", "zh-CN")
+	l = l.Set("window-size", "1280,900")
+	if headed {
+		return l.Headless(false)
+	}
+	return l.HeadlessNew(true)
+}
+
 // tryLaunch 用给定 user-data-dir 启动浏览器并连接，返回是否成功。
+// headed 决定有没有窗口（见 browserHeaded）。
 // 用 recover 捕获启动/连接异常（如 profile 被锁），供用户模式失败降级。
 // 环境变量 DSC_BROWSER_CDP_URL 指向现有 CDP 端点时跳过本地 chromium 启动，
-// 直接连接该端点（供 mock chromium 集成测试等场景复用，避免依赖本机浏览器）。
-func tryLaunch(userDataDir string) (b *rod.Browser, ok bool) {
+// 直接连接该端点（供 mock chromium 集成测试等场景复用，避免依赖本机浏览器）——
+// 这条路径由调用方自备浏览器，反爬策略也由那边负责。
+func tryLaunch(userDataDir string, headed bool) (b *rod.Browser, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			ok = false
@@ -129,24 +238,38 @@ func tryLaunch(userDataDir string) (b *rod.Browser, ok bool) {
 		}
 	}()
 	if u := os.Getenv("DSC_BROWSER_CDP_URL"); u != "" {
-		b = rod.New().ControlURL(u).MustConnect()
+		b = newBrowser(u)
 		return b, true
 	}
 	l := launcher.New().UserDataDir(userDataDir)
-	b = rod.New().ControlURL(l.MustLaunch()).MustConnect()
+	if bin := browserBin(); bin != "" {
+		l = l.Bin(bin)
+	}
+	l = hardenLauncher(l, headed)
+	b = newBrowser(l.MustLaunch())
 	return b, true
 }
 
 // launchBrowserRod 启动浏览器实例。userMode 为真时优先复用默认 Chrome 用户数据
 // 目录（携带登录态）；该目录不可用（如用户 Chrome 已在运行、profile 被锁）时
 // 自动降级到按 session 隔离的临时目录。返回浏览器与是否命中了用户模式。
-func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, error) {
-	// 用户模式：复用默认用户数据目录以保留登录态；失败则降级
+func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool, error) {
+	headed := browserHeaded(userMode)
+
+	// 用户模式：复用默认用户数据目录以保留登录态；失败则逐级降级
 	if userMode {
 		if dir := defaultUserDataDir(); dir != "" {
-			if b, ok := tryLaunch(dir); ok {
-				log.Printf("[BrowserSessionManager] user-mode session %s using default Chrome profile %s", sessionID, dir)
-				return b, true, nil
+			if b, ok := tryLaunch(dir, headed); ok {
+				log.Printf("[BrowserSessionManager] user-mode session %s using default Chrome profile %s (headed=%v)", sessionID, dir, headed)
+				return b, true, !headed, nil
+			}
+			// 有头起不来（无桌面会话 / profile 被运行中的 Chrome 占用）时先退化到无头，
+			// 再退化到隔离 profile——降级顺序按「反爬风险」从小到大排。
+			if headed {
+				if b, ok := tryLaunch(dir, false); ok {
+					log.Printf("[BrowserSessionManager] user-mode session %s: headed launch failed, using default profile headless", sessionID)
+					return b, true, true, nil
+				}
 			}
 			log.Printf("[BrowserSessionManager] user-mode profile unavailable for %s (likely locked), falling back to isolated temp profile", sessionID)
 		}
@@ -155,26 +278,27 @@ func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, erro
 	// 获取可执行文件所在目录
 	exeDir, err := getExeDir()
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to get executable dir: %w", err)
+		return nil, false, false, fmt.Errorf("failed to get executable dir: %w", err)
 	}
 
 	// 浏览器数据目录：程序可执行路径下的 temp/browser-data/<sessionID>
 	// 避免与 workspace 混雜，並通過 sessionID 區分不同實例
 	browserDataDir := dsc.PJoin(exeDir, "temp", "browser-data", sessionID)
 	if err := dsc.MkdirAll(browserDataDir); err != nil {
-		return nil, false, fmt.Errorf("failed to create browser data directory: %w", err)
+		return nil, false, false, fmt.Errorf("failed to create browser data directory: %w", err)
 	}
 
 	// 清理24小時前的臨時瀏覽器數據
 	if err := cleanupOldBrowserData(exeDir); err != nil {
-		log.Printf("[BrowserSessionManager] warning: failed to cleanup old browser data: %v", err)
+		log.Printf("[BrowserSessionManager] warning: failed to clean up old browser data: %v", err)
 	}
 
-	b, ok := tryLaunch(browserDataDir)
+	isolatedHeaded := browserHeaded(false)
+	b, ok := tryLaunch(browserDataDir, isolatedHeaded)
 	if !ok {
-		return nil, false, fmt.Errorf("failed to launch browser for session %s", sessionID)
+		return nil, false, false, fmt.Errorf("failed to launch browser for session %s", sessionID)
 	}
-	return b, false, nil
+	return b, false, !isolatedHeaded, nil
 }
 
 // CreateSession 創建新的瀏覽器會話
@@ -192,7 +316,7 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 	}
 
 	// 啟動瀏覽器
-	browser, usedUserMode, err := launchBrowserRod(sessionID, userMode)
+	browser, usedUserMode, headless, err := launchBrowserRod(sessionID, userMode)
 	if err != nil {
 		return nil, fmt.Errorf("啟動瀏覽器失敗: %w", err)
 	}
@@ -205,6 +329,7 @@ func (m *BrowserSessionManager) CreateSession(sessionID string, userMode bool) (
 		CreatedAt: now,
 		LastUsed:  now,
 		UserMode:  usedUserMode,
+		Headless:  headless,
 	}
 
 	m.sessions[sessionID] = sess
@@ -312,6 +437,20 @@ func (s *BrowserSession) CreatePage(pageID string, url string) (*rod.Page, error
 	page, err := s.Browser.Page(rodproto.TargetCreateTarget{URL: url})
 	if err != nil {
 		return nil, fmt.Errorf("創建頁面失敗: %w", err)
+	}
+	// 无头会话的 UA 里带 "HeadlessChrome/xx"，等于自报「我是无头浏览器」，按 UA 拦爬的
+	// 站点一眼就看出来。取页面自身 UA 去掉这个标记再回设——版本号与平台照旧是真的，
+	// 不另编 UA。有头会话不用动。
+	if s.Headless {
+		if raw, err := page.Eval("() => navigator.userAgent"); err == nil && raw.Value.Str() != "" {
+			ua := strings.Replace(raw.Value.Str(), "HeadlessChrome", "Chrome", 1)
+			if err := page.SetUserAgent(&rodproto.NetworkSetUserAgentOverride{
+				UserAgent:      ua,
+				AcceptLanguage: "zh-CN,zh;q=0.9,en;q=0.8",
+			}); err != nil {
+				log.Printf("[BrowserSession] 設置 UA 失敗（忽略）: %v", err)
+			}
+		}
 	}
 
 	s.Pages[pageID] = page
@@ -913,7 +1052,7 @@ func main() {
                         },
                         "user_mode": {
                                 "type": "boolean",
-                                "description": "Whether to reuse the default Chrome profile (logged-in state) when creating the session. Defaults to true."
+                                "description": "Whether to reuse the default Chrome profile (logged-in state) and launch with a visible window. Defaults to true; a headed browser is much less likely to be blocked by anti-bot checks. Set false for an isolated headless profile."
                         }
                 },
                 "required": ["url"]
@@ -960,7 +1099,7 @@ func main() {
                         },
                         "user_mode": {
                                 "type": "boolean",
-                                "description": "Whether to reuse the default Chrome profile (logged-in state) when creating the session. Defaults to true."
+                                "description": "Whether to reuse the default Chrome profile (logged-in state) and launch with a visible window. Defaults to true; a headed browser is much less likely to be blocked by anti-bot checks. Set false for an isolated headless profile."
                         }
                 },
                 "required": ["query"]
