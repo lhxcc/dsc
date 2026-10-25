@@ -821,6 +821,16 @@ func main() {
 		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
 			logger.Warn(warn)
 		}
+		// 声明了需要宿主凭据的能力、却没有在 config.yaml 里显式授予时，插件运行时
+		// 会静默失败（401/连不上）。宿主不按插件名自动放行凭据，所以这里必须把
+		// 「该给哪个插件加哪一行」说出来。
+		grants := make(map[string]map[string]string, len(merged.Plugins))
+		for _, e := range merged.Plugins {
+			grants[e.Name] = e.Env
+		}
+		for _, warn := range mgr.MissingCapabilityGrants(core.GrantMap(grants)) {
+			logger.Warn(warn)
+		}
 	}
 	if loadErr != nil {
 		// 先锁定最近「正常」备份（避免把下面刚备份的坏版当成正常版回读），
