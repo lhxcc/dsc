@@ -171,21 +171,39 @@ func defaultUserDataDir() string {
 	return ""
 }
 
-// browserHeaded 决定本次启动有没有窗口（有头）。
+// browserHeaded 决定本次启动有没有窗口（有头）。默认**无头**。
 //
-// 默认规则：复用用户 profile 时有头，隔离 profile 时无头。理由是反爬：有头浏览器在
-// 站点眼里与用户自己打开的 Chrome 没有区别；无头再像，也总是差几项（插件、WebGL、
-// 字体、窗口尺寸）。代价是多一个窗口，所以服务器 / 无桌面环境用 DSC_BROWSER_HEADLESS=1
-// 强制无头；反过来 DSC_BROWSER_HEADED=1 可强制有头（含隔离会话，便于人工看现场）。
-// 有头启动失败（没有桌面会话、profile 被占用）时调用方会自动退化到无头。
-func browserHeaded(userMode bool) bool {
+// 早先的直觉是「复用用户 profile 就该有头，否则容易被反爬」。实测（本机 Chrome 155，
+// --headless=new）否掉了这个直觉：无头与有头在常用指纹上完全一致——
+//
+//	plugins=5、WebGL 渲染器是真实显卡（ANGLE/NVIDIA RTX 3060 Ti，不是 SwiftShader）、
+//	window.chrome=object、outer 1280x900 / inner 1264x805（连窗口边框都被模拟了）、
+//	visibilityState=visible、webdriver=false、UA 是真实 Windows Chrome。
+//
+// 差别只剩「有没有一个窗口」，所以默认无头：不弹窗，且不可见性本身就是体验。
+//
+// 真要更保险时有两条路：
+//
+//	DSC_BROWSER_OFFSCREEN=1  真·有头浏览器，但窗口挪到屏幕外（看不见，任务栏有图标）；
+//	DSC_BROWSER_HEADED=1     看得见的有头窗口（排查问题时用）。
+//
+// 优先级：HEADLESS > HEADED > OFFSCREEN > 默认（无头）。
+func browserHeaded() bool {
 	if truthy(os.Getenv("DSC_BROWSER_HEADLESS")) {
 		return false
 	}
 	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
 		return true
 	}
-	return userMode
+	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
+}
+
+// browserOffscreen 有头时是否把窗口挪到屏幕外（DSC_BROWSER_HEADED=1 显式要窗口时不挪）。
+func browserOffscreen() bool {
+	if truthy(os.Getenv("DSC_BROWSER_HEADED")) {
+		return false
+	}
+	return truthy(os.Getenv("DSC_BROWSER_OFFSCREEN"))
 }
 
 // truthy 宽松解析开关型环境变量：1/true/yes/on 都算开。
@@ -213,12 +231,16 @@ func newBrowser(controlURL string) *rod.Browser {
 // 一条「Chrome 正受自动测试软件控制」的提示条——这是最廉价也最致命的指纹，不少站点
 // 据此直接 403。这里删掉它并抑制 AutomationControlled。无头模式改用 --headless=new：
 // UA 与真机一致（老的 --headless 会把 UA 写成 HeadlessChrome/xx）。
-func hardenLauncher(l *launcher.Launcher, headed bool) *launcher.Launcher {
+func hardenLauncher(l *launcher.Launcher, headed, offscreen bool) *launcher.Launcher {
 	l = l.Delete("enable-automation")
 	l = l.Set("disable-blink-features", "AutomationControlled")
 	l = l.Set("lang", "zh-CN")
 	l = l.Set("window-size", "1280,900")
 	if headed {
+		if offscreen {
+			// 有头但挪到可视区外：真浏览器，没有窗口挡在用户面前（任务栏仍会有图标）
+			l = l.Set("window-position", "-32000,-32000")
+		}
 		return l.Headless(false)
 	}
 	return l.HeadlessNew(true)
@@ -230,7 +252,7 @@ func hardenLauncher(l *launcher.Launcher, headed bool) *launcher.Launcher {
 // 环境变量 DSC_BROWSER_CDP_URL 指向现有 CDP 端点时跳过本地 chromium 启动，
 // 直接连接该端点（供 mock chromium 集成测试等场景复用，避免依赖本机浏览器）——
 // 这条路径由调用方自备浏览器，反爬策略也由那边负责。
-func tryLaunch(userDataDir string, headed bool) (b *rod.Browser, ok bool) {
+func tryLaunch(userDataDir string, headed, offscreen bool) (b *rod.Browser, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			ok = false
@@ -245,7 +267,7 @@ func tryLaunch(userDataDir string, headed bool) (b *rod.Browser, ok bool) {
 	if bin := browserBin(); bin != "" {
 		l = l.Bin(bin)
 	}
-	l = hardenLauncher(l, headed)
+	l = hardenLauncher(l, headed, offscreen)
 	b = newBrowser(l.MustLaunch())
 	return b, true
 }
@@ -254,19 +276,20 @@ func tryLaunch(userDataDir string, headed bool) (b *rod.Browser, ok bool) {
 // 目录（携带登录态）；该目录不可用（如用户 Chrome 已在运行、profile 被锁）时
 // 自动降级到按 session 隔离的临时目录。返回浏览器与是否命中了用户模式。
 func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool, error) {
-	headed := browserHeaded(userMode)
+	headed := browserHeaded()
+	off := headed && browserOffscreen()
 
 	// 用户模式：复用默认用户数据目录以保留登录态；失败则逐级降级
 	if userMode {
 		if dir := defaultUserDataDir(); dir != "" {
-			if b, ok := tryLaunch(dir, headed); ok {
+			if b, ok := tryLaunch(dir, headed, off); ok {
 				log.Printf("[BrowserSessionManager] user-mode session %s using default Chrome profile %s (headed=%v)", sessionID, dir, headed)
 				return b, true, !headed, nil
 			}
 			// 有头起不来（无桌面会话 / profile 被运行中的 Chrome 占用）时先退化到无头，
 			// 再退化到隔离 profile——降级顺序按「反爬风险」从小到大排。
 			if headed {
-				if b, ok := tryLaunch(dir, false); ok {
+				if b, ok := tryLaunch(dir, false, false); ok {
 					log.Printf("[BrowserSessionManager] user-mode session %s: headed launch failed, using default profile headless", sessionID)
 					return b, true, true, nil
 				}
@@ -293,8 +316,8 @@ func launchBrowserRod(sessionID string, userMode bool) (*rod.Browser, bool, bool
 		log.Printf("[BrowserSessionManager] warning: failed to clean up old browser data: %v", err)
 	}
 
-	isolatedHeaded := browserHeaded(false)
-	b, ok := tryLaunch(browserDataDir, isolatedHeaded)
+	isolatedHeaded := browserHeaded()
+	b, ok := tryLaunch(browserDataDir, isolatedHeaded, isolatedHeaded && browserOffscreen())
 	if !ok {
 		return nil, false, false, fmt.Errorf("failed to launch browser for session %s", sessionID)
 	}
@@ -1052,7 +1075,7 @@ func main() {
                         },
                         "user_mode": {
                                 "type": "boolean",
-                                "description": "Whether to reuse the default Chrome profile (logged-in state) and launch with a visible window. Defaults to true; a headed browser is much less likely to be blocked by anti-bot checks. Set false for an isolated headless profile."
+                                "description": "Whether to reuse the default Chrome profile (so logged-in sessions are available). Defaults to true. The browser runs headless with the profile, so no window is shown."
                         }
                 },
                 "required": ["url"]
@@ -1099,7 +1122,7 @@ func main() {
                         },
                         "user_mode": {
                                 "type": "boolean",
-                                "description": "Whether to reuse the default Chrome profile (logged-in state) and launch with a visible window. Defaults to true; a headed browser is much less likely to be blocked by anti-bot checks. Set false for an isolated headless profile."
+                                "description": "Whether to reuse the default Chrome profile (so logged-in sessions are available). Defaults to true. The browser runs headless with the profile, so no window is shown."
                         }
                 },
                 "required": ["query"]

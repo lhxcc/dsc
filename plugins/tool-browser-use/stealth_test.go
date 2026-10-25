@@ -1,33 +1,41 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
 
-// TestBrowserHeadedDefaults 默认策略：复用用户 profile 时有头（反爬），隔离 profile 时无头；
-// 环境变量可以各自强制。
+// TestBrowserHeadedDefaults 默认无头（不弹窗）；HEADLESS / HEADED / OFFSCREEN 可覆盖，
+// 优先级 HEADLESS > HEADED > OFFSCREEN。
 func TestBrowserHeadedDefaults(t *testing.T) {
-	t.Setenv("DSC_BROWSER_HEADLESS", "")
-	t.Setenv("DSC_BROWSER_HEADED", "")
-
-	if !browserHeaded(true) {
-		t.Fatal("用户模式默认应有头")
-	}
-	if browserHeaded(false) {
-		t.Fatal("隔离模式默认应无头")
+	clear := func() {
+		t.Setenv("DSC_BROWSER_HEADLESS", "")
+		t.Setenv("DSC_BROWSER_HEADED", "")
+		t.Setenv("DSC_BROWSER_OFFSCREEN", "")
 	}
 
+	clear()
+	if browserHeaded() {
+		t.Fatal("默认应无头（实测无头与有头在常用指纹上一致，且不弹窗）")
+	}
+
+	clear()
+	t.Setenv("DSC_BROWSER_OFFSCREEN", "1")
+	if !browserHeaded() || !browserOffscreen() {
+		t.Fatal("OFFSCREEN 应有头且离屏")
+	}
+
+	clear()
+	t.Setenv("DSC_BROWSER_HEADED", "1")
+	if !browserHeaded() || browserOffscreen() {
+		t.Fatal("HEADED 应有头且可见（不离屏）")
+	}
+
+	clear()
+	t.Setenv("DSC_BROWSER_HEADED", "1")
 	t.Setenv("DSC_BROWSER_HEADLESS", "1")
-	if browserHeaded(true) {
-		t.Fatal("DSC_BROWSER_HEADLESS=1 应强制无头（含用户模式）")
-	}
-
-	os.Unsetenv("DSC_BROWSER_HEADLESS")
-	t.Setenv("DSC_BROWSER_HEADED", "true")
-	if !browserHeaded(false) {
-		t.Fatal("DSC_BROWSER_HEADED=true 应强制有头（含隔离模式）")
+	if browserHeaded() {
+		t.Fatal("HEADLESS 优先级最高")
 	}
 }
 
