@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"dsc/proto"
@@ -22,6 +23,71 @@ func msgAssistantWithCalls(content string, ids ...string) *proto.Message {
 
 func msgToolResult(id, content string) *proto.Message {
 	return &proto.Message{Role: "tool", Content: content, ToolCallId: id}
+}
+
+// BenchmarkSanitizeToolPairing 量化早退的收益：无工具流量的会话只剩一遍轻量扫描，
+// 不建索引 map 也不复制结果 slice。
+func BenchmarkSanitizeToolPairingClean(b *testing.B)     { benchmarkSanitize(b, false) }
+func BenchmarkSanitizeToolPairingWithTools(b *testing.B) { benchmarkSanitize(b, true) }
+
+func benchmarkSanitize(b *testing.B, withTools bool) {
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 500; i++ {
+		msgs = append(msgs, msgUser("这是一条普通对话消息"))
+		if withTools {
+			id := fmt.Sprintf("call_%d", i)
+			msgs = append(msgs, msgAssistantWithCalls("", id), msgToolResult(id, "output"))
+			continue
+		}
+		msgs = append(msgs, &proto.Message{Role: "assistant", Content: "回复"})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, dropped := SanitizeToolPairing(msgs); dropped != 0 {
+			b.Fatalf("dropped = %d, want 0", dropped)
+		}
+	}
+}
+
+// TestSanitizeToolPairingSkipsCleanHistory 没有任何工具流量时早退：
+// 返回的是输入本身（同一底层数组，不做索引也不复制），dropped 为 0。
+func TestSanitizeToolPairingSkipsCleanHistory(t *testing.T) {
+	in := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		msgUser("讲讲 Go 的调度器"),
+		{Role: "assistant", Content: "好"},
+		msgUser("再细一点"),
+	}
+	out, dropped := SanitizeToolPairing(in)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("len = %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i] != in[i] {
+			t.Fatalf("#%d 不是同一条消息：整理函数不该在无工具流量时重建消息", i)
+		}
+	}
+}
+
+// TestSanitizeToolPairingEarlyExitNeedsBothChecks 早退的两个条件缺一不可：
+// 「有调用、无结果」的历史没有 tool 消息，但悬空调用仍必须被清掉——不能因为
+// 只查 tool 结果就跳过整理，否则 provider 照样报 calls 与 results 不匹配。
+func TestSanitizeToolPairingEarlyExitNeedsBothChecks(t *testing.T) {
+	in := []*proto.Message{
+		msgUser("跑一下"),
+		msgAssistantWithCalls("", "call_X"), // 工具被中断，没有结果
+	}
+	out, dropped := SanitizeToolPairing(in)
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1", dropped)
+	}
+	if len(out) != 1 || out[0].GetRole() != "user" {
+		t.Fatalf("悬空调用没被清掉：%+v", out)
+	}
 }
 
 // TestSanitizeToolPairingKeepsIntactHistory 正常配对的历史必须原样保留：

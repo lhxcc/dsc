@@ -28,6 +28,18 @@ import (
 //
 // 只在发送前整理请求副本，不改会话事件日志，因此历史始终可完整恢复。
 func SanitizeToolPairing(msgs []*proto.Message) ([]*proto.Message, int) {
+	// 0) 早退：历史里既没有 tool 结果、也没有带 tool_calls 的 assistant 时不可能不配对。
+	//
+	// 这是确定性等价，不是启发式：缺了这两类消息，循环体里每条消息都只可能走 default
+	// 分支原样保留，输出必然与输入顺序一致、dropped 必然为 0。此时直接返回原 slice，
+	// 省掉下面的索引 map 与结果 slice 的分配（纯对话会话不会有任何工具流量）。
+	//
+	// 注意两个条件缺一不可：只查 tool 结果会漏掉「有调用、无结果」的历史——那种情况
+	// 下面是要丢掉悬空调用的，不能跳过。
+	if !hasToolTraffic(msgs) {
+		return msgs, 0
+	}
+
 	// 1) 索引工具结果
 	results := make(map[string]*proto.Message, 8)
 	dropped := 0
@@ -80,6 +92,20 @@ func SanitizeToolPairing(msgs []*proto.Message) ([]*proto.Message, int) {
 	}
 	dropped += len(results) - len(used) // 没有任何 assistant 认领的结果
 	return out, dropped
+}
+
+// hasToolTraffic 判断这批消息里是否存在任何「工具流量」：tool 结果，或发起调用的 assistant。
+// 两者都不存在时 SanitizeToolPairing 必然是恒等变换，可以直接跳过。
+func hasToolTraffic(msgs []*proto.Message) bool {
+	for _, m := range msgs {
+		if m.GetRole() == "tool" {
+			return true
+		}
+		if m.GetRole() == "assistant" && len(m.GetToolCalls()) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // copyMessageWithCalls 复制一条消息并替换其工具调用列表（保留全部字段）。
