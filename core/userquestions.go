@@ -49,7 +49,30 @@ func (m *Manager) Ask(ctx context.Context, req *userquestions.Request) (*userque
 	if provider == nil {
 		return nil, &userquestions.Error{Code: userquestions.ErrNoProvider, Err: fmt.Errorf("no user-questions provider is registered")}
 	}
+	// 提问即将展示给用户：广播事件让通知类插件提醒（用户离开屏幕时靠音效知道模型在等回答）。
+	// 放在调 provider 之前、且不因事件失败影响提问——事件只是旁路提醒。
+	m.emitUserQuestionAsked(req)
 	return provider(ctx, req)
+}
+
+// emitUserQuestionAsked 广播「即将提问」事件；无事件总线时静默跳过。
+//
+// 广播前先看**能力**：没有插件提供 notify 时不广播。这不是省事，而是把
+// 「不装通知插件 = 静音」做成用户可控的开关——如果照发不误，谁来接、接不接
+// 都得靠插件自觉，用户也就失去了"卸载插件即关闭提醒"这个直觉开关。
+// 判据用能力名而非插件名（将来换桌面通知插件，只要声明 notify 即接管）。
+func (m *Manager) emitUserQuestionAsked(req *userquestions.Request) {
+	if m == nil || m.events == nil || req == nil {
+		return
+	}
+	if !m.HasPluginProvidingCapability("notify") {
+		return
+	}
+	ev := UserQuestionAskedEvent{Questions: len(req.Questions)}
+	if len(req.Questions) > 0 {
+		ev.Header = req.Questions[0].Header
+	}
+	m.events.Emit(EventUserQuestionAsked, EventContext{Context: context.Background(), Data: ev})
 }
 
 // userQuestionsGRPCServer 暴露给 agent 的 gRPC 服务端。

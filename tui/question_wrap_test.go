@@ -38,37 +38,24 @@ func TestQuestionOverlayRowBudgetAnalysis(t *testing.T) {
 				},
 			}}}, answer: ansCh, err: errCh})
 
-			v := m.questionView()
-			logicalRows := strings.Count(v, "\n") + 1
-
-			// 计算实际可见行数（考虑宽度 wrap）
-			// 终端宽度 - boxBorder(2) - padding(2) = 内部内容宽度
-			innerWidth := m.width - 4
-			if innerWidth < 1 {
-				innerWidth = 1
+			// 直接数整屏渲染结果的行数——这才是用户看到的最终形态。
+			// 此前这里用「按 innerWidth 重新估算折行数」的近似：覆盖层一旦铺满终端宽度，
+			// 那种估算会把每行当成两行，得出虚假的溢出结论。真实不变量是 View() 的行数。
+			view := m.View().Content
+			rows := strings.Split(view, "\n")
+			for len(rows) > 0 && strings.TrimSpace(ansi.Strip(rows[len(rows)-1])) == "" {
+				rows = rows[:len(rows)-1]
 			}
-			actualRows := 0
-			for _, line := range strings.Split(v, "\n") {
-				if line == "" {
-					actualRows++
-					continue
-				}
-				w := ansi.StringWidth(line)
-				rows := (w + innerWidth - 1) / innerWidth
-				if rows < 1 {
-					rows = 1
-				}
-				actualRows += rows
+			if len(rows) > high {
+				t.Errorf("LAYOUT OVERFLOW: 渲染 %d 行 > 终端 %d 行 → 覆盖层会被裁掉 %d 行",
+					len(rows), high, len(rows)-high)
 			}
-
-			vh := m.vpHeight()
-			// 总布局行数：标题(1) + viewport + 覆盖层 + composer(input.Height+2) + info(1) + status(2)
-			total := 1 + vh + actualRows + (m.input.Height() + 2) + 1 + 2
-			t.Logf("high=%d: vpHeight=%d, overlay logical=%d actual(wrap)=%d, total=%d (over by %d)",
-				high, vh, logicalRows, actualRows, total, total-high)
-			if total > high {
-				t.Errorf("LAYOUT OVERFLOW: total=%d > high=%d → overlay clipped by %d rows",
-					total, high, total-high)
+			// 覆盖层必须完整可见：问题与全部选项都在最终视图里
+			plain := ansi.Strip(view)
+			for _, want := range []string{"請告訴我您想分析哪個專案", "當前目錄下的源碼", "特定專案的源碼", "特定功能的源碼"} {
+				if !strings.Contains(plain, want) {
+					t.Errorf("high=%d 覆盖层应完整显示 %q", high, want)
+				}
 			}
 		})
 	}

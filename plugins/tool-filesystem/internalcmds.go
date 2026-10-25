@@ -19,7 +19,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -141,18 +140,12 @@ func res(hc interp.HandlerContext, p string) string {
 	if p == "" {
 		return ""
 	}
-	if runtime.GOOS == "windows" && p == "/dev/null" {
-		return "NUL"
-	}
-	// Windows 上没有真正的 /tmp（会被解析成当前盘根）：把 /tmp 与 /tmp/... 映射到
-	// DSC 自己的临时目录，模型的 Unix 习惯写法（临时脚本、diff 中间产物）都能落地。
-	// Unix 上 /tmp 是真实挂载点，不动。
-	if runtime.GOOS == "windows" && (p == "/tmp" || strings.HasPrefix(p, "/tmp/")) {
-		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
-		if rel == "" {
-			return dsc.TempDir()
-		}
-		return dsc.PJoin(dsc.TempDir(), rel)
+	// 设备名（Windows 的 /dev/null → NUL）与虚拟根（/workspace、Windows 的 /tmp 与
+	// /mnt/<drive>）统一由 core 的两张表决定。本函数不再持有任何一条规则——
+	// 此前这里自带的 /tmp 分支必须与 AST 重写里的同名逻辑手工保持一致，正是
+	// 「四处实现覆盖不一致」的来源。命中后已是真实路径，不再做相对拼接。
+	if mapped := dsc.MapModelPath(p); mapped != p {
+		return mapped
 	}
 	if filepath.IsAbs(p) {
 		return p

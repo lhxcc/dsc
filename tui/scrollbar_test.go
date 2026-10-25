@@ -55,15 +55,7 @@ func pumpFrames(t *testing.T, frames []*core.RunStreamResponse) *Model {
 	m := New(&stubAgent{frames: frames}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 400)
 	return model.(*Model)
 }
 

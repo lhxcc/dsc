@@ -58,10 +58,17 @@ type Config struct {
 	// depends_on 字段——能力依赖由插件二进制内的 sdk.Config.Requires 自描述，
 	// 无需落盘。
 	//
-	// 例如：tool-agentic-bench 声明 Requires: [{Type: "tool", Capability:
+	// 例如：基准测试插件 声明 Requires: [{Type: "tool", Capability:
 	// "agentic-bench-runner"}] —— 这里它本身是 bench runner，自己依赖另一
 	// 个具 cron 能力的插件时，可改声明 [{Type: "tool", Capability: "cron"}]，
 	// 宿主据此自动绑定到首个声明了 cron 能力的 tool 插件。
+	// Commands 声明本插件提供的斜杆命令（**声明式**）。
+	//
+	// 命令属于外部能力：核心与前端都不内置任何插件的命令名。界面把 /<name>
+	// 交给声明了它的插件（经 PluginHookService.RunCommand），插件返回要展示的
+	// 文本。卸载插件 = 命令消失，无需改宿主。
+	Commands []Command
+
 	Requires []CapabilityRequirement
 	// Provides 声明本插件**提供**的能力（capability）——对齐 DSH/Cordis 的 provide
 	// 模型（见 vendor/cordis/src/registry.ts Plugin.Base.provide）。
@@ -74,7 +81,7 @@ type Config struct {
 	// 无需在 Provides 中重复声明。tool/agent/policy/dsc 类型插件若需声明自定义能力，
 	// 在此字段填入即可。
 	//
-	// 例如：tool-filesystem 可声明 Provides: map[string]string{"filesystem": "true"}，
+	// 例如：文件系统插件 可声明 Provides: map[string]string{"filesystem": "true"}，
 	// 其他依赖文件系统能力的插件声明 Requires: [{Type:"tool", Capability:"filesystem"}]，
 	// 宿主据此自动绑定。
 	Provides map[string]string
@@ -99,7 +106,7 @@ type SDK struct {
 	hook   *Hook
 	inter  InterconnectHandler
 	// toolProvider 可选动态工具提供者：每次 ListTools/ExecuteTool 求值当前工具集，
-	// 覆盖「运行时动态注册工具」的插件（如 tool-lua-host 的脚本工具）。非 nil 时
+	// 覆盖「运行时动态注册工具」的插件（如 LUA 宿主插件的脚本工具）。非 nil 时
 	// 优先于静态 tools，validate 允许二选一。
 	toolProvider func() []Tool
 	// agentBroker 可选的 agent 类型 gRPC server 初始化回调（注入宿主 broker 的

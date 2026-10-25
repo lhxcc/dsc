@@ -81,7 +81,7 @@ func assembleMerged(llmEntries []core.PluginEntry, agentEntry *core.PluginEntry,
 	if ag == nil {
 		ext := modelExt()
 		// 发现机制：扫描 plugins/ 目录取首个 agent-* 目录（按名升序），
-		// 不再硬编码 "agent-react-loop"（对齐 AGENTS.md §8）。
+		// 不再硬编码具体的 agent 插件名（对齐 AGENTS.md §8）。
 		agentName := discoverFirstAgentPlugin()
 		if agentName == "" {
 			// 与 main.go LLM 兜底同款 fail-loud：log.Fatal 退出。
@@ -140,7 +140,7 @@ func assembleMerged(llmEntries []core.PluginEntry, agentEntry *core.PluginEntry,
 	}
 	// 压缩后端选择（配置层）：preset 显式声明的 compaction 优先（preset 是具体
 	// 预设、主导行为，与插件条目同规），config.yaml 仅在 preset 未声明时兜底。
-	// preset 缺省启用 compaction: dsc-system——「无配置时按能力依赖启动不因压缩
+	// preset 缺省启用某个压缩后端——「无配置时按能力依赖启动不因压缩
 	// 后端缺席而阻塞」；merged 经 LoadFromConfig 交 Manager，m.compactionBackend
 	// 据此验证 Provides compaction 能力声明（registerDscCoreLocked）。
 	if presetCfg != nil && presetCfg.Compaction != "" {
@@ -211,7 +211,7 @@ func modelExt() string {
 // injectRuntimeEnv 向所有插件进程注入当前模式/工作根/沙箱档/审批策略（主路径与「失败重试」共用）。
 // injectContextWindow 向所有插件注入 DSC_CONTEXT_WINDOW（有效上下文窗口值）。
 //
-// 为什么不能只给 agent：压缩后端（dsc-system 的 compaction-basic、dsc-billion-context）
+// 为什么不能只给 agent：压缩后端（基础压缩与上下文管理插件）
 // 在各自进程里按窗口算压力阈值，此前拿不到该值只能退回 128K 默认——云端接 1M 窗口时
 // 仍按 128K 判压力，几步就触发压缩（用户实测 TUI 标题已显示 1.0M）。
 // 显式配置优先：插件条目 env 里写了该键（或宿主环境已有）则不覆盖。

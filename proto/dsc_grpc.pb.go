@@ -1481,6 +1481,7 @@ const (
 	PluginHookService_AfterTool_FullMethodName   = "/dsc.PluginHookService/AfterTool"
 	PluginHookService_OnEvent_FullMethodName     = "/dsc.PluginHookService/OnEvent"
 	PluginHookService_ListContext_FullMethodName = "/dsc.PluginHookService/ListContext"
+	PluginHookService_RunCommand_FullMethodName  = "/dsc.PluginHookService/RunCommand"
 )
 
 // PluginHookServiceClient is the client API for PluginHookService service.
@@ -1516,6 +1517,11 @@ type PluginHookServiceClient interface {
 	// 宿主聚合所有插件的贡献，拼接到 agent 的 system prompt。
 	// 旧插件未实现时返回 Unimplemented，宿主应跳过。
 	ListContext(ctx context.Context, in *ListContextRequest, opts ...grpc.CallOption) (*ListContextResponse, error)
+	// 斜杆命令转发：用户在界面输入 /<name>（name 由本插件的 metadata.commands
+	// 声明）时，宿主把 name + 原始参数转发到这里，插件返回要展示的文本。
+	// 命令名不写在宿主里——宿主只按声明清单分发，因此换插件不需要改宿主/前端。
+	// 旧插件未实现时返回 Unimplemented，宿主据此报「该命令不可用」。
+	RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (*RunCommandResponse, error)
 }
 
 type pluginHookServiceClient struct {
@@ -1566,6 +1572,16 @@ func (c *pluginHookServiceClient) ListContext(ctx context.Context, in *ListConte
 	return out, nil
 }
 
+func (c *pluginHookServiceClient) RunCommand(ctx context.Context, in *RunCommandRequest, opts ...grpc.CallOption) (*RunCommandResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunCommandResponse)
+	err := c.cc.Invoke(ctx, PluginHookService_RunCommand_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PluginHookServiceServer is the server API for PluginHookService service.
 // All implementations must embed UnimplementedPluginHookServiceServer
 // for forward compatibility.
@@ -1599,6 +1615,11 @@ type PluginHookServiceServer interface {
 	// 宿主聚合所有插件的贡献，拼接到 agent 的 system prompt。
 	// 旧插件未实现时返回 Unimplemented，宿主应跳过。
 	ListContext(context.Context, *ListContextRequest) (*ListContextResponse, error)
+	// 斜杆命令转发：用户在界面输入 /<name>（name 由本插件的 metadata.commands
+	// 声明）时，宿主把 name + 原始参数转发到这里，插件返回要展示的文本。
+	// 命令名不写在宿主里——宿主只按声明清单分发，因此换插件不需要改宿主/前端。
+	// 旧插件未实现时返回 Unimplemented，宿主据此报「该命令不可用」。
+	RunCommand(context.Context, *RunCommandRequest) (*RunCommandResponse, error)
 	mustEmbedUnimplementedPluginHookServiceServer()
 }
 
@@ -1620,6 +1641,9 @@ func (UnimplementedPluginHookServiceServer) OnEvent(context.Context, *OnEventReq
 }
 func (UnimplementedPluginHookServiceServer) ListContext(context.Context, *ListContextRequest) (*ListContextResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListContext not implemented")
+}
+func (UnimplementedPluginHookServiceServer) RunCommand(context.Context, *RunCommandRequest) (*RunCommandResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RunCommand not implemented")
 }
 func (UnimplementedPluginHookServiceServer) mustEmbedUnimplementedPluginHookServiceServer() {}
 func (UnimplementedPluginHookServiceServer) testEmbeddedByValue()                           {}
@@ -1714,6 +1738,24 @@ func _PluginHookService_ListContext_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PluginHookService_RunCommand_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunCommandRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PluginHookServiceServer).RunCommand(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PluginHookService_RunCommand_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PluginHookServiceServer).RunCommand(ctx, req.(*RunCommandRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PluginHookService_ServiceDesc is the grpc.ServiceDesc for PluginHookService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1736,6 +1778,10 @@ var PluginHookService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListContext",
 			Handler:    _PluginHookService_ListContext_Handler,
+		},
+		{
+			MethodName: "RunCommand",
+			Handler:    _PluginHookService_RunCommand_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

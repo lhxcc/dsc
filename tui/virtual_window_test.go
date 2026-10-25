@@ -28,15 +28,7 @@ func TestVirtualWindowBoundsViewportContent(t *testing.T) {
 	m := New(&stubAgent{frames: frames}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 50 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 50)
 	m2 := model.(*Model)
 
 	// 内容已远超一屏：全量可视行应远大于窗口高度
@@ -77,15 +69,7 @@ func TestVirtualWindowStreamingKeepsLastLineLive(t *testing.T) {
 	m := New(&stubAgent{frames: frames}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 40 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 40)
 	m2 := model.(*Model)
 	if !m2.streaming {
 		t.Fatal("前置条件：应处于流式状态")

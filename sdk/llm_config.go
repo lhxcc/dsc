@@ -21,8 +21,8 @@ import (
 // openai 路径→ reasoning_effort 字面量（OpenAIReasoningEffort，6 档 1:1 透传，亦可被
 // DSC_OPENAI_REASONING_EFFORT 直接覆盖为端点支持的字面量）。
 //
-// 解析顺序（先 provider 专属 env，后宿主通用 DSC_ env）对齐既有 llm-anthropic
-// 与 llm-openai 的实现（先读 DSC_<P>_MAX_OUTPUT_TOKENS / 旧名 <P>_MAX_OUTPUT_TOKENS，
+// 解析顺序（先 provider 专属 env，后宿主通用 DSC_ env）对齐既有 LLM provider 插件
+// 与 LLM provider 插件的实现（先读 DSC_<P>_MAX_OUTPUT_TOKENS / 旧名 <P>_MAX_OUTPUT_TOKENS，
 // 再回退 DSC_MAX_OUTPUT_TOKENS），消除两份复制粘贴。
 type LLMConfig struct {
 	// APIKey 来自 <PROVIDER>_API_KEY；缺席返回空串（由调用方决定是否兜底）。

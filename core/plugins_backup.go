@@ -80,7 +80,7 @@ func RestorePluginsDir(backupDir, pluginsDir string, logger hclog.Logger) error 
 	return nil
 }
 
-// RequiredPluginDirBases 从合并插件集抽取每个插件的二进制**目录基名**（如 tool-filesystem）。
+// RequiredPluginDirBases 从合并插件集抽取每个插件的二进制**目录基名**（如 文件系统插件）。
 // 供恢复后识别 plugin/ 下哪些目录「不在配置引用」（孤立插件）。
 func RequiredPluginDirBases(merged *Config) map[string]bool {
 	keep := map[string]bool{}

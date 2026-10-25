@@ -135,12 +135,12 @@ func TestAssembleMergedConfigToolsDedup(t *testing.T) {
 // preset 显式声明的 compaction 优先（preset 主导行为，与插件条目同规）；
 // config.yaml 仅在 preset 未声明时兜底；两侧均未声明为空（agent 内联兜底）。
 func TestAssembleMergedCompactionPropagation(t *testing.T) {
-	mainCfg := &core.Config{Compaction: "dsc-billion-context"}
+	mainCfg := &core.Config{Compaction: "backend-x"}
 	presetCfg := &core.Config{Compaction: "dsc-system"}
 	if got := assembleMerged(nil, nil, mainCfg, presetCfg, 128000, false, "").Compaction; got != "dsc-system" {
 		t.Fatalf("preset 声明时应取 preset 值, got %q", got)
 	}
-	if got := assembleMerged(nil, nil, mainCfg, nil, 128000, false, "").Compaction; got != "dsc-billion-context" {
+	if got := assembleMerged(nil, nil, mainCfg, nil, 128000, false, "").Compaction; got != "backend-x" {
 		t.Fatalf("preset 缺失时应兜底 config.yaml 值, got %q", got)
 	}
 	if got := assembleMerged(nil, nil, nil, nil, 128000, false, "").Compaction; got != "" {

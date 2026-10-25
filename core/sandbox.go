@@ -206,7 +206,7 @@ func ToolCallReadOnly(capabilities []string, argsJSON string) bool {
 }
 
 // legacyWriteCapableExecutors 是无法从参数路径判断写入目标、却可对文件系统任意写/执行
-// 命令的解释器/执行器工具（如 tool-filesystem 的 shell，内部为 mvdan/sh）。
+// 命令的解释器/执行器工具（如文件系统插件的 shell，内部为 mvdan/sh）。
 // read-only 下必须整体禁用——因为无法从命令文本判定某条命令是否只读，放行即等于
 // 允许「echo x > /anywhere」绕开只读沙箱。workspace-write 下放行（缺省档，运行 shell
 // 是其主要用途；其工作区写入边界由工具/OS 层约束）。
@@ -287,7 +287,7 @@ func canonicalWorkspaceRoot() string {
 // inWorkspace 判断路径是否位于 WorkspaceRoot 之下。
 //
 // 路径先经 core.MapWorkspacePath 归并——沙箱与各工具插件（str_replace_editor、
-// tool-filesystem 的 shell AST 字面量重写）必须用同一份「虚拟根 = 工作空间根」
+// 文件系统插件的 shell AST 字面量重写）必须用同一份「虚拟根 = 工作空间根」
 // 映射，故此处不得另立一套实现：/workspace（含 \workspace 形态）别名锚定工作区根、
 // Windows 上 WSL 习惯路径 /mnt/<drive>/... 映射为盘符路径；前缀后必须跟分隔符或
 // 结尾（/workspacefoo 之类是独立绝对路径，不认作别名）。否则沙箱会把工具实际能写
@@ -299,7 +299,7 @@ func canonicalWorkspaceRoot() string {
 // 比较误判为「在根内」而写穿沙箱（P0-3）。
 //
 // 相对路径一律以 WorkspaceRoot 为基解析（对齐工具插件语义：str_replace_editor 的
-// safePath 与 tool-filesystem 的 shell 均把相对路径落在工作区根下）——若按宿主进程
+// safePath 与文件系统插件的 shell 均把相对路径落在工作区根下）——若按宿主进程
 // cwd 解析，cwd 与工作区根不一致时会把本在工作区内的相对写误判为越界而误拒。
 // 例外：Windows 上盘符无关的根路径（/xxx 或 \xxx，filepath.IsAbs 判为假）不是
 // 工作区相对路径，若并入 WorkspaceRoot 会把 /etc/hosts 之类误判为工作区内而放行

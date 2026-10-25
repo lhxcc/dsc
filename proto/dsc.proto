@@ -310,6 +310,11 @@ service PluginHookService {
   // 宿主聚合所有插件的贡献，拼接到 agent 的 system prompt。
   // 旧插件未实现时返回 Unimplemented，宿主应跳过。
   rpc ListContext(ListContextRequest) returns (ListContextResponse);
+  // 斜杆命令转发：用户在界面输入 /<name>（name 由本插件的 metadata.commands
+  // 声明）时，宿主把 name + 原始参数转发到这里，插件返回要展示的文本。
+  // 命令名不写在宿主里——宿主只按声明清单分发，因此换插件不需要改宿主/前端。
+  // 旧插件未实现时返回 Unimplemented，宿主据此报「该命令不可用」。
+  rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
 }
 
 message BeforeToolRequest {
@@ -350,6 +355,18 @@ message OnEventRequest {
 message OnEventResponse {
   string result_json = 1; // 改写后的载荷（waterfall 模式生效；emit 忽略）
   string error = 2;        // 非 nil 视为 veto（waterfall/serial/bail 生效；emit 忽略）
+}
+
+message RunCommandRequest {
+  string name = 1; // 命令名（不含前导 "/"）
+  string args = 2; // 原始参数串（未解析，由插件决定语义）
+}
+
+// RunCommandResponse 命令输出。text 直接展示给用户（可多行）；error 非空表示
+// 执行失败（宿主以错误样式展示，仍带 text 作为补充说明）。
+message RunCommandResponse {
+  string text = 1;
+  string error = 2;
 }
 
 message AskRequest {

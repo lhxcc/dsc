@@ -91,7 +91,11 @@ plugins:
     type: agent
     binary_path: ./plugins/agent-react-loop/agent-react-loop.exe
     enabled: true
+  # 选用 billion-context 需要**同时**改两处，缺一处就是静默失效（宿主会回落到内联压缩）：
+  #   1) 顶部 compaction: dsc-billion-context
+  #   2) 下面这段 plugins 条目（去掉注释、enabled: true）
+  # 注意 Windows 的 binary_path 要带 .exe，否则加载失败只留一条插件启动错误。
   # - name: dsc-billion-context
   #   type: dsc
   #   enabled: true
-  #   binary_path: ./plugins/dsc-billion-context/dsc-billion-context
+  #   binary_path: ./plugins/dsc-billion-context/dsc-billion-context.exe

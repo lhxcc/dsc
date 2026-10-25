@@ -39,7 +39,7 @@ func (p *dscGRPCPlugin) GRPCServer(broker *plugin.GRPCBroker, s *grpc.Server) er
 	}
 	// 始终注册 ToolServiceServer：让宿主经 ListTools 探测插件是否暴露工具。
 	// 工具集为空时 ListTools 返回空列表，宿主据此跳过 tool 登记——零行为变化
-	// （如 dsc-notify 无工具时与历史行为一致）。非空时宿主登记为 tool provider。
+	// （如 通知插件 无工具时与历史行为一致）。非空时宿主登记为 tool provider。
 	// 对齐 DSH/Cordis：插件类型与服务正交，TypeDsc 亦可暴露模型可见工具。
 	proto.RegisterToolServiceServer(s, &toolServiceServer{sdk: p.sdk, broker: broker})
 	return nil

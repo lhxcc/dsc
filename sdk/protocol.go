@@ -43,6 +43,9 @@ type (
 	// AgentPreStepEvent agent/pre-step 载荷：本步消息列表（MessagesJSON）与工具目录，
 	// 压缩/注入类插件在此改写 msgs。
 	AgentPreStepEvent = core.AgentPreStepEvent
+	// UserQuestionAskedEvent userquestion/asked 载荷：问题数量与首个标题。
+	UserQuestionAskedEvent = core.UserQuestionAskedEvent
+
 	// AgentRequestErrorEvent agent/request-error 载荷：请求失败码（如
 	// context_window_exceeded），插件可返回 retry 让宿主重走 pre-step。
 	AgentRequestErrorEvent = core.AgentRequestErrorEvent
@@ -71,6 +74,9 @@ const (
 	EventAgentStatus       = core.EventAgentStatus
 	EventAgentError        = core.EventAgentError
 	EventApprovalAsked     = core.EventApprovalAsked
+	// EventUserQuestionAsked 宿主即将向用户提问（ask_user_question / 计划评审）。
+	// 通知类插件订阅它提醒用户「需要你处理」——agent 此时阻塞等待回答。
+	EventUserQuestionAsked = core.EventUserQuestionAsked
 	EventApprovalDecided   = core.EventApprovalDecided
 	EventApprovalPolicy    = core.EventApprovalPolicy
 )

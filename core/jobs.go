@@ -19,6 +19,25 @@ func WithCaller(ctx context.Context, sessionID string) context.Context {
 }
 
 // CallerFromContext 读取 ctx 中的调用方会话标识（空 = 无会话调用方）。
+// toolCallIDKey 保存本次工具调用 id（与 caller 会话一起跨层转发）。
+type toolCallIDKey struct{}
+
+// WithToolCallID 把工具调用 id 注入 ctx。
+func WithToolCallID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, toolCallIDKey{}, id)
+}
+
+// ToolCallIDFromContext 读取工具调用 id（无则空串）。
+func ToolCallIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(toolCallIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
 func CallerFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(ctxCallerKey{}).(string); ok {
 		return v

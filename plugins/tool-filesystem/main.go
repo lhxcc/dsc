@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dsc-sdk"
@@ -33,6 +35,10 @@ type Session struct {
 	stdoutSignal *activityWriter
 	stderrSignal *activityWriter
 	mu           sync.Mutex
+	// lastUsed 最近一次执行命令的时间（LRU 淘汰依据）。持久会话是默认行为，
+	// 池子里必然会有多个；淘汰必须挑「最久没用过的」，而不是 map 里随便一个
+	// ——后者会把正在用的会话踢掉，模型下一轮进来 cwd 莫名丢失。
+	lastUsed time.Time
 }
 
 // syncedBuilder 是線程安全的輸出累加緩衝：Runner 經 activityWriter 向其寫入
@@ -116,7 +122,7 @@ func (a *activityWriter) bind(ctx context.Context) {
 // ToolServiceServer/MetadataServer/ToolMetadataGRPCPlugin 样板）。
 func main() {
 	// 定義 shell 工具描述
-	baseDescription := "Execute a shell command or script using mvdan/sh interpreter internally (POSIX shell standard). Each call without a reused session_id runs in a fresh shell: no state (cwd, variables, functions) persists between calls — pass `workdir` instead of using `cd`. A consistent session_id maintains state (cwd, environment variables) across calls."
+	baseDescription := "Execute a shell command or script using mvdan/sh interpreter internally (POSIX shell standard). The shell persists across calls by default: cwd, exported variables and shell functions carry over, so `cd` once instead of repeating it in every command. Pass `workdir` to move the shell into a directory (applies to new and existing sessions alike). Pass `session_id: \"new\"` only when you need a clean shell with a fresh cwd and environment; an explicit non-empty `session_id` gives you a separate persistent shell, e.g. one per task."
 
 	var pathAdvice string
 	var extraAdvice string
@@ -154,7 +160,7 @@ func main() {
                         },
                         "session_id": {
                                 "type": "string",
-                                "description": "Persistent session ID to maintain state (cwd, environment variables). If not provided or 'new', a new session is created."
+                                "description": "Shell to use. Omit to reuse the conversation's persistent shell (default: cwd and exported variables carry over). Use 'new' for a clean shell; any other name keeps a separate persistent shell of its own."
                         },
                         "sandbox_permissions": {
                                 "type": "string",
@@ -186,12 +192,14 @@ func main() {
 			return "", fmt.Errorf("command is required")
 		}
 
-		// 處理 session
-		sessionID := params.SessionID
-		if sessionID == "" || sessionID == "new" {
-			// 創建新 session
-			sessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
-		}
+		// 會話鍵：默認持久。
+		//
+		// 語義（反轉自早期實現：那時不傳 id 就每次新 shell，模型必須反復 cd）：
+		//   - 不傳 session_id → 綁到**調用方會話**（同一對話復用同一個 shell），
+		//     宿主沒給身份時退化為進程內單一默認會話；
+		//   - session_id: "new" → 顯式要一個全新 shell（cwd/env 都乾淨）；
+		//   - 其它值 → 按該名字取用（模型自建的分組，例如按任務隔離）。
+		sessionID := sessionKeyFor(ctx, params.SessionID)
 
 		// 獲取或創建 session
 		// workdir 优先于 cwd（对齐 DSH 参数名）；cwd 保留向后兼容
@@ -205,6 +213,7 @@ func main() {
 		}
 
 		// 執行命令到 session
+		touchSession(session)
 		output, exitCode, err := execSessionCommand(ctx, session, params.Command)
 		if err != nil {
 			return "", fmt.Errorf("failed to execute command in session: %w", err)
@@ -229,23 +238,18 @@ func main() {
 // exitCodeMarkRe 匹配结果里追加的退出码标记（[exit_code: N]，见 formatShellResult）。
 var exitCodeMarkRe = regexp.MustCompile(`\[exit_code\s*:\s*(-?\d+)\]`)
 
-// mapWorkspacePath 把模型书写的路径按「虚拟根 = 工作区根」契约映射为真实路径。
-// 实现已上收至 dsc.MapWorkspacePath（宿主与各插件进程同源，SDK 层有同名二次
-// 封装供第三方插件，各插件不再各自实现归并转换）；此处仅保留 shell AST 字面量
-// 重写（mapWorkspacePaths）的接入点。规则与例外详见 core/workspace.go：
-// /workspace 前缀（全平台，前缀后必须是分隔符或结尾）、裸 POSIX 绝对路径保持
-// 原样（Windows 上经绝对化解析为当前盘根，与 Linux 真实根一致）、
-// /dev/null 与 // UNC 例外、WSL 风格 /mnt/<drive>/ 映射（仅 Windows）。
+// mapWorkspacePath 把模型书写的路径按虚拟根表映射为真实路径（实现在 core，SDK 转发）。
+// shell 侧只保留 AST 字面量重写这一个接入点——本插件不再持有任何虚拟根知识。
 func mapWorkspacePath(p string) string {
 	return dsc.MapWorkspacePath(p)
 }
 
 // mapWorkspacePaths 遍历 shell AST，把纯字面量词中的虚拟根前缀重写为真实路径：
-// 工作空间根 /workspace（跨平台，见 dsc.MapWorkspacePath）与临时目录 /tmp（仅 Windows，
-// 见 mapTempPath）。只改写词首的路径形状词（裸词 / 单双引号内无变量展开），变量展开/
-// 命令替换等复杂词不改，避免误伤。cd /workspace、ls -la /workspace/x、cat "/workspace/a b"、
-// cd /tmp、ls /tmp/x 等均被覆盖——包括 cd 内建（改 runner.Dir，不经文件操作的 res()），
-// 这正是此前 /tmp 在 cd 下失效而文件操作下正常的根因。
+// /workspace（跨平台）、/tmp 与 /mnt/<drive>（仅 Windows）——规则全在 core 的虚拟根
+// 表里，这里只负责「在解释执行前改写字面量」。只改写词首的路径形状词（裸词 / 单双引号
+// 内无变量展开），变量展开/命令替换等复杂词不改，避免误伤。cd /workspace、cd /tmp、
+// ls -la /workspace/x、cat "/workspace/a b" 都被覆盖——包括 cd 内建（改 runner.Dir，
+// 不经文件操作的 res()），这正是当年 /tmp 在 cd 下失效、而文件操作下正常的根因。
 func mapWorkspacePaths(node syntax.Node) {
 	mapWorkspacePathsFor(node, runtime.GOOS)
 }
@@ -263,10 +267,9 @@ func mapWorkspacePathsFor(node syntax.Node, goos string) {
 			v.Value = mapShellLitFor(v.Value, goos)
 			return false
 		case *syntax.DblQuoted:
-			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会再被
-			// 上面的 *syntax.Lit 分支映射第二次。此前的 workspace 映射幂等（已映射值
-			// 不再以 /workspace 开头）而看不出问题，但 /tmp 映射不幂等——已映射的
-			// /tmp/myws/... 会被二次改写为临时目录，导致 cd /workspace 等被误伤。
+			// 改写各 Lit 子部分后返回 false 阻止 Walk 下钻：否则子 Lit 节点会被
+			// *syntax.Lit 分支再映射一次。映射表本身「首次命中即返回」，对已映射
+			// 的结果再跑一遍也只会落到「不匹配任何前缀」，但双重遍历没有意义。
 			for _, part := range v.Parts {
 				if lit, ok := part.(*syntax.Lit); ok {
 					lit.Value = mapShellLitFor(lit.Value, goos)
@@ -278,41 +281,13 @@ func mapWorkspacePathsFor(node syntax.Node, goos string) {
 	})
 }
 
-// mapShellLitFor 合并两个虚拟根映射（goos 显式注入便于测试）：
-//   - /tmp → DSC 临时目录（仅 Windows；Unix 上 /tmp 是真实挂载点，原样）
-//   - /workspace → 工作空间根（跨平台，见 dsc.MapWorkspacePath）
+// mapShellLitFor 用虚拟根表映射一个字面量（goos 显式注入便于跨平台测试）。
 //
-// 次序关键：必须先做 /tmp 映射，再做 /workspace 映射。两者前缀互不相交，正常输入下
-// 次序无所谓；但若工作空间根自身落在 /tmp/... 下（用户从 /tmp 启动 dsc，或
-// DSC_WORKSPACE_ROOT=/tmp/...），先做 /workspace 映射会把根改写成 /tmp/...，再被 /tmp
-// 映射误伤成临时目录——此前 TestMapWorkspaceAST 的假根 /tmp/myws 就踩中此碰撞。
-// Windows 上 /tmp 会被 mvdan/sh 解析成当前盘根（如 E:\tmp），没有真实挂载点，故需在
-// AST 层就把 /tmp 字面量改写成临时目录，使 cd /tmp 与文件操作一致落到 DSC temp
-// （res() 仅对文件操作参数与重定向目标做同名映射，漏了 cd 内建）。
+// 表内已按「具体前缀在前」排好序，且**首次命中即返回**，因此不存在旧实现
+// 「先 /tmp 后 /workspace」那种两段串联的顺序陷阱（工作区根落在 /tmp/... 下时
+// 会被二次改写）。
 func mapShellLitFor(p, goos string) string {
-	return mapWorkspacePath(mapTempPathFor(p, dsc.TempDir(), goos))
-}
-
-// mapTempPath 把模型的 /tmp 虚拟根字面量重写为 DSC 临时目录（Windows 专用）。
-func mapTempPath(p string) string {
-	return mapTempPathFor(p, dsc.TempDir(), runtime.GOOS)
-}
-
-// mapTempPathFor 是 mapTempPath 的纯函数本体（goos 显式注入便于测试），语义与 res()
-// 的 /tmp 分支（见 internalcmds.go）保持一致：/tmp 与 /tmp/... 映射到临时目录，
-// Unix 上 /tmp 是真实挂载点，原样不动。
-func mapTempPathFor(p, tempDir, goos string) string {
-	if goos != "windows" {
-		return p
-	}
-	if p == "/tmp" || strings.HasPrefix(p, "/tmp/") {
-		rel := strings.TrimPrefix(strings.TrimPrefix(p, "/tmp"), "/")
-		if rel == "" {
-			return tempDir
-		}
-		return dsc.PJoin(tempDir, rel)
-	}
-	return p
+	return dsc.MapWorkspacePathFor(p, dsc.WorkspaceRoot(), dsc.TempDir(), goos)
 }
 
 // shellView 为 shell 工具声明结构化视图：标题 Shell + 退出码徽标（0 绿 / 非 0 红）
@@ -340,13 +315,21 @@ func shellView(_ context.Context, _ json.RawMessage, result string) (json.RawMes
 // formatShellResult 根據命令輸出與退出碼組裝最終返回文本：
 // - 非 0 退出碼：無論是否有輸出，都追加 [exit_code: N]。
 // - 0 退出碼且有輸出：直接返回輸出，不附加 [exit_code: 0]。
-// - 0 退出碼且無輸出：返回 [exit_code: 0]。
+// - 無輸出：顯式寫出 (no output)。
+//
+// 最後一條是刻意的：只回 [exit_code: 0] 時，模型分不清「命令沒東西可說」與
+// 「工具沒抓到輸出」，往往把乾淨工作區的 `git status` 當成工具壞了、反复重跑。
+// 明確寫出無輸出，配合退出碼即可唯一確定「跑成功了，只是沒有任何輸出」。
 func formatShellResult(output string, exitCode int32) string {
+	empty := strings.TrimSpace(output) == ""
 	if exitCode != 0 {
+		if empty {
+			return fmt.Sprintf("\n[exit_code: %d]\n(no output)\n", exitCode)
+		}
 		return output + fmt.Sprintf("\n[exit_code: %d]\n", exitCode)
 	}
-	if strings.TrimSpace(output) == "" {
-		return "\n[exit_code: 0]\n"
+	if empty {
+		return "\n[exit_code: 0]\n(no output)\n"
 	}
 	return output
 }
@@ -369,32 +352,98 @@ func shellHandlers() []interp.RunnerOption {
 	}
 }
 
+// defaultSessionKey 拿不到调用方身份时使用的兜底会话键（進程內单例）。
+const defaultSessionKey = "default"
+
+// shellSessionSeq 为显式 "new" 的会话名提供单调序号（见 sessionKeyFor）。
+var shellSessionSeq uint64
+
+// sessionKeyFor 计算本次调用使用的 shell 会话键。
+//
+// 语义：**默认持久**。不传 session_id 时绑定到调用方会话，同一对话复用同一个
+// shell（cwd、export 的变量、函数都留着），模型不必每条命令都 `cd` 一次。
+// 想要干净环境必须显式 `session_id: "new"`。
+func sessionKeyFor(ctx context.Context, requested string) string {
+	switch k := strings.TrimSpace(requested); {
+	case k == "new":
+		// 显式新建：纳秒 + 自增序号。只用纳秒不够——同一纳秒内连续两次调用
+		// 会拿到同一个键，等于 "new" 又复用了刚才那个 shell（Windows 时钟粒度
+		// 下实测能撞上）。
+		return fmt.Sprintf("shell-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&shellSessionSeq, 1))
+	case k != "":
+		return k
+	}
+	if sid := dsc.CallSessionID(ctx); sid != "" {
+		// 前缀避免与模型自建的 id 撞名（模型可能正好用 "default" 之类）
+		return "conv:" + sid
+	}
+	return defaultSessionKey
+}
+
+// resolveSessionWorkdir 把 workdir 参数归一为可用的绝对目录。
+//
+// 空值 → 统一工作空间根（启动 dsc 的目录），而不是插件进程的可执行目录；显式值
+// 先过 `/workspace` 前缀映射（与命令 AST 的路径映射同一套语义），相对路径锚到
+// 工作空间根——与 shell 内相对路径的语义一致。
+func resolveSessionWorkdir(w string) string {
+	if w == "" {
+		if ws := dsc.WorkspaceRoot(); ws != "" {
+			return ws
+		}
+		if cwd, err := os.Getwd(); err == nil {
+			return cwd
+		}
+		return os.TempDir()
+	}
+	mapped := dsc.MapModelPath(w) // 设备名 + 虚拟根，与命令里的路径同一套表
+	if !filepath.IsAbs(mapped) {
+		if ws := dsc.WorkspaceRoot(); ws != "" {
+			mapped = dsc.PJoin(ws, mapped)
+		}
+	}
+	return mapped
+}
+
+// touchSession 记录最近使用时间（LRU 淘汰依据）。
+func touchSession(s *Session) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lastUsed = time.Now()
+	s.mu.Unlock()
+}
+
+// lastUse 读取最近使用时间（加锁，避免与 touchSession 竞态）。
+func (s *Session) lastUse() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastUsed
+}
+
 // getOrCreateSession 獲取或創建 session
 func getOrCreateSession(sessionID, cwd string) (*Session, error) {
+	dir := resolveSessionWorkdir(cwd)
+
 	globalSessionManager.mu.RLock()
 	session, exists := globalSessionManager.sessions[sessionID]
 	globalSessionManager.mu.RUnlock()
 
 	if exists {
+		// 復用時也要遵守 workdir：此前是直接 return，模型按描述傳 workdir 會被
+		// 靜默忽略（命令照樣跑在舊目錄），而且沒有任何提示。
+		if strings.TrimSpace(cwd) != "" {
+			session.mu.Lock()
+			session.Runner.Dir = dir
+			session.Cwd = dir
+			session.mu.Unlock()
+		}
+		touchSession(session)
 		return session, nil
 	}
 
 	// 創建新 session runner
 	initialEnv := expand.ListEnviron(os.Environ()...)
-	if cwd == "" {
-		// 未显式指定 cwd 时，默认以統一工作空間根（DSC_WORKSPACE_ROOT，即启动 dsc 的
-		// 目录 cwd）为 shell 工作目录，而非插件进程自身的可执行目录。这样模型执行
-		// pwd 得到的是用户的启动目录（workspace 根），而非程序安装目录（execDir）。
-		if ws := dsc.WorkspaceRoot(); ws != "" {
-			cwd = ws
-		} else {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				cwd = os.TempDir()
-			}
-		}
-	}
 
 	stdoutBuf := &syncedBuilder{}
 	stderrBuf := &syncedBuilder{}
@@ -405,7 +454,7 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 
 	runnerOpts := []interp.RunnerOption{
 		interp.Env(initialEnv),
-		interp.Dir(cwd),
+		interp.Dir(dir),
 		interp.StdIO(nil, stdoutSignal, stderrSignal),
 	}
 	runnerOpts = append(runnerOpts, shellHandlers()...)
@@ -417,7 +466,8 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 
 	session = &Session{
 		SessionID:    sessionID,
-		Cwd:          cwd,
+		Cwd:          dir,
+		lastUsed:     time.Now(),
 		Runner:       runner,
 		StdoutBuf:    stdoutBuf,
 		StderrBuf:    stderrBuf,
@@ -426,11 +476,18 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 	}
 
 	globalSessionManager.mu.Lock()
-	// 达上限时任删一个会话，避免 map 无限增长。
+	// 达上限时淘汰**最久未用**的会话。以前是 map 里随便取一个删——可能踢掉正在用的
+	// 那个，模型下一轮带同一 id 进来拿到全新 shell，cwd/变量「莫名失忆」且无从解释。
 	if len(globalSessionManager.sessions) >= maxSessions {
-		for k := range globalSessionManager.sessions {
-			delete(globalSessionManager.sessions, k)
-			break
+		oldestKey := ""
+		var oldest time.Time
+		for k, v := range globalSessionManager.sessions {
+			if lu := v.lastUse(); oldestKey == "" || lu.Before(oldest) {
+				oldestKey, oldest = k, lu
+			}
+		}
+		if oldestKey != "" {
+			delete(globalSessionManager.sessions, oldestKey)
 		}
 	}
 	globalSessionManager.sessions[sessionID] = session

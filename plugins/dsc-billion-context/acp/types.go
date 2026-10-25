@@ -50,9 +50,14 @@ type CoreMessage struct {
 }
 
 // CoreToolCall assistant 消息上的工具调用（proto.ToolCall 保真往返）。
+//
+// Arguments 必须带上：它才是「这条调用到底做了什么」。只留 id/name 时，模型在
+// 后续轮次里看到的自己历史是「调过 shell，参数未知」，于是无法判断自己跑过什么、
+// 只能重跑一遍——表现为反复执行同一命令、对空输出越发困惑。
 type CoreToolCall struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"` // 原始 JSON 字符串（proto.ArgumentsJson）
 }
 
 // CompressionTier 压缩块层级。
@@ -116,6 +121,19 @@ type CompressionStats struct {
 	TokensCompressed int `json:"tokensCompressed"`
 	CompressionCount int `json:"compressionCount"`
 	AbsorbedTokens   int `json:"absorbedTokens,omitempty"`
+
+	// ---- 可观测性：省了多少、取回多少次（用户与模型都看不到过程，只能看这组数）----
+	// CrushCount / CrushTokensSaved 确定性压缩（absorb 第一段）的命中次数与省下的 token。
+	CrushCount       int `json:"crushCount,omitempty"`
+	CrushTokensSaved int `json:"crushTokensSaved,omitempty"`
+	// CCRStored / CCRStoredTokens 已卸载条数与原文规模（一次性写进附件库的量）。
+	CCRStored       int `json:"ccrStored,omitempty"`
+	CCRStoredTokens int `json:"ccrStoredTokens,omitempty"`
+	// CCRRetrieved / CCRExported 回取次数与其中导出成文件的次数（导出率过高说明内联上限偏低）。
+	CCRRetrieved int `json:"ccrRetrieved,omitempty"`
+	CCRExported  int `json:"ccrExported,omitempty"`
+	// RetrievalMisses 取不到的 ref 次数（模型幻觉或条目被淘汰——>0 值得排查）。
+	RetrievalMisses int `json:"retrievalMisses,omitempty"`
 }
 
 // AbsorbRecord 一次即时工具结果吸收（对齐 acp-kernel AbsorbRecord）：
@@ -142,8 +160,12 @@ type CompressionState struct {
 	Absorbed []AbsorbRecord `json:"absorbed,omitempty"`
 	// TerminalStreak 近满无解连续计数（terminal-escape 信号，对齐 #300）
 	TerminalStreak int `json:"terminalStreak,omitempty"`
-	NextBlockID    int `json:"nextBlockId"`
-	NextRunID      int `json:"nextRunId"`
+	// CCR 已卸载内容的索引（字节在附件库里，这里只存引用与元数据）。
+	CCR []CCREntry `json:"ccr,omitempty"`
+	// NextCCRID 下一个回取 ref 的序号（单调递增，永不复用）。
+	NextCCRID   int `json:"nextCcrId,omitempty"`
+	NextBlockID int `json:"nextBlockId"`
+	NextRunID   int `json:"nextRunId"`
 }
 
 // Config 压缩配置（对齐 acp-kernel Config，精简版）。
@@ -154,6 +176,24 @@ type Config struct {
 	ProtectedTools     []string   `json:"protectedTools"`     // 受保护工具名（其 tool-call/result 不被压缩）
 	PromotionThreshold int        `json:"promotionThreshold"` // young→old 升级所需存活次数
 	Tiers              TierConfig `json:"tiers"`              // 多层蒸馏触发阈值
+
+	// 以下为 nudge 的「增长/蒸馏」口径（对齐 acp-kernel config.nudge.*）。把绝对值
+	// 换成与窗口成比例的量：小窗口不会要求离谱的增量，大窗口也不会因为攒了几个
+	// 小摘要就反复提示蒸馏。
+	//
+	//   nudgeGrowthTokens = clamp(limit × GrowthRatio, GrowthFloor, GrowthCap)
+	//   growthFloorTokens = max(MinGrowthFloor, MinGrowthRatio × nudgeGrowthTokens)
+	//   tierMassThreshold = TierGrowthMultiplier × nudgeGrowthTokens
+	//
+	// tierMassThreshold 是「蒸馏一个层级值不值得」的判据：T1 摘要被压到 ~10:1，
+	// 光数块数会在上下文还很宽裕时就把细节蒸干；按可回收的摘要质量（tokens）算，
+	// 才与"这一层真的占地方了吗"对得上。
+	GrowthRatio          float64 `json:"growthRatio"`          // 增长率（默认 0.05）
+	GrowthFloor          int     `json:"growthFloor"`          // nudgeGrowthTokens 下限（默认 1000）
+	GrowthCap            int     `json:"growthCap"`            // nudgeGrowthTokens 上限（默认 50000）
+	MinGrowthFloor       int     `json:"minGrowthFloor"`       // growthFloorTokens 的下限（默认 1000）
+	MinGrowthRatio       float64 `json:"minGrowthRatio"`       // growthFloorTokens 占 nudgeGrowthTokens 的比例（默认 0.45）
+	TierGrowthMultiplier float64 `json:"tierGrowthMultiplier"` // 蒸馏质量阈值倍数（默认 1.5）
 	// MinCompressRangeChars 推荐范围的最小字符量（对齐 acp-kernel
 	// compress.minCompressRange，默认 5000）——mergeRangesToThreshold 把相邻范围
 	// 批量合并到该阈值之上，低于阈值的尾部并入前一批，整段低于阈值则不出推荐
@@ -167,6 +207,13 @@ type Config struct {
 	TerminalEscapeAfter int `json:"terminalEscapeAfter"`
 	// Absorb 即时工具结果吸收配置（默认关闭，DSC_ACP_ABSORB=1 开启）
 	Absorb AbsorbConfig `json:"absorb"`
+	// Crush 工具结果的确定性压缩（absorb 两段式的第一段，默认关闭）。
+	// 只在 Absorb.Enabled 时生效：没有第二段兜底时压一半没有意义。
+	Crush CrushConfig `json:"crush"`
+	// CCR 内容缓存回取：大工具结果按内容 hash 存一次，线上只留占位符，
+	// 模型用 acp_retrieve 取回（默认关闭）。文本复用 dsc-txt:// 附件库，
+	// 图像只记 dsc-img:// ref——不另建存储层。
+	CCR CCRConfig `json:"ccr"`
 }
 
 // AbsorbConfig 吸收配置（对齐 acp-kernel AbsorbConfig）。
@@ -181,10 +228,14 @@ type AbsorbConfig struct {
 // TierConfig 多层蒸馏配置（对齐 acp-kernel TierConfig）。
 type TierConfig struct {
 	// Tier2Trigger 当 active T1 块数达到此值时，nudge 提示模型蒸馏为 T2。
-	// 默认 5（ summaries ~10:1 condensed，5 个 T1 ~10K token，达到蒸馏经济性）。
+	//
+	// **计数不是需求信号**（acp-kernel #379）：摘要已被压到 ~10:1，攒 5 个块可能只
+	// 占几千 token，此时提示蒸馏纯属把细节白烧掉，还会重写 wire 前缀（缓存失效）。
+	// 故计数路径默认关（1000 = 实际不触发）；真正的需求信号是「可回收的摘要质量」，
+	// 由 Config.TierGrowthMultiplier × nudgeGrowthTokens 判定，两条路径取「或」。
+	// 显式配置较小值仍可按纯计数触发（no usage gate，与内核一致）。
 	Tier2Trigger int `json:"tier2Trigger"`
-	// Tier3Trigger 当 active T2 块数达到此值时，nudge 提示模型凝结为 T3。
-	// 默认 10。
+	// Tier3Trigger 当 active T2 块数达到此值时，nudge 提示模型凝结为 T3。默认关（2000）。
 	Tier3Trigger int `json:"tier3Trigger"`
 }
 
@@ -197,9 +248,15 @@ func DefaultConfig(modelContextLimit int) Config {
 		ProtectedTools:     []string{},
 		PromotionThreshold: 3,
 		Tiers: TierConfig{
-			Tier2Trigger: 5,  // T1 块数达 5 时蒸馏为 T2
-			Tier3Trigger: 10, // T2 块数达 10 时凝结为 T3
+			Tier2Trigger: 1000, // 计数路径默认关（质量路径才是需求信号）
+			Tier3Trigger: 2000,
 		},
+		GrowthRatio:            0.05,
+		GrowthFloor:            1000,
+		GrowthCap:              50000,
+		MinGrowthFloor:         1000,
+		MinGrowthRatio:         0.45,
+		TierGrowthMultiplier:   1.5,
 		MinCompressRangeChars:  5000,
 		TruncateThreshold:      0.95,
 		PreserveRecentMessages: 5,
@@ -208,6 +265,13 @@ func DefaultConfig(modelContextLimit int) Config {
 			Enabled:       false,
 			ToolName:      "absorb",
 			MinToolTokens: 1000,
+		},
+		CCR: CCRConfig{
+			Enabled:           false,
+			MinToolTokens:     2000,
+			InlineLimitTokens: 4000,
+			ToolName:          "acp_retrieve",
+			MaxEntries:        200,
 		},
 	}
 }

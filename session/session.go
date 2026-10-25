@@ -66,7 +66,7 @@ const (
 	// 后续 prompt 变化以 replace 覆盖 node 0。空 content 表示"无 system prompt"
 	// 占位节点——保留 surface 位置但不派生模型消息（投影为 nil），
 	// 让"先空后非空"的 prompt 仍能 replace node 0 而非追加到 user 历史之后。
-	// agent-react-loop 每轮 buildSystemPrompt 后比较 surface 当前 system 节点
+	// agent 插件 每轮 buildSystemPrompt 后比较 surface 当前 system 节点
 	// 内容，差异即 emit 一条 SystemMessage（append 或 replace）。
 	SystemMessage EventType = "system/message"
 )

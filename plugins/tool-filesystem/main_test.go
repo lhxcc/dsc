@@ -19,7 +19,7 @@ func TestFormatShellResult(t *testing.T) {
 			name:     "非零退出碼且無輸出，也追加 [exit_code: N]",
 			output:   "",
 			exitCode: 2,
-			want:     "\n[exit_code: 2]\n",
+			want:     "\n[exit_code: 2]\n(no output)\n",
 		},
 		{
 			name:     "零退出碼且有輸出，不附加 [exit_code: 0]",
@@ -28,16 +28,16 @@ func TestFormatShellResult(t *testing.T) {
 			want:     "hello world",
 		},
 		{
-			name:     "零退出碼且全空白輸出，返回 [exit_code: 0]",
+			name:     "零退出碼且全空白輸出，明示無輸出",
 			output:   "  \n\t ",
 			exitCode: 0,
-			want:     "\n[exit_code: 0]\n",
+			want:     "\n[exit_code: 0]\n(no output)\n",
 		},
 		{
-			name:     "零退出碼且零輸出，返回 [exit_code: 0]",
+			name:     "零退出碼且零輸出，明示無輸出",
 			output:   "",
 			exitCode: 0,
-			want:     "\n[exit_code: 0]\n",
+			want:     "\n[exit_code: 0]\n(no output)\n",
 		},
 	}
 

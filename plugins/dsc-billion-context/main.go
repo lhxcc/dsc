@@ -39,6 +39,13 @@ type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
 	config bcacp.Config
+	// lastTokenCount 最近一次 pre-step 观测到的上下文占用（宿主估算或本地兜底）。
+	lastTokenCount int
+
+	// state 当前会话的压缩状态（含 CCR 条目索引）；pre-step 每轮刷新，
+	// 供 acp_retrieve 查条目（工具调用不带会话上下文，只能读最近一次快照）。
+	state *bcacp.CompressionState
+
 	// sessionID 当前会话 ID（须持 mu 读写）。
 	// 取值优先级：pre-step 事件里的 Session（宿主真实会话 ID，见 handlePreStep）>
 	// DSC_SESSION_ID env > 工作区派生的项目级键。此前只用后两者，而宿主从不注入
@@ -91,6 +98,23 @@ func main() {
 		}
 	}
 
+	// 内容缓存回取（CCR）开关（默认关闭，DSC_ACP_CCR=1 启用）。
+	// 与 absorb 相互独立：absorb 是有损蒸馏，CCR 是把原文按内容 hash 存起来随时取回；
+	// 两者可以只开一个，也可以都开（CCR 的占位符很短，absorb 不会再要求蒸馏它）。
+	if dsc.EnvBool("DSC_ACP_CCR", false) {
+		bc.config.CCR.Enabled = true
+		if n := os.Getenv("DSC_ACP_CCR_MIN_TOKENS"); n != "" {
+			if v, err := parseInt(n); err == nil && v >= 0 {
+				bc.config.CCR.MinToolTokens = v
+			}
+		}
+		if n := os.Getenv("DSC_ACP_CCR_INLINE_TOKENS"); n != "" {
+			if v, err := parseInt(n); err == nil && v > 0 {
+				bc.config.CCR.InlineLimitTokens = v
+			}
+		}
+	}
+
 	sdkInst := dsc.New(dsc.Config{
 		Name:    bcadapter.PluginName,
 		Version: "0.3.0",
@@ -100,6 +124,11 @@ func main() {
 		// 不硬编码插件名，任何声明 Provides compaction 的插件都接管。
 		Provides: map[string]string{
 			"compaction": "true",
+		},
+		// 命令是声明出来的能力：核心/前端不认识这些名字，只按声明清单把
+		// /<name> 转发回本插件（PluginHookService.RunCommand）。
+		Commands: []dsc.Command{
+			{Name: "context", Summary: "上下文压缩状态（占用 / 已压 / 可回收）", Usage: "/context"},
 		},
 	})
 
@@ -183,9 +212,39 @@ func main() {
 		})
 	}
 
+	// 回取工具（启用 CCR 时注册）：把占位符换回原文。
+	if bc.config.CCR.Enabled {
+		sdkInst.Tool(dsc.Tool{
+			Name:        bc.config.CCR.ToolName,
+			Description: "Fetch the full content behind an [acp-stored cNNNNN] placeholder. Inline up to a size limit; larger payloads are exported to a workspace file you read with your own file tool.",
+			Handler:     bc.handleRetrieve,
+			Schema:      json.RawMessage(bcacp.CCRToolSchema()),
+			// 图像条目：把 ref 挂回工具结果，由 provider 解析成真正的图像块
+			ImagesFn: func(ctx context.Context, args json.RawMessage, result string) []string {
+				var in struct {
+					Ref string `json:"ref"`
+				}
+				if json.Unmarshal(args, &in) != nil {
+					return nil
+				}
+				bc.mu.Lock()
+				defer bc.mu.Unlock()
+				if bc.state == nil {
+					return nil
+				}
+				entry, ok := bcacp.FindCCREntry(bc.state.CCR, in.Ref)
+				if !ok || entry.Kind != bcacp.CCRKindImage {
+					return nil
+				}
+				return entry.Images
+			},
+		})
+	}
+
 	// Hook: 拦截 agent/pre-step 改写消息列表 + ContextFn 贡献 ACP system prompt
 	sdkInst.Hook(dsc.Hook{
-		OnEvent: bc.onEvent,
+		OnEvent:    bc.onEvent,
+		RunCommand: bc.runCommand,
 		ContextFn: func() string {
 			if bc.config.Absorb.Enabled {
 				return bcacp.ACPSystemPrompt + "\n\n" + bcacp.BuildAbsorbSystemPrompt(bc.config.Absorb.ToolName)
@@ -344,16 +403,27 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// （hide-compress-calls 依此区分已消费调用与孤儿调用）
 	backfillCompressCallIDs(coreMsgs, state)
 
-	// token 计数：优先用事件携带的宿主估算值（含工具结构开销），回退本地估算
-	tokenCount := ev.TokenCount
-	if tokenCount <= 0 {
-		tokenCount = estimateTokens(protoMsgs)
-	}
+	// 本次决策用的上下文用量（口径见 usageTokens）
+	tokenCount := usageTokens(ev, protoMsgs)
 
 	// 跑 pipeline（renderTags=false：不注入 <acp> 标签到消息文本——标签的 tokens
 	// 属性每轮估算会变化，破坏前缀缓存。改为仅用 mNNNNN ref 映射，标签信息经
 	// acp_status 工具按需查询）
 	result := bcacp.ProcessTurn(coreMsgs, state, bc.config, tokenCount)
+
+	// CCR 副作用：把要卸载的正文写进内容寻址附件库（dsc-txt://<sha>），
+	// 并校验 sha 与条目一致——不一致说明正文在 acp 与插件之间被改写过，
+	// 此时**回滚该条**（恢复原文）而不是留一个取不回来的占位符。
+	if len(result.CCROffloads) > 0 {
+		result.Messages = bc.persistCCROffloads(result.Messages, result.CCROffloads)
+	}
+
+	// 缓存 state 与最近一次 token 数：status 报告与 context/status 事件都要用真实占用，
+	// 之前 handleStatus 用「已压缩 token + 1000」当占用，报出来的百分比毫无意义。
+	bc.mu.Lock()
+	bc.state = result.State
+	bc.lastTokenCount = tokenCount
+	bc.mu.Unlock()
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -371,6 +441,13 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	if result.Nudge != nil && result.Nudge.ShouldInject {
 		nudgeText := bcacp.FormatNudgeText(*result.Nudge)
 		if nudgeText != "" {
+			// 每次提示都留一行数字：窗口、触发线、当前用量、下次需要的增量。
+			// 这些值此前只在首个 pre-step 打一次窗口，出现「怎么老提示压缩」时无法
+			// 判断是窗口取错了、还是用量真的到了，只能靠猜。
+			fmt.Fprintf(os.Stderr, "[billion-context] nudge: reason=%q tokens=%d limit=%d threshold=%d growthFloor=%d baseline=%d\n",
+				result.Nudge.Reason, result.Nudge.Breakdown["usage"], bc.config.ModelContextLimit,
+				result.Nudge.Breakdown["thresholdTokens"], bcacp.GrowthFloorTokens(bc.config),
+				result.Nudge.Breakdown["baselineTokens"])
 			renderedMsgs = append(renderedMsgs, bcacp.CoreMessage{
 				ID:          "acp_nudge",
 				Role:        bcacp.RoleUser,
@@ -508,8 +585,10 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 		return "", fmt.Errorf("load state: %w", err)
 	}
 
-	// 估算当前 token 数（无消息列表时用 state 估算）
-	tokenCount := state.Stats.TokensCompressed + 1000 // 粗略估算
+	// 用最近一次 pre-step 的真实占用；没有时退回 0（而不是拿"已压缩量"冒充占用）
+	bc.mu.Lock()
+	tokenCount := bc.lastTokenCount
+	bc.mu.Unlock()
 	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
 	text := bcacp.FormatStatus(report)
 
@@ -546,15 +625,35 @@ func (bc *BillionContext) setSessionID(id string) {
 }
 
 // estimateTokens 估算 proto.Message 列表的总 token 数。
+// estimateTokens 估算消息列表 token（转调 SDK 的唯一实现）。
+//
+// 本地曾写 len(content)/4：对 CJK 低估 4 倍（UTF-8 一个汉字 3 字节），与 acp 包
+// 里另一份「max(bytes/4, runes)」（对 ASCII 高估 4~5 倍）方向相反——同一个插件里
+// 两个口径打架，阈值到底偏哪边取决于走哪条路径。统一由 SDK 计算。
 func estimateTokens(msgs []*proto.Message) int {
-	total := 0
-	for _, m := range msgs {
-		total += len(m.Content) / 4
-		if len(m.ToolCalls) > 0 {
-			total += 8 // tool-call 结构开销
-		}
+	return dsc.EstimateProtoMessagesTokens(msgs)
+}
+
+// usageTokens 选本次压缩决策用的上下文用量。
+//
+// 优先级：**上一轮 provider 上报的 prompt 用量** > 宿主对原始历史的估算 > 本地估算。
+//
+// 为什么不能直接用 ev.TokenCount：它是宿主对 req.Messages 的估算，而那是 agent 的
+// append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent 侧「有后端时
+// 跳过内联 compactHistory」）。于是原始历史只增不减：一旦越过使用率阈值，压缩再怎么
+// 压都不会让它回落，插件便每一轮都提示「该压缩了」，模型只能每隔几步压一小段，而
+// 主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`（上一轮
+// provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
+//
+// provider 不报用量时退回旧口径（原始历史估算）——行为不变，不会比现在更差。
+func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
+	if ev.LastUsageTokens > 0 {
+		return ev.LastUsageTokens
 	}
-	return total
+	if ev.TokenCount > 0 {
+		return ev.TokenCount
+	}
+	return estimateTokens(msgs)
 }
 
 // containsStr 报告 s 是否包含 sub（轻量实现，避免引入 strings 包）。
@@ -636,4 +735,193 @@ func parseInt(s string) (int, error) {
 		n = n*10 + int(c-'0')
 	}
 	return n, nil
+}
+
+// persistCCROffloads 把 CCR 要卸载的正文写进附件库，并校验 sha。
+//
+// 失败处理：附件写不进去（磁盘满、权限）时，**把该条消息的正文恢复原样**——
+// 留一个指向不存在内容的占位符，模型会反复回取失败，比不压缩更糟。
+func (bc *BillionContext) persistCCROffloads(msgs []bcacp.CoreMessage, offloads []bcacp.CCROffload) []bcacp.CoreMessage {
+	restore := map[string]bool{}
+	for _, off := range offloads {
+		if off.Body == "" {
+			continue // 纯图像条目没有正文要存（图像字节本来就在附件库）
+		}
+		ref, err := dsc.SaveTextAttachment([]byte(off.Body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[billion-context] CCR 落盘失败（%s）: %v\n", off.Entry.Ref, err)
+			restore[off.MessageID] = true
+			continue
+		}
+		// SaveTextAttachment 返回 dsc-txt://<sha256>，与条目 sha 必须一致
+		if ref != dsc.TextRefPrefix+off.Entry.Shasum {
+			fmt.Fprintf(os.Stderr, "[billion-context] CCR sha 不一致（%s: %s ≠ %s），回滚该条\n",
+				off.Entry.Ref, ref, dsc.TextRefPrefix+off.Entry.Shasum)
+			restore[off.MessageID] = true
+		}
+	}
+	if len(restore) == 0 {
+		return msgs
+	}
+	for i := range msgs {
+		if restore[msgs[i].ID] {
+			// 原文已随 offload 存过一份（Body），此处按 ID 回填
+			for _, off := range offloads {
+				if off.MessageID == msgs[i].ID {
+					msgs[i].Text = off.Body
+					break
+				}
+			}
+		}
+	}
+	return msgs
+}
+
+// handleRetrieve 处理 acp_retrieve 工具调用：把占位符换回原文。
+//
+// 交付形态（见 acp.PlanRetrieval）：
+//   - 图像条目 → 正文给一句话，图像 ref 经 ImagesFn 挂回工具结果（provider 解析）
+//   - 文本且未超内联上限 → 直接内联
+//   - 文本超限 → 导出到工作区 acp-retrieved/，返回指针让模型自己分页读
+//
+// 为什么要设上限：回取不设限等于把刚省下的上下文又塞回去，还可能一次撑爆窗口。
+func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessage) (string, error) {
+	var in struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 参数解析失败: %w", err)
+	}
+	bc.mu.Lock()
+	st := bc.state
+	bc.mu.Unlock()
+	if st == nil {
+		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+	}
+	entry, ok := bcacp.FindCCREntry(st.CCR, in.Ref)
+	if !ok {
+		bc.noteRetrieval(false, false)
+		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+	}
+	if entry.Kind == bcacp.CCRKindImage {
+		head := fmt.Sprintf("[acp-retrieved %s] 已将 %d 张图像重新挂回本次工具结果，请直接查看。",
+			entry.Ref, len(entry.Images))
+		// 图像条目可能还带说明文字：有就一起给（否则模型为看这句话还得再取一次）
+		if txt, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum); err == nil && txt != "" {
+			plan := bcacp.PlanRetrieval(entry, bc.config, txt)
+			if plan.Inline {
+				return head + "\n\n" + plan.Text, nil
+			}
+		}
+		return head, nil
+	}
+	text, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum)
+	if err != nil {
+		return "", fmt.Errorf("acp_retrieve: 读取原文失败（%s）: %w", entry.Ref, err)
+	}
+	plan := bcacp.PlanRetrieval(entry, bc.config, text)
+	if plan.Inline {
+		bc.noteRetrieval(true, false)
+		return plan.Text, nil
+	}
+	// 超限：导出到工作区，返回指针（模型用自己的文件工具分页读）
+	dir := dsc.PJoin(dsc.WorkspaceRoot(), "acp-retrieved")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 创建导出目录失败: %w", err)
+	}
+	full := dsc.PJoin(dir, plan.ExportPath)
+	if err := os.WriteFile(full, []byte(text), 0o644); err != nil {
+		return "", fmt.Errorf("acp_retrieve: 导出失败: %w", err)
+	}
+	bc.noteRetrieval(true, true)
+	return bcacp.CCRPointerText(entry, "acp-retrieved/"+plan.ExportPath, bc.config.CCR.InlineLimitTokens), nil
+}
+
+// noteRetrieval 累计回取指标（命中/导出/落空）。
+//
+// 为什么值得记：`retrievalMisses` 涨说明模型在编 ref 或条目被淘汰后仍被引用；
+// `ccrExported` 占比高说明内联上限偏低、模型被迫多走一次文件读取。两者都是
+// 调参信号，不看数据只能靠猜。
+func (bc *BillionContext) noteRetrieval(hit, exported bool) {
+	bc.mu.Lock()
+	st := bc.state
+	bc.mu.Unlock()
+	if st == nil {
+		return
+	}
+	if !hit {
+		st.Stats.RetrievalMisses++
+		return
+	}
+	st.Stats.CCRRetrieved++
+	if exported {
+		st.Stats.CCRExported++
+	}
+}
+
+// runCommand 执行宿主转发过来的斜杆命令（命令名由本插件在 metadata.commands 里
+// 声明，宿主不认识这些名字）。多行文本由界面自行排版。
+func (bc *BillionContext) runCommand(ctx context.Context, name, args string) (string, error) {
+	switch name {
+	case "context":
+		return bc.renderContextStatus(), nil
+	}
+	return "", fmt.Errorf("unknown command: %s", name)
+}
+
+// renderContextStatus 生成状态面板文本（/context 命令的输出）。
+//
+// 排版放在插件里是有意的：这些指标（分层块、确定性压缩、可回取条目）是 ACP 的
+// 概念，核心与前端不该认识它们；插件只负责产出一段给人看的文本。
+func (bc *BillionContext) renderContextStatus() string {
+	bc.mu.Lock()
+	state := bc.state
+	tokenCount := bc.lastTokenCount
+	bc.mu.Unlock()
+
+	if state == nil {
+		return "（压缩状态尚未建立：本会话还没跑过一个回合）"
+	}
+	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
+	bd := report.Breakdown
+
+	short := func(n int) string {
+		switch {
+		case n >= 1_000_000:
+			return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
+		case n >= 1_000:
+			return fmt.Sprintf("%dK", n/1_000)
+		}
+		return fmt.Sprintf("%d", n)
+	}
+
+	var b strings.Builder
+	b.WriteString("DSC · 上下文压缩\n")
+	if report.ModelContextLimit > 0 {
+		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n",
+			short(report.TokenCount), short(report.ModelContextLimit),
+			float64(report.TokenCount)*100/float64(report.ModelContextLimit))
+	} else {
+		fmt.Fprintf(&b, "  占用: %s\n", short(report.TokenCount))
+	}
+	fmt.Fprintf(&b, "  块: %d active / %d total（T1=%d T2=%d T3=%d）\n",
+		report.ActiveBlocks, report.TotalBlocks, bd["tier1"], bd["tier2"], bd["tier3"])
+	if bd["tokensCompressed"] > 0 || bd["compressionCount"] > 0 {
+		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", short(bd["tokensCompressed"]), bd["compressionCount"])
+	}
+	if v := bd["absorbedTokens"]; v > 0 {
+		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", short(v))
+	}
+	if bd["crushCount"] > 0 {
+		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], short(bd["crushTokensSaved"]))
+	}
+	if bd["ccrStored"] > 0 {
+		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], short(bd["ccrStoredTokens"]))
+		fmt.Fprintf(&b, "  回取: %d 次（导出 %d · 落空 %d）\n",
+			bd["ccrRetrieved"], bd["ccrExported"], bd["retrievalMisses"])
+	}
+	if n := len(report.CompressibleRanges); n > 0 {
+		fmt.Fprintf(&b, "  可压范围: %d 段\n", n)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

@@ -17,8 +17,8 @@ func TestDispatchPreStepOnlyBackendRewriteAdopted(t *testing.T) {
 
 	m.mu.Lock()
 	m.toolHookClients["dsc-system"] = backend
-	m.toolHookClients["dsc-billion-context"] = other
-	m.toolHookOrder = []string{"dsc-billion-context", "dsc-system"}
+	m.toolHookClients["backend-b"] = other
+	m.toolHookOrder = []string{"backend-b", "dsc-system"}
 	m.compactionBackend = "dsc-system"
 	m.mu.Unlock()
 
@@ -50,8 +50,8 @@ func TestDispatchPreStepIgnoresRewritesWithoutBackend(t *testing.T) {
 	m, _ := hookManager()
 	h := &fakeHook{events: make(chan *proto.OnEventRequest, 1), eventResult: `{"messages":"[rewritten]"}`}
 	m.mu.Lock()
-	m.toolHookClients["dsc-billion-context"] = h
-	m.toolHookOrder = []string{"dsc-billion-context"}
+	m.toolHookClients["backend-b"] = h
+	m.toolHookOrder = []string{"backend-b"}
 	m.compactionBackend = ""
 	m.mu.Unlock()
 
@@ -74,11 +74,11 @@ func TestDispatchPreStepIgnoresRewritesWithoutBackend(t *testing.T) {
 }
 
 // TestCompactionBackendActiveRequiresConfiguredPlugin 标记判定必须落在选定后头上：
-// 未选中的提供者（同时启用的 dsc-billion-context）不得让 agent 误判为「有后端」。
+// 未选中的提供者（同时启用了第二个压缩后端）不得让 agent 误判为「有后端」。
 func TestCompactionBackendActiveRequiresConfiguredPlugin(t *testing.T) {
 	m, _ := hookManager()
 	m.mu.Lock()
-	m.coreMetadata["dsc-billion-context"] = &metadata.PluginInfo{
+	m.coreMetadata["backend-b"] = &metadata.PluginInfo{
 		Capabilities: map[string]string{"compaction": "true"},
 	}
 	m.compactionBackend = "dsc-system" // 选定但尚未加载

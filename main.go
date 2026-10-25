@@ -340,20 +340,20 @@ func main() {
 		os.Setenv("DSC_TEMP_DIR", core.PJoin(execDir, "temp"))
 	}
 
-	// 会话目录（agent-react-loop 写会话日志、dsc-billion-context 写压缩状态）：
+	// 会话目录（agent 写会话日志、压缩后端插件写自己的状态文件）：
 	// 未显式配置 DSC_SESSION_DIR 时注入 <ExecDir>/sessions，路径唯一来源是
 	// session.Dir——宿主 Store、插件经 dsc.SessionDir() 读同一值，不得各自拼。
 	if os.Getenv("DSC_SESSION_DIR") == "" {
 		os.Setenv("DSC_SESSION_DIR", session.Dir(execDir))
 	}
 
-	// 记忆库目录（tool-memory-service 写入 memory.db）：未显式配置
+	// 记忆库目录（记忆库插件 写入 memory.db）：未显式配置
 	// DSC_MEMORY_DIR 时注入 <ExecDir>/memory，插件经 dsc.MemoryDir() 读取同一值。
 	if os.Getenv("DSC_MEMORY_DIR") == "" {
 		os.Setenv("DSC_MEMORY_DIR", core.PJoin(execDir, core.MemoryDirName))
 	}
 
-	// 技能目录（dsc-system 的 skill 工具与 TUI 的 listSkills 都需引用）：
+	// 技能目录（插件的技能工具与 TUI 的 listSkills 都需引用）：
 	// 未显式配置 DSC_SKILLS_DIR 时注入 <ExecDir>/skills，避免插件 fallback
 	// "./skills"（CWD 相对）与 TUI 的 <exeDir>/skills 不一致。
 	if os.Getenv("DSC_SKILLS_DIR") == "" {
@@ -758,7 +758,7 @@ func main() {
 	if baseURL := groupEnv(activeLLMEnv, "OPENAI", envGroupPreferDSC(activeLLMEnv, "OPENAI"), "BASE_URL"); baseURL != "" {
 		probeWindow = probeContextWindow(baseURL)
 	} else if baseURL := groupEnv(activeLLMEnv, "ANTHROPIC", envGroupPreferDSC(activeLLMEnv, "ANTHROPIC"), "BASE_URL"); baseURL != "" {
-		// llm-anthropic 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
+		// LLM provider 插件 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
 		// OPENAI 组 BASE_URL 缺席时回退探测 anthropic 端点（两组均优先 DSC_ 前缀、旧名回退）。
 		probeWindow = probeContextWindow(baseURL)
 	}
@@ -803,7 +803,7 @@ func main() {
 			"hint", "edit the preset's compaction field, or clear it there, to use the config value")
 	}
 
-	// 注入当前模式 + 工作根 + 沙箱档到所有插件进程（DSC_MODE）：tool-lua-host 据此限制
+	// 注入当前模式 + 工作根 + 沙箱档到所有插件进程（DSC_MODE）：LUA 宿主插件 据此限制
 	// 「插件创造」仅在创造模式（creation）下允许。
 	injectRuntimeEnv(merged, mode, core.WorkspaceRoot, sandboxPolicyEnv())
 
@@ -831,6 +831,23 @@ func main() {
 	pluginsDir := core.PJoin(execDir, "plugins")
 	pluginsSnap := pluginsDir + "-backup"
 	loadErr := mgr.LoadFromConfig(merged)
+	if loadErr == nil {
+		// 配置了压缩后端却没生效时，宿主此前是**静默**回落到内联压缩的：用户只看到
+		// "新压缩没生效"，日志里也没有一句解释。这里至少留一条明确告警。
+		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
+			logger.Warn(warn)
+		}
+		// 声明了需要宿主凭据的能力、却没有在 config.yaml 里显式授予时，插件运行时
+		// 会静默失败（401/连不上）。宿主不按插件名自动放行凭据，所以这里必须把
+		// 「该给哪个插件加哪一行」说出来。
+		grants := make(map[string]map[string]string, len(merged.Plugins))
+		for _, e := range merged.Plugins {
+			grants[e.Name] = e.Env
+		}
+		for _, warn := range mgr.MissingCapabilityGrants(core.GrantMap(grants)) {
+			logger.Warn(warn)
+		}
+	}
 	if loadErr != nil {
 		// 先锁定最近「正常」备份（避免把下面刚备份的坏版当成正常版回读），
 		// 再把当前坏版各自备份留档，最后分别还原各自最近正常备份续启
@@ -916,7 +933,7 @@ func main() {
 		}
 
 		// 启动管理 API（管理能力）：
-		// 管理能力是一种「可选能力」——只有需要它的插件（如 tool-harness-webui）
+		// 管理能力是一种「可选能力」——只有需要它的插件（如 管理界面插件）
 		// 才声明依赖。宿主按以下优先级决定是否启动管理 API：
 		//   1. 用户显式 -admin <addr>：强制启动
 		//   2. DSC_ADMIN_ADDR 环境变量：强制启动
@@ -951,7 +968,7 @@ func main() {
 			}
 			adminAddr = finalAddr
 			logger.Info("admin api started", "addr", adminAddr)
-			// 把实际监听地址注入到环境变量，供 tool-harness-webui 等插件子进程读取
+			// 把实际监听地址注入到环境变量，供需要它的插件子进程读取
 			os.Setenv("DSC_ADMIN_ADDR", adminAddr)
 		}
 	}
@@ -961,7 +978,7 @@ func main() {
 	agentName := mgr.GetMainAgentName()
 	if agentName == "" {
 		// 发现机制兜底：扫描 plugins/agent-* 目录取首个（与 assembleMerged 一致），
-		// 不再硬编码 "agent-react-loop"（对齐 AGENTS.md §8）。
+		// 不再硬编码具体的 agent 插件名（对齐 AGENTS.md §8）。
 		agentName = "agent-" + discoverFirstAgentPlugin()
 	}
 	agent, ok := mgr.EventAgent()

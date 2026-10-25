@@ -35,7 +35,7 @@ func TestMapWorkspacePathForWorkspaces(t *testing.T) {
 	}
 	for _, goos := range []string{"linux", "darwin", "windows"} {
 		for _, c := range common {
-			if got := mapWorkspacePathFor(c.in, "G:/ws", goos); got != c.want {
+			if got := MapWorkspacePathFor(c.in, "G:/ws", "G:/tmp", goos); got != c.want {
 				t.Errorf("goos=%s mapWorkspacePathFor(%q) = %q, want %q", goos, c.in, got, c.want)
 			}
 		}
@@ -54,7 +54,7 @@ func TestMapWorkspacePathForBarePosixRoot(t *testing.T) {
 			{"/dev/null", "/dev/null"},
 			{"//server/share", "//server/share"},
 		} {
-			if got := mapWorkspacePathFor(c.in, "G:/ws", goos); got != c.want {
+			if got := MapWorkspacePathFor(c.in, "G:/ws", "G:/tmp", goos); got != c.want {
 				t.Errorf("goos=%s mapWorkspacePathFor(%q) = %q, want %q", goos, c.in, got, c.want)
 			}
 		}
@@ -65,17 +65,17 @@ func TestMapWorkspacePathForBarePosixRoot(t *testing.T) {
 // 非法盘符（/mnt/zz）不匹配映射，保持原样（真实根语义，不再落入工作区根）。
 // Linux/macOS 原样返回。
 func TestMapWorkspacePathForWSL(t *testing.T) {
-	if got := mapWorkspacePathFor("/mnt/c/Users/foo", "G:/ws", "windows"); got != "C:/Users/foo" {
+	if got := MapWorkspacePathFor("/mnt/c/Users/foo", "G:/ws", "G:/tmp", "windows"); got != "C:/Users/foo" {
 		t.Errorf("windows WSL map = %q, want C:/Users/foo", got)
 	}
-	if got := mapWorkspacePathFor("/mnt/c", "G:/ws", "windows"); got != "C:/" {
+	if got := MapWorkspacePathFor("/mnt/c", "G:/ws", "G:/tmp", "windows"); got != "C:/" {
 		t.Errorf("windows /mnt/c = %q, want C:/", got)
 	}
-	if got := mapWorkspacePathFor("/mnt/zz/x", "G:/ws", "windows"); got != "/mnt/zz/x" {
+	if got := MapWorkspacePathFor("/mnt/zz/x", "G:/ws", "G:/tmp", "windows"); got != "/mnt/zz/x" {
 		t.Errorf("windows 非法盘符应原样（真实根语义）: got %q", got)
 	}
 	for _, goos := range []string{"linux", "darwin"} {
-		if got := mapWorkspacePathFor("/mnt/c/Users/foo", "G:/ws", goos); got != "/mnt/c/Users/foo" {
+		if got := MapWorkspacePathFor("/mnt/c/Users/foo", "G:/ws", "G:/tmp", goos); got != "/mnt/c/Users/foo" {
 			t.Errorf("goos=%s /mnt/c 不应改写: got %q", goos, got)
 		}
 	}
@@ -85,7 +85,7 @@ func TestMapWorkspacePathForWSL(t *testing.T) {
 // 生产中 WorkspaceRoot 经 init 回退链恒非空）。
 func TestMapWorkspacePathForNoRoot(t *testing.T) {
 	for _, p := range []string{"/workspace/x", "/", "/docs/a.md", "rel"} {
-		if got := mapWorkspacePathFor(p, "", "windows"); got != p {
+		if got := MapWorkspacePathFor(p, "", "G:/tmp", "windows"); got != p {
 			t.Errorf("root 空时 %q 应原样，got %q", p, got)
 		}
 	}
@@ -150,7 +150,7 @@ func TestResolveWorkspacePath(t *testing.T) {
 // 传递（映射层不再锚定工作区根），由下游 filepath.Abs 解析为当前盘根——与 Linux
 // 把 /docs 解析到真实根行为一致（「错了也一致」）。
 func TestResolveWorkspacePathWindowsBareRoot(t *testing.T) {
-	got := mapWorkspacePathFor("/docs/architecture.md", "G:/Agents/deepseek-harness", "windows")
+	got := MapWorkspacePathFor("/docs/architecture.md", "G:/Agents/deepseek-harness", "G:/tmp", "windows")
 	if got != "/docs/architecture.md" {
 		t.Fatalf("Windows 裸 / 必须原样传递（真实根语义）: got %q", got)
 	}

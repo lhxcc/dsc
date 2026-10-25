@@ -24,6 +24,11 @@ func (m *hookMockClient) ListContext(context.Context, *proto.ListContextRequest,
 	return &proto.ListContextResponse{Content: m.content}, nil
 }
 
+// RunCommand 插件命令转发（本用例不关心，返回空输出）。
+func (*hookMockClient) RunCommand(context.Context, *proto.RunCommandRequest, ...grpc.CallOption) (*proto.RunCommandResponse, error) {
+	return &proto.RunCommandResponse{}, nil
+}
+
 // lctxMockClient 实现 proto.ToolServiceClient 的最小 mock（旧 ListContext 测试用）。
 type lctxMockClient struct{ content string }
 

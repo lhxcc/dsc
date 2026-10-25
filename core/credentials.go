@@ -199,7 +199,7 @@ func (cs *CredentialStore) saveToFile(pluginName string) error {
 
 // credEnvKey 把插件名 + 凭据键转为环境变量名。
 // 约定：PLUGIN_NAME_KEY（全大写、连字符转下划线）。
-// 例如：pluginName="llm-anthropic", key="api_key" → "LLM_ANTHROPIC_API_KEY"
+// 例如：pluginName="my-plugin", key="api_key" → "MY_PLUGIN_API_KEY"
 func credEnvKey(pluginName, key string) string {
 	s := pluginName + "_" + key
 	s = replaceAll(s, "-", "_")

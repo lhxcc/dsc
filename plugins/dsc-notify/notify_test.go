@@ -174,10 +174,12 @@ func TestDecodeMP3(t *testing.T) {
 // ---------- 测试内置音效缓存 ----------
 func TestInitSoundCache(t *testing.T) {
 	initSoundCache()
-	if len(soundMap) != 4 {
-		t.Errorf("缓存大小错误: 期望 4, 实际 %d", len(soundMap))
+	// question 是「模型在等你回答」的专用音效（宿主 userquestion/asked 事件触发），
+	// 与 success/error/warning/info 并列。
+	expectedTypes := []string{"success", "error", "warning", "info", "question"}
+	if len(soundMap) != len(expectedTypes) {
+		t.Errorf("缓存大小错误: 期望 %d, 实际 %d", len(expectedTypes), len(soundMap))
 	}
-	expectedTypes := []string{"success", "error", "warning", "info"}
 	for _, typ := range expectedTypes {
 		if _, ok := soundMap[typ]; !ok {
 			t.Errorf("缺少 %s 音效", typ)

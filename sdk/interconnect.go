@@ -79,7 +79,7 @@ func (ic *Interconnect) Close() error {
 }
 
 // llmDial/toolDial/notifyDial/agentDial 是各 client 包的 Dial 薄封装，
-// 统一处理「未提供 serviceID 时返回 nil 而非错误」（tool-lua-host 同款语义）。
+// 统一处理「未提供 serviceID 时返回 nil 而非错误」（LUA 宿主插件 同款语义）。
 func agentDial(broker *plugin.GRPCBroker, id uint32) (*agentclient.Client, error) {
 	if broker == nil || id == 0 {
 		return nil, nil

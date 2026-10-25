@@ -10,6 +10,70 @@ import (
 	"dsc/proto"
 )
 
+// TestRoundTripPreservesToolCallArguments 改写往返必须保住 tool-call 的**参数**。
+//
+// 背景：pre-step 会把整个消息列表经 ToCoreMessages → RenderMessages →
+// FromCoreMessages 转一圈再发给模型。此前 CoreToolCall 只有 id/name，参数被静默丢弃，
+// 于是模型在第二轮起看到的自己历史是「调过 shell，参数未知」——它无法判断自己跑过
+// 什么命令，只能反复重跑，并把「空输出」（git status 干净工作区）当成工具坏了。
+//
+// 这条属于「返回子集适配器」的字段保真往返：喂全字段，逐字段断言存活。
+func TestRoundTripPreservesToolCallArguments(t *testing.T) {
+	args := `{"command":"git status --short","description":"Show working tree status"}`
+	msgs := []*proto.Message{
+		{Role: "user", Content: "看一下工作区"},
+		{
+			Role:    "assistant",
+			Content: "",
+			ToolCalls: []*proto.ToolCall{
+				{Id: "call_a", Name: "shell", ArgumentsJson: args},
+				{Id: "call_b", Name: "read_file", ArgumentsJson: `{"path":"a.go"}`},
+			},
+		},
+		{Role: "tool", Content: "[exit_code: 0]", ToolCallId: "call_a"},
+		{Role: "tool", Content: "package main", ToolCallId: "call_b"},
+		{Role: "assistant", Content: "干净", Images: []string{"dsc-img://abc"}},
+	}
+
+	back := FromCoreMessages(ToCoreMessages(msgs, nil))
+	if len(back) != len(msgs) {
+		t.Fatalf("消息条数应保持 %d，实际 %d", len(msgs), len(back))
+	}
+	for i := range msgs {
+		if back[i].Role != msgs[i].Role {
+			t.Fatalf("#%d role 丢失: %q → %q", i, msgs[i].Role, back[i].Role)
+		}
+		if back[i].Content != msgs[i].Content {
+			t.Fatalf("#%d content 丢失: %q → %q", i, msgs[i].Content, back[i].Content)
+		}
+		if back[i].ToolCallId != msgs[i].ToolCallId {
+			// assistant 消息带工具调用时，往返会补上「首个调用的 id」——那是压缩侧把
+			// tool-call 与 tool-result 配对用的键（stripOrphaned* 依赖它），属派生值，
+			// 不是丢字段；provider 侧只对 role=tool 读 tool_call_id。
+			derived := len(msgs[i].ToolCalls) > 0 && back[i].ToolCallId == msgs[i].ToolCalls[0].Id
+			if !derived {
+				t.Fatalf("#%d tool_call_id 丢失: %q → %q", i, msgs[i].ToolCallId, back[i].ToolCallId)
+			}
+		}
+		if len(back[i].ToolCalls) != len(msgs[i].ToolCalls) {
+			t.Fatalf("#%d tool_calls 条数丢失: %d → %d", i, len(msgs[i].ToolCalls), len(back[i].ToolCalls))
+		}
+		for j, want := range msgs[i].ToolCalls {
+			got := back[i].ToolCalls[j]
+			if got.Id != want.Id || got.Name != want.Name {
+				t.Fatalf("#%d.%d 调用身份丢失: %+v → %+v", i, j, want, got)
+			}
+			if got.ArgumentsJson != want.ArgumentsJson {
+				t.Fatalf("#%d.%d 参数丢失（模型将看不到自己执行过什么）: %q → %q",
+					i, j, want.ArgumentsJson, got.ArgumentsJson)
+			}
+		}
+		if len(back[i].Images) != len(msgs[i].Images) {
+			t.Fatalf("#%d 图像引用丢失: %v → %v", i, msgs[i].Images, back[i].Images)
+		}
+	}
+}
+
 // TestCoreMessageIDsUniqueByPosition 内容相同的两条消息必须得到不同 ID。
 //
 // 旧实现按 (role+content+toolIds) 做 FNV hash：两条"继续"、两次相同 compile 输出

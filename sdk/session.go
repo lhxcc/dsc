@@ -54,10 +54,9 @@ func ValidSessionID(id string) bool {
 // TempDir 返回临时目录：优先 DSC_TEMP_DIR（宿主注入），缺省 <ExecDir>/temp。
 // 用于工具产物（截图、spill、脚本临时档）：按进程 cwd 落盘会在不同启动方式下漂移。
 func TempDir() string {
-	if dir := EnvStr("DSC_TEMP_DIR", ""); dir != "" {
-		return dir
-	}
-	return PJoin(ExecDir(), core.TempDirName)
+	// 单一实现放在 core：/tmp 虚拟根映射用的也是它，两边必须同源，否则模型写的
+	// /tmp/a 与工具自己的临时文件会落进不同目录。
+	return core.TempDir()
 }
 
 // SkillsDir 返回技能目录：优先 DSC_SKILLS_DIR（宿主注入，可与 ExecDir 分离），

@@ -75,9 +75,10 @@ const (
 	thinkAnimEn                      // 「Deep Seeking..」→「Deep Thinking..」
 )
 
-// thinkAnim 是一轮之内保持不变的动画状态；frame 由 spinner 的 tick 推进
-// （每 tick 一帧，约 100ms）。用 spinner 的节拍而不是自己的定时器：两者
-// 同时存在只会多出一条永远在跑的时钟，且容易与 spinner 的启停错位。
+// thinkAnim 是一轮之内保持不变的动画状态；frame 由工作行时钟推进（每拍一帧，
+// 约 100ms，见 animTick）。**帧只在时钟推进时有意义**：中文动画未扫到的字是
+// 同色背景的实心遮罩块，一旦停表就把某一帧冻在屏幕上，看到的是「深度██」这种
+// 半成品——所以停表等于工作行整行消失（见 workingLineVisible），而不是留帧。
 type thinkAnim struct {
 	kind  thinkAnimKind
 	frame int

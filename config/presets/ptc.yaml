@@ -44,7 +44,11 @@ plugins:
     type: tool
     enabled: true
     binary_path: ./plugins/tool-lua-host/tool-lua-host.exe
+  # 声明了 Requires: admin 能力：宿主若设置了 DSC_ADMIN_TOKEN，必须在这里显式授予
+  # 同一个值，否则它代理管理 API 时会被拒绝（401）。宿主不会按插件名自动放行凭据。
   - name: tool-harness-webui
     type: tool
     enabled: true
     binary_path: ./plugins/tool-harness-webui/tool-harness-webui.exe
+    # env:
+    #   DSC_ADMIN_TOKEN: "<与宿主环境相同的值>"

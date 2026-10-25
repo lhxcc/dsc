@@ -20,15 +20,7 @@ func TestPumpLoopReversedOrderContentBeforeReasoning(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	full := strings.Join(m2.lines, "\n")
 	if !strings.Contains(full, "你好！我在的") {
@@ -49,15 +41,7 @@ func TestPumpLoopOrderedReasoningThenContent(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	full := strings.Join(m2.lines, "\n")
 	if !strings.Contains(full, "思考過程") {
@@ -115,15 +99,7 @@ func TestPumpLoopReasoningDimDoesNotLeakToBody(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	full := strings.Join(m2.lines, "\n")
 	// 正文应保持普通样式：其位置不应紧随一个“开着的”暗色前缀

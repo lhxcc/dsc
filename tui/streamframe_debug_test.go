@@ -66,18 +66,7 @@ func TestPumpLoopRealFlow(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
 	// 通过真实消息队列执行：submitCmd → first 帧 → pump 循环
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-
-	// 反复执行返回的 cmd，收集后续帧
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
-	m2 := model.(*Model)
+	m2 := submitAndDrain(m, "你好", 20).(*Model)
 	t.Logf("streamBuffer=%q", m2.streamBuffer)
 	t.Logf("streaming=%v streamOpen=%v", m2.streaming, m2.streamOpen)
 	for i, l := range m2.lines {

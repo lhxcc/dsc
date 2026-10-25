@@ -212,7 +212,7 @@ func (m *Manager) handleList(c *vodka.Context) error {
 
 // handleTools 返回当前模型可直接调用的工具目录（调试用）。
 // 数据源与 agent 从聚合 Tool 服务拿到的工具同一（AgentDirectTools），
-// 涵盖宿主内置工具与各插件工具（含 tool-lua-host 脚本注册等动态工具），
+// 涵盖宿主内置工具与各插件工具（含 LUA 宿主插件的脚本注册等动态工具），
 // 供观察模型实际可用工具及其随插件/热加载的变化。
 func (m *Manager) handleTools(c *vodka.Context) error {
 	type item struct {

@@ -50,6 +50,7 @@ func (s *metadataServer) GetInfo(ctx context.Context, _ *metadata.Empty) (*metad
 		ApiVersion:   s.cfg.APIVersion,
 		Capabilities: caps,
 		Services:     s.services,
+		Commands:     commandsToProto(s.cfg.Commands),
 	}, nil
 }
 

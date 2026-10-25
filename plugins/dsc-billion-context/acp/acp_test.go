@@ -1061,3 +1061,175 @@ func TestRebuildStateFromMessages(t *testing.T) {
 		t.Fatalf("plain history must not carry trace")
 	}
 }
+
+// TestNudgeThresholdsScaleWithWindow 增长/蒸馏门槛随窗口缩放并夹在下限与上限之间。
+// 写死绝对值会在小窗口要求离谱增量、在大窗口被噪声触发（acp-kernel 用
+// growthRatio/growthFloor/growthCap 三件套解决）。
+func TestNudgeThresholdsScaleWithWindow(t *testing.T) {
+	small := DefaultConfig(128_000)
+	large := DefaultConfig(1_000_000)
+
+	if got, want := NudgeGrowthTokens(small), 6400; got != want {
+		t.Errorf("128K 窗口 nudgeGrowthTokens = %d, want %d (5%%)", got, want)
+	}
+	if got, want := NudgeGrowthTokens(large), 50000; got != want {
+		t.Errorf("1M 窗口 nudgeGrowthTokens = %d, want %d (封顶)", got, want)
+	}
+	if GrowthFloorTokens(large) <= GrowthFloorTokens(small) {
+		t.Errorf("增长门槛应随窗口变大：128K=%d, 1M=%d",
+			GrowthFloorTokens(small), GrowthFloorTokens(large))
+	}
+	if got := GrowthFloorTokens(small); got < small.MinGrowthFloor {
+		t.Errorf("增长门槛 %d 低于下限 %d", got, small.MinGrowthFloor)
+	}
+	if TierMassThreshold(large) != 75000 {
+		t.Errorf("1M 窗口蒸馏质量门槛 = %d, want 75000 (1.5×50000)", TierMassThreshold(large))
+	}
+	// 极小窗口也不至于把门槛压到 0
+	if TierMassThreshold(DefaultConfig(1000)) < 1 {
+		t.Error("质量门槛不应为 0")
+	}
+}
+
+// TestDefaultTierCountPathIsOff 计数不是需求信号（acp-kernel #379）：默认计数阈值
+// 应高到实际不触发，真正的需求信号是可回收的摘要质量。
+func TestDefaultTierCountPathIsOff(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	if cfg.Tiers.Tier2Trigger < 1000 || cfg.Tiers.Tier3Trigger < 2000 {
+		t.Fatalf("默认计数阈值应实际关闭: tier2=%d tier3=%d", cfg.Tiers.Tier2Trigger, cfg.Tiers.Tier3Trigger)
+	}
+}
+
+// TestTierNudgeIgnoresSmallBlockCount 攒了几个小摘要不该触发蒸馏：块数够了但质量
+// 不够时，T2 nudge 不得发出（此前默认 5 个块就蒸，白烧细节）。
+func TestTierNudgeIgnoresSmallBlockCount(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	cfg.NudgeThresholdPct = 0.30
+	state := CreateInitialState()
+	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 50 token，合计 ~500 token
+	for i := 0; i < 10; i++ {
+		state.Blocks = append(state.Blocks, CompressionBlock{
+			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
+			Summary: strings.Repeat("x", 200), CompressedTokens: 5000,
+		})
+	}
+	state.NextBlockID = 10
+
+	msgs := longTailMessages(3)
+	AssignRefs(msgs, state)
+
+	decision := DecideNudge(msgs, state, cfg, 500_000) // 50% > 30%
+	if decision.Tier != nil {
+		t.Fatalf("质量未达阈值时不应蒸馏: tier=%v reason=%s", *decision.Tier, decision.Reason)
+	}
+	if decision.Breakdown["t1Mass"] >= TierMassThreshold(cfg) {
+		t.Fatalf("夹具质量 %d 不该 >= 阈值 %d", decision.Breakdown["t1Mass"], TierMassThreshold(cfg))
+	}
+}
+
+// TestTierNudgeFiresOnSummaryMass 摘要质量达到门槛时要蒸馏（哪怕块数没到计数阈值）。
+func TestTierNudgeFiresOnSummaryMass(t *testing.T) {
+	cfg := DefaultConfig(1_000_000)
+	cfg.NudgeThresholdPct = 0.30
+	state := CreateInitialState()
+	// 40 条摘要、每条 8000 字节 ASCII ≈ 2000 token，合计 ~80K > 75000 门槛
+	for i := 0; i < 40; i++ {
+		state.Blocks = append(state.Blocks, CompressionBlock{
+			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
+			Summary: strings.Repeat("y", 8000), CompressedTokens: 20000,
+		})
+	}
+	state.NextBlockID = 40
+
+	msgs := longTailMessages(3)
+	AssignRefs(msgs, state)
+
+	decision := DecideNudge(msgs, state, cfg, 500_000)
+	if !decision.ShouldInject || decision.Tier == nil || *decision.Tier != Tier2 {
+		t.Fatalf("质量达标应触发 T2 蒸馏: inject=%v tier=%v reason=%s",
+			decision.ShouldInject, decision.Tier, decision.Reason)
+	}
+	if len(decision.TierTargetBlocks) != 40 {
+		t.Errorf("目标块数 = %d, want 40", len(decision.TierTargetBlocks))
+	}
+}
+
+// longTailMessages 造 n 条较长的可压缩消息（配合低阈值触发 nudge 路径）。
+func longTailMessages(n int) []CoreMessage {
+	msgs := make([]CoreMessage, 0, n+4)
+	for i := 0; i < n; i++ {
+		msgs = append(msgs, CoreMessage{ID: fmt.Sprintf("m%d", i), Role: RoleUser, Text: strings.Repeat("z", 6000)})
+	}
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs, CoreMessage{ID: fmt.Sprintf("t%d", i), Role: RoleAssistant, Text: "tail"})
+	}
+	return msgs
+}
+
+// nudgeFixture 造一份「用量已过阈值、且有可压缩范围」的会话，供增长门控用例共用。
+func nudgeFixture(t *testing.T) ([]CoreMessage, *CompressionState, Config) {
+	t.Helper()
+	config := DefaultConfig(10000) // 10K 窗口：45% = 4500
+	config.NudgeThresholdPct = 0.45
+	config.MinCompressRangeChars = 0 // 本测关注门控，不关注范围大小门
+	longText := strings.Repeat("x", 2500)
+	msgs := []CoreMessage{
+		{ID: "a", Role: RoleUser, Text: longText},
+		{ID: "b", Role: RoleAssistant, Text: longText},
+		{ID: "c", Role: RoleUser, Text: longText},
+		{ID: "d", Role: RoleAssistant, Text: "short tail"},
+		{ID: "e", Role: RoleUser, Text: "short tail 2"},
+	}
+	state := CreateInitialState()
+	AssignRefs(msgs, state)
+	return msgs, state, config
+}
+
+// TestNudgeGrowthGateStopsRepeating 增长门控必须真的生效：同一规模不得反复提示。
+//
+// 以前 BaselineTokens 只会被置 0、从不写入真实规模，`if BaselineTokens > 0` 恒不成立，
+// 于是只要越过使用率阈值，之后每一轮都再提示一次「该压缩了」——模型便每隔几步压一次，
+// 把细节反复蒸干。这条用例钉住「提示时记下规模、未增长不再提示、长够才再提示」。
+func TestNudgeGrowthGateStopsRepeating(t *testing.T) {
+	msgs, state, config := nudgeFixture(t)
+
+	first := ProcessTurn(msgs, state, config, 5000) // 50% > 45%
+	if first.Nudge == nil || !first.Nudge.ShouldInject {
+		t.Fatalf("首次应提示压缩，reason=%v", first.Nudge)
+	}
+	if state.Nudge.BaselineTokens != 5000 {
+		t.Fatalf("提示后应记下本次规模 5000，实际 %d", state.Nudge.BaselineTokens)
+	}
+
+	// 规模没变：不得再提示
+	second := ProcessTurn(msgs, state, config, 5000)
+	if second.Nudge.ShouldInject {
+		t.Fatalf("用量未增长时不应再提示，reason=%q", second.Nudge.Reason)
+	}
+	if !strings.Contains(second.Nudge.Reason, "insufficient growth") {
+		t.Fatalf("应因增长不足而拒绝，reason=%q", second.Nudge.Reason)
+	}
+
+	// 长够 growthFloor：可以再提示
+	floor := GrowthFloorTokens(config)
+	third := ProcessTurn(msgs, state, config, 5000+floor)
+	if !third.Nudge.ShouldInject {
+		t.Fatalf("增长 %d 后应再提示，reason=%q", floor, third.Nudge.Reason)
+	}
+}
+
+// TestCompressionKeepsNudgeBaseline 压缩成功不得把 baseline 清零——清零等于关掉增长
+// 门控，压缩完下一轮又会立刻提示，正是「每几步压一次」的另一半原因。
+func TestCompressionKeepsNudgeBaseline(t *testing.T) {
+	msgs, state, config := nudgeFixture(t)
+	state.Nudge.BaselineTokens = 5000
+
+	ranges := []PruneRange{{StartRef: "m00000", EndRef: "m00001", Summary: strings.Repeat("s", 120)}}
+	_, res := ApplyCompression(ranges, msgs, state, config)
+	if res.BlocksCreated == 0 {
+		t.Fatalf("前置条件：应产生压缩块，errors=%v", res.Errors)
+	}
+	if state.Nudge.BaselineTokens != 5000 {
+		t.Fatalf("压缩后 baseline 不应清零，实际 %d", state.Nudge.BaselineTokens)
+	}
+}

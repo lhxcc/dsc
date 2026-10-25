@@ -4,8 +4,8 @@ package core
 //
 // 模型可见的文件系统是「以工作空间根为 / 的 POSIX 虚拟根」，所有平台所有输入输出
 // 统一正斜杆。模型书写的路径（相对路径、/workspace 前缀、裸 / 前缀、WSL 风格、
-// Windows 盘符路径）到真实路径的归并映射原先散落各插件（tool-filesystem 的
-// mapWorkspacePath、tool-str-replace-editor 的 normalizeWorkspacePath/makeAbsPath），
+// Windows 盘符路径）到真实路径的归并映射原先散落各插件（文件系统插件的
+// mapWorkspacePath、文本替换插件的 normalizeWorkspacePath/makeAbsPath），
 // 语义漂移且覆盖不全（报告案例：str_replace_editor 把 /docs/architecture.md 经
 // 绝对化解析落到进程 cwd 所在盘的盘根 D:/docs，而非 <workspace>/docs/architecture.md）。
 //
@@ -36,7 +36,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 // WorkspaceRoot 統一工作空間根目錄（對齊 DSH ctx.sandboxPolicy 的單一根來源）：
@@ -71,14 +70,6 @@ func pickWorkspaceRoot(envRoot, cwd, exePath string) string {
 	}
 }
 
-// MapWorkspacePath 把模型书写的路径按「虚拟根 = 工作空间根」契约映射为真实路径。
-// 读取统一根 WorkspaceRoot（宿主与插件进程同源），规则见包注释；不匹配任何规则
-// 的输入原样返回。shell 的 AST 字面量重写与各插件路径入口统一走此函数，
-// 插件不得各自实现映射（SDK 层有同名二次封装供第三方插件使用）。
-func MapWorkspacePath(p string) string {
-	return mapWorkspacePathFor(p, WorkspaceRoot, runtime.GOOS)
-}
-
 // ResolveWorkspacePath 把模型书写的路径映射（MapWorkspacePath）后解析为真实绝对路径：
 //   - 映射后为绝对路径（盘符路径、POSIX 系统上的 / 绝对路径、已锚定工作空间根的
 //     /workspace 路径）→ 直接 Abs 求净；
@@ -96,60 +87,4 @@ func ResolveWorkspacePath(p string) (string, error) {
 		return PAbs(mapped)
 	}
 	return PAbs(PJoin(WorkspaceRoot, mapped))
-}
-
-// mapWorkspacePathFor 是 MapWorkspacePath 的纯函数本体（root 与 goos 显式注入，
-// 便于跨平台测试全部规则分支）。语义逐条对齐 tool-filesystem 既有实现并扩展
-// 反斜杆形态识别：规则匹配在显式正斜杆副本上进行，映射结果一律正斜杆。
-func mapWorkspacePathFor(p, root, goos string) string {
-	// 规则匹配统一在正斜杆副本上进行（模型可能传入 \workspace、\x 等 Windows 风格）。
-	// 注意不用 filepath.ToSlash：它在非 Windows 宿主上是空操作（反斜杆在 POSIX
-	// 不是分隔符），纯函数必须显式替换才能宿主无关。
-	// 规则 10：两行连续替换，先双反斜杆（UNC 网络路径那类写法）再单个，顺序不可颠倒。
-	slash := strings.ReplaceAll(p, `\\`, "/")
-	slash = strings.ReplaceAll(slash, "\\", "/")
-
-	// 1. WSL 路径映射：/mnt/c/... → C:/...，/mnt/d/... → D:/...（仅 Windows）
-	if goos == "windows" && strings.HasPrefix(slash, "/mnt/") {
-		rest := slash[len("/mnt/"):]
-		if len(rest) >= 2 && rest[1] == '/' {
-			drive := string(rest[0])
-			if drive >= "a" && drive <= "z" || drive >= "A" && drive <= "Z" {
-				return strings.ToUpper(drive) + ":/" + rest[2:]
-			}
-		}
-		// /mnt/c (no trailing slash) → C:/
-		if len(rest) == 1 {
-			drive := rest
-			if drive >= "a" && drive <= "z" || drive >= "A" && drive <= "Z" {
-				return strings.ToUpper(drive) + ":/"
-			}
-		}
-	}
-
-	if root == "" {
-		return p
-	}
-	// 规则 10：同上，两行连续替换后再去尾随分隔符。
-	r := strings.ReplaceAll(root, `\\`, "/")
-	r = strings.TrimRight(strings.ReplaceAll(r, "\\", "/"), "/")
-
-	// 2. /workspace 虚拟根映射（所有平台生效）
-	const prefix = "/workspace"
-	if strings.HasPrefix(slash, prefix) {
-		rest := slash[len(prefix):]
-		// 边界检查：前綴後必須是分隔符或結尾，否則 /workspacefoo 不當作 /workspace 別名
-		if rest == "" || strings.HasPrefix(rest, "/") {
-			sub := strings.TrimLeft(rest, "/")
-			if sub == "" {
-				return r
-			}
-			return r + "/" + sub
-		}
-	}
-
-	// 3. 其余裸 POSIX 绝对路径保持原样（所有平台，真实根语义）：Windows 上无盘符裸
-	//    /x 或 \x 由下游绝对化解析为当前盘根（对齐 Linux 真实根行为），不再
-	//    锚定工作区根；/workspace 与 /mnt/<drive> 是引用工作区与盘符的显式别名。
-	return p
 }

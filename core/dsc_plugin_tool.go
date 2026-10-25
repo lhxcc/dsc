@@ -35,7 +35,7 @@ func binExt() string {
 	return ""
 }
 
-// execName 按约定插件可执行文件名 = 目录基名 + 平台后缀。例如 tool-filesystem.exe。
+// execName 按约定插件可执行文件名 = 目录基名 + 平台后缀。例如 <目录基名>.exe。
 func (m *Manager) execName(dirBase string) string { return dirBase + binExt() }
 
 // pluginsRoot 返回插件根目录（ExecDir/plugins）。
@@ -94,7 +94,7 @@ func (t *installDscPluginTool) TimeoutMs() int { return 120000 } // 安装+live 
 
 func (t *installDscPluginTool) Description() string {
 	return "Install a DSC plugin (our own binary plugin, a Go program built with the dsc-sdk and loaded via go-plugin/gRPC) into this DSC instance so it can be used. " +
-		"Give name as the full plugin directory basename under plugins/ (e.g. tool-musicplayer), consistent with " +
+		"Give name as the full plugin directory basename under plugins/ (e.g. the plugin directory name), consistent with " +
 		"load_dsc_plugin/unload_dsc_plugin/uninstall_dsc_plugin/upgrade_dsc_plugin: the directory will be plugins/<name>/ " +
 		"and its executable <name>.exe. <type> is one of tool|llm|agent|policy|dsc and must match the plugin's own declared type. " +
 		"Provide source as a directory already laid out as plugins/<name>/ (containing <name>.exe), or as a single built <name>.exe binary. " +
@@ -107,7 +107,7 @@ func (t *installDscPluginTool) Description() string {
 func (t *installDscPluginTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "type":{"type":"string","enum":["tool","llm","agent","policy","dsc"],"description":"Plugin type (must match the plugin's own declared type)."},
-"name":{"type":"string","description":"Full plugin directory basename (e.g. tool-musicplayer), consistent with load/unload/uninstall/upgrade; directory will be plugins/<name>/."},
+"name":{"type":"string","description":"Full plugin directory basename (e.g. the plugin directory name), consistent with load/unload/uninstall/upgrade; directory will be plugins/<name>/."},
 "source":{"type":"string","description":"Path to a directory laid out as plugins/<name>/ (containing <name>.exe) or to a single <name>.exe binary."},
 "enabled":{"type":"boolean","description":"Whether to mark the plugin enabled in config. Default true."}},
 "required":["type","name","source"],"additionalProperties":false}`)
@@ -147,7 +147,7 @@ func (t *installDscPluginTool) install(ctx context.Context, ptype, name, source 
 	if !dscPluginNameRe.MatchString(name) || name == "" || name == "." || name == ".." {
 		return fmt.Errorf("invalid name %q: use [A-Za-z0-9_-] only (prevents path traversal)", name)
 	}
-	// name 即完整目录基名（如 tool-musicplayer），与 load/unload/uninstall/upgrade
+	// name 即完整目录基名（如 音乐播放插件），与 load/unload/uninstall/upgrade
 	// 一致，直接作为 plugins/ 下的目录基名；type 仅用于条目声明与 live 加载元数据校验。
 	dirBase := name
 	pluginRoot := PJoin(t.m.pluginsRoot(), dirBase)
@@ -229,14 +229,14 @@ func (t *uninstallDscPluginTool) ApprovalReason(_ string) string {
 }
 
 func (t *uninstallDscPluginTool) Description() string {
-	return "Uninstall a DSC plugin by its config entry name (the directory basename like tool-filesystem or dsc-notify). " +
+	return "Uninstall a DSC plugin by its config entry name (the directory basename). " +
 		"Backs up config.yaml, removes the plugin from config so it won't load on restart, live-unloads it, " +
 		"and optionally deletes its directory under plugins/. Pass delete_dir=true to also remove the files."
 }
 
 func (t *uninstallDscPluginTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
-"name":{"type":"string","description":"Config entry name = directory basename (e.g. tool-filesystem, dsc-notify)."},
+"name":{"type":"string","description":"Config entry name = directory basename (e.g. the plugin directory name)."},
 "delete_dir":{"type":"boolean","description":"Also delete plugins/<name>/ directory. Default false."}},
 "required":["name"],"additionalProperties":false}`)
 }
@@ -410,7 +410,7 @@ func (t *listDscPluginsTool) Execute(_ context.Context, _ json.RawMessage) (stri
 //   即 <type>-<name>；若带版本号（升级部署按 -v<semver> 后缀），版本号须符合
 //   语义版本约定。目录内存在合规二进制则该目录是一个插件（孤儿/未配候选）——
 //   判定依据是「文件名称」，而非仅目录名。
-// 例如：tool-novelforge/tool-novelforge.exe 合规；tool-novelforge-v2.3.1.exe 合规；
+// 例如：小说生成插件/小说生成插件.exe 合规；小说生成插件-v2.3.1.exe 合规；
 //      novelforge.exe（省略 tool- 前缀）与目录名不符，不合规，系旧残留。
 
 // pluginVersionSuffixRe 匹配 -v<semver> 版本后缀（形如 2 / 2.3 / 2.3.1）。
@@ -561,7 +561,7 @@ func (t *upgradeDscPluginTool) TimeoutMs() int { return 120000 } // 部署+热�
 
 func (t *upgradeDscPluginTool) Description() string {
 	return "Upgrade an already-installed DSC plugin to a new version. " +
-		"name is the existing plugin's directory basename (e.g. tool-filesystem); " +
+		"name is the existing plugin's directory basename (e.g. the plugin directory name); " +
 		"version is the new semantic version (e.g. 2.3.1); " +
 		"source is the new plugin binary (a single <name>.exe) or a directory laid out as plugins/<name>/ containing <name>.exe. " +
 		"The tool deploys the new binary as <name>-v<version>.exe inside the plugin dir and hot-reloads the process to it; " +
@@ -570,7 +570,7 @@ func (t *upgradeDscPluginTool) Description() string {
 
 func (t *upgradeDscPluginTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
-"name":{"type":"string","description":"Existing plugin name = directory basename (e.g. tool-filesystem)."},
+"name":{"type":"string","description":"Existing plugin name = directory basename (e.g. the plugin directory name)."},
 "version":{"type":"string","description":"New semantic version, e.g. '2.3.1' or '2.4'."},
 "source":{"type":"string","description":"Path to the new plugin binary (single <name>.exe) or to a directory laid out as plugins/<name>/ containing <name>.exe."}},
 "required":["name","version","source"],"additionalProperties":false}`)
@@ -707,7 +707,7 @@ func (t *loadDscPluginTool) TimeoutMs() int { return 120000 } // 加载插件进
 
 func (t *loadDscPluginTool) Description() string {
 	return "Activate an existing DSC plugin that is already on disk under the plugins/ directory but not yet loaded (e.g. it exists but is not in the running config), so its tools become usable by the model this session. " +
-		"Give the plugin id as the directory name under plugins/ (e.g. tool-musicplayer). The binary is resolved automatically " +
+		"Give the plugin id as the directory name under plugins/ (e.g. the plugin directory name). The binary is resolved automatically " +
 		"(plugins/<name>/<name>.exe, honoring versioned binaries), and type defaults to tool. " +
 		"This does NOT modify config.yaml (the change lasts only for the current process; after a restart you can reload it again). " +
 		"A successful return (ok:true, status=loaded) is sufficient confirmation: the plugin is active and its commands are immediately usable this session — " +
@@ -717,7 +717,7 @@ func (t *loadDscPluginTool) Description() string {
 
 func (t *loadDscPluginTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
-"name":{"type":"string","description":"插件 id，即 plugins/ 下的目录名（如 tool-musicplayer），须匹配 [A-Za-z0-9_-]。"},
+"name":{"type":"string","description":"插件 id，即 plugins/ 下的目录名（如插件目录名），须匹配 [A-Za-z0-9_-]。"},
 "type":{"type":"string","enum":["tool","llm","agent","policy","dsc"],"description":"插件类型，默认 tool。"},
 "persist":{"type":"boolean","description":"是否写回 config.yaml 使重启后仍加载。默认 false：仅当前进程生效、不改配置；true：持久化（先备份 config）。"}},
 "required":["name"],"additionalProperties":false}`)
@@ -853,7 +853,7 @@ func (t *unloadDscPluginTool) TimeoutMs() int { return 120000 }
 
 func (t *unloadDscPluginTool) Description() string {
 	return "Unload a DSC plugin that is currently loaded (stops it in this process and removes its tools). " +
-		"Give the plugin id as the plugins/ directory name (e.g. tool-musicplayer). " +
+		"Give the plugin id as the plugins/ directory name (e.g. the plugin directory name). " +
 		"Set persist=true to also remove its entry from config.yaml so it no longer loads on restart (config is backed up first); " +
 		"files under plugins/ are always kept. This complements uninstall_dsc_plugin (which removes config and optionally the directory). " +
 		"A successful return (ok:true) is sufficient confirmation: the plugin's commands are removed from your available tool list. Do NOT verify with the shell tool."
@@ -861,7 +861,7 @@ func (t *unloadDscPluginTool) Description() string {
 
 func (t *unloadDscPluginTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
-"name":{"type":"string","description":"插件 id，即 plugins/ 下的目录名（如 tool-musicplayer）。"},
+"name":{"type":"string","description":"插件 id，即 plugins/ 下的目录名（如插件目录名）。"},
 "persist":{"type":"boolean","description":"是否同时从 config.yaml 移除条目（重启后不再加载）。默认 false。"}},
 "required":["name"],"additionalProperties":false}`)
 }

@@ -84,19 +84,47 @@ func BuildStatus(messages []CoreMessage, state *CompressionState, config Config,
 			activeCount++
 		}
 	}
+	t1, t2, t3 := 0, 0, 0
+	for _, b := range state.Blocks {
+		if !b.Active {
+			continue
+		}
+		switch b.Tier {
+		case Tier1:
+			t1++
+		case Tier2:
+			t2++
+		case Tier3:
+			t3++
+		}
+	}
+	st := state.Stats
 	return StatusReport{
 		ContextUsage:       usage,
 		TokenCount:         tokenCount,
 		ModelContextLimit:  config.ModelContextLimit,
 		ActiveBlocks:       activeCount,
 		TotalBlocks:        len(state.Blocks),
-		TokensCompressed:   state.Stats.TokensCompressed,
+		TokensCompressed:   st.TokensCompressed,
 		CompressibleRanges: ComputeCompressibleRanges(messages, state, config),
 		Breakdown: map[string]int{
-			"tokensCompressed": state.Stats.TokensCompressed,
-			"compressionCount": state.Stats.CompressionCount,
-			"activeBlocks":     activeCount,
-			"totalBlocks":      len(state.Blocks),
+			"tokensCompressed":  st.TokensCompressed,
+			"compressionCount":  st.CompressionCount,
+			"activeBlocks":      activeCount,
+			"totalBlocks":       len(state.Blocks),
+			"tier1":             t1,
+			"tier2":             t2,
+			"tier3":             t3,
+			"absorbedTokens":    st.AbsorbedTokens,
+			"crushCount":        st.CrushCount,
+			"crushTokensSaved":  st.CrushTokensSaved,
+			"ccrStored":         st.CCRStored,
+			"ccrStoredTokens":   st.CCRStoredTokens,
+			"ccrRetrieved":      st.CCRRetrieved,
+			"ccrExported":       st.CCRExported,
+			"retrievalMisses":   st.RetrievalMisses,
+			"tokensInContext":   tokenCount,
+			"modelContextLimit": config.ModelContextLimit,
 		},
 	}
 }
@@ -110,6 +138,24 @@ func FormatStatus(report StatusReport) string {
 	sb.WriteString(fmt.Sprintf("  Blocks: %d active / %d total\n", report.ActiveBlocks, report.TotalBlocks))
 	sb.WriteString(fmt.Sprintf("  Compressed: %d tokens reclaimed across %d compressions\n",
 		report.TokensCompressed, report.Breakdown["compressionCount"]))
+	// 节省明细：压缩/确定性压缩/无损卸载三条通路各自省了多少
+	bd := report.Breakdown
+	if bd["crushCount"] > 0 || bd["ccrStored"] > 0 || bd["absorbedTokens"] > 0 {
+		sb.WriteString(fmt.Sprintf("  Tiers: T1=%d T2=%d T3=%d active\n", bd["tier1"], bd["tier2"], bd["tier3"]))
+		if bd["crushTokensSaved"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Crush: %d deterministic compactions, %d tokens saved\n",
+				bd["crushCount"], bd["crushTokensSaved"]))
+		}
+		if bd["ccrStored"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Stored: %d payloads (%d tokens) retrievable via acp_retrieve\n",
+				bd["ccrStored"], bd["ccrStoredTokens"]))
+			sb.WriteString(fmt.Sprintf("  Retrievals: %d (%d exported to files)\n",
+				bd["ccrRetrieved"], bd["ccrExported"]))
+		}
+		if bd["absorbedTokens"] > 0 {
+			sb.WriteString(fmt.Sprintf("  Absorbed: %d tokens distilled\n", bd["absorbedTokens"]))
+		}
+	}
 	if len(report.CompressibleRanges) > 0 {
 		sb.WriteString(fmt.Sprintf("\nCompressible ranges (%d):\n", len(report.CompressibleRanges)))
 		for i, r := range report.CompressibleRanges {
@@ -127,6 +173,8 @@ type ProcessTurnResult struct {
 	Messages []CoreMessage     `json:"messages"`
 	State    *CompressionState `json:"state"`
 	Nudge    *NudgeDecision    `json:"nudge,omitempty"`
+	// CCROffloads 本步需要宿主落盘的内容（kernel 不做 IO，只产出副作用）。
+	CCROffloads []CCROffload `json:"-"`
 }
 
 // ProcessTurn 每轮跑 pipeline（对齐 acp-kernel processTurn）。
@@ -136,10 +184,19 @@ type ProcessTurnResult struct {
 //	assign-refs → advance-survival → sync-blocks → prune(render)
 //	→ hide-compress-calls → absorb(hide+prompt) → decide-nudge → emergency-truncate
 //
-// 仍未实现：merge-blocks（old-gen 块批合并；acp 包内只有范围合并 mergeBatch，
-// 不是块合并）、filter/ccr-store（acp_retrieve 内容仓库）。缺失 merge 的后果是
-// 块数量随压缩次数线性增长，每个块每轮都渲染 summary——压缩收益会被自身开销
-// 逐步吃掉，属后续待补项。
+// 仍未实现：filter（可插拔过滤框架）、output-steering（冗长度分级）、
+// packs（提示面/工具面定制）。
+//
+// 关于 merge-blocks（old-gen 块批合并）：acp-kernel 的 README/DESIGN 仍写着这个
+// 节点与 mergeMarkedBlocks，但**当前源码的 pipeline 里已经没有它**（节点表见
+// src/compress.ts 的 buildNodes）。块膨胀在上游是靠「蒸馏」（模型用 bN 引用把
+// T1 折成 T2/T3）解决的，不是靠自动批合并——这里也不实现它，而是把蒸馏的触发
+// 条件做对（按摘要质量而非块数，见 nudge.go）。
+//
+// 已对齐（勿重复实现）：assign-refs / 存活升级 / sync-blocks / prune /
+// ccr-store（无损回取，复用 dsc-txt:// 附件库）/ crush（确定性压缩）/
+// hide-compress-calls / absorb(hide+prompt) /
+// decide-nudge（计数+质量双路径）/ emergency-truncate / 孤儿配对清理。
 //
 // 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
 // 消息文本。原因：tokens 属性每轮估算会变化（消息文本可能改变），导致前缀缓存
@@ -165,11 +222,33 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 		rendered = hid.Messages
 	}
 
+	// 5.5 ccr-store：大工具结果到达即按内容 hash 卸载，线上只留确定性占位符。
+	// 放在 absorb 之前：absorb 看到的是占位符（很短），自然不会再要求蒸馏一份
+	// 已经不存在的原文——这也是内核把 ccr-store 排在 absorb 前面的原因。
+	var ccrOffloads []CCROffload
+	if config.CCR.Enabled {
+		if cr, off := ApplyCCR(rendered, state, config); len(off) > 0 || config.CCR.Enabled {
+			rendered = cr
+			ccrOffloads = off
+			for _, o := range off {
+				state.Stats.CCRStored++
+				state.Stats.CCRStoredTokens += o.Entry.Tokens
+			}
+		}
+	}
+
 	// 6. absorb（DSC 扩展，仅 Absorb.Enabled）：先隐藏已吸收的 tool-call/result 对，
 	// 再为达标的大工具结果追加 [ACP absorb] 提示。此前两个节点都没有接线，导致
 	// absorb 工具只写记录、原文照旧发送——等于不生效。
 	if config.Absorb.Enabled {
 		rendered = HideAbsorbedMessages(rendered, state)
+		// crush：absorb 的第一段——先用纯确定性策略把大结果压下去，压到阈值下
+		// 就不必再让模型蒸馏（省一次往返，也就省一次可能塞不进窗口的调用）。
+		if cr, cs := ApplyCrush(rendered, state, config, tokenCount); cs.Crushed+cs.Distilled > 0 {
+			rendered = cr
+			state.Stats.CrushCount += cs.Crushed + cs.Distilled
+			state.Stats.CrushTokensSaved += cs.TokensSaved
+		}
 		if ap := AppendAbsorbPrompts(rendered, state, config, tokenCount); ap.PromptedCount > 0 {
 			rendered = ap.Messages
 		}
@@ -177,6 +256,16 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 
 	// 7. decide-nudge：决策是否注入压缩提示（注入由 adapter 追加为尾部 user 消息）
 	nudge := DecideNudge(messages, state, config, tokenCount)
+	// 记下这次提示发生时的上下文规模：下一次提示必须在此基础上再涨够
+	// growthFloor（见 DecideNudge 的增长门控）。
+	//
+	// 这一步以前是缺的——baseline 只会被置 0、从不被写入真实规模，于是
+	// `if BaselineTokens > 0` 的增长门控恒不成立：只要越过使用率阈值，之后每一轮
+	// 都会再提示一次「该压缩了」，模型于是每隔几步就压一次，把细节反复蒸干。增长
+	// 门控才是「攒够一段再压」的唯一实现，留空等于没有。
+	if nudge.ShouldInject {
+		state.Nudge.BaselineTokens = tokenCount
+	}
 
 	// 8. emergency-truncate：最后安全阀——上下文接近满且模型未主动压缩时，截断
 	// 超大工具输出，避免直接撞窗口（DESIGN 的 LAST safety valve）。
@@ -185,8 +274,9 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	}
 
 	return ProcessTurnResult{
-		Messages: rendered,
-		State:    state,
-		Nudge:    &nudge,
+		Messages:    rendered,
+		State:       state,
+		Nudge:       &nudge,
+		CCROffloads: ccrOffloads,
 	}
 }

@@ -155,13 +155,6 @@ func (s selection) ordered() (start, end selPos) {
 
 func (s selection) empty() bool { return s.anchor == s.head }
 
-// submitResult 是一次 agent.Run 完成后的结果消息
-type submitResult struct {
-	input  string
-	result *core.AgentResult
-	err    error
-}
-
 // streamFrame 是流式響應的一幀
 type streamFrame struct {
 	input  string
@@ -216,6 +209,17 @@ type Model struct {
 	// 上下文容量顯示：contextWindow 為總容量（token 數），usedTokens 為已用容量
 	contextWindow int
 	usedTokens    int
+
+	// 工作行的时钟（见 animTick/armAnim）。animTicking 表示**时钟当前是否在跑**，
+	// animGen 是时钟的代次：每次点火换代，换代即作废所有在途的旧 tick。
+	//
+	// 工作行是否出现只取决于 workingLineVisible()：时钟在跑 && 工作中。两者必须
+	// 同时成立——只有其一时画出来的都是谎话：时钟停了却把某一帧冻在屏幕上（看到
+	// 的「动画停在扫到一半的蒙版块」），或者本轮已结束却还留着一行。
+	animTicking bool
+	animGen     int
+	// spinnerFrame 为 spinner 字形帧号，由同一个时钟推进（不再用 spinner.Tick）。
+	spinnerFrame int
 
 	// 当前轮运行指标（对齐 REX working 行）：runStart 记录启动时刻，elapsed 为
 	// 已耗时秒数（每秒 elapsedTick 刷新）；turnTokens 为本轮累计下行生成 token；
@@ -277,7 +281,9 @@ type Model struct {
 
 	viewport viewport.Model
 	input    textarea.Model
-	spinner  spinner.Model
+	// spinner 只提供字形帧与样式：节拍由工作行时钟（animTick）统一推进，
+	// 不再使用 spinner.Tick/Update 的 tag 自续链（那条链会静默断掉，见 animTick）。
+	spinner spinner.Model
 
 	// 工作行文字动画（见 thinking.go）：每轮随机中/英文案，帧号随 spinner 的
 	// tick 推进——不另开定时器，spinner 的启停即动画的启停。
@@ -357,7 +363,6 @@ type Model struct {
 
 	// 当前会话 id（初始 default；/session 切换或新建时更新，供 /export 使用）
 	currentSessionID string
-
 	// 用户评审通道：program 供 askProvider 把问题送进事件循环；question 为待回答的问题
 	program  *tea.Program
 	question *pendingQuestion
@@ -369,6 +374,17 @@ type Model struct {
 	pendingWakeups []string
 }
 
+// 输入行几何常量：提示符 2 列（"❯ "）、composer 左侧 padding 1 列。
+//
+// 这两个数是真实光标算式（inputCursorAbs）里唯一写死的部分——其余列宽都从已输入
+// 文字量出来。改动提示符文案或 composer 内边距时必须同步改这里，否则整行文字会
+// 相对光标模型偏移（中文输入时表现为「只选中半个字」）。cursor_prompt_width_test
+// 盯住提示符那一侧。
+const (
+	composerPromptWidth = 2
+	composerPadLeft     = 1
+)
+
 // New 创建一个聊天界面模型
 func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) *Model {
 	// 宿主侧计量实例需要窗口换算百分比；模型切换后由 SwitchModel 再同步
@@ -376,25 +392,43 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		manager.SetContextWindow(contextWindow)
 	}
 	input := textarea.New()
-	// 占位符只讲「在这里能做什么」，不重复按键提示：按键（Enter 发送 / Ctrl+J 换行 /
-	// Ctrl+Q 退出）统一由底部状态栏承担一处即可，两处都写既冗长又容易互相漂移
-	// （此前一处写「回车发送」、另一处写「Enter 发送」）。腾出的位置改为提示 @ 引用，
-	// 那是输入框独有的能力，看着占位符就能发现。
-	input.Placeholder = "输入消息；@ 引用文件或图片"
+	// 占位符讲输入框**独有**的两件事，别再重复「在这里打字」这种自明信息：
+	//   - @ 引用文件/图片（只有输入框能做）；
+	//   - 选区与复制的键位（Shift+←/→ 选字、Ctrl+Shift+C 复制）——这两个键不写出来
+	//     没人会发现（Ctrl+A 全选、Esc 取消选区是加分项，不占位）。
+	// 复制只提示 Ctrl+Shift+C：Ctrl+C 也支持（实现见键处理），但运行期它是中断键，
+	// 摆在最显眼处等于教用户误按一下终止任务——隐含支持、不明示。
+	// Enter 发送 / Ctrl+J 换行 / Ctrl+Q 退出仍只由底部状态栏承担，避免两处漂移。
+	input.Placeholder = "@ 引用文件或图片 · Shift+←/→ 选字 · Ctrl+Shift+C 复制"
 	input.CharLimit = 4096
 	input.ShowLineNumbers = false
 	// 对齐 REX：关闭虚拟光标，改用真实终端光标。虚拟光标在消息区动态重排时无法
 	// 稳定跟随输入位置，会导致中文输入法候选窗/文字光标随上方输出横向漂移；
 	// 真实光标由 View 显式锚定到输入插入点（见 View 末尾的 v.Cursor 设置）。
 	input.SetVirtualCursor(false)
+	// 输入框选区高亮（bubbles v2.2.1 起 textarea 自带选区：Shift+←/→ 逐字、
+	// Shift+↑/↓ 跨行、Ctrl+Shift+←/→ 按词、Ctrl+Shift+C 复制；Ctrl+A 全选由宿主
+	// 在键处理里补绑）。
+	// 用反色，与正文拖选（selStyle）保持同一种视觉语言。
+	inputStyles := input.Styles()
+	inputStyles.Focused.Selection = selStyle
+	inputStyles.Blurred.Selection = selStyle
+	input.SetStyles(inputStyles)
 	// 对齐 REX：动态高度让输入区随内容自动增长（1~composerMax 行），多行输入不再被
 	// 压扁到固定 3 行；回车在宿主层拦截用于发送，换行交给 Shift+Enter/Ctrl+J/Alt+Enter。
 	input.DynamicHeight = true
 	input.MinHeight = 1
 	input.MaxHeight = composerMax
 	input.SetHeight(1)
-	// 仅首行显示提示符「❯ 」，续行留空；高度随内容行数变化（见 syncInputHeight）
-	input.SetPromptFunc(2, func(info textarea.PromptInfo) string {
+	// 仅首行显示提示符「❯ 」，续行留空；高度随内容行数变化（见 syncInputHeight）。
+	//
+	// 提示符占 2 列，是输入行原点的一部分：真实光标的位置按「padding + 提示符 +
+	// 已输入文字到插入点的列宽」算出来（见 inputCursorAbs），所以这里的宽度必须与
+	// lipgloss 量到的（同样 2 列）一致，否则整行文字会相对光标模型偏移。U+276F 的
+	// 东亚宽度是 Neutral，个别终端会把它交给中文字体按全角绘制——真出现那种情况，
+	// 症状是输入行整体右移一列、光标压在相邻汉字的半个格子上。宽度假设在
+	// cursor_prompt_width_test.go 里钉住。
+	input.SetPromptFunc(composerPromptWidth, func(info textarea.PromptInfo) string {
 		if info.LineNumber != 0 {
 			return ""
 		}
@@ -417,7 +451,7 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(accent)
 
-	return &Model{
+	m := &Model{
 		agent:            agent,
 		manager:          manager,
 		ctx:              ctx,
@@ -432,6 +466,7 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
+	return m
 }
 
 // defaultSessionID 决定启动时的当前会话标识：优先取宿主的默认（项目）会话 id
@@ -529,13 +564,11 @@ func inputPaletteFor(isDark bool) (text, hint string) {
 	return "#1F1F1F", "#8A8A8A"
 }
 
-// Init 启动输入框焦点、spinner，并请求终端底色（据此选择输入区高对比配色）。
+// Init 启动输入框焦点。
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.input.Focus(),
-		m.spinner.Tick,
-		tea.RequestBackgroundColor,
-	)
+	// 工作行时钟不在这里点火：它由 armAnim 在进入工作态时点火、离场时停止
+	// （见 workingLineVisible），启动时没有工作行可画。
+	return m.input.Focus()
 }
 
 // submitCmd 发起一次 agent.RunStream，结果通过 streamFrame 消息返回
@@ -605,6 +638,33 @@ func (m *Model) copySelected() tea.Cmd {
 	return copyNoticeExpire(m.copyNoticeSeq)
 }
 
+// takeInputSelection 取出输入框里 Shift+←/→ 选中的文字，并收起选区。
+//
+// 收起是刻意的：Ctrl+C 在没有选区时承担「中断本轮 / 清空输入」，若复制后选区还留着，
+// 这个键就永远停在复制语义上，用户没法再用它中断或清空。复制完即回到常态更可预期。
+// 与真正的剪贴板写入分开，便于测试只验「取到什么、有没有收起」而不碰系统剪贴板。
+func (m *Model) takeInputSelection() string {
+	text := m.input.SelectedText()
+	if text == "" {
+		return ""
+	}
+	m.input.ClearSelection()
+	m.render()
+	return text
+}
+
+// copyInputSelection 复制输入框选区到剪贴板并弹出提示；无选区则不处理。
+func (m *Model) copyInputSelection() tea.Cmd {
+	text := m.takeInputSelection()
+	if text == "" {
+		return nil
+	}
+	_ = clipboard.WriteAll(text)
+	m.copyNotice = fmt.Sprintf("已复制 %d 字符", runeCount(text))
+	m.copyNoticeSeq++
+	return copyNoticeExpire(m.copyNoticeSeq)
+}
+
 // interruptTurn 中断当前一轮（走 cancelable ctx，参考 rex）：调用按轮取消并置位中断标记，
 // 丢弃后续 streamFrame，复位流式状态回到就绪。
 func (m *Model) interruptTurn() (tea.Model, tea.Cmd) {
@@ -615,6 +675,8 @@ func (m *Model) interruptTurn() (tea.Model, tea.Cmd) {
 	m.streamCancelled = true
 	m.thinking = false
 	m.streaming = false
+	// 中断同样属于「本轮结束」：停表，工作行立即整行消失；不等下一拍 tick 自己发现
+	m.disarmAnim()
 	m.streamOpen = false
 	m.clearStream()
 	m.viewport.SetHeight(m.vpHeight())
@@ -628,14 +690,15 @@ func (m *Model) interruptTurn() (tea.Model, tea.Cmd) {
 // 输入区高度随内容行数变化（1~composerMin 行），这里以当前实际高度为准。
 func (m *Model) vpHeight() int {
 	h := m.high - titleRows - statusRows - infoRows - boxBorder - m.input.Height()
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		h -= thinkingRow
 	}
-	if q := m.questionView(); q != "" {
+	if rows := m.questionRows(); rows > 0 {
 		// 问题覆盖层占独立行（View 组装位于 viewport 之后）：viewport 必须等量收缩，
 		// 否则覆盖层被推到终端可视区之外（AltScreen 截断）——提问弹出后界面无任何
-		// 可见变化。与 inputCursorAbs 的行数计入保持对称。
-		h -= strings.Count(q, "\n") + 1
+		// 可见变化。用 questionRows() 而不是数渲染结果的行数：覆盖层高度现在受
+		// 终端预算约束（见 questionLayoutOf），两处必须用同一个口径。
+		h -= rows
 	}
 	if m.completion.active && len(m.completion.items) > 0 {
 		// 减去补全菜单的高度：显示行数（窗口封顶 maxCompRows）+ 1 行提示
@@ -847,6 +910,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.render()
 		return m, nil
 
+	case pluginCommandMsg:
+		// 插件命令的输出：插件给什么就显示什么，前端不做语义解释。
+		header := assistantNameSty.Render(assistantMark + " DSC · /" + msg.name)
+		switch {
+		case msg.err != nil && msg.text == "":
+			m.appendMessage(header + "\n" + errorSty.Render(msg.err.Error()))
+		case msg.err != nil:
+			m.appendMessage(header + "\n" + msg.text + "\n" + errorSty.Render(msg.err.Error()))
+		default:
+			m.appendMessage(header + "\n" + msg.text)
+		}
+		m.render()
+		m.virtualGotoBottom()
+		return m, nil
+
 	case jobDoneMsg:
 		// 后台任务完成：排队通知并尝试唤醒（空闲自动开启一轮）
 		m.pendingWakeups = append(m.pendingWakeups, renderJobDoneNotice(msg.snapshot))
@@ -900,9 +978,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if inRunning {
 				return m.interruptTurn()
 			}
-			// 恢复复制语义（参考 rex）：有选区则复制；否则清空输入；都无则忽略（退出已移交给 Ctrl+Q）
+			// 恢复复制语义（参考 rex）：正文有选区则复制正文；否则输入框有选区则复制
+			// 输入框选区（Shift+←/→ 选的文字）；都没有才清空输入。
 			if m.sel.active {
 				return m, m.copySelected()
+			}
+			if m.input.HasSelection() {
+				return m, m.copyInputSelection()
 			}
 			if strings.TrimSpace(m.input.Value()) != "" {
 				m.input.SetValue("")
@@ -910,6 +992,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateCompletion()
 			}
 			return m, nil
+		case "ctrl+a":
+			// 全选输入框内容（终端里 Ctrl+A 是 0x01，与 shell 的「行首」不冲突——
+			// 输入框是 DSC 自己的行编辑，取 Windows/编辑器习惯）。textarea 上游只
+			// 绑了 Ctrl+G，这里补齐用户最常用的那个。
+			m.input.SelectAll()
+			return m, m.pumpStreamIfOpen()
+		case "ctrl+shift+c":
+			// 复制键的「安全形态」：运行期也不中断当前轮（占位符只提示这一个）。
+			// 与 Ctrl+C 走同一条复制路径，提示文案与收起选区的行为保持一致。
+			if m.input.HasSelection() {
+				return m, m.copyInputSelection()
+			}
+			return m, m.pumpStreamIfOpen()
+		case "esc":
+			// 有选区时 Esc 取消选区（与编辑器一致）；无选区时 Esc 不做任何事，
+			// 避免抢走终端/输入法可能用到的键。
+			if m.input.HasSelection() {
+				m.input.ClearSelection()
+				m.render()
+			}
+			return m, m.pumpStreamIfOpen()
 		case "up", "down":
 			// 正在翻阅历史（histPos 未到末尾）时 ↑/↓ 都继续翻，直到回到草稿位置；
 			// 正常编辑位仅单行输入允许 ↑ 进入历史（多行输入仍交给输入框移动光标）。
@@ -991,18 +1094,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmd, m.pumpStreamIfOpen())
 		}
 
-	case spinner.TickMsg:
-		if m.thinking || m.streaming {
-			var cmd tea.Cmd
-			m.spinner, cmd = m.spinner.Update(msg)
-			m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
-			return m, cmd
+	case animTickMsg:
+		// 工作行时钟的一拍（唯一驱动 spinner 字形与文字动画的节拍源）。
+		//
+		// 旧代 tick 一律丢弃：换代说明已有新链在跑，这条不应再续，否则同一时刻
+		// 会有两条链并行、帧走得比时钟快。
+		if msg.gen != m.animGen {
+			return m, nil
 		}
-		return m, nil
+		if !m.working() {
+			// 本轮已结束：时钟到此终止，工作行随之从视图里消失（见 View）。
+			// 这里不再有任何「停在中途帧」的中间态——行要么在动，要么不在。
+			m.animTicking = false
+			return m, nil
+		}
+		m.spinnerFrame++
+		m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
+		return m, animTick(m.animGen)
 
 	case elapsedTickMsg:
 		// 每秒刷新「思考中」行的耗时（对齐 REX elapsed tick）
-		if m.thinking || m.streaming {
+		if m.working() {
 			m.elapsed = int(time.Since(m.runStart).Seconds())
 			m.render()
 			return m, elapsedTick()
@@ -1045,15 +1157,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamBuffer = ""
 			// 創建助手消息佔位符（僅身份頭）；新建块时重置思考/答案状态
 			m.openAssistantBlock()
+			// 先点火再渲染：行是否出现取决于时钟在跑，晚一步就会先画一帧无工作行
+			anim := m.armAnim()
 			m.render()
 			m.virtualGotoBottom()
 			if msg.ch == nil {
 				m.streaming = false
+				m.disarmAnim()
 				m.streamOpen = false
 				m.clearStream()
 				if msg.err != nil {
 					m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
 				}
+				m.viewport.SetHeight(m.vpHeight())
+				m.render()
 				m.input.Focus()
 				m.virtualGotoBottom()
 				return m, nil
@@ -1063,11 +1180,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancelled = false
 			m.streamInput = msg.input
 			m.streamCh = msg.ch
-			return m, m.pumpStream(msg.input, msg.ch)
+			return m, tea.Batch(m.pumpStream(msg.input, msg.ch), anim)
 		}
 		if msg.done {
 			m.thinking = false
 			m.streaming = false
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream()
 			if msg.err != nil {
@@ -1087,6 +1205,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.thinking = false
 			m.streaming = false
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream()
 			m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
@@ -1222,6 +1341,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "success", "error":
 			m.thinking = false
 			m.streaming = false
+			m.disarmAnim() // 本轮结束：时钟停，工作行整行消失（在途 tick 换代作废）
 			m.streamOpen = false
 			m.clearStream() // 成功/失敗後清理流通道狀態，避免後續 pumpStreamIfOpen 誤判「流進行中」
 			if f.Status == "success" && f.Usage != nil {
@@ -1242,7 +1362,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.render()
 			m.input.Focus()
 			m.virtualGotoBottom()
-			return m, nil
+			// 本轮到此结束（通道已清理，done 帧可能不再到达）：若有排队中的完成通知
+			// （后台任务在本轮进行中结束），必须在这里尝试唤醒，否则通知会一直躺在
+			// 队列里等用户敲字——用户看到的就是「任务完成了，模型却没被叫醒」。
+			return m, m.tryWakeup()
 		}
 		return m, m.pumpStream(msg.input, msg.ch)
 
@@ -1256,23 +1379,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 注入不应打断当前流；若有进行中的流式通道则继续保持泵取。
 		return m, m.pumpStreamIfOpen()
 
-	case submitResult:
-		m.thinking = false
-		if msg.err != nil {
-			m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
-		} else if msg.result != nil {
-			if msg.result.Status == "success" {
-				body := renderMarkdown(msg.result.Output, max(m.width-4, 20))
-				m.appendMessage(m.renderAssistant(body))
-			} else {
-				m.appendMessage(errorSty.Render("错误: ") + msg.result.Output)
-			}
-		}
-		m.viewport.SetHeight(m.vpHeight())
-		m.render()
-		m.input.Focus()
-		m.virtualGotoBottom()
-		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -2394,7 +2500,24 @@ func (m *Model) slashCommandItems() []compItem {
 	if !inserted {
 		out = append(out, modeItems...)
 	}
+	// 插件声明的命令：菜单内容来自宿主的声明汇总，前端不认识任何具体命令。
+	if plugins := m.pluginCommands(); len(plugins) > 0 {
+		items := make([]compItem, 0, len(plugins))
+		for _, c := range plugins {
+			items = append(items, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
+		}
+		// 插到 "/export" 之前，保持内置命令的收尾顺序（/export、/exit 在最后）
+		out = append(out, items...)
+	}
 	return out
+}
+
+// pluginCommands 返回宿主侧汇总的插件命令声明（无 manager 时为空）。
+func (m *Model) pluginCommands() []core.PluginCommandInfo {
+	if m.manager == nil {
+		return nil
+	}
+	return m.manager.Commands()
 }
 
 // availableModes 返回可用模式名（presets 目录下 <name>.yaml 去扩展名）。
@@ -2418,7 +2541,7 @@ func modeHint(mode string) string {
 	case core.ModeStandard:
 		return "切换至标准模式"
 	case core.ModeCreation:
-		return "切换至创造模式（可经 tool-lua-host 创造 LUA 插件）"
+		return "切换至创造模式（可经宿主内脚本插件创造 LUA 插件）"
 	case core.ModePTC:
 		return "引导用 run_code 写 Lua 一把过组合多步"
 	}
@@ -2599,7 +2722,7 @@ func modeSwitchMessage(mode string) string {
 	case core.ModeStandard:
 		return "已切換至標準模式 (standard)。"
 	case core.ModeCreation:
-		return "已切換至創造模式 (creation)：可經 tool-lua-host 跨寫 LUA 插件（參考 lua-core-creator 技能）。"
+		return "已切換至創造模式 (creation)：可經宿主內腳本插件跨寫 LUA 插件（參考 lua-core-creator 技能）。"
 	case core.ModePTC:
 		return "已切換至 PTC 模式 (ptc)：引导用 run_code 写 Lua 一把过组合多步。"
 	}
@@ -2615,6 +2738,9 @@ func (m *Model) buildHelpText() string {
 		"  Enter        发送消息",
 		"  Ctrl+J       换行（终端协议不区分 Ctrl+Enter 与 Enter，故用 LF 键）",
 		"  ↑/↓          翻阅历史命令（单行输入时）",
+		"  Shift+←/→    选中输入框文字（Shift+↑/↓ 跨行、Ctrl+Shift+←/→ 按词）",
+		"  Ctrl+Shift+C 复制选中的文字（Ctrl+A 全选、Esc 取消选区）",
+		"  Ctrl+C       空闲时也复制选区（无选区则清空输入）；运行中始终是中断当前轮",
 		"  Ctrl+V       粘贴剪贴板内容",
 		"  /            在输入框首字符唤起命令菜单",
 		"  Ctrl+C       有选区复制 / 运行中中断 / 否则清空输入",
@@ -2659,6 +2785,17 @@ func (m *Model) buildHelpText() string {
 		"  /export [id]  导出当前会话（或指定 id）为 Markdown 文件",
 		"  /exit        退出聊天",
 	)
+	// 插件声明的命令由宿主动态汇总：核心不认识这些名字，也不内置任何一个。
+	if cmds := m.pluginCommands(); len(cmds) > 0 {
+		lines = append(lines, "", "插件命令:")
+		for _, c := range cmds {
+			summary := c.Summary
+			if summary == "" {
+				summary = c.Usage
+			}
+			lines = append(lines, "  "+c.Usage+"   "+summary)
+		}
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -3073,8 +3210,47 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
+
+	// 不是内置命令：看有没有插件**声明**过这个名字。有则转发给该插件执行，
+	// 没有才当作普通输入。命令名不写在核心/TUI 里——声明在插件，转发在宿主。
+	if name, args, ok := splitSlashCommand(cmd); ok && m.manager != nil && m.manager.HasCommand(name) {
+		return true, m.runPluginCommand(name, args)
+	}
 	return false, nil
 }
+
+// splitSlashCommand 拆分 "/name rest" → (name, rest)。
+func splitSlashCommand(cmd string) (name, args string, ok bool) {
+	t := strings.TrimPrefix(strings.TrimSpace(cmd), "/")
+	if t == "" {
+		return "", "", false
+	}
+	if i := strings.IndexAny(t, " \t"); i >= 0 {
+		return t[:i], strings.TrimSpace(t[i+1:]), true
+	}
+	return t, "", true
+}
+
+// runPluginCommand 异步转发命令（插件可能在另一个进程里跑，不能阻塞 UI 循环）。
+func (m *Model) runPluginCommand(name, args string) tea.Cmd {
+	manager := m.manager
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), pluginCommandTimeout)
+		defer cancel()
+		text, err := manager.RunCommand(ctx, name, args)
+		return pluginCommandMsg{name: name, text: text, err: err}
+	}
+}
+
+// pluginCommandMsg 插件命令的执行结果（从 tea.Cmd 回到事件循环）。
+type pluginCommandMsg struct {
+	name string
+	text string
+	err  error
+}
+
+// pluginCommandTimeout 插件命令的超时：命令是同步 RPC，卡住不能拖死界面。
+const pluginCommandTimeout = 20 * time.Second
 
 // appendCronList 输出定时任务列表（/crons 与 /cron list 共用）。
 func (m *Model) appendCronList() {
@@ -3584,6 +3760,58 @@ func elapsedTick() tea.Cmd {
 	return tea.Tick(time.Second, func(_ time.Time) tea.Msg { return elapsedTickMsg{} })
 }
 
+// ---- 工作行时钟 ----
+
+// animFPS 工作行时钟的节拍（与 spinner.Dot 的 FPS 一致：每秒 10 帧）。
+const animFPS = 100 * time.Millisecond
+
+// animTickMsg 工作行时钟的一拍；gen 为发起时的代次。
+type animTickMsg struct{ gen int }
+
+// animTick 排下一拍。自续：每条 tick 处理完都排同代的下一拍，直到本轮结束。
+//
+// 这条链由 DSC 自己持有，而不是复用 spinner.Tick：bubbles 的 spinner 会给每个
+// tick 打 tag，tag 不匹配的 tick 被**静默丢弃**并返回 nil 命令——链就此断掉，而
+// thinking/streaming 仍是 true，工作行于是永久冻在某一帧上（扫到一半的蒙版块）。
+// 自持链按代次编号：换代后旧 tick 一律作废，同一时刻只可能有一条链，断链也就
+// 只可能是「本轮结束」这一种预期原因。
+func animTick(gen int) tea.Cmd {
+	return tea.Tick(animFPS, func(time.Time) tea.Msg { return animTickMsg{gen: gen} })
+}
+
+// working 本轮的「工作态」：正在等 agent 响应或正在流式输出。
+func (m *Model) working() bool { return m.thinking || m.streaming }
+
+// workingLineVisible 工作行是否应当出现在屏幕上：时钟在跑**且**处于工作态。
+//
+// 两个条件缺一不可，否则画出来的都是谎话——时钟停了却把某一帧冻着（「动画停在
+// 扫到一半」），或本轮已结束却还留着一行（模型已离开）。用户的判据很简单：模型
+// 走了，这一行就该整行消失，不是停在动画中途。
+func (m *Model) workingLineVisible() bool { return m.animTicking && m.working() }
+
+// armAnim 点燃工作行时钟。幂等：每次调用换代重启，旧链因代次不符自然终止，
+// 所以同一时刻只会有一条链（重复点火不会让动画走快，也不会出现两条链互相打架）。
+func (m *Model) armAnim() tea.Cmd {
+	m.animGen++
+	m.animTicking = true
+	return tea.Batch(animTick(m.animGen), elapsedTick())
+}
+
+// disarmAnim 停止工作行时钟：工作行立即从视图消失，在途 tick 因代次不符作废。
+func (m *Model) disarmAnim() {
+	m.animTicking = false
+	m.animGen++
+}
+
+// spinnerGlyph 当前 spinner 字形（帧号由工作行时钟推进）。
+func (m *Model) spinnerGlyph() string {
+	frames := m.spinner.Spinner.Frames
+	if len(frames) == 0 {
+		return ""
+	}
+	return m.spinner.Style.Render(frames[m.spinnerFrame%len(frames)])
+}
+
 // statusBar 渲染底部状态栏（两行）：首行一条通栏分隔线，次行容纳模型/复制提示与快捷键。
 // 采用 REX 风格的缩进 + 分隔线布局，把交互信息与模型信息区分开，营造呼吸感。
 func (m *Model) statusBar() string {
@@ -3654,11 +3882,15 @@ func (m *Model) View() tea.View {
 	if q := m.questionView(); q != "" {
 		parts = append(parts, q)
 	}
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
 		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
 		// 所以只有尾部提示用 dim。
-		line := "  " + m.spinner.View() + " " + m.thinkAnim.text() +
+		//
+		// 只在时钟推进时出现：时钟停（本轮结束／模型离开）就整行消失，绝不把某一
+		// 帧冻在屏幕上——中文动画未扫到的字是实心遮罩块，冻住半帧看起来像渲染
+		// 到一半被打断（见 workingLineVisible）。
+		line := "  " + m.spinnerGlyph() + " " + m.thinkAnim.text() +
 			dimSty.Render(fmt.Sprintf(" (%d 秒 · Ctrl+C 取消)", m.elapsed))
 		if m.turnTokens > 0 {
 			line += dimSty.Render(" · ↓" + shortTokens(m.turnTokens))
@@ -3716,14 +3948,14 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 	if cur == nil {
 		return nil
 	}
-	// X：外层 composer 左侧 padding 1 列（无左边框线）
-	cur.X += 1
+	// X：外层 composer 左侧 padding（无左边框线）
+	cur.X += composerPadLeft
 	// Y：标题(1) + viewport + 中间各部件（待办面板/思考行/补全菜单）+ composer 顶边框(1)
 	y := titleRows + m.viewport.Height()
 	if q := m.questionView(); q != "" {
 		y += strings.Count(q, "\n") + 1
 	}
-	if m.thinking || m.streaming {
+	if m.workingLineVisible() {
 		y += thinkingRow
 	}
 	y += m.todoPanelRows()

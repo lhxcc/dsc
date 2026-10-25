@@ -29,12 +29,12 @@ type llmAggregateServer struct {
 // （避免长调用阻塞热重载，同时消除与热重载写 m.llms 的并发 map 竞态）。
 //
 // 在调 provider 前先经 dispatchEventToPlugins 分发 agent/pre-step 事件（waterfall
-// 模式）：插件（如 billion-context）可改写消息列表——注入 <acp> 标签、应用 prune、
+// 模式）：声明了该能力的插件可改写消息列表——注入上下文标签、应用裁剪、
 // 注入 nudge 等。改写后的消息列表透传给实际 provider。无插件监听时事件直接通过，
 // 行为与原先一致（零开销）。
 //
 // 失败时经 agent/request-error 事件让插件决定是否重试：插件返回 {"retry": true}
-// 时重新走一轮 applyPreStepHook + provider 调用（如 billion-context 触发溢出压缩后重试）。
+// 时重新走一轮 applyPreStepHook + provider 调用（如插件触发溢出压缩后要求重试）。
 // 最多重试 maxRetries 次防止无限循环。
 func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (*proto.ChatResponse, error) {
 	const maxRetries = 3
@@ -170,7 +170,7 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 }
 
 // applyPreStepHook 在 LLM 请求前分发 agent/pre-step 事件（waterfall 模式），
-// 让插件（如 billion-context）有机会改写消息列表。无插件监听或返回空 result
+// 让订阅了 pre-step 的插件有机会改写消息列表。无插件监听或返回空 result
 // 时原样返回 req（零开销）。
 //
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
@@ -294,11 +294,11 @@ func (m *Manager) lastSessionPrompt(sessionID string) int32 {
 }
 
 // emitRequestError 在 LLM 请求失败后分发 agent/request-error 事件（waterfall 模式），
-// 让插件（如 billion-context）有机会决定是否重试。返回 true 表示插件要求重试——
+// 让订阅了 pre-step 的插件有机会决定是否重试。返回 true 表示插件要求重试——
 // 调用方（Chat/ChatStream）据此重新走一轮 applyPreStepHook + provider 调用。
 //
 // 插件经 result_json 返回 {"retry": true} 时视为重试请求。
-// 典型场景：上下文溢出时 billion-context 触发紧急压缩后要求重试。
+// 典型场景：上下文溢出时压缩后端插件触发紧急压缩后要求重试。
 func (s *llmAggregateServer) emitRequestError(ctx context.Context, req *proto.ChatRequest, err error) bool {
 	if err == nil {
 		return false
@@ -339,7 +339,7 @@ func isContextWindowExceeded(err error) bool {
 // 的稳定词汇）：context_window_exceeded / rate_limited / network_error / unknown；
 // err 为 nil 返回空串。仅供日志与诊断留痕（llm/attempt 会话事件、宿主运行日志）——
 // 重试协议（agent/request-error）不受此分类影响，仍按 isContextWindowExceeded 判定，
-// 保证既有插件（如 billion-context）的重试决策路径零变化。
+// 保证既有压缩插件的重试决策路径零变化。
 func ClassifyLLMErrorCode(err error) string {
 	if err == nil {
 		return ""

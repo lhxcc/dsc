@@ -183,30 +183,37 @@ func TestMapWorkspaceASTBareRoot(t *testing.T) {
 	}
 }
 
-// TestMapTempPathFor 校验 /tmp 虚拟根映射的纯函数本体（goos 显式注入，跨平台全覆盖）：
-//   - Windows：/tmp 与 /tmp/... → 临时目录（与 res() 的 /tmp 分支一致）
-//   - Unix：/tmp 是真实挂载点，原样不动
-//   - 边界：/tmpfoo、/tmpx 不是别名；/workspace 等其它前缀不受影响
-func TestMapTempPathFor(t *testing.T) {
+// TestTempRootRuleViaSharedTable /tmp 虚拟根现在由 core 的虚拟根表决定（本插件不再
+// 自带规则）。这里直接验证共享表本体：Windows 映射到临时目录，Unix 原样，边界不误判。
+func TestTempRootRuleViaSharedTable(t *testing.T) {
 	cases := []struct {
 		in, tempDir, goos, want string
 	}{
 		{"/tmp", "/tmp/mytemp", "windows", "/tmp/mytemp"},
 		{"/tmp/", "/tmp/mytemp", "windows", "/tmp/mytemp"},
 		{"/tmp/a/b.txt", "/tmp/mytemp", "windows", "/tmp/mytemp/a/b.txt"},
-		{"/tmp/sub", "/tmp/mytemp", "windows", "/tmp/mytemp/sub"},
 		// Unix：/tmp 是真实挂载点，原样
 		{"/tmp", "/tmp/mytemp", "linux", "/tmp"},
 		{"/tmp/a", "/tmp/mytemp", "darwin", "/tmp/a"},
-		// 边界：/tmpfoo 不是别名
+		// 边界：/tmpfoo、/tmpx 不是别名
 		{"/tmpfoo/x", "/tmp/mytemp", "windows", "/tmpfoo/x"},
 		{"/tmpx", "/tmp/mytemp", "windows", "/tmpx"},
-		// 非 /tmp 路径原样（包括 /workspace）
-		{"/workspace/x", "/tmp/mytemp", "windows", "/workspace/x"},
 	}
 	for _, c := range cases {
-		if got := mapTempPathFor(c.in, c.tempDir, c.goos); got != c.want {
-			t.Fatalf("mapTempPathFor(%q, %q, %q) = %q, want %q", c.in, c.tempDir, c.goos, got, c.want)
+		if got := dsc.MapWorkspacePathFor(c.in, "/tmp/myws", c.tempDir, c.goos); got != c.want {
+			t.Fatalf("MapWorkspacePathFor(%q, temp=%q, %q) = %q, want %q",
+				c.in, c.tempDir, c.goos, got, c.want)
+		}
+	}
+
+	// 同一次映射里 /workspace 与 /tmp 互不干扰（表内按前缀各自命中，首次命中即返回）
+	both := []struct{ in, want string }{
+		{"/workspace/x", "/tmp/myws/x"},
+		{"/tmp/x", "/tmp/mytemp/x"},
+	}
+	for _, c := range both {
+		if got := dsc.MapWorkspacePathFor(c.in, "/tmp/myws", "/tmp/mytemp", "windows"); got != c.want {
+			t.Fatalf("%q = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
