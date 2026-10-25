@@ -478,7 +478,13 @@ func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, erro
 
 	content := ""
 	if plainText {
-		content = page.MustEval("() => document.body.innerText").Str()
+		// 按**视觉版面**还原正文（见 layout.go）：innerText 是按 DOM 块结构断行的，
+		// flex/grid 页面上并排的导航项、表格单元格会被拆成一词一行，模型读不出
+		// 「谁和谁在同一行」。排版失败（页面异常/脚本被禁）才退回 innerText。
+		content, _ = renderLayout(page.MustEval(layoutExtractJS).Str())
+		if content == "" {
+			content = page.MustEval("() => document.body.innerText").Str()
+		}
 	} else {
 		content = page.MustEval("() => document.documentElement.outerHTML").Str()
 	}
