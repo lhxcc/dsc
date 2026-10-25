@@ -88,6 +88,16 @@ func shellExecHandler(ctx context.Context, args []string) error {
 	}
 	err := defaultExecHandler(ctx, args)
 	if err != nil {
+		// Windows 应用执行别名（Store 占位符）会「非零退出 + 零输出」，模型无从自查；
+		// 命中时直接说明它是什么、该怎么办，免得同一命令被反复重试。
+		//
+		// 只在「进程真的跑起来并返回非零」时提示：找不到命令（127）已经有明确报错，
+		// 再叠一句「它是个别名」只会让原因更难看清。
+		if _, ran := err.(interp.ExitStatus); ran {
+			if hint := aliasStubHint(args[0]); hint != "" {
+				fmt.Fprintf(interp.HandlerCtx(ctx).Stderr, "%s\n", hint)
+			}
+		}
 		if hint := posixHint(args[0]); hint != "" {
 			return fmt.Errorf("%v%s", err, hint)
 		}
