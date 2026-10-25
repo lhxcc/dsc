@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -395,6 +396,7 @@ func buildPlatform(repoRoot string, p platform, includeInternal bool) bool {
 	}
 	builtPlugins := 0
 	skippedPlugins := []string{}
+	failedPlugins := []string{}
 	for _, name := range plugins {
 		pdir := filepath.Join(repoRoot, "plugins", name)
 		if _, err := os.Stat(pdir); err != nil {
@@ -409,6 +411,7 @@ func buildPlatform(repoRoot string, p platform, includeInternal bool) bool {
 			}
 			if err := goBuildNative(pdir, out); err != nil {
 				printError(fmt.Sprintf("  ✗ 插件 %s 本机 CGO 编译失败: %v\n", name, err))
+				failedPlugins = append(failedPlugins, name)
 				continue
 			}
 			printSuccess(fmt.Sprintf("  ✓ 插件(cgo): %s\n", name))
@@ -426,6 +429,8 @@ func buildPlatform(repoRoot string, p platform, includeInternal bool) bool {
 		}
 		if err := goBuild(pdir, out, p); err != nil {
 			printError(fmt.Sprintf("  ✗ 插件 %s 编译失败: %v\n", name, err))
+			failedPlugins = append(failedPlugins, name)
+			hintStaleModule(name, err)
 			continue
 		}
 		printSuccess(fmt.Sprintf("  ✓ 插件: %s\n", name))
@@ -436,7 +441,24 @@ func buildPlatform(repoRoot string, p platform, includeInternal bool) bool {
 	if len(skippedPlugins) > 0 {
 		fmt.Printf("  （跳过平台不适用插件: %s）\n", strings.Join(skippedPlugins, ", "))
 	}
+	// 插件编译失败＝发布包不完整，必须让整轮构建失败：以前这里只是 continue，
+	// 最后照样打印「打包完成」，于是跑出来一个悄悄缺插件的发布目录，人还以为成功了。
+	if len(failedPlugins) > 0 {
+		printError(fmt.Sprintf("  ！%d 个插件编译失败：%s\n", len(failedPlugins), strings.Join(failedPlugins, ", ")))
+		return false
+	}
 	return true
+}
+
+// hintStaleModule 当插件编译失败的原因是「go.mod 需要更新」时，直接把修复命令打出来。
+//
+// 典型场景：根模块升级依赖（如 lipgloss/ansi 抬高共享的间接依赖版本），插件模块仍钉着
+// 旧版本，于是 go build 以 "updates to go.mod needed" 退出——它只要跑一次 go mod tidy。
+func hintStaleModule(name string, err error) {
+	if err == nil || !strings.Contains(err.Error(), "updates to go.mod needed") {
+		return
+	}
+	printInfo(fmt.Sprintf("    → 该插件的依赖已过期：cd plugins/%s && go mod tidy 后重跑构建\n", name))
 }
 
 // goBuild 以目标平台环境在 dir 目录交叉编译到 out。跨平台一律 CGO_ENABLED=0；
@@ -458,10 +480,27 @@ func goBuild(dir, out string, p platform) error {
 		"GOARCH="+p.GOARCH,
 		"CGO_ENABLED=0",
 	)
-	// 交错输出，便于在目标平台文件名上保留后缀
+	// 交错输出，便于在目标平台文件名上保留后缀；同时留一份 stderr 摘要——
+	// go 的 error 只有 "exit status 1"，真正原因（编译错误、go.mod 过期）在 stderr 里。
+	var stderr bytes.Buffer
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	if err := cmd.Run(); err != nil {
+		return buildError(err, stderr.String())
+	}
+	return nil
+}
+
+// buildError 把失败原因与 stderr 尾部几行拼进 error，供上层判断与提示。
+func buildError(err error, stderr string) error {
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	if len(lines) == 0 || lines[len(lines)-1] == "" {
+		return err
+	}
+	if len(lines) > 3 { // 只留最后三行，避免整段编译日志塞进一行提示
+		lines = lines[len(lines)-3:]
+	}
+	return fmt.Errorf("%v: %s", err, strings.Join(lines, " | "))
 }
 
 // goBuildNative 本机 CGO 构建（tool-computer-use 等 cgo 插件）：不交叉、不强制
