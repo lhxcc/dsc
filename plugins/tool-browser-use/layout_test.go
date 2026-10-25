@@ -210,3 +210,24 @@ func TestRenderLayoutDoesNotMergeBeyondPageWidth(t *testing.T) {
 
 // TestRenderLayoutJoinsInlineRuns 同一位置起头的两块（<b>、<span> 把一个词拆成两个
 // 文本节点）必须直接拼接，不能插空格——否则 "PDI" 会被写成 "PD I"。
+
+// TestRenderLayoutDropsBareSeparators 门户页把「|」「·」之类分隔符也当成块，
+// 单独成行读起来全是噪声；只有纯分隔符（1~2 字符）才丢，带文字的照常保留。
+func TestRenderLayoutDropsBareSeparators(t *testing.T) {
+	payload := mkPayload(8,
+		item("|", 0, 0, 20),
+		item("要闻", 40, 0, 20),
+		item("·", 90, 0, 20),
+		item("财经", 120, 0, 20),
+		item("A|B", 200, 0, 20), // 含分隔符但有内容，必须保留
+	)
+	out, _ := renderLayout(payload)
+	for _, ln := range strings.Split(out, "\n") {
+		if trimmed := strings.TrimSpace(ln); trimmed == "|" || trimmed == "·" {
+			t.Fatalf("纯分隔符应被丢弃：%q", out)
+		}
+	}
+	if !strings.Contains(out, "要闻") || !strings.Contains(out, "财经") || !strings.Contains(out, "A|B") {
+		t.Fatalf("有内容的块不能被丢：%q", out)
+	}
+}

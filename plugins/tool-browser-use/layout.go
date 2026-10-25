@@ -233,9 +233,10 @@ func renderLayout(payload string) (string, bool) {
 	// 在**紧邻的两块**之间，跨容器的东西不会撞在一起。
 	items := make([]layoutItem, 0, len(page.Items))
 	for _, it := range page.Items {
-		if strings.TrimSpace(it.Text) != "" {
-			items = append(items, it)
+		if strings.TrimSpace(it.Text) == "" || isSeparatorOnly(it.Text) {
+			continue
 		}
+		items = append(items, it)
 	}
 	if len(items) == 0 {
 		return "", false
@@ -364,6 +365,24 @@ func isMergeableRow(row []layoutItem, charW float64, cols int) bool {
 	}
 	if cols > 0 && charW > 0 && prevEnd-start > float64(cols)*charW {
 		return false
+	}
+	return true
+}
+
+// separatorChars 页面里只用来分隔栏目的符号。单独成块的这类符号没有信息量，
+// 留着只会让输出多出一堆孤零零的「|」行（门户首页尤其多）。
+const separatorChars = "|｜/\\·•・-–—~=+*_.,;:!?›»‹«<>()[]{}"
+
+// isSeparatorOnly 该块是否只是分隔符号（1~2 个字符且全在 separatorChars 里）。
+func isSeparatorOnly(s string) bool {
+	rs := []rune(strings.TrimSpace(s))
+	if len(rs) == 0 || len(rs) > 2 {
+		return false
+	}
+	for _, r := range rs {
+		if !strings.ContainsRune(separatorChars, r) {
+			return false
+		}
 	}
 	return true
 }
