@@ -7,15 +7,14 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	dsc "dsc-sdk"
-
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/launcher/flags"
+
+	dsc "dsc-sdk"
 )
 
 // 浏览器进程的启动与回收。
@@ -29,7 +28,9 @@ import (
 //     再调用 taskkill，这些都是控制台进程，进一步放大闪烁与拖慢关闭。
 //
 // 这两点都无法从 rod 外部关掉（osSetupCmd 是内部方法），所以自己起进程：参数仍由
-// rod 的 FormatArgs 生成（flag 集合不变），exec 换成我们能控制 SysProcAttr 的那种。
+// rod 的 FormatArgs 生成（flag 集合不变），exec 换成能挂统一防护网的那种——子进程属性
+// 一律经 SDK 的 ConfigureChildProcessAttrs（宿主唯一 chokepoint，Windows 隐藏控制台、
+// 其余平台 no-op），不在插件里另写一份 SysProcAttr。
 // 附带好处：进程句柄归我们管，会话关闭时能真正结束浏览器，而不是留一堆僵尸 chrome。
 
 // launchChrome 启动浏览器并返回 CDP 端点，以及一个结束进程的函数。
@@ -50,12 +51,8 @@ func launchChrome(l *launcher.Launcher) (controlURL, product string, kill func()
 	args := l.FormatArgs()
 
 	cmd := exec.Command(bin, args...)
-	// Windows：控制台隐藏走 SDK 统一实现（HideWindow + CREATE_NO_WINDOW），
-	// 与宿主其余派生点同一份逻辑，避免两套「别弹窗」实现各自漂移。
-	// Unix：SDK 为 no-op，另需把浏览器放进独立进程组（见 configureProcessGroup）。
-	dsc.ConfigureChildProcessAttrs(cmd)
-	configureProcessGroup(cmd)
-	cmd.Stdout = io.Discard // Chrome 的日志没人看，别继承我们的控制台
+	dsc.ConfigureChildProcessAttrs(cmd) // ← 关键：子进程不弹窗（宿主统一防护网）
+	cmd.Stdout = io.Discard             // Chrome 的日志没人看，别继承我们的控制台
 	cmd.Stderr = io.Discard
 	if env, ok := l.GetFlags(flags.Env); ok && len(env) > 0 {
 		cmd.Env = env
@@ -116,24 +113,6 @@ func waitCDP(baseURL string, timeout time.Duration, cmd *exec.Cmd) (wsURL, produ
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-// killProcessTree 结束浏览器及其所有子进程。
-//
-// 只 kill 主进程不够：Chrome 的渲染/网络子进程会多活一会儿，仍占着 user-data-dir 里的
-// 文件（临时 profile 目录因此删不掉）。Windows 用 taskkill /T 整棵结束，同样带上
-// HideWindow——taskkill 自己是控制台程序，不隐藏就会闪一下黑框（正是要避免的东西）。
-func killProcessTree(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	pid := cmd.Process.Pid
-	if runtime.GOOS == "windows" {
-		k := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
-		dsc.ConfigureChildProcessAttrs(k)
-		_ = k.Run()
-	}
-	_ = cmd.Process.Kill()
 }
 
 // freePort 让内核分配一个空闲端口并立刻释放，交给浏览器监听。
