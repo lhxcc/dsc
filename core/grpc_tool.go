@@ -24,6 +24,10 @@ func (s *ToolGRPCServer) ExecuteTool(ctx context.Context, req *proto.ExecuteTool
 	if sid := req.GetSessionId(); sid != "" {
 		ctx = WithCaller(ctx, sid)
 	}
+	// 调用 id 同样注入：插件侧据它把日志与模型侧调用对齐（sdk.CallInfo）。
+	if id := req.GetToolCallId(); id != "" {
+		ctx = WithToolCallID(ctx, id)
+	}
 	// 调用方会话随调用转发的审批策略注入 ctx（审批门优先使用，实现重启后 per-session 恢复）
 	if p := req.GetApprovalPolicy(); p != "" {
 		ctx = WithApprovalPolicy(ctx, p)

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dsc-sdk"
@@ -33,6 +35,10 @@ type Session struct {
 	stdoutSignal *activityWriter
 	stderrSignal *activityWriter
 	mu           sync.Mutex
+	// lastUsed 最近一次执行命令的时间（LRU 淘汰依据）。持久会话是默认行为，
+	// 池子里必然会有多个；淘汰必须挑「最久没用过的」，而不是 map 里随便一个
+	// ——后者会把正在用的会话踢掉，模型下一轮进来 cwd 莫名丢失。
+	lastUsed time.Time
 }
 
 // syncedBuilder 是線程安全的輸出累加緩衝：Runner 經 activityWriter 向其寫入
@@ -116,7 +122,7 @@ func (a *activityWriter) bind(ctx context.Context) {
 // ToolServiceServer/MetadataServer/ToolMetadataGRPCPlugin 样板）。
 func main() {
 	// 定義 shell 工具描述
-	baseDescription := "Execute a shell command or script using mvdan/sh interpreter internally (POSIX shell standard). Each call without a reused session_id runs in a fresh shell: no state (cwd, variables, functions) persists between calls — pass `workdir` instead of using `cd`. A consistent session_id maintains state (cwd, environment variables) across calls."
+	baseDescription := "Execute a shell command or script using mvdan/sh interpreter internally (POSIX shell standard). The shell persists across calls by default: cwd, exported variables and shell functions carry over, so `cd` once instead of repeating it in every command. Pass `workdir` to move the shell into a directory (applies to new and existing sessions alike). Pass `session_id: \"new\"` only when you need a clean shell with a fresh cwd and environment; an explicit non-empty `session_id` gives you a separate persistent shell, e.g. one per task."
 
 	var pathAdvice string
 	var extraAdvice string
@@ -154,7 +160,7 @@ func main() {
                         },
                         "session_id": {
                                 "type": "string",
-                                "description": "Persistent session ID to maintain state (cwd, environment variables). If not provided or 'new', a new session is created."
+                                "description": "Shell to use. Omit to reuse the conversation's persistent shell (default: cwd and exported variables carry over). Use 'new' for a clean shell; any other name keeps a separate persistent shell of its own."
                         },
                         "sandbox_permissions": {
                                 "type": "string",
@@ -186,12 +192,14 @@ func main() {
 			return "", fmt.Errorf("command is required")
 		}
 
-		// 處理 session
-		sessionID := params.SessionID
-		if sessionID == "" || sessionID == "new" {
-			// 創建新 session
-			sessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
-		}
+		// 會話鍵：默認持久。
+		//
+		// 語義（反轉自早期實現：那時不傳 id 就每次新 shell，模型必須反復 cd）：
+		//   - 不傳 session_id → 綁到**調用方會話**（同一對話復用同一個 shell），
+		//     宿主沒給身份時退化為進程內單一默認會話；
+		//   - session_id: "new" → 顯式要一個全新 shell（cwd/env 都乾淨）；
+		//   - 其它值 → 按該名字取用（模型自建的分組，例如按任務隔離）。
+		sessionID := sessionKeyFor(ctx, params.SessionID)
 
 		// 獲取或創建 session
 		// workdir 优先于 cwd（对齐 DSH 参数名）；cwd 保留向后兼容
@@ -205,6 +213,7 @@ func main() {
 		}
 
 		// 執行命令到 session
+		touchSession(session)
 		output, exitCode, err := execSessionCommand(ctx, session, params.Command)
 		if err != nil {
 			return "", fmt.Errorf("failed to execute command in session: %w", err)
@@ -369,32 +378,98 @@ func shellHandlers() []interp.RunnerOption {
 	}
 }
 
+// defaultSessionKey 拿不到调用方身份时使用的兜底会话键（進程內单例）。
+const defaultSessionKey = "default"
+
+// shellSessionSeq 为显式 "new" 的会话名提供单调序号（见 sessionKeyFor）。
+var shellSessionSeq uint64
+
+// sessionKeyFor 计算本次调用使用的 shell 会话键。
+//
+// 语义：**默认持久**。不传 session_id 时绑定到调用方会话，同一对话复用同一个
+// shell（cwd、export 的变量、函数都留着），模型不必每条命令都 `cd` 一次。
+// 想要干净环境必须显式 `session_id: "new"`。
+func sessionKeyFor(ctx context.Context, requested string) string {
+	switch k := strings.TrimSpace(requested); {
+	case k == "new":
+		// 显式新建：纳秒 + 自增序号。只用纳秒不够——同一纳秒内连续两次调用
+		// 会拿到同一个键，等于 "new" 又复用了刚才那个 shell（Windows 时钟粒度
+		// 下实测能撞上）。
+		return fmt.Sprintf("shell-%d-%d", time.Now().UnixNano(), atomic.AddUint64(&shellSessionSeq, 1))
+	case k != "":
+		return k
+	}
+	if sid := dsc.CallSessionID(ctx); sid != "" {
+		// 前缀避免与模型自建的 id 撞名（模型可能正好用 "default" 之类）
+		return "conv:" + sid
+	}
+	return defaultSessionKey
+}
+
+// resolveSessionWorkdir 把 workdir 参数归一为可用的绝对目录。
+//
+// 空值 → 统一工作空间根（启动 dsc 的目录），而不是插件进程的可执行目录；显式值
+// 先过 `/workspace` 前缀映射（与命令 AST 的路径映射同一套语义），相对路径锚到
+// 工作空间根——与 shell 内相对路径的语义一致。
+func resolveSessionWorkdir(w string) string {
+	if w == "" {
+		if ws := dsc.WorkspaceRoot(); ws != "" {
+			return ws
+		}
+		if cwd, err := os.Getwd(); err == nil {
+			return cwd
+		}
+		return os.TempDir()
+	}
+	mapped := dsc.MapWorkspacePath(w)
+	if !filepath.IsAbs(mapped) {
+		if ws := dsc.WorkspaceRoot(); ws != "" {
+			mapped = dsc.PJoin(ws, mapped)
+		}
+	}
+	return mapped
+}
+
+// touchSession 记录最近使用时间（LRU 淘汰依据）。
+func touchSession(s *Session) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lastUsed = time.Now()
+	s.mu.Unlock()
+}
+
+// lastUse 读取最近使用时间（加锁，避免与 touchSession 竞态）。
+func (s *Session) lastUse() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastUsed
+}
+
 // getOrCreateSession 獲取或創建 session
 func getOrCreateSession(sessionID, cwd string) (*Session, error) {
+	dir := resolveSessionWorkdir(cwd)
+
 	globalSessionManager.mu.RLock()
 	session, exists := globalSessionManager.sessions[sessionID]
 	globalSessionManager.mu.RUnlock()
 
 	if exists {
+		// 復用時也要遵守 workdir：此前是直接 return，模型按描述傳 workdir 會被
+		// 靜默忽略（命令照樣跑在舊目錄），而且沒有任何提示。
+		if strings.TrimSpace(cwd) != "" {
+			session.mu.Lock()
+			session.Runner.Dir = dir
+			session.Cwd = dir
+			session.mu.Unlock()
+		}
+		touchSession(session)
 		return session, nil
 	}
 
 	// 創建新 session runner
 	initialEnv := expand.ListEnviron(os.Environ()...)
-	if cwd == "" {
-		// 未显式指定 cwd 时，默认以統一工作空間根（DSC_WORKSPACE_ROOT，即启动 dsc 的
-		// 目录 cwd）为 shell 工作目录，而非插件进程自身的可执行目录。这样模型执行
-		// pwd 得到的是用户的启动目录（workspace 根），而非程序安装目录（execDir）。
-		if ws := dsc.WorkspaceRoot(); ws != "" {
-			cwd = ws
-		} else {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				cwd = os.TempDir()
-			}
-		}
-	}
 
 	stdoutBuf := &syncedBuilder{}
 	stderrBuf := &syncedBuilder{}
@@ -405,7 +480,7 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 
 	runnerOpts := []interp.RunnerOption{
 		interp.Env(initialEnv),
-		interp.Dir(cwd),
+		interp.Dir(dir),
 		interp.StdIO(nil, stdoutSignal, stderrSignal),
 	}
 	runnerOpts = append(runnerOpts, shellHandlers()...)
@@ -417,7 +492,8 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 
 	session = &Session{
 		SessionID:    sessionID,
-		Cwd:          cwd,
+		Cwd:          dir,
+		lastUsed:     time.Now(),
 		Runner:       runner,
 		StdoutBuf:    stdoutBuf,
 		StderrBuf:    stderrBuf,
@@ -426,11 +502,18 @@ func getOrCreateSession(sessionID, cwd string) (*Session, error) {
 	}
 
 	globalSessionManager.mu.Lock()
-	// 达上限时任删一个会话，避免 map 无限增长。
+	// 达上限时淘汰**最久未用**的会话。以前是 map 里随便取一个删——可能踢掉正在用的
+	// 那个，模型下一轮带同一 id 进来拿到全新 shell，cwd/变量「莫名失忆」且无从解释。
 	if len(globalSessionManager.sessions) >= maxSessions {
-		for k := range globalSessionManager.sessions {
-			delete(globalSessionManager.sessions, k)
-			break
+		oldestKey := ""
+		var oldest time.Time
+		for k, v := range globalSessionManager.sessions {
+			if lu := v.lastUse(); oldestKey == "" || lu.Before(oldest) {
+				oldestKey, oldest = k, lu
+			}
+		}
+		if oldestKey != "" {
+			delete(globalSessionManager.sessions, oldestKey)
 		}
 	}
 	globalSessionManager.sessions[sessionID] = session

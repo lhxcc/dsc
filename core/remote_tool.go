@@ -70,6 +70,11 @@ func (r *RemoteTool) ExecuteWithViewAndImages(ctx context.Context, args json.Raw
 	resp, err := r.client.ExecuteTool(ctx, &proto.ExecuteToolRequest{
 		ToolName:      r.name,
 		ArgumentsJson: string(args),
+		// 调用方身份随调用下发：插件据此做「按会话隔离」的状态（如持久 shell 的
+		// cwd）。此前这两个字段在这一跳被丢弃，插件侧永远拿不到会话 id，只能退化
+		// 成全局单例——多个对话会共用同一个 shell。
+		SessionId:  CallerFromContext(ctx),
+		ToolCallId: ToolCallIDFromContext(ctx),
 	})
 	if err != nil {
 		return "", "", nil, err
