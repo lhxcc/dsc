@@ -391,11 +391,12 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		manager.SetContextWindow(contextWindow)
 	}
 	input := textarea.New()
-	// 占位符只讲「在这里能做什么」，不重复按键提示：按键（Enter 发送 / Ctrl+J 换行 /
-	// Ctrl+Q 退出）统一由底部状态栏承担一处即可，两处都写既冗长又容易互相漂移
-	// （此前一处写「回车发送」、另一处写「Enter 发送」）。腾出的位置改为提示 @ 引用，
-	// 那是输入框独有的能力，看着占位符就能发现。
-	input.Placeholder = "输入消息；@ 引用文件或图片"
+	// 占位符讲输入框**独有**的两件事，别再重复「在这里打字」这种自明信息：
+	//   - @ 引用文件/图片（只有输入框能做）；
+	//   - 选区与复制的键位（Shift+←/→ 选字、Ctrl+C 复制）——这两个键不写出来
+	//     没人会发现（Ctrl+A 全选、Esc 取消选区是加分项，不占位）。
+	// Enter 发送 / Ctrl+J 换行 / Ctrl+Q 退出仍只由底部状态栏承担，避免两处漂移。
+	input.Placeholder = "@ 引用文件或图片 · Shift+←/→ 选字 · Ctrl+C 复制"
 	input.CharLimit = 4096
 	input.ShowLineNumbers = false
 	// 对齐 REX：关闭虚拟光标，改用真实终端光标。虚拟光标在消息区动态重排时无法
