@@ -393,10 +393,12 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	input := textarea.New()
 	// 占位符讲输入框**独有**的两件事，别再重复「在这里打字」这种自明信息：
 	//   - @ 引用文件/图片（只有输入框能做）；
-	//   - 选区与复制的键位（Shift+←/→ 选字、Ctrl+C 复制）——这两个键不写出来
+	//   - 选区与复制的键位（Shift+←/→ 选字、Ctrl+Shift+C 复制）——这两个键不写出来
 	//     没人会发现（Ctrl+A 全选、Esc 取消选区是加分项，不占位）。
+	// 复制只提示 Ctrl+Shift+C：Ctrl+C 也支持（实现见键处理），但运行期它是中断键，
+	// 摆在最显眼处等于教用户误按一下终止任务——隐含支持、不明示。
 	// Enter 发送 / Ctrl+J 换行 / Ctrl+Q 退出仍只由底部状态栏承担，避免两处漂移。
-	input.Placeholder = "@ 引用文件或图片 · Shift+←/→ 选字 · Ctrl+C 复制"
+	input.Placeholder = "@ 引用文件或图片 · Shift+←/→ 选字 · Ctrl+Shift+C 复制"
 	input.CharLimit = 4096
 	input.ShowLineNumbers = false
 	// 对齐 REX：关闭虚拟光标，改用真实终端光标。虚拟光标在消息区动态重排时无法
@@ -904,6 +906,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// 输入框是 DSC 自己的行编辑，取 Windows/编辑器习惯）。textarea 上游只
 			// 绑了 Ctrl+G，这里补齐用户最常用的那个。
 			m.input.SelectAll()
+			return m, m.pumpStreamIfOpen()
+		case "ctrl+shift+c":
+			// 复制键的「安全形态」：运行期也不中断当前轮（占位符只提示这一个）。
+			// 与 Ctrl+C 走同一条复制路径，提示文案与收起选区的行为保持一致。
+			if m.input.HasSelection() {
+				return m, m.copyInputSelection()
+			}
 			return m, m.pumpStreamIfOpen()
 		case "esc":
 			// 有选区时 Esc 取消选区（与编辑器一致）；无选区时 Esc 不做任何事，
@@ -2639,7 +2648,8 @@ func (m *Model) buildHelpText() string {
 		"  Ctrl+J       换行（终端协议不区分 Ctrl+Enter 与 Enter，故用 LF 键）",
 		"  ↑/↓          翻阅历史命令（单行输入时）",
 		"  Shift+←/→    选中输入框文字（Shift+↑/↓ 跨行、Ctrl+Shift+←/→ 按词）",
-		"  Ctrl+A       全选输入框内容；Ctrl+C 复制选区（无选区时清空输入）",
+		"  Ctrl+Shift+C 复制选中的文字（Ctrl+A 全选、Esc 取消选区）",
+		"  Ctrl+C       空闲时也复制选区（无选区则清空输入）；运行中始终是中断当前轮",
 		"  Ctrl+V       粘贴剪贴板内容",
 		"  /            在输入框首字符唤起命令菜单",
 		"  Ctrl+C       有选区复制 / 运行中中断 / 否则清空输入",

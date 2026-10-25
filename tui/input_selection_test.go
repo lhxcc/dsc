@@ -105,3 +105,19 @@ func TestInputSelectionEscClears(t *testing.T) {
 		t.Fatalf("取消选区不得改动内容，got %q", got)
 	}
 }
+
+// TestCtrlShiftCDoesNotInterrupt Ctrl+Shift+C 是「安全」复制键：即使本轮正在运行，
+// 也不得被当成中断（用户误在任务跑到一半时按它，不该把任务终止掉）。无选区时它
+// 什么都不做——这正是占位符只提示这个键的原因。
+func TestCtrlShiftCDoesNotInterrupt(t *testing.T) {
+	m := newInputModel(t, "随手打的一点内容")
+	m.thinking = true // 模拟本轮运行中
+
+	m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl | tea.ModShift})
+	if !m.thinking {
+		t.Fatal("Ctrl+Shift+C 不应中断正在运行的一轮")
+	}
+	if got := m.input.Value(); got != "随手打的一点内容" {
+		t.Fatalf("无选区时 Ctrl+Shift+C 不应改动输入，got %q", got)
+	}
+}
