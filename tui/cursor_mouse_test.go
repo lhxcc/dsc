@@ -23,7 +23,7 @@ func TestViewAnchorsRealCursor(t *testing.T) {
 	if v.Cursor.Y != wantY {
 		t.Fatalf("View cursor Y = %d, want %d (viewport.Height=%d)", v.Cursor.Y, wantY, m.viewport.Height())
 	}
-	// X：prompt「❯ 」（2 列）+ 外层 composer 左侧 padding（1 列）
+	// X：prompt「> 」（2 列）+ 外层 composer 左侧 padding（1 列）
 	if v.Cursor.X != 3 {
 		t.Fatalf("View cursor X = %d, want 3", v.Cursor.X)
 	}

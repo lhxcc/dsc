@@ -397,12 +397,22 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 	input.MinHeight = 1
 	input.MaxHeight = composerMax
 	input.SetHeight(1)
-	// 仅首行显示提示符「❯ 」，续行留空；高度随内容行数变化（见 syncInputHeight）
+	// 仅首行显示提示符「> 」，续行留空；高度随内容行数变化（见 syncInputHeight）。
+	//
+	// 提示符必须是**宽度确定的 ASCII**：真实光标的位置是按「padding + 提示符 +
+	// 已输入文字的列宽」算出来的（见 inputCursorAbs），只要提示符在终端里比我们
+	// 以为的宽一列，整行文字就会右移一列、光标落到中文的第二个单元格上——看起来
+	// 就是「中文只被选中一半」。
+	//
+	// 这里原本用「❯ 」（U+276F）。它的东亚宽度是 Neutral：多数等宽字体没有这个
+	// 字形，终端回退到中文字体后按全角 2 列绘制，而 lipgloss 只算 1 列，于是差出
+	// 一列（虚拟光标时代看不出来，因为光标画在文字里、一起偏移；改成真实终端光标
+	// 后这个偏差就暴露在光标位置上了）。ASCII 的 ">" 是 Narrow，任何字体都是 1 列。
 	input.SetPromptFunc(2, func(info textarea.PromptInfo) string {
 		if info.LineNumber != 0 {
 			return ""
 		}
-		return "❯ "
+		return "> "
 	})
 	// 回车在宿主层拦截用于发送，这里仅兜底新增换行键位。
 	// 终端协议里 Enter/Ctrl+Enter 都发送相同的 CR 字节（Bubble Tea v2 无法区分），

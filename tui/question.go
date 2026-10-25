@@ -520,7 +520,10 @@ func (m *Model) questionLayoutOf(q *pendingQuestion) questionLayout {
 				mark = "✓ "
 			}
 		} else if i == q.cursor {
-			mark = "❯ "
+			// 游标用 ASCII「> 」：U+276F 这类字形在多数字体里缺失、被中文字体
+			// 按全角绘制，会让这一行比面板宽一列、把右边框挤歪（理由同输入框
+			// 提示符，见 tui.New 里 SetPromptFunc 的注释）。
+			mark = "> "
 		}
 		line := mark + o.Label
 		if o.Description != "" {
