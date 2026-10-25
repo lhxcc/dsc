@@ -6,7 +6,7 @@ DSC 插件：为模型提供网页浏览能力（抓取、搜索、点击、输�
 
 | 工具 | 作用 |
 | --- | --- |
-| `web_fetch` | 打开 URL 取正文。`return_html=true` 时返回原始 HTML，否则返回纯文本（版面模式） |
+| `web_fetch` | 打开 URL 取内容。`format` 三选一：`layout`（默认，保留视觉行列）／`text`（原始 innerText，紧凑）／`html`（原始标记） |
 | `web_search` | 用搜索引擎（google / duckduckgo / baidu / so360）搜索并提取结果条目 |
 | `browser_click` | 按 CSS 选择器点击元素 |
 | `browser_type` | 向输入框写入文本，可选回车提交 |
@@ -16,7 +16,19 @@ DSC 插件：为模型提供网页浏览能力（抓取、搜索、点击、输�
 它不影响有没有窗口——浏览器默认无头运行，不会弹窗。会话一旦建立，该参数即固定；
 要换 profile 得先关会话（`session_id` 变化会新建）。
 
-## 取文：保住视觉版面
+## 取文：三种形态（`format`）
+
+| 值 | 内容 | 何时用 |
+| --- | --- | --- |
+| `layout`（默认） | 按视觉版面还原的文本：同一行的内容仍在同一行、列大致对齐 | 读文章、看表格/卡片/导航，需要「谁和谁并排」这层信息 |
+| `text` | 原始 `document.body.innerText`：紧凑、无补白，但并排的块会被拆成多行 | 只要文字、不在意版面（省 token） |
+| `html` | 原始 HTML 标记 | 自己解析结构（选择器、属性、JSON-LD） |
+
+别名宽容：`visual`/`default` → `layout`，`plain`/`innertext` → `text`，`raw`/`markup` → `html`；
+大小写与首尾空白忽略。旧参数 `return_html: true` 仍然接受，等价于 `format=html`（不再出现在 schema 里）。
+非法值直接报错并列出可选值——静默回退会让模型以为拿到了 `layout`。
+
+## 取文：版面是怎么还原的
 
 `web_fetch` 的纯文本模式不再用 `document.body.innerText`——它按 DOM 块结构断行，flex/grid
 页面上并排的导航项、表格单元格会被拆成一词一行。现在的做法分两步：

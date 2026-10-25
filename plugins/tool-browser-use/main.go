@@ -652,10 +652,47 @@ func sessionNote(userMode bool, sess *BrowserSession) string {
 		"页面要求登录属正常现象。关闭正在运行的 Chrome 后重试，或显式传 user_mode=false 以消除该提示。"
 }
 
-// webFetchImpl 抓取网页内容。plainText 为真时返回剥离结构的纯文本（默认，
-// 便于模型直接阅读、避免对大量 HTML 产生抗拒），为假时返回原始 HTML 供需要
-// 结构化内容的场景使用。结果用 json.Marshal 序列化，避免手拼字符串破坏转义。
-func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, error) {
+// fetchFormat 决定 web_fetch 返回哪种形态的内容。三种需求互斥，用一个枚举表达，
+// 而不是再堆一个布尔（布尔只能表达两态，第三种就得再发明一个参数名）。
+type fetchFormat string
+
+const (
+	// formatLayout 默认：保留页面的视觉行与列（表格/卡片/导航并排的内容不会被拆成
+	// 一词一行），代价是列位补白会多出一些空格。
+	formatLayout fetchFormat = "layout"
+	// formatText 原始 innerText：紧凑、没有补白，但并排的块会被拆行。
+	formatText fetchFormat = "text"
+	// formatHTML 原始 HTML 标记：需要自行解析结构（选择器、属性、JSON-LD 等）时用。
+	formatHTML fetchFormat = "html"
+)
+
+// parseFetchFormat 解析 format 参数：空值取默认，大小写与空白宽容，
+// 兼容旧的布尔参数 return_html=true（等价于 html）。非法值报错并列出可选值——
+// 静默回退会让模型以为自己拿到了 layout，实际是另一种。
+func parseFetchFormat(format string, legacyReturnHTML bool) (fetchFormat, error) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "":
+		if legacyReturnHTML {
+			return formatHTML, nil
+		}
+		return formatLayout, nil
+	case string(formatLayout), "visual", "default":
+		return formatLayout, nil
+	case string(formatText), "plain", "innertext":
+		return formatText, nil
+	case string(formatHTML), "raw", "markup":
+		return formatHTML, nil
+	}
+	return "", fmt.Errorf("invalid format %q: use layout (default), text, or html", format)
+}
+
+// webFetchImpl 抓取网页内容。format 决定返回形态（见 fetchFormat）：
+//   - layout：按视觉版面还原的文本（默认，便于模型理解表格/卡片等并排结构）；
+//   - text  ：原始 innerText（紧凑，丢失并排关系）；
+//   - html  ：原始 HTML 标记。
+//
+// 结果用 json.Marshal 序列化，避免手拼字符串破坏转义。
+func webFetchImpl(sessionID, url string, format fetchFormat, userMode bool) (string, error) {
 	page, sess, err := getOrCreatePage(sessionID, "default", url, userMode)
 	if err != nil {
 		e := WebFetchResult{Success: false, URL: url, Error: err.Error()}
@@ -668,8 +705,13 @@ func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, erro
 		log.Printf("頁面加載警告: %v", err)
 	}
 
-	content := ""
-	if plainText {
+	var content string
+	switch format {
+	case formatHTML:
+		content = page.MustEval("() => document.documentElement.outerHTML").Str()
+	case formatText:
+		content = page.MustEval("() => document.body.innerText").Str()
+	default: // formatLayout
 		// 按**视觉版面**还原正文（见 layout.go）：innerText 是按 DOM 块结构断行的，
 		// flex/grid 页面上并排的导航项、表格单元格会被拆成一词一行，模型读不出
 		// 「谁和谁在同一行」。排版失败（页面异常/脚本被禁）才退回 innerText。
@@ -677,8 +719,6 @@ func webFetchImpl(sessionID, url string, plainText, userMode bool) (string, erro
 		if content == "" {
 			content = page.MustEval("() => document.body.innerText").Str()
 		}
-	} else {
-		content = page.MustEval("() => document.documentElement.outerHTML").Str()
 	}
 
 	e := WebFetchResult{Success: true, URL: url, Content: content, Note: sessionNote(userMode, sess)}
@@ -1102,9 +1142,10 @@ func main() {
                                 "type": "string",
                                 "description": "URL to fetch"
                         },
-                        "return_html": {
-                                "type": "boolean",
-                                "description": "Whether to return raw HTML instead of plain text. Defaults to false (plain text)."
+                        "format": {
+                                "type": "string",
+                                "enum": ["layout", "text", "html"],
+                                "description": "What to return. layout (default): text that keeps the page's visual rows and columns, so items placed side by side stay on one line (best for tables, cards, nav). text: raw innerText - compact, but blocks placed side by side are split into separate lines. html: raw HTML markup for parsing structure yourself."
                         },
                         "user_mode": {
                                 "type": "boolean",
@@ -1117,7 +1158,8 @@ func main() {
 		var params struct {
 			SessionID  string `json:"session_id"`
 			URL        string `json:"url"`
-			ReturnHTML bool   `json:"return_html"`
+			Format     string `json:"format"`
+			ReturnHTML bool   `json:"return_html"` // 兼容旧参数：等价于 format=html
 			UserMode   *bool  `json:"user_mode"`
 		}
 		if err := json.Unmarshal(args, &params); err != nil {
@@ -1134,7 +1176,11 @@ func main() {
 		if params.UserMode != nil {
 			userMode = *params.UserMode
 		}
-		return webFetchImpl(sessionID, params.URL, !params.ReturnHTML, userMode)
+		format, err := parseFetchFormat(params.Format, params.ReturnHTML)
+		if err != nil {
+			return "", err
+		}
+		return webFetchImpl(sessionID, params.URL, format, userMode)
 	}
 
 	// 定義 web_search 工具
@@ -1317,7 +1363,7 @@ func main() {
 			"browser": "true",
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "web_fetch", Description: "Fetch the content of a URL using a headless browser, supporting JavaScript rendering", Schema: webFetchSchema, Handler: webFetchHandler,
+	sdk.Tool(dsc.Tool{Name: "web_fetch", Description: "Fetch a URL with a real browser (JavaScript rendered). Returns layout-preserved text by default; format=text for compact innerText, format=html for raw markup", Schema: webFetchSchema, Handler: webFetchHandler,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return webFetchView(result)
 		},
