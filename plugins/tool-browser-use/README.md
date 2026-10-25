@@ -40,9 +40,22 @@ DSC 插件：为模型提供网页浏览能力（抓取、搜索、点击、输�
 
 | 问题 | rod 默认 | 我们的做法 |
 | --- | --- | --- |
-| `navigator.webdriver` | 带 `--enable-automation` → `true` | `Delete("enable-automation")` + `disable-blink-features=AutomationControlled` |
+| `navigator.webdriver` | `true` | `disable-blink-features=AutomationControlled`（真正起作用的一条）+ 删掉 `--enable-automation` |
 | 平台自相矛盾 | `rod.New()` 默认模拟 MacBook：Windows 上 UA 报 Macintosh + Chrome/114 | `NoDefaultDevice()`，UA/视口回到浏览器真实值 |
 | 版本错配导致 profile 打不开 | 找不到浏览器就下载自带旧 Chromium，用户 v155 profile 被拒 → `user_mode` 静默降级 | 优先 `DSC_BROWSER_BIN` → 系统 Chrome → Edge |
+
+`navigator.webdriver` 的四个组合实测（Chrome 155）：
+
+| 组合 | `navigator.webdriver` |
+| --- | --- |
+| 只带 `--enable-automation`（rod 默认） | `true` |
+| 带 `--enable-automation` + `disable-blink-features=…` | `false` |
+| 只删 `--enable-automation` | `true` ← 删了也没用 |
+| 两者都做（现状） | `false` |
+
+只删命令行开关不够：该属性挂在 Blink 的 `AutomationControlled` 运行时特性上，页面一旦被
+CDP 客户端接管就会被打开。删 `--enable-automation` 是为了另一件事——它还会挂「正受自动
+测试软件控制」提示条、关掉翻译/恢复页面等交互，是明面上的自动化痕迹。
 
 实测（Chrome 155，`--headless=new` 对比有头）：`navigator.plugins=5`、WebGL 渲染器是真实显卡
 （ANGLE/NVIDIA，不是 SwiftShader）、`window.chrome=object`、`outer/inner` 1280×900 / 1264×805、

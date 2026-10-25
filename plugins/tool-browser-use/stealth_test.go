@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/go-rod/rod/lib/launcher"
 )
 
 // TestBrowserHeadedDefaults 默认无头（不弹窗）；HEADLESS / HEADED / OFFSCREEN 可覆盖，
@@ -79,5 +81,38 @@ func TestCandidateBrowsersPreferExplicitBin(t *testing.T) {
 	}
 	if edgeAt >= 0 && edgeAt < chromeAt {
 		t.Fatalf("Chrome 应排在 Edge 之前（profile 目录按 Chrome 找）：%v", list)
+	}
+}
+
+// TestHardenLauncherFlags 两个开关缺一不可：
+//   - 必须从引擎侧关掉 AutomationControlled（只删命令行开关无效，CDP 接管后
+//     navigator.webdriver 仍会变成 true）；
+//   - 不能留 rod 默认的 --enable-automation（它会挂「正受自动测试软件控制」提示条）。
+//
+// 无头时还要用新的 --headless=new，否则 UA 里带 HeadlessChrome。
+func TestHardenLauncherFlags(t *testing.T) {
+	l := hardenLauncher(launcher.New().Leakless(false), false, false)
+
+	if got := l.Get("disable-blink-features"); !strings.Contains(got, "AutomationControlled") {
+		t.Fatalf("必须设置 disable-blink-features=AutomationControlled，实际 %q", got)
+	}
+	if l.Has("enable-automation") {
+		t.Fatal("不能保留 --enable-automation")
+	}
+	if !l.Has("headless") {
+		t.Fatal("无头模式应设置 --headless=new")
+	}
+
+	// 有头：不应带 headless；离屏时窗口要挪出可视区
+	h := hardenLauncher(launcher.New().Leakless(false), true, false)
+	if h.Has("headless") {
+		t.Fatal("有头不应带 --headless")
+	}
+	if h.Has("window-position") {
+		t.Fatal("可见有头不该挪窗口")
+	}
+	off := hardenLauncher(launcher.New().Leakless(false), true, true)
+	if pos := off.Get("window-position"); !strings.Contains(pos, "-32000") {
+		t.Fatalf("离屏模式应把窗口挪到 -32000，实际 %q", pos)
 	}
 }

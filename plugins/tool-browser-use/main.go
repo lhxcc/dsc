@@ -227,10 +227,23 @@ func newBrowser(controlURL string) *rod.Browser {
 
 // hardenLauncher 抹掉最容易被反爬识别的自动化痕迹。
 //
-// rod 默认会带 --enable-automation：它让 navigator.webdriver === true，并在页面顶部挂
-// 一条「Chrome 正受自动测试软件控制」的提示条——这是最廉价也最致命的指纹，不少站点
-// 据此直接 403。这里删掉它并抑制 AutomationControlled。无头模式改用 --headless=new：
-// UA 与真机一致（老的 --headless 会把 UA 写成 HeadlessChrome/xx）。
+// 两个开关分工，实测（Chrome 155，--headless=new）：
+//
+//	                             navigator.webdriver
+//	A 只带 --enable-automation（rod 默认）      true
+//	B 再加 disable-blink-features=…             false   ← 真正起作用的是这一条
+//	C 只删 --enable-automation                  true    ← 删了也没用
+//	D 两者都做（现状）                          false
+//
+// 为什么 C 仍是 true：`navigator.webdriver` 的实现挂在 Blink 的 AutomationControlled
+// 运行时特性上，只要页面被 CDP 客户端接管（我们必然会接管）它就会被打开，与命令行
+// 是否带 --enable-automation 无关。所以必须从引擎侧关掉这个特性（B/D）。
+//
+// 那为什么还要删 --enable-automation：它不止设 webdriver，还会在页面顶部挂一条
+// 「Chrome 正受自动测试软件控制」的提示条、关掉翻译与「恢复上次页面」等交互，属于
+// 明面上的自动化痕迹；删掉它没有副作用（同组实测里 focus/plugins/userActivation 都不变）。
+//
+// 无头模式另外改用 --headless=new：老的 --headless 会把 UA 写成 HeadlessChrome/xx。
 func hardenLauncher(l *launcher.Launcher, headed, offscreen bool) *launcher.Launcher {
 	l = l.Delete("enable-automation")
 	l = l.Set("disable-blink-features", "AutomationControlled")
