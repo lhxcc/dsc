@@ -37,6 +37,11 @@ var virtualRoots = []virtualRoot{
 	{prefix: "/tmp", goos: "windows", resolve: resolveTempRoot},
 	// 统一工作空间根，跨平台（模型不知道工作区的真实路径）。
 	{prefix: "/workspace", resolve: resolveWorkspaceRoot},
+	// 单字母盘符别名（Git Bash / MSYS 风格）/c/Users → C:/Users、/d → D:/。
+	// 前缀为空 = 兜底规则，**必须排在最后**：它匹配一切输入，放在前面会把 /tmp 吃成
+	// T:/mp、/workspace 吃成 W:/orkspace。表内首次命中，顺序即优先级；解析器对
+	// 非盘符形状（/cdrom、/dev/null、/docs）返回 false，于是继续落到「原样返回」。
+	{prefix: "", goos: "windows", resolve: resolveDriveLetterRoot},
 }
 
 // devicePath 一个设备名映射（只做精确匹配：设备名不是路径根，不做前缀展开）。
@@ -168,13 +173,47 @@ func resolveDriveRoot(rest, _, _ string) (string, bool) {
 	if len(after) != 0 && after[0] != '/' {
 		return "", false // /mnt/cdrom 不是盘符别名
 	}
-	if !(drive >= "a" && drive <= "z" || drive >= "A" && drive <= "Z") {
+	return driveToRoot(drive, after)
+}
+
+// resolveDriveLetterRoot 单字母盘符别名：/c[/…] → C:/[…]（仅 Windows 入表）。
+//
+// rest 形如 "/c" 或 "/c/Users"。rest 后面不是分隔符的（如 /cdrom、/dev/null）不匹配，
+// 交给后续处理——真实根语义下它们是当前盘根下的路径，不能当成盘符别名。
+func resolveDriveLetterRoot(rest, _, _ string) (string, bool) {
+	body := strings.TrimPrefix(rest, "/")
+	if body == "" {
+		return "", false
+	}
+	drive := body[:1]
+	if !isDriveLetter(drive) {
+		return "", false
+	}
+	after := body[1:]
+	if after != "" && !strings.HasPrefix(after, "/") {
+		return "", false
+	}
+	return driveToRoot(drive, after)
+}
+
+// driveToRoot 拼「盘符 + 剩余部分」：after 为空时给盘根 C:/，否则 C:/rest。
+func driveToRoot(drive, after string) (string, bool) {
+	if !isDriveLetter(drive) {
 		return "", false
 	}
 	if after == "" {
-		return strings.ToUpper(drive) + ":/", true // /mnt/c 是盘根，不是裸盘符
+		return strings.ToUpper(drive) + ":/", true
 	}
 	return strings.ToUpper(drive) + ":" + after, true
+}
+
+// isDriveLetter 报告 b 是否为单个 ASCII 字母（盘符）。
+func isDriveLetter(b string) bool {
+	if len(b) != 1 {
+		return false
+	}
+	c := b[0]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // cleanSlashRoot 归一化一个真实根目录：正斜杆、去掉尾随分隔符。

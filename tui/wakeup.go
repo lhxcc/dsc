@@ -66,7 +66,22 @@ func (m *Model) startTurn(text string, images []string, rendered string, warning
 	m.render()
 	m.pinnedToBottom = true // 新轮开始：重新钉在底部跟随新内容（对齐 REX 发送消息即重新钉住）
 	m.virtualGotoBottom()
-	return tea.Batch(m.submitCmd(text, images), m.spinner.Tick, elapsedTick())
+	return tea.Batch(m.submitCmd(text, images), m.keepAnimAlive())
+}
+
+// keepAnimAlive 保证「工作行可见」与「驱动它的 tick 链在跑」严格同步。
+//
+// spinner.Tick 是一次性命令：处理 TickMsg 时若不在工作态就返回 nil，链断掉。
+// 而 TUI 有多个进入工作态的入口（用户提交、后台任务唤醒、迟到的 first 帧），
+// 只要其中一个没重启链，工作行就会停在**中途帧**：行还在（thinking/streaming
+// 为真），帧与秒数都不动，直到本轮结束才消失——正是「动画卡住」的表现。
+// 这里把它做成幂等入口：工作中且链没跑时才点火，重复调用无副作用。
+func (m *Model) keepAnimAlive() tea.Cmd {
+	if m.animTicking {
+		return nil
+	}
+	m.animTicking = true
+	return tea.Batch(m.spinner.Tick, elapsedTick())
 }
 
 // tryWakeup 空闲且预算未耗尽时，把排队通知作为新轮输入自动发送

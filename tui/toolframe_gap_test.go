@@ -26,15 +26,7 @@ func TestToolFrameGapVisual(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 
 	// 真实 lipgloss 渲染（与 render() 一致），去掉 ANSI 控制码后写入文件人工核对。
@@ -65,15 +57,7 @@ func TestToolFrameGapStructural(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	full := strings.Join(m2.lines, "\n")
 
@@ -97,15 +81,7 @@ func TestToolCallResultContiguous(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	stripFull := ansi.Strip(strings.Join(m2.lines, "\n"))
 
@@ -146,17 +122,8 @@ func TestScrollbarDragDuringStreaming(t *testing.T) {
 	m := New(&stubAgent{frames: frames}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
 	// 泵足够多帧使内容溢出视口，同时保持流式进行中（通道仍有余帧）
-	for i := 0; i < 25 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
-	m2 := model.(*Model)
+	m2 := submitAndDrain(m, "你好", 25).(*Model)
 	if !m2.streaming {
 		t.Fatal("前置条件：应处于流式状态")
 	}
@@ -167,8 +134,8 @@ func TestScrollbarDragDuringStreaming(t *testing.T) {
 
 	// 工作期间点按滚动条：应进入拖拽并脱离自动跟随
 	sx := m2.viewport.Width() // 滚动条列（内容区右侧一列）
-	model, _ = model.Update(tea.MouseClickMsg{X: sx, Y: 8, Button: tea.MouseLeft})
-	m2 = model.(*Model)
+	updated, _ := m2.Update(tea.MouseClickMsg{X: sx, Y: 8, Button: tea.MouseLeft})
+	m2 = updated.(*Model)
 	if !m2.scrollbarDrag {
 		t.Fatal("模型工作期间点按滚动条应进入拖拽模式")
 	}
@@ -177,8 +144,8 @@ func TestScrollbarDragDuringStreaming(t *testing.T) {
 	}
 
 	// 向上拖拽：YOffset 应减小
-	model, _ = model.Update(tea.MouseMotionMsg{X: sx, Y: 3, Button: tea.MouseLeft})
-	m2 = model.(*Model)
+	updated, _ = m2.Update(tea.MouseMotionMsg{X: sx, Y: 3, Button: tea.MouseLeft})
+	m2 = updated.(*Model)
 	if !m2.scrollbarDrag {
 		t.Fatal("拖拽中应保持 scrollbarDrag")
 	}
@@ -188,19 +155,19 @@ func TestScrollbarDragDuringStreaming(t *testing.T) {
 	}
 
 	// 继续泵一帧流式：脱离后视口不应被拉回底部
-	if cmd == nil {
+	pump := pumpNextFrame(m2)
+	if pump == nil {
 		t.Fatal("流式通道应仍打开")
 	}
-	msg := cmd()
-	model, cmd = model.Update(msg)
-	m2 = model.(*Model)
+	updated, _ = m2.Update(pump())
+	m2 = updated.(*Model)
 	if got := m2.viewStart; got != detachedYoff {
 		t.Fatalf("脱离跟随后流式帧不应把 viewStart 拉回底: got %d, want %d", got, detachedYoff)
 	}
 
 	// 松开：退出拖拽；未回到底部则保持脱离
-	model, _ = model.Update(tea.MouseReleaseMsg{X: sx, Y: 3, Button: tea.MouseLeft})
-	m2 = model.(*Model)
+	updated, _ = m2.Update(tea.MouseReleaseMsg{X: sx, Y: 3, Button: tea.MouseLeft})
+	m2 = updated.(*Model)
 	if m2.scrollbarDrag {
 		t.Fatal("松开后应退出拖拽")
 	}
@@ -223,15 +190,7 @@ func TestWheelDetachesAndRepins(t *testing.T) {
 	m := New(&stubAgent{frames: frames}, nil, context.Background(), "Agentic-Turbo-Coder", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 25 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 25)
 	m2 := model.(*Model)
 	if m2.viewStart == 0 {
 		t.Fatal("前置条件：内容应溢出视口")
@@ -275,15 +234,7 @@ func TestToolResultReasoningSeparated(t *testing.T) {
 
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	var model tea.Model = m
-	var cmd tea.Cmd
-	cmd = model.(*Model).submitCmd("你好", nil)
-	firstMsg := cmd()
-	model, cmd = model.Update(firstMsg)
-	for i := 0; i < 20 && cmd != nil; i++ {
-		msg := cmd()
-		model, cmd = model.Update(msg)
-	}
+	model := submitAndDrain(m, "你好", 20)
 	m2 := model.(*Model)
 	stripFull := ansi.Strip(strings.Join(m2.lines, "\n"))
 	// 末行可能被宽度对齐补尾随空格，故以「非换行字符 + 空行 + ✦ DSC」判定分隔。

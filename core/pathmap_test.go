@@ -102,3 +102,36 @@ func TestMapModelPathComposition(t *testing.T) {
 		t.Fatalf("相对路径应原样，got %q", got)
 	}
 }
+
+// TestDriveLetterAlias 单字母盘符别名（仅 Windows）：/c/Users → C:/Users、/d → D:/。
+// 关键约束是**表内顺序**：这条前缀只有一个 "/"，若排在 /tmp、/workspace 之前，
+// 会把 /tmp 吃成 T:/mp、/workspace 吃成 W:/orkspace。
+func TestDriveLetterAlias(t *testing.T) {
+	const root, temp = "G:/ws", "G:/tmp/dsc"
+	cases := []struct{ in, want string }{
+		{"/c", "C:/"},
+		{"/c/", "C:/"},
+		{"/c/Users/foo", "C:/Users/foo"},
+		{"/d", "D:/"},
+		{"/z/data", "Z:/data"},
+		{`\e\proj`, "E:/proj"},
+		// 不是盘符别名：前缀后不是分隔符
+		{"/cdrom/x", "/cdrom/x"},
+		{"/dev/null", "/dev/null"},
+		// 已有更具体前缀的必须优先命中，不能被 /t、/w 抢走
+		{"/tmp/x", temp + "/x"},
+		{"/workspace/a", root + "/a"},
+		{"/mnt/c/x", "C:/x"},
+	}
+	for _, c := range cases {
+		if got := MapWorkspacePathFor(c.in, root, temp, "windows"); got != c.want {
+			t.Errorf("windows %q = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// POSIX 上单字母路径是真实根下的目录，绝不改写
+	for _, goos := range []string{"linux", "darwin"} {
+		if got := MapWorkspacePathFor("/c/Users", root, temp, goos); got != "/c/Users" {
+			t.Errorf("%s 不应把 /c 当盘符: %q", goos, got)
+		}
+	}
+}

@@ -154,13 +154,6 @@ func (s selection) ordered() (start, end selPos) {
 
 func (s selection) empty() bool { return s.anchor == s.head }
 
-// submitResult 是一次 agent.Run 完成后的结果消息
-type submitResult struct {
-	input  string
-	result *core.AgentResult
-	err    error
-}
-
 // streamFrame 是流式響應的一幀
 type streamFrame struct {
 	input  string
@@ -215,6 +208,15 @@ type Model struct {
 	// 上下文容量顯示：contextWindow 為總容量（token 數），usedTokens 為已用容量
 	contextWindow int
 	usedTokens    int
+
+	// animTicking 表示 spinner/elapsed 这两条自续链**当前是否在跑**。
+	//
+	// spinner 的 Tick 是一次性命令：处理时若不在工作态就返回 nil，链就此断掉。
+	// 因此「工作中」必须与「链在跑」严格同步——任何一条把状态置为工作中的路径
+	// （提交、唤醒、迟到帧）只要漏了重启链，工作行就会停在中途帧且永不恢复：
+	// 行还在（thinking/streaming 为真），帧不动，直到本轮结束才消失。keepAnimAlive
+	// 用这个标志把两者的对应关系收敛成一个入口。
+	animTicking bool
 
 	// 当前轮运行指标（对齐 REX working 行）：runStart 记录启动时刻，elapsed 为
 	// 已耗时秒数（每秒 elapsedTick 刷新）；turnTokens 为本轮累计下行生成 token；
@@ -922,6 +924,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.thinkAnim.tick() // 工作行文字动画与 spinner 同节拍（见 thinking.go）
 			return m, cmd
 		}
+		// 空闲：链到此终止，标志同步归位（下次进入工作态由 keepAnimAlive 重新点火）
+		m.animTicking = false
 		return m, nil
 
 	case elapsedTickMsg:
@@ -931,6 +935,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.render()
 			return m, elapsedTick()
 		}
+		m.animTicking = false
 		return m, nil
 
 	case streamFrame:
@@ -987,11 +992,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCancelled = false
 			m.streamInput = msg.input
 			m.streamCh = msg.ch
-			return m, m.pumpStream(msg.input, msg.ch)
+			return m, tea.Batch(m.pumpStream(msg.input, msg.ch), m.keepAnimAlive())
 		}
 		if msg.done {
 			m.thinking = false
 			m.streaming = false
+			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
 			m.streamOpen = false
 			m.clearStream()
 			if msg.err != nil {
@@ -1011,6 +1017,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.thinking = false
 			m.streaming = false
+			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
 			m.streamOpen = false
 			m.clearStream()
 			m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
@@ -1146,6 +1153,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "success", "error":
 			m.thinking = false
 			m.streaming = false
+			m.animTicking = false // 链随本轮结束终止，下一轮由 keepAnimAlive 重新点火
 			m.streamOpen = false
 			m.clearStream() // 成功/失敗後清理流通道狀態，避免後續 pumpStreamIfOpen 誤判「流進行中」
 			if f.Status == "success" && f.Usage != nil {
@@ -1166,7 +1174,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.render()
 			m.input.Focus()
 			m.virtualGotoBottom()
-			return m, nil
+			// 本轮到此结束（通道已清理，done 帧可能不再到达）：若有排队中的完成通知
+			// （后台任务在本轮进行中结束），必须在这里尝试唤醒，否则通知会一直躺在
+			// 队列里等用户敲字——用户看到的就是「任务完成了，模型却没被叫醒」。
+			return m, m.tryWakeup()
 		}
 		return m, m.pumpStream(msg.input, msg.ch)
 
@@ -1180,23 +1191,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 注入不应打断当前流；若有进行中的流式通道则继续保持泵取。
 		return m, m.pumpStreamIfOpen()
 
-	case submitResult:
-		m.thinking = false
-		if msg.err != nil {
-			m.appendMessage(errorSty.Render("错误: ") + msg.err.Error())
-		} else if msg.result != nil {
-			if msg.result.Status == "success" {
-				body := renderMarkdown(msg.result.Output, max(m.width-4, 20))
-				m.appendMessage(m.renderAssistant(body))
-			} else {
-				m.appendMessage(errorSty.Render("错误: ") + msg.result.Output)
-			}
-		}
-		m.viewport.SetHeight(m.vpHeight())
-		m.render()
-		m.input.Focus()
-		m.virtualGotoBottom()
-		return m, nil
 	}
 
 	var cmd tea.Cmd
