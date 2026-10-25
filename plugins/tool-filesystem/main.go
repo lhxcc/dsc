@@ -315,13 +315,21 @@ func shellView(_ context.Context, _ json.RawMessage, result string) (json.RawMes
 // formatShellResult 根據命令輸出與退出碼組裝最終返回文本：
 // - 非 0 退出碼：無論是否有輸出，都追加 [exit_code: N]。
 // - 0 退出碼且有輸出：直接返回輸出，不附加 [exit_code: 0]。
-// - 0 退出碼且無輸出：返回 [exit_code: 0]。
+// - 無輸出：顯式寫出 (no output)。
+//
+// 最後一條是刻意的：只回 [exit_code: 0] 時，模型分不清「命令沒東西可說」與
+// 「工具沒抓到輸出」，往往把乾淨工作區的 `git status` 當成工具壞了、反复重跑。
+// 明確寫出無輸出，配合退出碼即可唯一確定「跑成功了，只是沒有任何輸出」。
 func formatShellResult(output string, exitCode int32) string {
+	empty := strings.TrimSpace(output) == ""
 	if exitCode != 0 {
+		if empty {
+			return fmt.Sprintf("\n[exit_code: %d]\n(no output)\n", exitCode)
+		}
 		return output + fmt.Sprintf("\n[exit_code: %d]\n", exitCode)
 	}
-	if strings.TrimSpace(output) == "" {
-		return "\n[exit_code: 0]\n"
+	if empty {
+		return "\n[exit_code: 0]\n(no output)\n"
 	}
 	return output
 }
