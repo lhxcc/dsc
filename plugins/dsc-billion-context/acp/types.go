@@ -50,9 +50,14 @@ type CoreMessage struct {
 }
 
 // CoreToolCall assistant 消息上的工具调用（proto.ToolCall 保真往返）。
+//
+// Arguments 必须带上：它才是「这条调用到底做了什么」。只留 id/name 时，模型在
+// 后续轮次里看到的自己历史是「调过 shell，参数未知」，于是无法判断自己跑过什么、
+// 只能重跑一遍——表现为反复执行同一命令、对空输出越发困惑。
 type CoreToolCall struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments,omitempty"` // 原始 JSON 字符串（proto.ArgumentsJson）
 }
 
 // CompressionTier 压缩块层级。
