@@ -39,6 +39,7 @@ func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req = s.applyPreStepHook(ctx, req)
+		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		for _, np := range s.m.llmRouteSnapshot() {
 			start := time.Now()
@@ -98,6 +99,7 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req = s.applyPreStepHook(stream.Context(), req)
+		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		providerTried := false
 		for _, np := range s.m.llmRouteSnapshot() {
@@ -158,6 +160,30 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 		return lastErr
 	}
 	return fmt.Errorf("all providers failed after %d retries", maxRetries)
+}
+
+// sanitizeRequestPairing 在把请求交给 provider 前整理 tool_call 与 tool_result 的配对。
+//
+// 放在 pre-step 之后：压缩插件会改写消息（可能丢掉某些结果），整理要看的是最终将发出去
+// 的那一份。整理本身幂等，重试再次调用不会累积改动。
+//
+// 丢弃不是无声的：provider 侧的报错（"tool calls and tool results do not match"）发生在
+// 请求已经发出之后，用户只能「新建任务」；这里丢掉并在日志留一条，至少能看出是哪一轮
+// 少了什么。
+func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatRequest {
+	if req == nil || len(req.GetMessages()) == 0 {
+		return req
+	}
+	fixed, dropped := SanitizeToolPairing(req.GetMessages())
+	// 无论有没有丢弃都要回写：插话落在调用与结果之间时，一条都不用丢，
+	// 但顺序必须换（结果紧跟调用）。只在丢东西时才记日志。
+	req.Messages = fixed
+	if dropped > 0 {
+		m.logger.Warn("llm request: repaired tool call/result pairing",
+			"dropped", dropped, "messages", len(req.GetMessages()), "kept", len(fixed),
+			"hint", "工具调用与其结果不再一一对应（插话落在调用与结果之间、或工具被中断）；已丢弃无法配对的部分")
+	}
+	return req
 }
 
 // applyPreStepHook 在 LLM 请求前分发 agent/pre-step 事件（waterfall 模式），

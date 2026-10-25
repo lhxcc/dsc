@@ -18,12 +18,16 @@ type mockLLMProvider struct {
 	failStart int  // ChatStream 建立阶段剩余失败次数
 	midErr    bool // 流中途失败（已发帧后）
 	chatCalls int
+	// lastMessages 记录最近一次 Chat 收到的消息列表：供「发给 provider 的到底是
+	// 什么」这类断言使用（如 tool_call/tool_result 配对整理后的顺序）。
+	lastMessages []Message
 }
 
-func (p *mockLLMProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
+func (p *mockLLMProvider) Chat(_ context.Context, msgs []Message, _ []Tool, _ int) (*ChatResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.chatCalls++
+	p.lastMessages = append([]Message(nil), msgs...)
 	if p.failChat > 0 {
 		p.failChat--
 		return nil, errors.New("provider unavailable")
