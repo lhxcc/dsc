@@ -93,7 +93,7 @@ DSC 與 DSH 同源於「一切皆插件」的設計哲學，兩者在概念層�
 | 會話             | 事件日誌（event log）+ `deriveMessages()` 派生模型歷史                                       | 事件溯源 `session` 包 + `DeriveMessages`（同構）                                                                                                                                                                                |
 | 上下文壓縮          | `compaction-basic`：thresholdRatio / retainRatio                                  | `dsc-system` 駐留壓縮（自宿主遷入，宿主零壓縮代碼）：80% 閾值接管（後端標記驅動，agent 內聯壓縮自動跳過）、16% 尾部保留（≥1024 token）、聚合 LLM 摘要（未互聯退化截斷式）、per-session 狀態指紋複用、溢出緊急壓縮重試                                                                                 |
 | token 計量       | TokenMeter：本地精確 tokenizer，缺省字符估算回退                                               | 以服務端上報 usage（精確）為準；服務端不可用（重啟）或低估（提示緩存命中）時回退字節級啓發式估算 + 提示緩存感知（`input_tokens + cache_read_input_tokens`）                                                                                                                 |
-| 歷史注入           | 無按條數限制機制（靠壓縮限界）；`maxMessages` 僅用於歷史查看分頁                                          | **`/settings history N\|off\|unlimited`** 項目級會話隔離（按工作區命名）+ 持久化到配置；`history_injection` 三值為 **負值 不注入 / 0 未定義（默認不限制）/ N 條**——與 DSH 相反，見下節；TUI 啟動回顯按同值派生（負值不顯示 / 0 最近 20 條 / N 最近 N 條） |
+| 歷史注入           | 無按條數限制機制（靠壓縮限界）；`maxMessages` 僅用於歷史查看分頁                                          | **`/settings history N\|off\|unlimited`** 項目級會話隔離（按工作區命名）+ 持久化到配置；`history_injection` 三值為 **負值 不注入 / 0 未定義（默認不限制）/ N 條**——與 DSH 相反，見下節；TUI 啟動回顯由 **`history_shows`** 控制（-1 不顯示 / 0 默認 20 / N 最近 N，受 `history_injection` 門控且不超過注入量） |
 | 技能             | `skill/` provider registry + catalog/loader tool（`ctx.skills`）                   | `skills/builtin` + `skills/installed`，`skill` 按需加載、`install_skill`/`uninstall_skill` 管理                                                                                                                                |
 | plan/goal/todo | plan-mode、goal、todo 領域                                                           | 對齊：宿主託管 plan/goal/todo 工具，狀態經事件日誌折疊                                                                                                                                                                                    |
 | UI             | Web UI（`apps/web`）                                                               | TUI（bubbletea）+ Web UI（`tool-harness-webui`）                                                                                                                                                                           |
@@ -116,15 +116,17 @@ DSC 以自身語言棧為準，理由只有一條：**Go 的零值就是 0**。�
 
 該開關只作用于**從存檔恢復的歷史**：同一會話內已經發生的輪次屬於當前上下文，永遠完整保留（`Session.restoredThrough` 劃界），不受此設置影響。
 
-**TUI 啟動回顯**（同一開關，無第二個配置項）：重啟 DSC 進入「有恢復歷史的會話」時，正文區會回顯最近若干條 `user/assistant` 消息，避免用戶面對空白界面想不起先前對話。回顯條數由 `history_injection` 直接派生，因此不存在「注入量」與「顯示量」兩個旋鈕打架的問題：
+**TUI 啟動回顯**（`history_shows`，顯示層）：重啟 DSC 進入「有恢復歷史的會話」時，正文區會回顯最近若干條 `user/assistant` 消息，避免用戶面對空白界面想不起先前對話。回顯條數由 `history_shows` 獨立控制，與 agent 的注入條數 `history_injection` 分離：
 
-| `history_injection` | agent 注入的恢復歷史 | TUI 啟動回顯 |
-| --- | --- | --- |
-| 負值 | 不注入 | **不顯示**（注入關閉 → 顯示關閉） |
-| `0`（未定義/默認） | 不限制（全部） | **最近 20 條**（渲染上限，避免長會話刷屏；模型仍拿到全部） |
-| `N > 0` | 最近 N 條 | **最近 N 條**（不超過注入量） |
+| `history_shows` | 含義 |
+| --- | --- |
+| 負值 | 不顯示 |
+| `0`（未設置/默認） | 顯示最近 **20** 條 |
+| `N > 0` | 顯示最近 N 條 |
 
-回顯只呈現 `user/assistant` 主線，跳過 `system`/`tool`；顯示的是「模型也看得到的那部分恢復歷史」（派生走同一個 `DeriveMessagesLimited`）。
+兩條硬約束避免「注入量 / 顯示量」打架：**注入關閉則顯示關閉**（`history_injection < 0` 時 `history_shows` 不起作用），且**顯示量不超過注入量**（派生走同一個 `DeriveMessagesLimited`，只顯示模型也看得到的那部分恢復歷史）。回顯只呈現 `user/assistant` 主線，跳過 `system`/`tool`。
+
+例：`history_injection: 0`（不限制注入）+ `history_shows: 5` → 模型拿全部恢復歷史，界面只回顯最近 5 條。
 
 ### 功能對齊程度
 

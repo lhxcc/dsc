@@ -7,31 +7,36 @@ import (
 	"dsc/session"
 )
 
-// HistoryShowsDefault 恢复历史回显的默认条数：当 history_injection 为 0（未设置，
-// 即「不限制注入」）时，TUI 只回显最近这么多条，避免长会话启动即刷屏。它是**渲染
-// 上限**，不是注入上限——模型仍按 history_injection 的语义拿到全部恢复历史。
+// HistoryShowsDefault history_shows 为 0（未设置）时，TUI 默认回显的历史消息条数。
+// 它是**渲染上限**，不是注入上限——模型仍按 history_injection 的语义拿恢复历史。
 const HistoryShowsDefault = 20
 
-// displayCountForInjection 由 history_injection 派生 TUI 回显的条数——显示与注入
-// 共用同一个值，不再有第二个「显示条数」配置项，因此不存在两个旋钮不一致的对齐问题。
+// resolveHistoryShowsCount 把 history_shows 配置解析为「最多显示多少条」。
 //
-//   - 负值：不注入恢复历史 → 也不显示；
-//   - 0（未设置，不限制注入）：回显默认 HistoryShowsDefault 条（渲染上限，非注入上限）；
-//   - N>0：回显最近 N 条（不超过注入量）。
-func displayCountForInjection(injectCount int) int {
+// injectCount 是 history_injection 的有效值（负值 = 不注入恢复历史）。显示层受
+// 注入层门控：注入关闭时没有可显示的恢复历史，显示也一并关闭。其余沿用 DSC 三值
+// 语义：负值 = 不显示、0 = 未设置（默认 HistoryShowsDefault）、N>0 = 显示 N 条。
+//
+// 返回值只是「请求条数」；最终还会被实际可显示的消息数截断（见 LoadDisplayHistory），
+// 因此显示量不会超过注入量。
+func resolveHistoryShowsCount(shows, injectCount int) int {
 	if injectCount < 0 {
 		return 0
 	}
-	if injectCount == 0 {
+	switch {
+	case shows < 0:
+		return 0
+	case shows == 0:
 		return HistoryShowsDefault
+	default:
+		return shows
 	}
-	return injectCount
 }
 
 // LoadDisplayHistory 加载当前工作区项目会话，按历史注入设置派生消息，并截取最近
-// displayCountForInjection(historyInjection) 条可显示消息（仅 user/assistant，跳过
-// system/tool），供 TUI 启动时在正文区回显——避免用户重启后面对空白界面、想不起
-// 先前的对话。
+// resolveHistoryShowsCount(historyShows, historyInjection) 条可显示消息（仅
+// user/assistant，跳过 system/tool），供 TUI 启动时在正文区回显——避免用户重启后
+// 面对空白界面、想不起先前的对话。
 //
 // 与 agent 视角严格对齐（这三点保证「显示的就是模型也看得到的那部分恢复历史」）：
 //   - 会话键与 agent 相同：session.SessionKeyForProject(WorkspaceRoot)；
@@ -40,8 +45,8 @@ func displayCountForInjection(injectCount int) int {
 //   - 派生走同一个 session.DeriveMessagesLimited，因此「注入关闭 = 不显示」与
 //     「显示不超过实际注入量」天然成立，不需要在此另做上限换算。
 //
-// 返回 nil 表示无需回显（无会话、注入关闭、或没有可显示消息）。
-func (m *Manager) LoadDisplayHistory(historyInjection int) []*AgentDebugMessage {
+// 返回 nil 表示无需回显（无会话、注入关闭、显示关闭、或没有可显示消息）。
+func (m *Manager) LoadDisplayHistory(historyInjection, historyShows int) []*AgentDebugMessage {
 	if m == nil {
 		return nil
 	}
@@ -57,7 +62,7 @@ func (m *Manager) LoadDisplayHistory(historyInjection int) []*AgentDebugMessage 
 	if limit, ok := session.FoldHistoryLimit(sess.Events()); ok {
 		inject = limit // 会话内 /settings history 覆盖配置缺省（与 agent 一致）
 	}
-	count := displayCountForInjection(inject)
+	count := resolveHistoryShowsCount(historyShows, inject)
 	if count == 0 {
 		return nil
 	}

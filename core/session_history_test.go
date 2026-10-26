@@ -8,23 +8,26 @@ import (
 	"dsc/session"
 )
 
-// TestDisplayCountForInjection 显示条数由 history_injection 单旋钮派生。
-func TestDisplayCountForInjection(t *testing.T) {
+// TestResolveHistoryShowsCount 显示条数解析：受注入层门控 + 自身三值语义。
+func TestResolveHistoryShowsCount(t *testing.T) {
 	cases := []struct {
 		name   string
+		shows  int
 		inject int
 		want   int
 	}{
-		{"注入关闭时显示也关", -1, 0},
-		{"任意负值关闭", -5, 0},
-		{"未设置(不限制注入)取显示默认", 0, HistoryShowsDefault},
-		{"显式 N", 5, 5},
-		{"N=1", 1, 1},
+		{"注入关闭时显示也关", 10, -1, 0},
+		{"注入关闭且默认", 0, -1, 0},
+		{"显式关闭显示", -1, 0, 0},
+		{"未设置取默认", 0, 0, HistoryShowsDefault},
+		{"显式 N", 5, 0, 5},
+		{"注入限量不影响显示请求(最终由条数封顶)", 0, 3, HistoryShowsDefault},
+		{"显示请求大于注入量(最终由条数封顶)", 100, 3, 100},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := displayCountForInjection(c.inject); got != c.want {
-				t.Fatalf("displayCountForInjection(%d) = %d, want %d", c.inject, got, c.want)
+			if got := resolveHistoryShowsCount(c.shows, c.inject); got != c.want {
+				t.Fatalf("resolveHistoryShowsCount(%d,%d) = %d, want %d", c.shows, c.inject, got, c.want)
 			}
 		})
 	}
@@ -74,7 +77,7 @@ func appendAssistant(sess *session.Session, content string) {
 		&session.SurfaceOp{Op: session.SurfaceAppend})
 }
 
-// TestLoadDisplayHistoryCount 端到端：注入 N 条 → 回显最近 N 条可显示消息。
+// TestLoadDisplayHistoryCount 显示条数由 history_shows 控制，与注入量独立。
 func TestLoadDisplayHistoryCount(t *testing.T) {
 	origRoot := WorkspaceRoot
 	WorkspaceRoot = t.TempDir()
@@ -89,26 +92,75 @@ func TestLoadDisplayHistoryCount(t *testing.T) {
 		appendAssistant(sess, "a3")
 	})
 
-	// history_injection=4 → 回显最近 4 条：u2 a2 u3 a3
-	got := m.LoadDisplayHistory(4)
-	want := []string{"u2", "a2", "u3", "a3"}
+	cases := []struct {
+		name        string
+		inject      int
+		shows       int
+		wantContent []string
+	}{
+		// 注入不限制、显示最近 4 条
+		{"显示4条", 0, 4, []string{"u2", "a2", "u3", "a3"}},
+		// 注入最近 4 条、显示默认 20（被实际注入量截断为 4）
+		{"注入4显示默认", 4, 0, []string{"u2", "a2", "u3", "a3"}},
+		// 注入最近 2 条、显示 1 条（显示可独立调小）
+		{"注入2显示1", 2, 1, []string{"a3"}},
+		// 注入不限制、显示 2 条
+		{"显示2条", 0, 2, []string{"u3", "a3"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := m.LoadDisplayHistory(c.inject, c.shows)
+			if len(got) != len(c.wantContent) {
+				t.Fatalf("LoadDisplayHistory(%d,%d) = %d 条 (%+v), want %d",
+					c.inject, c.shows, len(got), got, len(c.wantContent))
+			}
+			for i, w := range c.wantContent {
+				if got[i].Content != w {
+					t.Fatalf("第 %d 条 = %q, want %q (全部: %+v)", i, got[i].Content, w, got)
+				}
+			}
+		})
+	}
+
+	// 注入关闭（<0）→ 显示不起作用 → nil
+	if got := m.LoadDisplayHistory(-1, 4); got != nil {
+		t.Fatalf("inject<0 应返回 nil, got %+v", got)
+	}
+	// 显示显式关闭（<0）→ nil，且与注入是否开启无关
+	if got := m.LoadDisplayHistory(0, -1); got != nil {
+		t.Fatalf("shows<0 应返回 nil, got %+v", got)
+	}
+}
+
+// TestLoadDisplayHistoryShowsCappedByInjection 显示请求大于注入量时，以实际注入量封顶。
+func TestLoadDisplayHistoryShowsCappedByInjection(t *testing.T) {
+	origRoot := WorkspaceRoot
+	WorkspaceRoot = t.TempDir()
+	defer func() { WorkspaceRoot = origRoot }()
+
+	m := stageDisplaySession(t, func(sess *session.Session) {
+		appendUser(sess, "u1")
+		appendAssistant(sess, "a1")
+		appendUser(sess, "u2")
+		appendAssistant(sess, "a2")
+		appendUser(sess, "u3")
+		appendAssistant(sess, "a3")
+	})
+
+	// 注入最近 2 条、显示 20 条 → 只能显示实际注入的 2 条
+	got := m.LoadDisplayHistory(2, 20)
+	want := []string{"u3", "a3"}
 	if len(got) != len(want) {
-		t.Fatalf("LoadDisplayHistory(4) = %d 条 (%+v), want %d", len(got), got, len(want))
+		t.Fatalf("LoadDisplayHistory(2,20) = %d 条 (%+v), want %d", len(got), got, len(want))
 	}
 	for i, w := range want {
 		if got[i].Content != w {
 			t.Fatalf("第 %d 条 = %q, want %q (全部: %+v)", i, got[i].Content, w, got)
 		}
 	}
-
-	// 注入关闭（<0）→ 显示也关闭 → nil
-	if got := m.LoadDisplayHistory(-1); got != nil {
-		t.Fatalf("inject<0 应返回 nil, got %+v", got)
-	}
 }
 
-// TestLoadDisplayHistoryDefaultCap history_injection=0（不限制注入）时，回显被
-// 渲染上限 HistoryShowsDefault 截断，避免长会话刷屏。
+// TestLoadDisplayHistoryDefaultCap history_shows=0（未设置）时回显被默认上限截断。
 func TestLoadDisplayHistoryDefaultCap(t *testing.T) {
 	origRoot := WorkspaceRoot
 	WorkspaceRoot = t.TempDir()
@@ -121,7 +173,7 @@ func TestLoadDisplayHistoryDefaultCap(t *testing.T) {
 		}
 	})
 
-	got := m.LoadDisplayHistory(0)
+	got := m.LoadDisplayHistory(0, 0)
 	if len(got) != HistoryShowsDefault {
 		t.Fatalf("默认回显 %d 条, want %d", len(got), HistoryShowsDefault)
 	}
@@ -146,10 +198,10 @@ func TestLoadDisplayHistoryRespectsSessionLimit(t *testing.T) {
 	})
 
 	// 配置注入=0（不限制），但会话内 limit=2 优先；回显也被限制到实际注入的 2 条。
-	got := m.LoadDisplayHistory(0)
+	got := m.LoadDisplayHistory(0, 0)
 	want := []string{"u3", "a3"}
 	if len(got) != len(want) {
-		t.Fatalf("LoadDisplayHistory(0) = %d 条 (%+v), want %d (会话内 limit=2)", len(got), got, len(want))
+		t.Fatalf("LoadDisplayHistory(0,0) = %d 条 (%+v), want %d (会话内 limit=2)", len(got), got, len(want))
 	}
 	for i, w := range want {
 		if got[i].Content != w {
@@ -165,11 +217,11 @@ func TestLoadDisplayHistoryNoSession(t *testing.T) {
 	defer func() { WorkspaceRoot = origRoot }()
 
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
-	if got := m.LoadDisplayHistory(0); got != nil {
+	if got := m.LoadDisplayHistory(0, 20); got != nil {
 		t.Fatalf("无会话应返回 nil, got %+v", got)
 	}
 	var nilMgr *Manager
-	if got := nilMgr.LoadDisplayHistory(0); got != nil {
+	if got := nilMgr.LoadDisplayHistory(0, 20); got != nil {
 		t.Fatalf("nil manager 应返回 nil, got %+v", got)
 	}
 }

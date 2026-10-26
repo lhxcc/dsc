@@ -1016,12 +1016,17 @@ func main() {
 			time.Sleep(completionSoundGrace)
 		}
 	} else {
-		// TUI 启动回显：复用 history_injection 单旋钮（负值不显示、0 默认 20、N 最近 N），
-		// 由宿主从项目会话派生并截取（见 core.Manager.LoadDisplayHistory）。
+		// TUI 启动回显：显示条数由 history_shows 控制（负值不显示、0 默认 20、N 最近 N），
+		// 并受 history_injection 门控（注入关闭则不显示）；宿主从项目会话派生并截取
+		// （见 core.Manager.LoadDisplayHistory）。
 		histInj, _ := historyInjectionCount(mainCfg)
-		displayHistory := mgr.LoadDisplayHistory(histInj)
+		histShows := 0
+		if mainCfg != nil {
+			histShows = mainCfg.HistoryShows
+		}
+		displayHistory := mgr.LoadDisplayHistory(histInj, histShows)
 		if n := len(displayHistory); n > 0 {
-			logger.Info("tui history display", "messages", n, "history_injection", histInj)
+			logger.Info("tui history display", "messages", n, "history_injection", histInj, "history_shows", histShows)
 		}
 		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, displayHistory); err != nil {
 			logger.Error("tui run failed", "error", err)
