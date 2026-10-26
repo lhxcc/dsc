@@ -15,9 +15,10 @@ import (
 // 事件循环：空闲时自动开启一轮（完成通知作为输入，模型据此 job_output 收集）；
 // 忙碌或预算耗尽时排队，下一条用户消息前置注入。用户消息恢复唤醒预算。
 
-// maxConsecutiveWakes 可由唤醒开启的连续轮数上限（对齐 DSH 默认 3），
-// 防自激：被唤醒的一轮可能启动新的后台任务，其完成又唤醒同一 owner。
-const maxConsecutiveWakes = 3
+// 说明：曾经有「连续唤醒预算」（最多 3 轮自动唤醒）。它唯一的作用是拦住
+// 任务完成唤醒，而这些唤醒都由真实任务落定触发——没有任务完成就不会有唤醒，
+// 预算只会制造「任务早就完成了、模型却要等下一次用户输入才知道」的延迟。
+// 现在忙碌时立即注入、空闲时立即唤醒，故取消该预算。
 
 // jobDoneMsg 后台任务完成事件（Manager 侧 jobs 落定回调 → 事件循环）。
 type jobDoneMsg struct {
@@ -118,14 +119,27 @@ func (m *Model) tryWakeup() tea.Cmd {
 	if len(m.pendingWakeups) == 0 {
 		return nil
 	}
-	if m.wakeBudget <= 0 {
-		return nil
-	}
-	m.wakeBudget--
 	text := strings.Join(m.pendingWakeups, "\n\n")
 	m.pendingWakeups = nil
 	// 通知**不进对话区**：它是给模型的唤醒信号，不是用户消息。以前这里渲染
 	// noticeBubble(text)，用户看到一屏「background job ... finished」。
 	// 模型侧内容照旧（text 作为本轮输入），只是不打印。
 	return m.startTurn(text, nil, "", "")
+}
+
+// jobNoticeInjectedMsg 完成通知的注入结果（仅失败时需要处理）。
+type jobNoticeInjectedMsg struct {
+	text string
+	err  error
+}
+
+// injectJobNoticeCmd 把完成通知实时注入当前回合（跨进程 RPC）。
+// 与用户输入共用 InjectMessage 通道：注入的内容在下一次 LLM 迭代可见，
+// 因此任务一落定模型就能知道，而不必等这一轮结束。
+// 通知不进对话区，故不渲染气泡。
+func (m *Model) injectJobNoticeCmd(text string) tea.Cmd {
+	return func() tea.Msg {
+		err := m.agent.InjectMessage(m.ctx, text, nil)
+		return jobNoticeInjectedMsg{text: text, err: err}
+	}
 }

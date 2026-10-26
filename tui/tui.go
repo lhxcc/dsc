@@ -375,9 +375,9 @@ type Model struct {
 	question *pendingQuestion
 
 	// 后台任务完成通知唤醒（对齐 DSH completionDelivery: wakeup）：
-	// wakeBudget 连续唤醒预算（用户消息恢复），pendingWakeups 忙碌/预算耗尽时排队
+	// pendingWakeups 待送达的任务完成通知：忙碌时走实时注入，注入失败才回落到这里，
+	// 在回合结束/下一条用户消息时补送。
 	// 的通知（下一条用户消息前置注入）。
-	wakeBudget     int
 	pendingWakeups []string
 }
 
@@ -464,7 +464,6 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		spinner:          s,
 		thinkAnim:        thinkAnim{kind: randThinkKind()},
 		currentSessionID: defaultSessionID(manager),
-		wakeBudget:       maxConsecutiveWakes,
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
@@ -849,9 +848,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case jobDoneMsg:
-		// 后台任务完成：排队通知并尝试唤醒（空闲自动开启一轮）
+		// 后台任务完成：**立即**送达模型。
+		//   - 忙碌（thinking/streaming）：注入当前回合，下一轮 LLM 迭代即可见；
+		//   - 空闲：直接唤醒开一轮。
+		// 不再「先排队、等回合结束/下一条用户输入再一次性补发」——那会让早已完成的
+		// 任务在很久以后才爆发成一片通知。
 		m.pendingWakeups = append(m.pendingWakeups, renderJobDoneNotice(msg.snapshot))
 		m.render()
+		if m.thinking || m.streaming {
+			text := strings.Join(m.pendingWakeups, "\n\n")
+			m.pendingWakeups = nil
+			return m, m.injectJobNoticeCmd(text)
+		}
+		return m, m.tryWakeup()
+
+	case jobNoticeInjectedMsg:
+		// 注入失败（agent 不在运行等）：回落到队列，由回合结束/下一条用户输入补送，
+		// 不静默丢掉一条「任务已完成」的通知。
+		if msg.err != nil && msg.text != "" {
+			m.pendingWakeups = append(m.pendingWakeups, msg.text)
+		}
 		return m, m.tryWakeup()
 
 	case tea.KeyPressMsg:
@@ -977,7 +993,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.draft = ""
 			m.input.SetValue("")
 			m.completion = completion{}
-			m.wakeBudget = maxConsecutiveWakes // 用户消息恢复唤醒预算（对齐 DSH）
 			// 解析 @文件引用（图片→dsc-img 多模态；文本→dsc-txt 注入内容）；解析出
 			// 图片但当前 LLM 不支持图像时明确提示，避免静默丢图（纯文本引用不提示）；
 			// @图片 解析失败（文件缺失/附件库写失败等）同样可见提示，供诊断

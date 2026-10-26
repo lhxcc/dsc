@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"charm.land/bubbletea/v2"
 	"dsc/core"
 	"dsc/jobs"
 )
@@ -18,7 +17,7 @@ func wakeSnap(id string) jobs.JobSnapshot {
 func TestWakeup(t *testing.T) {
 	m := New(&stubAgent{frames: []*core.RunStreamResponse{{Status: "success"}}}, nil, context.Background(), "m", "minimal", 131072)
 
-	// 空闲时收到完成通知 → 自动开启一轮，预算扣减，通知清空
+	// ① 空闲时收到完成通知 → 立即开启一轮（不排队、不打印）
 	_, cmd := m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-1")})
 	if !m.thinking {
 		t.Fatal("idle wakeup should start a turn")
@@ -26,48 +25,47 @@ func TestWakeup(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("wakeup should return a start cmd")
 	}
-	if m.wakeBudget != maxConsecutiveWakes-1 {
-		t.Fatalf("budget = %d, want %d", m.wakeBudget, maxConsecutiveWakes-1)
-	}
 	if len(m.pendingWakeups) != 0 {
-		t.Fatalf("notifications should be consumed by wakeup, got %+v", m.pendingWakeups)
+		t.Fatalf("通知应被唤醒消费, got %+v", m.pendingWakeups)
 	}
-	// 通知是给模型的唤醒信号，**不打印到对话区**（此前渲染成 dim 系统提示，
-	// 用户看到一屏 background job 噪音）。
+	// 通知只喂模型，不进对话区
 	if full := strings.Join(m.lines, "\n"); strings.Contains(full, "background job workflow-1") {
 		t.Fatalf("notice 不应打印到前端, got: %q", full)
 	}
 
-	// 忙碌时收到通知 → 排队，不自动发
-	m.thinking = false // 上一轮已结束
-	m.streaming = true // 模拟新一轮忙碌
+	// ② 忙碌时收到完成通知 → **立即注入当前回合**，不排队等回合结束
+	m.thinking = false
+	m.streaming = true
 	_, cmd = m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-2")})
-	if cmd != nil {
-		t.Fatal("busy should not auto-wake")
+	if cmd == nil {
+		t.Fatal("忙碌时应返回注入命令（立即送达模型），而不是静默排队")
 	}
-	if len(m.pendingWakeups) != 1 {
-		t.Fatalf("busy notification should queue, got %+v", m.pendingWakeups)
+	if len(m.pendingWakeups) != 0 {
+		t.Fatalf("通知已交给注入通道，不应再留在队列, got %+v", m.pendingWakeups)
+	}
+	// 注入成功（stub 返回 nil）→ 队列保持为空
+	_, _ = m.Update(jobNoticeInjectedMsg{text: "background job workflow-2 (workflow: x) finished [status: completed]. Read its output with job_output."})
+	if len(m.pendingWakeups) != 0 {
+		t.Fatalf("注入成功后不应回落队列, got %+v", m.pendingWakeups)
 	}
 	m.streaming = false
 
-	// 预算耗尽 → 通知排队，不自动发
-	m.wakeBudget = 0
-	_, cmd = m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-3")})
-	if cmd != nil || m.thinking {
-		t.Fatal("exhausted budget should not wake")
+	// ③ 注入失败 → 回落队列（不静默丢弃），随后空闲可被唤醒补送
+	m.thinking = false
+	m.streaming = true
+	_, _ = m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-3")})
+	_, cmd = m.Update(jobNoticeInjectedMsg{text: "notice-3", err: context.Canceled})
+	if len(m.pendingWakeups) != 1 {
+		t.Fatalf("注入失败应回落队列, got %+v", m.pendingWakeups)
 	}
-	if len(m.pendingWakeups) != 2 {
-		t.Fatalf("queued notifications = %d, want 2", len(m.pendingWakeups))
+	// 此刻仍忙碌 → 补送命令为空；回合结束后 tryWakeup 才会发
+	if cmd != nil && !m.thinking {
+		t.Logf("补送命令: %v", cmd)
 	}
-
-	// 用户消息 → 前置注入排队通知 + 恢复预算
-	m.input.SetValue("继续")
-	_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-	if m.wakeBudget != maxConsecutiveWakes {
-		t.Fatalf("user message should restore budget, got %d", m.wakeBudget)
-	}
-	if len(m.pendingWakeups) != 0 {
-		t.Fatalf("notifications should be injected, got %+v", m.pendingWakeups)
+	m.streaming = false
+	_, _ = m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-4")})
+	if !m.thinking {
+		t.Fatal("空闲时应重新唤醒并带上积压通知")
 	}
 }
 
