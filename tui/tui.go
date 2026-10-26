@@ -1674,7 +1674,16 @@ func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "user":
-			out = append(out, renderUserBubble(msg.Content, w))
+			// 唤醒机制会把后台任务完成通知前置拼进用户消息；重放时按同一形态拆开：
+			// 通知按系统提示渲染，其余才是用户气泡——避免「通知与用户消息粘连成
+			// 一块」（实时视图本就只把通知渲染成系统提示）。
+			notices, rest := splitJobDoneNotices(msg.Content)
+			for _, n := range notices {
+				out = append(out, noticeBubble(n))
+			}
+			if rest = strings.TrimSpace(rest); rest != "" {
+				out = append(out, renderUserBubble(rest, w))
+			}
 		case "assistant":
 			out = append(out, m.renderAssistant(renderMarkdown(msg.Content, w)))
 		}

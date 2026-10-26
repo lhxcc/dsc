@@ -69,3 +69,50 @@ func TestWakeup(t *testing.T) {
 		t.Fatalf("notifications should be injected, got %+v", m.pendingWakeups)
 	}
 }
+
+// TestSplitJobDoneNoticesReplay 重放时把用户消息里前置的后台通知拆出来：通知按
+// 系统提示、用户正文按用户气泡，二者不粘连。label 含换行（heredoc）也能匹配。
+func TestSplitJobDoneNoticesReplay(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.width = 80
+
+	n1 := renderJobDoneNotice(jobs.JobSnapshot{
+		ID: "shell-2", Kind: "shell",
+		Label: "shell: cd /workspace && python - <<'PY'\np = 'x'", Status: jobs.StatusCompleted,
+	})
+	n2 := renderJobDoneNotice(jobs.JobSnapshot{
+		ID: "shell-3", Kind: "shell",
+		Label: "shell: cd /workspace && ./build", Status: jobs.StatusCompleted,
+	})
+	content := n1 + "\n\n" + n2 + "\n\n量这条边际成本曲线"
+
+	blocks := m.renderHistoryBlocks([]*core.AgentDebugMessage{{Role: "user", Content: content}})
+	if len(blocks) != 3 {
+		t.Fatalf("应为 2 条通知 + 1 个用户气泡, got %d: %#v", len(blocks), blocks)
+	}
+	for i := 0; i < 2; i++ {
+		if !strings.Contains(blocks[i], "background job") {
+			t.Fatalf("第 %d 块应为通知, got %q", i, blocks[i])
+		}
+		if strings.Contains(blocks[i], "量这条边际成本曲线") {
+			t.Fatalf("通知块不应含用户正文, got %q", blocks[i])
+		}
+	}
+	if !strings.Contains(blocks[2], "量这条边际成本曲线") {
+		t.Fatalf("用户气泡应含用户正文, got %q", blocks[2])
+	}
+	if strings.Contains(blocks[2], "background job") {
+		t.Fatalf("用户气泡不应含通知, got %q", blocks[2])
+	}
+}
+
+// TestRenderJobDoneNoticeNoDupKind Label 已含 kind 前缀时不再重复（避免 shell: shell:）。
+func TestRenderJobDoneNoticeNoDupKind(t *testing.T) {
+	s := renderJobDoneNotice(jobs.JobSnapshot{ID: "shell-1", Kind: "shell", Label: "shell: ls", Status: jobs.StatusCompleted})
+	if strings.Contains(s, "shell: shell:") {
+		t.Fatalf("不应出现重复 kind 前缀: %q", s)
+	}
+	if !strings.Contains(s, "(shell: ls)") {
+		t.Fatalf("应为 (shell: ls), got %q", s)
+	}
+}

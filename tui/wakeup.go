@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,9 +26,41 @@ type jobDoneMsg struct {
 
 // renderJobDoneNotice 渲染完成通知文本（对齐 DSH：
 // background job <id> (<kind>: <label>) finished [status: ...]）。
+//
+// Label 本身已带「<kind>: <command>」前缀（core 侧 startBackgroundTool 生成），
+// 故不再重复拼 kind——否则会出现「shell: shell: ...」的双前缀。
 func renderJobDoneNotice(s jobs.JobSnapshot) string {
-	return fmt.Sprintf("background job %s (%s: %s) finished [status: %s]. Read its output with job_output.",
-		s.ID, s.Kind, s.Label, s.Status)
+	label := s.Label
+	switch {
+	case label == "":
+		label = s.Kind
+	case s.Kind != "" && !strings.HasPrefix(label, s.Kind+": "):
+		label = s.Kind + ": " + label
+	}
+	return fmt.Sprintf("background job %s (%s) finished [status: %s]. Read its output with job_output.",
+		s.ID, label, s.Status)
+}
+
+// jobDoneNoticeRe 匹配一条 renderJobDoneNotice 生成的完成通知。通知里的 label 是
+// 命令前缀（core 侧截断 60 字、未清洗换行），可能跨行，故用 (?s) 让 . 跨行、非贪婪
+// 到固定结尾后缀；锚定 ^ 只从文本开头剥离，避免误伤正文中间的同形文字。
+var jobDoneNoticeRe = regexp.MustCompile(`(?s)^background job \S+ \(.*?\) finished \[status: [^\]]*\]\. Read its output with job_output\.`)
+
+// splitJobDoneNotices 从用户消息内容前端剥离后台任务完成通知，返回通知列表与
+// 剩余的用户正文。唤醒机制会把通知前置拼进用户消息（见 startTurn 的 sendText），
+// 实时视图只把通知渲染成系统提示、用户气泡只放用户正文；重放时按同一形态拆开，
+// 避免「通知与用户消息粘连成一块」。旧会话（双前缀、含换行 label）同样能匹配。
+func splitJobDoneNotices(content string) (notices []string, rest string) {
+	rest = content
+	for {
+		m := jobDoneNoticeRe.FindString(rest)
+		if m == "" {
+			break
+		}
+		notices = append(notices, m)
+		rest = strings.TrimPrefix(rest[len(m):], "\n\n")
+	}
+	return notices, rest
 }
 
 // noticeBubble 渲染完成通知行（系统提示样式，不冒充用户消息）。
