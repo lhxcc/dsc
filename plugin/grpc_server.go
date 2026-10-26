@@ -69,7 +69,13 @@ type GRPCServer struct {
 // ServerProtocol impl.
 func (s *GRPCServer) Init() error {
 	// Create our server
-	var opts []grpc.ServerOption
+	// 收发上限必须显式放大：gRPC 默认收包只有 4 MiB，而 OnEvent 可能承载整份
+	// 消息列表（agent/pre-step 事件），长会话必然超限并让宿主的压缩改写被静默
+	// 丢弃（详见 MaxGRPCMessageSize 注释）。
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(MaxGRPCMessageSize),
+	}
 	if s.TLS != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(s.TLS)))
 	}

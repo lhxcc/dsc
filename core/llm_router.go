@@ -44,6 +44,9 @@ func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (
 		if preErr != nil {
 			return nil, preErr
 		}
+		// 发出一跳前统一修复工具调用/结果配对：压缩切点、历史注入或旧会话恢复
+		// 都可能留下孤立 tool 消息，OpenAI 兼容端点会直接拒绝整个请求。
+		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		for _, np := range s.m.llmRouteSnapshot() {
 			start := time.Now()
@@ -107,6 +110,7 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 		if preErr != nil {
 			return preErr
 		}
+		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		providerTried := false
 		for _, np := range s.m.llmRouteSnapshot() {
@@ -126,7 +130,15 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 				// 压力判定以此精确底数 + 启发式增量（对齐 DSH tokenMeter pressureTokens）。
 				// 仅流式请求携带 usage；非流式 Chat 不记录（保持 0 → 插件退回启发式）。
 				if call.Usage != nil && call.Usage.PromptTokens > 0 {
-					s.m.recordSessionUsage(req.GetSessionId(), call.Usage.PromptTokens)
+					// 记录锚点：req 是经 pre-step 改写后的最终请求，所以这里的估算与
+					// 指纹描述的就是真正发出的那个表面（压缩后端改写后的）。
+					s.m.recordSessionAnchor(req.GetSessionId(), sessionUsageAnchor{
+						promptTokens:  int(call.Usage.PromptTokens),
+						sentEstimate:  EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools),
+						toolsHash:     ToolsFingerprint(req.Tools),
+						model:         s.m.modelName,
+						contextWindow: s.m.contextWindow,
+					})
 				}
 				return nil
 			}
@@ -169,6 +181,30 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 	return fmt.Errorf("all providers failed after %d retries", maxRetries)
 }
 
+// sanitizeRequestPairing 在把请求交给 provider 前整理 tool_call 与 tool_result 的配对。
+//
+// 放在 pre-step 之后：压缩插件会改写消息（可能丢掉某些结果），整理要看的是最终将发出去
+// 的那一份。整理本身幂等，重试再次调用不会累积改动。
+//
+// 丢弃不是无声的：provider 侧的报错（"tool calls and tool results do not match"）发生在
+// 请求已经发出之后，用户只能「新建任务」；这里丢掉并在日志留一条，至少能看出是哪一轮
+// 少了什么。
+func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatRequest {
+	if req == nil || len(req.GetMessages()) == 0 {
+		return req
+	}
+	fixed, dropped := SanitizeToolPairing(req.GetMessages())
+	// 无论有没有丢弃都要回写：插话落在调用与结果之间时，一条都不用丢，
+	// 但顺序必须换（结果紧跟调用）。只在丢东西时才记日志。
+	req.Messages = fixed
+	if dropped > 0 {
+		m.logger.Warn("llm request: repaired tool call/result pairing",
+			"dropped", dropped, "messages", len(req.GetMessages()), "kept", len(fixed),
+			"hint", "工具调用与其结果不再一一对应（插话落在调用与结果之间、或工具被中断）；已丢弃无法配对的部分")
+	}
+	return req
+}
+
 // applyPreStepHook 在 LLM 请求前分发 agent/pre-step 事件（waterfall 模式），
 // 让订阅了 pre-step 的插件有机会改写消息列表。无插件监听或返回空 result
 // 时原样返回 req（零开销）。
@@ -185,17 +221,27 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	// 估算当前 token 数（复用 core 公用启发式 EstimateProtoMessagesTokens，
 	// CJK 感知 + 角色开销 + 图像 + 工具参数，供插件 nudge 决策）——
 	// 与压缩插件同一估算口径，避免各处字节/4 粗略估算漂移。
-	tokenCount := EstimateProtoMessagesTokens(req.Messages)
+	// 必须把工具目录一起算：它每次请求都随载荷发出，只算消息会系统性低估压力。
+	tokenCount := EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools)
+	// 投影压力：由宿主统一给出（消息+工具的表面大小，信封可比时以 provider 用量为底数）。
+	// 压缩后端不再各自合成这个数——决策输入只应有这一处来源（对齐 DSH：消费者读
+	// tokenMeter，不自己算）。
+	anchor, _ := s.m.lastSessionAnchor(req.GetSessionId())
+	projected, matched := projectPressure(anchor, tokenCount, ToolsFingerprint(req.Tools), s.m.modelName, s.m.contextWindow)
 	result, err := s.m.dispatchEventToPlugins(EventAgentPreStep, AgentPreStepEvent{
 		Agent:           s.m.GetMainAgentName(),
 		Session:         req.GetSessionId(),
 		MessagesJSON:    string(msgsJSON),
 		TokenCount:      tokenCount,
-		LastUsageTokens: int(s.m.lastSessionPrompt(req.GetSessionId())),
+		LastUsageTokens: anchor.promptTokens,
+		ProjectedTokens: projected,
+		EnvelopeMatched: matched,
 		UserInput:       req.GetNewUserInput(),
 	})
 	if err != nil {
 		// waterfall 返回 error 即插件 veto：终止本次请求（不再静默放行）。
+		// 传输层失败已在 dispatchEventToPlugins 内跳过该插件并继续下游，
+		// 能走到这里的都是插件显式拒绝，请求本身不该带着未改写的全量历史发出。
 		return nil, fmt.Errorf("agent/pre-step vetoed request: %w", err)
 	}
 	// 解析改写后的消息列表
@@ -273,24 +319,67 @@ func parsePreStepAppends(raw any) []*proto.Message {
 	return out
 }
 
-// recordSessionUsage 按会话记录最近一次成功 LLM 请求的服务端上报 prompt 用量
-// （对齐 DSH tokenMeter 的 pressureTokens：压力判定的精确底数）。空会话 id 或
-// 非正用量忽略（内部调用/非流式请求无上报值，不污染会话状态）。
-func (m *Manager) recordSessionUsage(sessionID string, promptTokens int32) {
-	if sessionID == "" || promptTokens <= 0 {
-		return
-	}
-	m.sessionLastPromptMu.Lock()
-	defer m.sessionLastPromptMu.Unlock()
-	m.sessionLastPrompt[sessionID] = promptTokens
+// sessionUsageAnchor 宿主侧 per-session 用量锚点（供 pre-step 计算投影压力）。
+type sessionUsageAnchor struct {
+	promptTokens  int    // provider 上报的 prompt 侧用量（实测）
+	sentEstimate  int    // 产生该用量时，对同一请求（消息+工具）的启发式估算
+	toolsHash     string // 产生该用量时的工具目录指纹（空 = 未知/不可比）
+	model         string // 产生该用量时的模型名（空 = 未知）
+	contextWindow int    // 产生该用量时的上下文窗口（0 = 未知）
 }
 
-// lastSessionPrompt 返回某会话最近一次成功请求的上报 prompt 用量（0 = 无记录：
+// recordSessionAnchor 按会话记录最近一次成功 LLM 请求的用量锚点
+// （对齐 DSH tokenMeter 的 pressureTokens + request header 语义）。空会话 id 或
+// 非正用量忽略（内部调用/非流式请求无上报值，不污染会话状态）。
+func (m *Manager) recordSessionAnchor(sessionID string, a sessionUsageAnchor) {
+	if sessionID == "" || a.promptTokens <= 0 {
+		return
+	}
+	m.sessionAnchorMu.Lock()
+	defer m.sessionAnchorMu.Unlock()
+	m.sessionAnchors[sessionID] = a
+}
+
+// lastSessionAnchor 返回某会话最近一次的用量锚点（ok=false = 无记录：
 // 首次请求、重启恢复或仅走非流式 Chat）。
-func (m *Manager) lastSessionPrompt(sessionID string) int32 {
-	m.sessionLastPromptMu.RLock()
-	defer m.sessionLastPromptMu.RUnlock()
-	return m.sessionLastPrompt[sessionID]
+func (m *Manager) lastSessionAnchor(sessionID string) (sessionUsageAnchor, bool) {
+	if m == nil || sessionID == "" {
+		return sessionUsageAnchor{}, false
+	}
+	m.sessionAnchorMu.RLock()
+	defer m.sessionAnchorMu.RUnlock()
+	a, ok := m.sessionAnchors[sessionID]
+	return a, ok
+}
+
+// projectPressure 由「锚点 + 当前表面」得出本轮压力（对齐 DSH tokenMeter.measure 的
+// baseline + surfaceDelta）：
+//
+//  1. 信封不可比（工具目录/窗口不同，或旧记录无指纹）→ 直接用当前启发式估算；
+//  2. 信封可比，但 provider 用量低于该信封的启发式价（说明那次请求被压缩/改写，
+//     用量描述的不是这个表面）→ 同样退回估算；
+//  3. 否则以 provider 用量为底数，只加「自采样以来的表面差量」（可正可负，下限 0）。
+//
+// matched 表示信封是否可比（供插件日志与调试）。
+func projectPressure(anchor sessionUsageAnchor, curEstimate int, curToolsHash, curModel string, window int) (projected int, matched bool) {
+	if curEstimate < 0 {
+		curEstimate = 0
+	}
+	matched = anchor.toolsHash != "" && curToolsHash != "" && anchor.toolsHash == curToolsHash
+	if matched && anchor.contextWindow > 0 && window > 0 && anchor.contextWindow != window {
+		matched = false // 换了窗口：用量不可比
+	}
+	if matched && anchor.model != "" && curModel != "" && anchor.model != curModel {
+		matched = false // 换了模型：tokenizer/计价都可能变，锚点作废
+	}
+	if !matched || anchor.promptTokens < anchor.sentEstimate {
+		return curEstimate, matched
+	}
+	p := anchor.promptTokens + (curEstimate - anchor.sentEstimate)
+	if p < 0 {
+		p = 0
+	}
+	return p, true
 }
 
 // emitRequestError 在 LLM 请求失败后分发 agent/request-error 事件（waterfall 模式），

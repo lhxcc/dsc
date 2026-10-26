@@ -37,10 +37,14 @@ var virtualRoots = []virtualRoot{
 	{prefix: "/tmp", goos: "windows", resolve: resolveTempRoot},
 	// 统一工作空间根，跨平台（模型不知道工作区的真实路径）。
 	{prefix: "/workspace", resolve: resolveWorkspaceRoot},
-	// 单字母盘符别名（Git Bash / MSYS 风格）/c/Users → C:/Users、/d → D:/。
+	// 单字母盘符别名（Git Bash / MSYS 风格）/c/Users → C:/Users、/c/ → C:/。
 	// 前缀为空 = 兜底规则，**必须排在最后**：它匹配一切输入，放在前面会把 /tmp 吃成
 	// T:/mp、/workspace 吃成 W:/orkspace。表内首次命中，顺序即优先级；解析器对
 	// 非盘符形状（/cdrom、/dev/null、/docs）返回 false，于是继续落到「原样返回」。
+	// 注意：**裸 /<letter>（无路径成分）不当盘符别名**——Windows 命令的单字母开关
+	// 正是 /F、/c、/S 这种形状（taskkill /F、cmd /c、xcopy /S），若把裸 /<letter>
+	// 也别名化，shell AST 重写会把命令开关改写成盘符路径（taskkill /F → taskkill F:/），
+	// 命令整体失效。要引用盘符根目录请用带分隔符的形态：/c/ 或 /mnt/c 或 C:/。
 	{prefix: "", goos: "windows", resolve: resolveDriveLetterRoot},
 }
 
@@ -176,10 +180,22 @@ func resolveDriveRoot(rest, _, _ string) (string, bool) {
 	return driveToRoot(drive, after)
 }
 
-// resolveDriveLetterRoot 单字母盘符别名：/c[/…] → C:/[…]（仅 Windows 入表）。
+// resolveDriveLetterRoot 单字母盘符别名：/c/Users → C:/Users、/c/ → C:/、/c:/ → C:/、
+// /c:/Users → C:/Users（仅 Windows 入表）。
 //
-// rest 形如 "/c" 或 "/c/Users"。rest 后面不是分隔符的（如 /cdrom、/dev/null）不匹配，
-// 交给后续处理——真实根语义下它们是当前盘根下的路径，不能当成盘符别名。
+// 接受的形态有两种（都指同一个盘符根或子路径）：
+//   - /c/…    （Git Bash / MSYS 风格，最常见，结尾斜杆可省略指根：/c/ = C:/）
+//   - /c:/…   （斜杆 + 盘符 + 冒号 + 结尾斜杆，模型自然写法；冒号被当作驱动器分隔符吃掉）
+//   - /mnt/c  （WSL 风格，由 resolveDriveRoot 处理）
+//
+// **裸 /c（after 为空、无冒号）不匹配**：Windows 命令的单字母开关也是 /F、/c、/S 这种
+// 形状（taskkill /F、cmd /c、xcopy /S），shell AST 重写会把每个字面量过一遍虚拟根表，
+// 裸 /<letter> 一旦被别名化，命令开关就被改写成盘符路径（taskkill /F → taskkill F:/），
+// 命令整体失效（已在会话日志实测：taskkill 报「无效参数/选项 - '//F'」）。
+//
+// 冒号形态**必须带结尾斜杆**：/c:/ 或 /c:/Users 才映射，**裸 /c: 不映射**——它省略了
+// 结尾斜杆，与 /x: 形状难以区分，且盘符根本就应用 /c/ 或 /c:/ 显式写出。rest 后面不是
+// 分隔符的（/cdrom、/c:foo）同样不匹配。引用盘符根目录可用 /c/、/c:/、/mnt/c 或 C:/。
 func resolveDriveLetterRoot(rest, _, _ string) (string, bool) {
 	body := strings.TrimPrefix(rest, "/")
 	if body == "" {
@@ -190,8 +206,17 @@ func resolveDriveLetterRoot(rest, _, _ string) (string, bool) {
 		return "", false
 	}
 	after := body[1:]
-	if after != "" && !strings.HasPrefix(after, "/") {
+	// /c:/… 形态：把冒号当作驱动器分隔符吃掉，之后与 /c/… 同构；
+	// /c:/Users → after="/Users"，/c:/ → after="/"。裸 /c:（冒号后为空）不映射。
+	if after != "" && after[0] == ':' {
+		after = after[1:]
+	}
+	if after == "" {
+		// 裸 /<letter> 或裸 /<letter>: 都是命令开关形态，不是盘符别名。
 		return "", false
+	}
+	if !strings.HasPrefix(after, "/") {
+		return "", false // /cdrom、/c:foo 不是盘符别名
 	}
 	return driveToRoot(drive, after)
 }

@@ -415,8 +415,14 @@ func (b *GRPCBroker) AcceptAndServe(id uint32, newGRPCServer func([]grpc.ServerO
 	defer func() { _ = ln.Close() }()
 
 	var opts []grpc.ServerOption
+	// 与插件主 server 同口径放大收发上限：broker 上承载的聚合 LLM/Tool 服务同样
+	// 会收到整份消息列表（如 agent 的 Chat 请求），默认 4 MiB 会直接拒收
+	// （见 MaxGRPCMessageSize）。
+	opts = append(opts,
+		grpc.MaxRecvMsgSize(MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(MaxGRPCMessageSize))
 	if b.tls != nil {
-		opts = []grpc.ServerOption{grpc.Creds(credentials.NewTLS(b.tls))}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(b.tls)))
 	}
 
 	server := newGRPCServer(opts)
@@ -576,6 +582,13 @@ func (b *GRPCBroker) Dial(id uint32) (conn *grpc.ClientConn, err error) { return
 
 // Dial opens a connection by ID with options.
 func (b *GRPCBroker) DialWithOptions(id uint32, opts ...grpc.DialOption) (conn *grpc.ClientConn, err error) {
+	// 与 server 侧同口径放大收发上限（见 MaxGRPCMessageSize）。放在调用方 opts
+	// 之前，调用方显式指定的限额仍然优先。
+	opts = append([]grpc.DialOption{
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(MaxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(MaxGRPCMessageSize)),
+	}, opts...)
 	if b.muxer.Enabled() {
 		return dialGRPCConn(b.tls, b.muxDial(id), opts...)
 	}

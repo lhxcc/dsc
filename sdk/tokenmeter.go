@@ -25,6 +25,7 @@ package dsc
 import (
 	"dsc/core"
 	"dsc/proto"
+	"dsc/session"
 )
 
 // TokenMeter 上下文占用计量器（唯一实现，见 core.TokenMeter）。
@@ -40,8 +41,10 @@ type Usage = core.Usage
 // NewTokenMeter 创建上下文计量器；window 为上下文窗口大小（token 数，0 表示未知）。
 func NewTokenMeter(window int) *TokenMeter { return core.NewTokenMeter(window) }
 
-// PromptSideTokens 返回 usage 的输入侧用量（prompt + cacheRead + cacheWrite）。
-// 上下文占用只算输入侧：输出已随历史进入下一发 prompt，计进来会重复。
+// PromptSideTokens 返回 usage 的输入侧用量，**就是 PromptTokens**。
+// 上下文占用只算输入侧（输出已随历史进入下一发 prompt，计进来会重复）；
+// 且不再叠加 cacheRead/cacheWrite——OpenAI 兼容端点的 PromptTokens 已含缓存部分，
+// 相加会把命中缓存的请求算成近两倍（历史 bug，见 commit 1de5494）。
 func PromptSideTokens(usage *Usage) int { return core.PromptSideTokens(usage) }
 
 // EstimateTextTokens 估算一段文本的 token 数（宽字符 1 token/字，其余 4 字节/token）。
@@ -61,5 +64,38 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 	return core.EstimateProtoMessagesTokens(msgs)
 }
 
+// EstimateProtoToolTokens 估算 proto 形态工具目录的 token 数。
+//
+// 工具目录是**每次请求都携带**的固定成本，必须与消息估算相加后再判定压力/裁剪；
+// 只算消息会系统性地低估一截（插件多时可达上万 token），窗口将满仍会判「还宽裕」。
+// 与 core.EstimateToolTokens 共用同一单项公式。
+func EstimateProtoToolTokens(tools []*proto.Tool) int { return core.EstimateProtoToolTokens(tools) }
+
 // FormatPressure 把压力比格式化为百分数文本（"82.3%"），供日志/提示统一口径。
 func FormatPressure(pressure float64) string { return core.FormatPressure(pressure) }
+
+// LastPromptUsage 从会话事件里倒查最近一次成功且带 prompt 用量的 LLM 调用
+// （唯一实现在 session.LastPromptUsage）。重启后的首发请求没有服务端锚点，
+// 用它把计量器接上「上次真实值」，不要在插件里自己遍历事件。
+//
+// 用法：拿到会话后 `meter.UpdateUsage(usage)`，之后 Project 即为「实测 + 增量」。
+func LastPromptUsage(sess *session.Session) (int, *Usage, bool) {
+	promptTokens, usage, ok := session.LastPromptUsage(sess)
+	if !ok {
+		return 0, nil, false
+	}
+	return promptTokens, UsageFromProto(usage), true
+}
+
+// UsageAnchor 上一次成功调用的用量锚点（含请求信封指纹，见 session.UsageAnchor）。
+type UsageAnchor = session.UsageAnchor
+
+// LastUsageAnchor 倒查最近一次成功且带用量的调用，连同信封指纹返回。
+// 需要判断「用量是否与当前请求可比」时用它，不要只看 prompt 数字。
+func LastUsageAnchor(sess *session.Session) (UsageAnchor, bool) {
+	return session.LastUsageAnchor(sess)
+}
+
+// ToolsFingerprint 工具目录指纹（唯一实现在 core.ToolsFingerprint）。
+// 写入 llm/attempt 与判定锚点可比性必须用同一个函数。
+func ToolsFingerprint(tools []*proto.Tool) string { return core.ToolsFingerprint(tools) }

@@ -359,14 +359,16 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		mode = "emit"
 	}
 
-	// agent/pre-step 的「消息改写权」只归 compaction 字段选定的后端：多个插件可能都
-	// 声明 Provides compaction（基础压缩与上下文管理插件都会声明），
-	// 若全部采纳就会层层改写、叠加压缩，与配置选择的后端不符。
-	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、
-	// 通知型 listener 等），只是它们的 result_json 不参与载荷改写；未选后端时
-	// 一律不采纳改写，由 agent 内联压缩兜底。
+	// agent/pre-step 的「消息改写权」与 agent/request-error 的「重试决定权」都只归
+	// compaction 字段选定的后端：多个插件可能都声明 Provides compaction（基础压缩与
+	// 上下文管理插件都会声明），若全部采纳就会层层改写、叠加压缩，与配置选择的后端
+	// 不符。request-error 必须走同一采纳规则——否则后端返回的 {"retry": true}（溢出
+	// 紧急压缩后要求重试）会被丢弃，首次请求超窗时没有任何安全阀。
+	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、通知型 listener
+	// 等），只是它们的 result_json 不参与载荷改写/重试决定；未选后端时一律不采纳，
+	// 由 agent 内联压缩兜底。
 	backend := ""
-	if name == EventAgentPreStep {
+	if name == EventAgentPreStep || name == EventAgentRequestError {
 		backend = m.compactionBackendName()
 	}
 
@@ -386,13 +388,16 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 			next = func() (string, error) {
 				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 				if err != nil {
-					// 传输层失败（插件崩溃/连接断开）不是语义否决：跳过该插件继续，
+					// 传输层失败（插件崩溃/连接断开/超时）不是语义否决：跳过该插件继续，
 					// 否则一个退出的观察者/压缩后端会让整轮请求永久失败。
+					// 标记为 dead 后后续事件不再尝试它，直到插件重载；日志同时带事件名，
+					// 便于区分「哪个插件的哪条链路断了」。
 					m.markHookClientDead(nc.name, err)
 					return innerNext()
 				}
 				if resp.GetError() != "" {
-					return "", fmt.Errorf("%s", resp.GetError())
+					// 应用层显式报错仍是 veto：插件确实拒绝处理该事件。
+					return "", fmt.Errorf("%s: %s", nc.name, resp.GetError())
 				}
 				if r := resp.GetResultJson(); r != "" {
 					// 插播消息：任何插件都可请求（只影响消息尾部，不改写既有内容），

@@ -104,3 +104,26 @@ func TestExportTranscriptRendersLLMAttempt(t *testing.T) {
 		t.Fatalf("导出未渲染失败留痕:\n%s", out)
 	}
 }
+
+// TestRequestHeaderLogOnly request/header 是 log-only（对齐 DSH request/header）：
+// 它只服务计量与排障，绝不能进入 surface 被当消息发给模型。
+func TestRequestHeaderLogOnly(t *testing.T) {
+	s := New()
+	s.Append(UserMessage, &UserMessageData{Content: "hi", Source: "user"}, &SurfaceOp{Op: SurfaceAppend})
+	n := len(s.SurfaceNodes())
+	s.Append(RequestHeader, &RequestHeaderData{
+		Turn: 1, Step: 1, ToolsHash: "h", Model: "m", ContextWindow: 1048576, SentEstimate: 100,
+	}, nil)
+	if len(s.SurfaceNodes()) != n {
+		t.Fatal("request/header 进入 surface，应为 log-only")
+	}
+	if surfaceEventTypes[RequestHeader] {
+		t.Fatal("request/header 不应登记为 surface 类型")
+	}
+	// 派生模型消息也不应包含它
+	for _, m := range s.DeriveMessages() {
+		if m.Role == "request/header" {
+			t.Fatal("request/header 派生成模型消息")
+		}
+	}
+}

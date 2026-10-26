@@ -80,7 +80,10 @@ func mustPreStepSession(t *testing.T, s *compactionBasicServer, sess string, msg
 }
 
 // mustPreStepUsage 携带 last_usage_tokens（宿主透传的上次服务端上报用量）的 pre-step。
-func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, lastUsage int) string {
+// mustPreStepProjected 构造 pre-step 事件并带上宿主给的投影压力。
+// 本插件只认 projected_tokens（压力合成在宿主，见 core.projectPressure）；
+// last_usage_tokens 仍照旧带上，用于确认插件**没有**再自作主张用它。
+func mustPreStepProjected(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, projected, lastUsage int) string {
 	t.Helper()
 	msgsJSON, err := json.Marshal(msgs)
 	if err != nil {
@@ -88,7 +91,7 @@ func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs 
 	}
 	evJSON, err := json.Marshal(map[string]any{
 		"agent": "agent-react-loop", "session": sess, "messages_json": string(msgsJSON),
-		"last_usage_tokens": lastUsage,
+		"projected_tokens": projected, "last_usage_tokens": lastUsage,
 	})
 	if err != nil {
 		t.Fatalf("marshal event: %v", err)
@@ -98,6 +101,11 @@ func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs 
 		t.Fatalf("pre-step: %v", err)
 	}
 	return res
+}
+
+func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, lastUsage int) string {
+	t.Helper()
+	return mustPreStepProjected(t, s, sess, msgs, lastUsage, lastUsage)
 }
 
 // parseRewrite 解析 {"messages": [...]} 改写结果（非空且含至少一条消息）。
@@ -283,26 +291,52 @@ func TestCompactionBasicTriggersOnReportedUsage(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicGrowthSinceReportedUsage 增量回归（对齐 DSH tokenMeter
-// projectedTokens = pressureTokens + surfaceTokens - sampledSurfaceTokens）：
-// 上次上报低于阈值，但自上次请求以来消息显著增长（启发式增量补足差量）时必须触发；
-// 无增量且低于阈值时不得误触发。
-func TestCompactionBasicGrowthSinceReportedUsage(t *testing.T) {
+// TestCompactionBasicMeasuresItsOwnSurface 压力必须按「本插件要发出的表面」算：
+//   - 尚无压缩记录时，其表面 == 请求表面 → 采信宿主投影（含工具目录与信封判据）；
+//   - 已有压缩记录时，表面已被改写（摘要 + 保留尾部），宿主投影仍按原始列表算，
+//     若照用会把已压到 ~2 条的视图当成 900k → 每步再摘要一次（回归：把 80% 阈值
+//     退化成「保留区一满就压」，实测会多打一次 LLM）。
+func TestCompactionBasicMeasuresItsOwnSurface(t *testing.T) {
 	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000
-	s.llm = &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
+	fake := &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
+	s.llm = fake
 
-	msgs1 := bigMsgs(4, 1200) // 每条 1204，共 4816
-	if res := mustPreStepUsage(t, s, "sess-g1", msgs1, 7000); res != "" {
-		t.Fatalf("上报 7000 < 阈值 8000 且无增量时不应改写, got %q", res)
-	}
-	msgs2 := append(append([]*proto.Message{}, msgs1...), bigMsgs(4, 1200)...) // 增量 +4816 估算
-	res := mustPreStepUsage(t, s, "sess-g1", msgs2, 7000)
+	// ① 无记录：宿主投影 9000 ≥ 阈值 → 压缩（哪怕本地估算只有 ~4.8k）
+	small := bigMsgs(4, 1200)
+	res := mustPreStepProjected(t, s, "sess-own-1", small, 9000, 9000)
 	if res == "" {
-		t.Fatalf("上报 7000 + 增量 4816 = 11816 >= 阈值 8000，必须触发压缩")
+		t.Fatal("宿主投影 9000 ≥ 阈值时必须压缩")
 	}
-	got := parseRewrite(t, res)
-	if len(got) >= len(msgs2) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
-		t.Fatalf("rewrite 未落地：%d msgs, head=%q", len(got), got[0].GetContent())
+	if fake.calls != 1 {
+		t.Fatalf("应只摘要一次，got %d", fake.calls)
+	}
+
+	// ② 无记录：宿主投影 7000 < 阈值 → 不压缩（插件不得用本地估算越权决策）
+	big := bigMsgs(8, 1200)
+	if res := mustPreStepProjected(t, s, "sess-own-2", big, 7000, 7000); res != "" {
+		t.Fatalf("宿主投影低于阈值时不得压缩，got %q", res)
+	}
+
+	// ③ 有记录：尾部只略增（渲染后远低于阈值），宿主投影仍按原始 19k 给 →
+	// 允许返回既有改写（隐藏已压段），但**不得新增摘要**。
+	msgs := bigMsgs(16, 1200)
+	if mustPreStepProjected(t, s, "sess-own-3", msgs, 19000, 19000) == "" {
+		t.Fatal("首次应压缩")
+	}
+	before := fake.calls
+	tailPlus2 := append(append([]*proto.Message{}, msgs...), bigMsgs(2, 1200)...)
+	if res := mustPreStepProjected(t, s, "sess-own-3", tailPlus2, 21000, 21000); res == "" {
+		t.Fatal("有记录时应返回既有改写（否则模型看到未压缩的全量历史）")
+	}
+	if fake.calls != before {
+		t.Fatalf("渲染后表面 ~2.4k << 阈值 8000，不得再摘要；摘要次数 %d → %d", before, fake.calls)
+	}
+
+	// ④ 尾部长到渲染后表面超阈值 → 允许再摘要
+	tailPlus8 := append(append([]*proto.Message{}, msgs...), bigMsgs(8, 1200)...)
+	mustPreStepProjected(t, s, "sess-own-3", tailPlus8, 27000, 27000)
+	if fake.calls <= before {
+		t.Fatalf("渲染后表面超过阈值时应再次摘要，摘要次数仍为 %d", fake.calls)
 	}
 }
 

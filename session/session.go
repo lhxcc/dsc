@@ -61,6 +61,15 @@ const (
 	// 该事件是排障一手证据：截断（finish_reason=max_tokens）、provider 报错、
 	// 上下文溢出、流中断、耗时与 token 消耗均在此一眼可查，无需审计代码。
 	LLMAttempt EventType = "llm/attempt"
+	// RequestHeader 每次请求**发出前**的信封快照（log-only，对齐 DSH request/header）：
+	// 工具目录指纹 + 模型 + 上下文窗口 + 该表面自身的启发式估算。
+	//
+	// 与 llm/attempt 的分工：attempt 记录「这次调用结果如何」，header 记录「发出去的是
+	// 什么信封」。用量锚点只有在信封相同（工具目录/模型/窗口一致）时才可用——把信封
+	// 独立成事件，失败请求也留有信封（诊断），且字段语义单一不会被结算字段污染。
+	//
+	// 注意：这是 log-only（不进 surface、不派生模型消息），仅用于计量与排障。
+	RequestHeader EventType = "request/header"
 	// SystemMessage 当前生效的 system prompt（surface，对齐 DSH v3 system/message）。
 	// 始终占据 surface node 0：会话首条 system/message 以 append 入位，
 	// 后续 prompt 变化以 replace 覆盖 node 0。空 content 表示"无 system prompt"
@@ -135,6 +144,17 @@ type ToolResultData struct {
 	Images []string
 }
 
+// RequestHeaderData request/header 事件载荷（log-only）：一次请求的**信封**。
+// 与 llm/attempt 配对使用（按 Turn/Step 对齐）：attempt 给「用量」，header 给
+// 「这个用量属于哪个信封」，两者都在才构成一个可用的用量锚点。
+type RequestHeaderData struct {
+	Turn, Step    int
+	ToolsHash     string // 工具目录指纹（core.ToolsFingerprint）
+	Model         string // 模型名（宿主经 DSC_MODEL 注入，空 = 未知）
+	ContextWindow int    // 本次请求使用的上下文窗口
+	SentEstimate  int    // 对本次请求（消息 + 工具目录）的启发式估算
+}
+
 // LLMAttemptData llm/attempt 事件载荷（log-only）：一次 LLM 调用的结算留痕。
 // 成功路径：FinishReason 非空、Error 为空；失败路径：Error 非空（Code 为稳定
 // 错误码），FinishReason/Usage 可能为零值（请求未达服务端或流中途断）。流式
@@ -163,7 +183,9 @@ type SystemMessageData struct {
 }
 
 // HistoryLimitData history/limit 事件载荷（log-only）：历史注入条数上限。
-// Count < 0 表示不限制（缺省）；0 表示不注入历史；>0 表示只注入最近 Count 条。
+// 沿用 DSC 全仓统一三值（刻意与 DSH 相反）：Count < 0 不注入恢复历史；
+// Count == 0 未定义（按默认 = 不限制，注入全部恢复历史）；Count > 0 只注入
+// 恢复历史中最近 Count 条。Go 零值即 0，把 0 当「关闭」会让漏写配置意外关掉历史。
 type HistoryLimitData struct {
 	Count int
 }

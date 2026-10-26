@@ -194,13 +194,14 @@ func TestInternalLsSingleColumn(t *testing.T) {
 		t.Errorf("ls -1 应每行一个条目（a.txt/b.txt，忽略 .hidden），got %q", out)
 	}
 
-	// 默认输出为单行（空格分隔、结尾换行），应与 -1 的逐行区分开
+	// 默认输出：非终端（工具抓 stdout）下与 -1 一样逐行——GNU ls 只在终端排多列。
+	// 单行空格分隔会让 `ls | wc -l` 恒为 1（现场 2824 个条目报 1）。
 	outDefault, err := runShell(t, dir, "ls d")
 	if exitCode(t, err) != 0 {
 		t.Fatalf("ls 失败: out=%q err=%v", outDefault, err)
 	}
-	if got := len(strings.Split(strings.TrimRight(outDefault, "\n"), "\n")); got != 1 {
-		t.Errorf("默认 ls 应为单行空格分隔，got %d 行: %q", got, outDefault)
+	if got := len(strings.Split(strings.TrimRight(outDefault, "\n"), "\n")); got != 2 {
+		t.Errorf("非终端下默认 ls 应逐行，got %d 行: %q", got, outDefault)
 	}
 	if !strings.Contains(outDefault, "a.txt") || !strings.Contains(outDefault, "b.txt") {
 		t.Errorf("默认 ls 应包含 a.txt/b.txt，got %q", outDefault)

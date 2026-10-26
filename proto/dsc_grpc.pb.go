@@ -262,8 +262,9 @@ type AgentServiceClient interface {
 	SetPlanMode(ctx context.Context, in *SetPlanModeRequest, opts ...grpc.CallOption) (*SetPlanModeResponse, error)
 	// SetHistoryInjection 设置当前会话的历史注入条数上限（对齐 DSH 会话事件持久化：
 	// 以 log-only history/limit 事件落盘，恢复/fork 时折叠还原）：
-	// count < 0 表示不限制（缺省）；count == 0 表示不注入历史（每轮仅 system + 当前输入）；
-	// count > 0 表示只注入最近 count 条派生消息（从最近的 user 边界截取，保证工具调用配对完整）。
+	// count < 0 不注入恢复历史；count == 0 未定义（按默认 = 不限制，注入全部恢复历史）；
+	// count > 0 只注入最近 count 条派生消息（从最近的 user 边界截取，保证工具调用配对完整）。
+	// 注意与 DSH 相反（DSH：count < 0 不限制、count == 0 不注入）——Go 零值是 0。
 	SetHistoryInjection(ctx context.Context, in *SetHistoryInjectionRequest, opts ...grpc.CallOption) (*SetHistoryInjectionResponse, error)
 	SetUserQuestionsService(ctx context.Context, in *SetUserQuestionsServiceRequest, opts ...grpc.CallOption) (*SetUserQuestionsServiceResponse, error)
 	Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error)
@@ -425,8 +426,9 @@ type AgentServiceServer interface {
 	SetPlanMode(context.Context, *SetPlanModeRequest) (*SetPlanModeResponse, error)
 	// SetHistoryInjection 设置当前会话的历史注入条数上限（对齐 DSH 会话事件持久化：
 	// 以 log-only history/limit 事件落盘，恢复/fork 时折叠还原）：
-	// count < 0 表示不限制（缺省）；count == 0 表示不注入历史（每轮仅 system + 当前输入）；
-	// count > 0 表示只注入最近 count 条派生消息（从最近的 user 边界截取，保证工具调用配对完整）。
+	// count < 0 不注入恢复历史；count == 0 未定义（按默认 = 不限制，注入全部恢复历史）；
+	// count > 0 只注入最近 count 条派生消息（从最近的 user 边界截取，保证工具调用配对完整）。
+	// 注意与 DSH 相反（DSH：count < 0 不限制、count == 0 不注入）——Go 零值是 0。
 	SetHistoryInjection(context.Context, *SetHistoryInjectionRequest) (*SetHistoryInjectionResponse, error)
 	SetUserQuestionsService(context.Context, *SetUserQuestionsServiceRequest) (*SetUserQuestionsServiceResponse, error)
 	Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error)

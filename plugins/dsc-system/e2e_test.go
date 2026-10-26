@@ -603,6 +603,8 @@ func TestCompactionBasicE2E(t *testing.T) {
 		data, err := json.Marshal(map[string]any{
 			"agent": "agent-react-loop", "session": "e2e-compaction-basic",
 			"messages_json": string(msgsJSON), "token_count": 1800,
+			// 压力由宿主投影给出（插件只读，见 core.projectPressure）。
+			"projected_tokens": 1800,
 		})
 		if err != nil {
 			t.Fatalf("marshal event: %v", err)
@@ -721,6 +723,8 @@ func TestImageOffloadE2E(t *testing.T) {
 		data, err := json.Marshal(map[string]any{
 			"agent": "agent-react-loop", "session": session,
 			"messages_json": string(msgsJSON), "token_count": tokenCount,
+			// 压力由宿主投影给出（插件只读，见 core.projectPressure）。
+			"projected_tokens": tokenCount,
 		})
 		if err != nil {
 			t2.Fatalf("marshal event: %v", err)
@@ -790,7 +794,8 @@ func TestImageOffloadE2E(t *testing.T) {
 		"DSC_COMPACTION_BASIC_CONTEXT_WINDOW=1000",
 		"DSC_MAX_REQUEST_IMAGES=1",
 	)
-	res = preStep(t, hookB, "e2e-image-offload-chain", msgsB, 100)
+	// 宿主投影 ≈ 消息估算（16×1200 字符 ≈ 4900 > 阈值 800，无锚点）→ 触发压缩
+	res = preStep(t, hookB, "e2e-image-offload-chain", msgsB, 4900)
 	got = parse(t, res)
 	if len(got) != 4 {
 		t.Fatalf("B: messages = %d, want 4 (summary + 3 tail)", len(got))

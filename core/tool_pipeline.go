@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -488,11 +490,11 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 					doneCh <- jobs.JobOutcome{Status: jobs.StatusKilled, Detail: detail, Output: result}
 					return
 				}
-				if err != nil {
-					doneCh <- jobs.JobOutcome{Status: jobs.StatusFailed, Detail: err.Error(), Output: result}
-				} else {
-					doneCh <- jobs.JobOutcome{Status: jobs.StatusCompleted, Output: result}
-				}
+				// 终态由 settleBackgroundOutcome 统一决定：流水线报错即 failed，
+				// 结果里的 [exit_code: N] 非 0 同样判 failed，让模型能从 [status: ...]
+				// 直接看出脚本失败（命令非零退出不算 Go error）。
+				status, detail := settleBackgroundOutcome(result, err)
+				doneCh <- jobs.JobOutcome{Status: status, Detail: detail, Output: result}
 			}()
 
 			return jobs.JobHooks{
@@ -515,6 +517,38 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 
 	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
 	return result, "", nil
+}
+
+// exitCodeMarkRe 匹配工具结果尾部追加的退出码标记（Shell 工具的结果约定：
+// 命令非零退出时在结果里附加 "[exit_code: N]"）。后台任务流水线只看 execute
+// 返回的 Go error 来决定终态，而命令非零退出码不被视为 Go 错误（err 恒为 nil，
+// 退出码只写进结果文本），故从这里把「命令失败」还原成任务失败状态——否则
+// 模型看到 [status: completed] 却无法知道脚本其实以非 0 退出。正则只认 DSC
+// 约定格式，不依赖任何插件名。
+var exitCodeMarkRe = regexp.MustCompile(`\[exit_code:\s*(-?\d+)\]`)
+
+// exitCodeFromResult 从工具结果文本提取首个 [exit_code: N] 标记的整数；未找到返回 0。
+func exitCodeFromResult(result string) int {
+	if m := exitCodeMarkRe.FindStringSubmatch(result); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// settleBackgroundOutcome 决定后台任务的终态：流水线自身报错（如超时裁决上抛）即
+// failed；否则从结果文本的 [exit_code: N] 标记还原命令退出码——N 非 0 也判 failed，
+// 让模型直接由 [status: ...] 看出脚本失败。同步路径语义不变：命令失败不视为工具
+// error，结果文本仍携退出码，模型可自行判断；这里只补「状态机可见性」这一跳。
+func settleBackgroundOutcome(result string, runErr error) (jobs.JobStatus, string) {
+	if runErr != nil {
+		return jobs.StatusFailed, runErr.Error()
+	}
+	if code := exitCodeFromResult(result); code != 0 {
+		return jobs.StatusFailed, fmt.Sprintf("exit code: %d", code)
+	}
+	return jobs.StatusCompleted, ""
 }
 
 // detachJobContext 把后台任务从「回合 ctx」解绑：保留归属信息（会话 id、审批策略），

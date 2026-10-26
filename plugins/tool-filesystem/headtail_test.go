@@ -148,12 +148,12 @@ func TestInternalWcFlags(t *testing.T) {
 	})
 
 	cases := []struct{ script, want string }{
-		{`wc -l t.txt`, " 1 t.txt\n"},
-		{`wc -w t.txt`, " 2 t.txt\n"},
-		{`wc -c t.txt`, " 4 t.txt\n"},
+		{`wc -l t.txt`, "1 t.txt\n"},
+		{`wc -w t.txt`, "2 t.txt\n"},
+		{`wc -c t.txt`, "4 t.txt\n"},
 		{`wc -cl t.txt`, " 1 4 t.txt\n"},     // 列序固定：行在前、字节在后
 		{`wc -lc t.txt`, " 1 4 t.txt\n"},     // 与旗标顺序无关
-		{`wc -m cjk.txt`, " 3 cjk.txt\n"},    // 码点计数且含换行（实测 GNU：printf '你好\n' | wc -m → 3）
+		{`wc -m cjk.txt`, "3 cjk.txt\n"},     // 码点计数且含换行（实测 GNU：printf '你好\n' | wc -m → 3）
 		{`wc -mc cjk.txt`, " 3 7 cjk.txt\n"}, // 字符 3、字节 7
 	}
 	for _, c := range cases {

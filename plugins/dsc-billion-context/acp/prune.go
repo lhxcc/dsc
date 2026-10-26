@@ -680,15 +680,12 @@ func renderTaggedMessage(msg CoreMessage, state *CompressionState, renderTags bo
 	return msg
 }
 
-// estimateTokensForText 字节/CJK 启发式 token 估算（对齐 acp-kernel estimateTokensFast）。
-// 取「字节数/4」与「rune 数」的较大者——英文按 /4（约 4 字符 1 token）；
-// CJK（UTF-8 每字 3 字节）字节/4 会低估，故回调为 rune 数（每字按 1 token）。
-// estimateTokensForText 估算文本 token（转调 SDK 的唯一实现）。
+// estimateTokensForText 估算文本 token（**转调 SDK 的唯一实现**，此处不再自带公式）。
 //
-// 本包曾自带一份 max(bytes/4, runes)：纯 ASCII/代码时 runes 就是字节数，等于按
+// 本包曾自带一份「max(bytes/4, runes)」：纯 ASCII/代码时 runes 就是字节数，等于按
 // 1 token/字符算，是真实值的 4~5 倍——nudge/absorb/截断阈值全被这几倍误差放大，
-// 上下文还很宽裕就提示压缩。口径统一由 SDK（dsc.EstimateTextTokens）负责，
-// 插件不再各自造公式。
+// 上下文还很宽裕就提示压缩。保留这个薄封装只为收敛 20 余处调用点的改动面，
+// 公式本身一律由 dsc.EstimateTextTokens 负责。
 func estimateTokensForText(s string) int {
 	return dsc.EstimateTextTokens(s)
 }

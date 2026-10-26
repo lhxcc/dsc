@@ -177,8 +177,10 @@ func TestLsEmptyDirPrintsNothing(t *testing.T) {
 			t.Fatalf("%s 应零输出，实际 %q (err=%v)", script, out, err)
 		}
 	}
-	// 有内容时仍按 GNU 单行空格分隔输出
-	if out, _ := runShell(t, dir, `mkdir a b && ls`); out != "a  b\n" {
-		t.Fatalf("非空目录应输出 %q，实际 %q", "a  b\n", out)
+	// 有内容时：非终端下按 GNU 行为一行一个（列布局只属于终端）。
+	// 曾经的期望是 "a  b\n"（一行两列），但那正是 `ls | wc -l` 恒为 1 的根因——
+	// 工具抓到的 stdout 永远不是终端，列布局等于让所有按行处理的脚本都算错。
+	if out, _ := runShell(t, dir, `mkdir a b && ls`); out != "a\nb\n" {
+		t.Fatalf("非终端下非空目录应一行一个，实际 %q", out)
 	}
 }

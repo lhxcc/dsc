@@ -31,7 +31,10 @@ const defaultContextWindow = 128 * 1024
 // 禁止 DSC_ 与非 DSC_ 变量混用。三者必须作为一个整体决定前缀。
 func envGroupPreferDSC(env map[string]string, prefix string) bool {
 	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
-		if v, ok := env["DSC_"+prefix+suf]; ok && v != "" {
+		// 键名必须与 groupEnv 同构：DSC_<PROVIDER>_<SUFFIX>。此前漏了下划线
+		//（拼出 DSC_OPENAIAPI_KEY），函数恒为 false——DSC_ 前缀的配置永远读不到，
+		// 一律回退旧名（模型名解析因此常年落到兜底值）。
+		if v, ok := env["DSC_"+prefix+"_"+suf]; ok && v != "" {
 			return true
 		}
 	}
@@ -50,7 +53,7 @@ func groupEnv(env map[string]string, prefix string, useDSC bool, suffix string) 
 // osEnvGroupPreferDSC 同 envGroupPreferDSC，但针对进程环境变量。
 func osEnvGroupPreferDSC(prefix string) bool {
 	for _, suf := range []string{"API_KEY", "BASE_URL", "MODEL"} {
-		if os.Getenv("DSC_"+prefix+suf) != "" {
+		if os.Getenv("DSC_"+prefix+"_"+suf) != "" {
 			return true
 		}
 	}
@@ -794,6 +797,14 @@ func main() {
 	// 安装的 —— 亦并入，按名去重、preset 优先（同名取 preset），使模型安装的插件能跨重启生效）
 	merged := assembleMerged(llmEntries, agentEntry, mainCfg, presetCfg, contextWindow, headless, inputText)
 
+	// 模型名：TUI 展示与 request/header 的信封字段共用同一处解析；必须在插件进程
+	// 拉起前注入 env（agent 写 header 时读 DSC_MODEL）。
+	llmModelName := resolveActiveModelName(llmEntries, activeLLMName)
+	injectModelName(merged, llmModelName)
+	// 宿主自己的计量口径也要知道窗口与模型（用量锚点的信封比对依赖它们）。
+	mgr.SetModelName(llmModelName)
+	mgr.SetContextWindow(contextWindow)
+
 	// compaction 选择同样 preset 优先（preset 是具体预设、主导行为）；config.yaml 写了
 	// 不同的后端时明确提示，避免「改了 compaction 却不生效」的静默困惑。该字段现在真正
 	// 决定由哪个插件接管 pre-step 压缩（见 Manager.dispatchEventToPlugins）。
@@ -986,31 +997,6 @@ func main() {
 		fail("agent %s not found after loading", agentName)
 	}
 
-	// 从配置提取 LLM 模型名称用于 TUI 展示；按 provider 整组决定前缀
-	// （DSC_ 优先、旧名回退），不与终端同名变量混用。
-	llmModelName := "Unknown"
-	for _, e := range llmEntries {
-		if e.Name == activeLLMName {
-			provider := strings.ToUpper(strings.TrimPrefix(e.Name, "llm-"))
-			if v := groupEnv(e.Env, provider, envGroupPreferDSC(e.Env, provider), "MODEL"); v != "" {
-				llmModelName = v
-			}
-			break
-		}
-	}
-	if llmModelName == "Unknown" {
-		// 從環境變量獲取（按 provider 整组决定前缀）
-		for _, provider := range []string{"OPENAI", "ANTHROPIC", "OLLAMA"} {
-			if v := osGroupEnv(provider, osEnvGroupPreferDSC(provider), "MODEL"); v != "" {
-				llmModelName = v
-				break
-			}
-		}
-		if llmModelName == "Unknown" {
-			llmModelName = "Agentic-Model" // 默認值
-		}
-	}
-
 	ctx := context.Background()
 
 	exitCode := 0
@@ -1032,7 +1018,20 @@ func main() {
 			time.Sleep(completionSoundGrace)
 		}
 	} else {
-		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow); err != nil {
+		// TUI 启动回显：显示条数由 history_shows 控制（负值不显示、0 默认 20、N 最近 N），
+		// 并受 history_injection 门控（注入关闭则不显示）；宿主从项目会话派生并截取
+		// （见 core.Manager.LoadDisplayHistory）。
+		histInj, _ := historyInjectionCount(mainCfg)
+		histShows := 0
+		if mainCfg != nil {
+			histShows = mainCfg.HistoryShows
+		}
+		replay := mgr.LoadHistoryReplay(histInj, histShows)
+		if replay != nil {
+			logger.Info("tui history replay", "total", len(replay.Messages), "initial", replay.Initial,
+				"history_injection", histInj, "history_shows", histShows)
+		}
+		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, replay); err != nil {
 			logger.Error("tui run failed", "error", err)
 			exitCode = 1
 		}

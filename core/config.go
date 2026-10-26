@@ -64,7 +64,18 @@ type Config struct {
 	//
 	// 它只作用于**从存档恢复的历史**；同一进程内已经发生的轮次属于当前上下文，
 	// 不受此设置影响（见 session.DeriveMessagesLimited）。
+	//
+	// TUI 启动回显另由 HistoryShows 控制（显示层，见下）；两者共用「会话内
+	// history/limit 事件优先」的折叠规则，但条数各自独立。
 	HistoryInjection int `json:"history_injection" yaml:"history_injection"`
+	// HistoryShows TUI 启动进入「有恢复历史的会话」时，正文区回显的历史消息条数
+	// （显示层，与 HistoryInjection 的 agent 注入层分离）：负值=不显示；0=未设置
+	// （按默认 HistoryShowsDefault 条处理）；N>0=显示最近 N 条。
+	//
+	// 受 HistoryInjection 门控：HistoryInjection < 0（不注入恢复历史）时本项不起
+	// 作用；且实际显示条数不会超过注入量——显示的是「模型也看得到的那部分恢复
+	// 历史」，不是凭空补出来的。
+	HistoryShows int `json:"history_shows" yaml:"history_shows"`
 	// HotReload 是否启用版本化二进制自动热重载 watch：插件目录内出现版本高于当前运行的
 	// <基名>-v<版本><ext> 文件时，自动经 HotReload 换成新进程（默认关闭）。
 	HotReload bool `json:"hot_reload" yaml:"hot_reload"`

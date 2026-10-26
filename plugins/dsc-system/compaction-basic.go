@@ -177,8 +177,6 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	}
 	sess := s.sessionKey(ev.Session)
 	s.mu.Lock()
-	prevMsgs := s.lastMsgs // 上次 pre-step 的消息列表（原始；供自上次请求以来的增量估算）
-	prevSession := s.lastSession
 	s.lastMsgs = msgs // 缓存供溢出紧急压缩使用（request-error 事件不带消息列表）
 	s.lastSession = sess
 	st := s.stateFor(sess)
@@ -191,21 +189,30 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 
 	// 复用既有压缩后的用量评估：低于阈值则直接返回改写（或无记录时不改写）
 	rewritten := applyRecords(msgs, records)
-	// 压力判定：优先「上次服务端上报用量 + 自上次请求以来改写列表的启发式增量」
-	//（对齐 DSH tokenMeter 的 projectedTokens = pressureTokens + surfaceTokens -
-	// sampledSurfaceTokens）：上报用量是精确底数，启发式只补差量。纯字节启发式
-	//（不含工具定义、CJK 每字 3 字节被 /4 低估）会把真实用量显著估低——实测
-	// 真实已用 83.56% 而插件估算仅 60.08%，压缩因此不触发。无上报记录（首次
-	// 请求/重启恢复）时退回纯启发式兜底。
-	pressure := dsc.EstimateProtoMessagesTokens(rewritten)
-	if ev.LastUsageTokens > 0 && prevSession == sess && len(prevMsgs) > 0 {
-		delta := pressure - dsc.EstimateProtoMessagesTokens(applyRecords(prevMsgs, records))
-		if delta < 0 {
-			delta = 0
-		}
-		pressure = ev.LastUsageTokens + delta
-	} else if ev.LastUsageTokens > 0 {
-		pressure = ev.LastUsageTokens
+	// 压力 = **我们即将发出的那个表面**的大小（message + 工具目录）。这不是可选项：
+	// 压缩后视图只剩「摘要 + 保留尾部」，若拿原始列表（或按原始列表算出的宿主投影）
+	// 当压力，压完永远是 900k → 每步再压一次（实测：渲染后仅 2 条消息仍触发第二次
+	// 摘要，等于把 80% 阈值变成「保留区一满就压」）。
+	//
+	// 所以分两种情况，各自用有效的那个数：
+	//   - 尚无压缩记录：我们的表面 == 请求表面 → 用宿主投影（ev.ProjectedTokens，
+	//     含工具目录、含信封可比性判据），比本地估算更准；
+	//   - 已有压缩记录：表面已被我们改写，宿主看不到 → 自测改写后的表面。
+	// 无论哪条，词元估算都走 SDK 唯一实现（不新增公式）。
+	toolTokens := ev.TokenCount - dsc.EstimateProtoMessagesTokens(msgs)
+	if toolTokens < 0 {
+		toolTokens = 0 // 旧宿主 TokenCount 不含工具
+	}
+	var pressure int
+	switch {
+	case len(records) > 0:
+		pressure = dsc.EstimateProtoMessagesTokens(rewritten) + toolTokens
+	case ev.ProjectedTokens > 0:
+		pressure = ev.ProjectedTokens
+	case ev.TokenCount > 0:
+		pressure = ev.TokenCount
+	default:
+		pressure = dsc.EstimateProtoMessagesTokens(rewritten) + toolTokens
 	}
 	if pressure < s.pressureThreshold() {
 		if len(records) > 0 {
