@@ -319,6 +319,12 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
+	// 与 GNU ls 一致：**只有 stdout 是终端**时才排多列。管道/重定向/工具抓输出一律
+	// 一行一个——否则列布局把整目录拼成一行，`ls | wc -l` 只会得到 1（实测 2824 个
+	// 条目的目录报 1），模型据此会误判目录规模、进而做错决策。
+	if !singleCol && !stdoutIsTerminal(hc.Stdout) {
+		singleCol = true
+	}
 	// 先按 GNU ls 的规则把参数分成「条目」与「目录清单」两段：只有目录清单印
 	// "dir:" 标题，而标题只在存在多段清单时出现（多个目录，或文件段与目录段并存）。
 	// 多个普通文件参数（`ls -t a/x b/x c/x`）属于同一段，不印任何标题。
@@ -1420,4 +1426,18 @@ func matchAnyPattern(name string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// stdoutIsTerminal 报告命令的 stdout 是否真的是终端（GNU ls 用它决定是否排多列）。
+// 非 *os.File（管道、缓冲区、gRPC 流）一律视为非终端；字符设备才当终端。
+func stdoutIsTerminal(w interface{ Write([]byte) (int, error) }) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
