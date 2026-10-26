@@ -1272,6 +1272,16 @@ func printWc(hc interp.HandlerContext, flags map[byte]bool, l, w, m, c int64, na
 	if flags['c'] {
 		parts = append(parts, strconv.FormatInt(c, 10))
 	}
+	// 只输出**一个**计数时不补前导空格、不右对齐（GNU 明确如此：让 wc 的结果能直接
+	// 参与比较，如 `[ "$(ls | wc -l)" = 40 ]`）。多计数仍按列对齐输出。
+	if len(parts) == 1 {
+		if name == "" {
+			fmt.Fprintln(hc.Stdout, parts[0])
+		} else {
+			fmt.Fprintf(hc.Stdout, "%s %s\n", parts[0], name)
+		}
+		return
+	}
 	if name == "" {
 		fmt.Fprintf(hc.Stdout, " %s\n", strings.Join(parts, " "))
 	} else {

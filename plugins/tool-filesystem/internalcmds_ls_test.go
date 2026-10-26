@@ -82,3 +82,23 @@ func TestLsPipedIsOnePerLine(t *testing.T) {
 		t.Fatalf("ls f0*.txt | wc -l = %q err=%v", strings.TrimSpace(got), err)
 	}
 }
+
+// TestWcSingleCountNoPadding 单个计数（wc -l / -w / -c / -m）不补前导空格，与 GNU 一致：
+// 结果要能直接参与比较，如 `[ "$(ls | wc -l)" = 40 ]`。多计数仍按列对齐（另见 headtail_test）。
+func TestWcSingleCountNoPadding(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct{ script, want string }{
+		{`printf 'x\ny\n' | wc -l`, "2\n"},
+		{`printf 'ab cd\n' | wc -w`, "2\n"},
+		{`printf 'abcd' | wc -c`, "4\n"},
+	}
+	for _, c := range cases {
+		got, err := runShell(t, dir, c.script)
+		if err != nil {
+			t.Fatalf("%s: %v", c.script, err)
+		}
+		if got != c.want {
+			t.Fatalf("%s = %q, want %q（单计数不得有前导空格）", c.script, got, c.want)
+		}
+	}
+}
