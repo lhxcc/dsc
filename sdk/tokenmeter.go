@@ -41,8 +41,10 @@ type Usage = core.Usage
 // NewTokenMeter 创建上下文计量器；window 为上下文窗口大小（token 数，0 表示未知）。
 func NewTokenMeter(window int) *TokenMeter { return core.NewTokenMeter(window) }
 
-// PromptSideTokens 返回 usage 的输入侧用量（prompt + cacheRead + cacheWrite）。
-// 上下文占用只算输入侧：输出已随历史进入下一发 prompt，计进来会重复。
+// PromptSideTokens 返回 usage 的输入侧用量，**就是 PromptTokens**。
+// 上下文占用只算输入侧（输出已随历史进入下一发 prompt，计进来会重复）；
+// 且不再叠加 cacheRead/cacheWrite——OpenAI 兼容端点的 PromptTokens 已含缓存部分，
+// 相加会把命中缓存的请求算成近两倍（历史 bug，见 commit 1de5494）。
 func PromptSideTokens(usage *Usage) int { return core.PromptSideTokens(usage) }
 
 // EstimateTextTokens 估算一段文本的 token 数（宽字符 1 token/字，其余 4 字节/token）。

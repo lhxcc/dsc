@@ -57,8 +57,9 @@ type TokenMeter struct {
 	totalTokens   int    // 当前估算的总 token（用于无 usage 时回退）
 
 	// 锚点与增量基线（对齐 DSH tokenMeter 的 pressureTokens / sampledSurfaceTokens）：
-	//   pressureTokens  服务端上报的 prompt 侧用量（prompt + cacheRead + cacheWrite）
-	//   sampledEstimate 取锚点那一刻「所发消息列表」的启发式估算
+	//   pressureTokens  服务端上报的 prompt 侧用量（PromptTokens；OpenAI 兼容端点已含
+	//                   缓存命中，再叠加 cacheRead/cacheWrite 会重复计数——见 PromptSideTokens）
+	//   sampledEstimate 取锚点那一刻「所发请求」的启发式估算（消息 + 工具目录）
 	// 两者必须来自同一个请求，否则增量算错。projected = pressure + (当前估算 − sampled)。
 	pressureTokens  int
 	sampledEstimate int
