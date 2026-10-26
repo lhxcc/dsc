@@ -125,6 +125,7 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 						promptTokens:  int(call.Usage.PromptTokens),
 						sentEstimate:  EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools),
 						toolsHash:     ToolsFingerprint(req.Tools),
+						model:         s.m.modelName,
 						contextWindow: s.m.contextWindow,
 					})
 				}
@@ -213,7 +214,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	// 压缩后端不再各自合成这个数——决策输入只应有这一处来源（对齐 DSH：消费者读
 	// tokenMeter，不自己算）。
 	anchor, _ := s.m.lastSessionAnchor(req.GetSessionId())
-	projected, matched := projectPressure(anchor, tokenCount, ToolsFingerprint(req.Tools), s.m.contextWindow)
+	projected, matched := projectPressure(anchor, tokenCount, ToolsFingerprint(req.Tools), s.m.modelName, s.m.contextWindow)
 	result, err := s.m.dispatchEventToPlugins(EventAgentPreStep, AgentPreStepEvent{
 		Agent:           s.m.GetMainAgentName(),
 		Session:         req.GetSessionId(),
@@ -316,6 +317,7 @@ type sessionUsageAnchor struct {
 	promptTokens  int    // provider 上报的 prompt 侧用量（实测）
 	sentEstimate  int    // 产生该用量时，对同一请求（消息+工具）的启发式估算
 	toolsHash     string // 产生该用量时的工具目录指纹（空 = 未知/不可比）
+	model         string // 产生该用量时的模型名（空 = 未知）
 	contextWindow int    // 产生该用量时的上下文窗口（0 = 未知）
 }
 
@@ -352,13 +354,16 @@ func (m *Manager) lastSessionAnchor(sessionID string) (sessionUsageAnchor, bool)
 //  3. 否则以 provider 用量为底数，只加「自采样以来的表面差量」（可正可负，下限 0）。
 //
 // matched 表示信封是否可比（供插件日志与调试）。
-func projectPressure(anchor sessionUsageAnchor, curEstimate int, curToolsHash string, window int) (projected int, matched bool) {
+func projectPressure(anchor sessionUsageAnchor, curEstimate int, curToolsHash, curModel string, window int) (projected int, matched bool) {
 	if curEstimate < 0 {
 		curEstimate = 0
 	}
 	matched = anchor.toolsHash != "" && curToolsHash != "" && anchor.toolsHash == curToolsHash
 	if matched && anchor.contextWindow > 0 && window > 0 && anchor.contextWindow != window {
-		matched = false // 换了窗口（模型切换）：用量不可比
+		matched = false // 换了窗口：用量不可比
+	}
+	if matched && anchor.model != "" && curModel != "" && anchor.model != curModel {
+		matched = false // 换了模型：tokenizer/计价都可能变，锚点作废
 	}
 	if !matched || anchor.promptTokens < anchor.sentEstimate {
 		return curEstimate, matched

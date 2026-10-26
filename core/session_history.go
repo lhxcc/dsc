@@ -144,6 +144,7 @@ func (m *Manager) seedSessionPromptFromLog(sessionID string, sess *session.Sessi
 		promptTokens:  a.PromptTokens,
 		sentEstimate:  a.SentEstimate,
 		toolsHash:     a.ToolsHash,
+		model:         a.Model,
 		contextWindow: a.ContextWindow,
 	})
 }

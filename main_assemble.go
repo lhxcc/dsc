@@ -278,3 +278,42 @@ func injectMaxOutputTokens(merged *core.Config, maxTokens int) {
 		e.Env["DSC_MAX_OUTPUT_TOKENS"] = strconv.Itoa(maxTokens)
 	}
 }
+
+// resolveActiveModelName 解析当前 provider 的模型名（DSC_ 前缀优先、旧名回退）。
+// 单一来源：TUI 展示与 request/header 的信封字段都用它，避免两处各解析一遍。
+func resolveActiveModelName(llmEntries []core.PluginEntry, activeLLMName string) string {
+	for _, e := range llmEntries {
+		if e.Name != activeLLMName {
+			continue
+		}
+		provider := strings.ToUpper(strings.TrimPrefix(e.Name, "llm-"))
+		if v := groupEnv(e.Env, provider, envGroupPreferDSC(e.Env, provider), "MODEL"); v != "" {
+			return v
+		}
+		break
+	}
+	for _, provider := range []string{"OPENAI", "ANTHROPIC", "OLLAMA"} {
+		if v := osGroupEnv(provider, osEnvGroupPreferDSC(provider), "MODEL"); v != "" {
+			return v
+		}
+	}
+	return "Agentic-Model"
+}
+
+// injectModelName 向所有插件注入 DSC_MODEL（模型名）：agent 写 request/header 时把
+// 它作为信封字段（插件自己不解析 provider 配置）。显式配置优先，不覆盖已有值。
+func injectModelName(merged *core.Config, model string) {
+	if model == "" {
+		return
+	}
+	for i := range merged.Plugins {
+		e := &merged.Plugins[i]
+		if e.Env == nil {
+			e.Env = map[string]string{}
+		}
+		if _, ok := e.Env["DSC_MODEL"]; ok {
+			continue
+		}
+		e.Env["DSC_MODEL"] = model
+	}
+}

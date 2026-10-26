@@ -167,3 +167,30 @@ func TestHistoryInjectionCountPassThrough(t *testing.T) {
 		}
 	}
 }
+
+// TestInjectModelNameAndResolve 模型名要注入所有插件（agent 写 request/header 的信封
+// 字段时读 DSC_MODEL），且解析只有一个入口（TUI 展示与信封共用）。
+func TestInjectModelNameAndResolve(t *testing.T) {
+	llmEntries := []core.PluginEntry{
+		{Name: "llm-openai", Type: "llm", Env: map[string]string{"DSC_OPENAI_MODEL": "deepseek-v4"}},
+	}
+	if got := resolveActiveModelName(llmEntries, "llm-openai"); got != "deepseek-v4" {
+		t.Fatalf("应从 provider 条目解析模型名，got %q", got)
+	}
+	// 未知 provider / 无 env → 兜底名（不能返回空串，否则信封里模型字段恒空）
+	if got := resolveActiveModelName(nil, "llm-none"); got == "" {
+		t.Fatal("兜底不应为空串")
+	}
+
+	merged := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "agent-x", Type: "agent"},
+		{Name: "tool-x", Type: "tool", Env: map[string]string{"DSC_MODEL": "explicit"}},
+	}}
+	injectModelName(merged, "deepseek-v4")
+	if got := merged.Plugins[0].Env["DSC_MODEL"]; got != "deepseek-v4" {
+		t.Fatalf("未配置的插件应获得模型名，got %q", got)
+	}
+	if got := merged.Plugins[1].Env["DSC_MODEL"]; got != "explicit" {
+		t.Fatalf("显式配置不得被覆盖，got %q", got)
+	}
+}

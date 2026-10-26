@@ -136,9 +136,10 @@ type Manager struct {
 	sessionApproval   map[string]ApprovalPolicy
 	sessionApprovalMu sync.RWMutex
 
-	// contextWindow 宿主侧已知的上下文窗口（0 = 未知）：仅用于判断用量锚点与当前
-	// 请求是否同一个信封（换模型/换窗口后锚点作废）。
+	// contextWindow / modelName 宿主侧已知的上下文窗口与模型名：仅用于判断用量锚点
+	// 与当前请求是否同一个信封（换模型/换窗口后锚点作废）。
 	contextWindow int
+	modelName     string
 
 	// sessionAnchors 按会话记录最近一次成功 LLM 请求的用量锚点：provider 实测 prompt
 	// 大小 + 产生它时的请求信封指纹（工具目录 + 窗口）+ 当时的启发式估算。
@@ -250,6 +251,16 @@ func (m *Manager) ResetContextMeters(sessionID string) {
 }
 
 // SetContextWindow 更新上下文窗口（模型切换后同步给宿主计量实例）。
+// SetModelName 记录当前模型名（启动时由 main 解析后注入）：用量锚点的信封比对用。
+func (m *Manager) SetModelName(name string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.modelName = name
+	m.mu.Unlock()
+}
+
 func (m *Manager) SetContextWindow(window int) {
 	if m == nil {
 		return

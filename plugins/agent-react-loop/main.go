@@ -662,6 +662,17 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 写入计量锚点，两边必须同源同口径——provider 的 prompt 计数本身就含工具定义，
 		// 只算消息会让锚点与后续增量不在同一尺度上。
 		sentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
+		// request/header（log-only）：把本次请求的**信封**落盘（工具目录指纹 + 模型 +
+		// 窗口 + 当次估算），与结算的 llm/attempt 按 Turn/Step 配对，构成用量锚点。
+		// 请求前写：失败请求也留有信封；宿主据此判断「下次能否沿用这次的用量」。
+		// 模型名由宿主经 DSC_MODEL 注入（插件自己不解析 provider 配置）。
+		sess.Append(session.RequestHeader, &session.RequestHeaderData{
+			Turn: turnNo, Step: stepNo,
+			ToolsHash:     dsc.ToolsFingerprint(availableTools),
+			Model:         dsc.EnvStr("DSC_MODEL", ""),
+			ContextWindow: a.contextWindow,
+			SentEstimate:  sentEstimate,
+		}, nil)
 		// 步开始信号帧：在 LLM 请求真实发出前发射（emit 包装器自动携带
 		// Turn/Step 编号），TUI 以此时刻测 TTFT/初速——覆盖 prompt 处理
 		// 与排队等待；仅靠首个内容帧打点会把这部分首响等待低估为零。
@@ -693,12 +704,6 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				Code:         dsc.ClassifyLLMErrorCode(llmErr),
 				ContentChars: len(content),
 				ToolCalls:    len(toolCalls),
-				// 请求信封指纹 + 当次表面估算：宿主据此判断「下次请求能否沿用这次
-				// 的用量做压力底数」，并在重启后从日志恢复同一判断（唯一实现在
-				// core，经 sdk 转发）。
-				ToolsHash:     dsc.ToolsFingerprint(availableTools),
-				ContextWindow: a.contextWindow,
-				SentEstimate:  sentEstimate,
 			}, nil)
 		}
 		if emit == nil {

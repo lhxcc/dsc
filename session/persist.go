@@ -149,6 +149,12 @@ func unmarshalData(typ EventType, raw json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return &d, nil
+	case RequestHeader:
+		var d RequestHeaderData
+		if err := decode(&d); err != nil {
+			return nil, err
+		}
+		return &d, nil
 	case LLMAttempt:
 		var d LLMAttemptData
 		if err := decode(&d); err != nil {

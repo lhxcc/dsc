@@ -274,9 +274,12 @@ func TestLoadHistoryReplay(t *testing.T) {
 func TestSeedSessionPromptFromLog(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	s := session.New()
+	// 信封（request/header）与用量（llm/attempt）分开落，按 Turn/Step 配对。
+	s.Append(session.RequestHeader, &session.RequestHeaderData{
+		Turn: 1, Step: 1, ToolsHash: "abc123", Model: "deepseek-test",
+		ContextWindow: 1048576, SentEstimate: 37790}, nil)
 	s.Append(session.LLMAttempt, &session.LLMAttemptData{Turn: 1, Step: 1,
-		Usage:        &proto.Usage{PromptTokens: 40347, TotalTokens: 40864},
-		SentEstimate: 37790, ToolsHash: "abc123", ContextWindow: 1048576}, nil)
+		Usage: &proto.Usage{PromptTokens: 40347, TotalTokens: 40864}}, nil)
 	// 之后一次失败：无 prompt 用量，不应覆盖
 	s.Append(session.LLMAttempt, &session.LLMAttemptData{Turn: 2, Step: 1,
 		Error: "context_window_exceeded"}, nil)
@@ -288,7 +291,7 @@ func TestSeedSessionPromptFromLog(t *testing.T) {
 		t.Fatalf("lastSessionAnchor = %+v ok=%v, want promptTokens=40347", a, ok)
 	}
 	// 信封指纹必须一并恢复，否则重启后首发的锚点会被判为不可比。
-	if a.toolsHash != "abc123" || a.sentEstimate != 37790 || a.contextWindow != 1048576 {
+	if a.toolsHash != "abc123" || a.sentEstimate != 37790 || a.contextWindow != 1048576 || a.model != "deepseek-test" {
 		t.Fatalf("锚点信封字段未恢复: %+v", a)
 	}
 }

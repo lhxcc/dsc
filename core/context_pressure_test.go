@@ -20,7 +20,7 @@ func TestProjectPressure(t *testing.T) {
 		{promptTokens: 40347, sentEstimate: 37790, toolsHash: ""},    // 旧记录无指纹
 		{promptTokens: 40347, sentEstimate: 37790, toolsHash: "old"}, // 工具目录变了
 	} {
-		got, matched := projectPressure(a, cur, "new", 1048576)
+		got, matched := projectPressure(a, cur, "new", "", 1048576)
 		if matched {
 			t.Fatalf("信封不同却判定可比: %+v", a)
 		}
@@ -31,7 +31,7 @@ func TestProjectPressure(t *testing.T) {
 
 	// 2) 可比且用量不低于当次估算 → 实测底数 + 差量
 	a := sessionUsageAnchor{promptTokens: 500000, sentEstimate: 480000, toolsHash: "h", contextWindow: 1048576}
-	got, matched := projectPressure(a, cur, "h", 1048576)
+	got, matched := projectPressure(a, cur, "h", "m", 1048576)
 	if !matched {
 		t.Fatal("同信封应判定可比")
 	}
@@ -41,7 +41,7 @@ func TestProjectPressure(t *testing.T) {
 
 	// 3) 可比但用量远低于当次估算（上一次被压缩后端改写，如 42k vs 900k）→ 不可当底数
 	b := sessionUsageAnchor{promptTokens: 40347, sentEstimate: 900000, toolsHash: "h", contextWindow: 1048576}
-	got, matched = projectPressure(b, cur, "h", 1048576)
+	got, matched = projectPressure(b, cur, "h", "m", 1048576)
 	if !matched {
 		t.Fatal("信封相同应判定可比（即使不采用用量）")
 	}
@@ -51,13 +51,24 @@ func TestProjectPressure(t *testing.T) {
 
 	// 4) 窗口变了（换模型）→ 不可比
 	c := sessionUsageAnchor{promptTokens: 500000, sentEstimate: 480000, toolsHash: "h", contextWindow: 131072}
-	if got, matched = projectPressure(c, cur, "h", 1048576); matched || got != cur {
+	if got, matched = projectPressure(c, cur, "h", "m", 1048576); matched || got != cur {
 		t.Fatalf("窗口不同应不可比: got=%d matched=%v", got, matched)
 	}
 
-	// 5) 表面缩小 → 允许负差量，但不低于 0
+	// 5) 换模型（窗口/工具目录相同）→ 不可比
+	e := sessionUsageAnchor{promptTokens: 500000, sentEstimate: 480000, toolsHash: "h", model: "m1", contextWindow: 1048576}
+	if got, matched = projectPressure(e, cur, "h", "m2", 1048576); matched || got != cur {
+		t.Fatalf("换模型应不可比: got=%d matched=%v", got, matched)
+	}
+	// 锚点未记录模型（旧日志）→ 不参与比较，仍按信封其余字段判定
+	e2 := sessionUsageAnchor{promptTokens: 500000, sentEstimate: 480000, toolsHash: "h", contextWindow: 1048576}
+	if _, matched = projectPressure(e2, cur, "h", "m2", 1048576); !matched {
+		t.Fatal("锚点无模型信息时不应仅因此判定不可比")
+	}
+
+	// 6) 表面缩小 → 允许负差量，但不低于 0
 	d := sessionUsageAnchor{promptTokens: 1000, sentEstimate: 2000, toolsHash: "h"}
-	if got, _ = projectPressure(d, 0, "h", 0); got != 0 {
+	if got, _ = projectPressure(d, 0, "h", "", 0); got != 0 {
 		t.Fatalf("负差量应被夹到 0, got %d", got)
 	}
 }

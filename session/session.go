@@ -61,6 +61,15 @@ const (
 	// 该事件是排障一手证据：截断（finish_reason=max_tokens）、provider 报错、
 	// 上下文溢出、流中断、耗时与 token 消耗均在此一眼可查，无需审计代码。
 	LLMAttempt EventType = "llm/attempt"
+	// RequestHeader 每次请求**发出前**的信封快照（log-only，对齐 DSH request/header）：
+	// 工具目录指纹 + 模型 + 上下文窗口 + 该表面自身的启发式估算。
+	//
+	// 与 llm/attempt 的分工：attempt 记录「这次调用结果如何」，header 记录「发出去的是
+	// 什么信封」。用量锚点只有在信封相同（工具目录/模型/窗口一致）时才可用——把信封
+	// 独立成事件，失败请求也留有信封（诊断），且字段语义单一不会被结算字段污染。
+	//
+	// 注意：这是 log-only（不进 surface、不派生模型消息），仅用于计量与排障。
+	RequestHeader EventType = "request/header"
 	// SystemMessage 当前生效的 system prompt（surface，对齐 DSH v3 system/message）。
 	// 始终占据 surface node 0：会话首条 system/message 以 append 入位，
 	// 后续 prompt 变化以 replace 覆盖 node 0。空 content 表示"无 system prompt"
@@ -135,6 +144,17 @@ type ToolResultData struct {
 	Images []string
 }
 
+// RequestHeaderData request/header 事件载荷（log-only）：一次请求的**信封**。
+// 与 llm/attempt 配对使用（按 Turn/Step 对齐）：attempt 给「用量」，header 给
+// 「这个用量属于哪个信封」，两者都在才构成一个可用的用量锚点。
+type RequestHeaderData struct {
+	Turn, Step    int
+	ToolsHash     string // 工具目录指纹（core.ToolsFingerprint）
+	Model         string // 模型名（宿主经 DSC_MODEL 注入，空 = 未知）
+	ContextWindow int    // 本次请求使用的上下文窗口
+	SentEstimate  int    // 对本次请求（消息 + 工具目录）的启发式估算
+}
+
 // LLMAttemptData llm/attempt 事件载荷（log-only）：一次 LLM 调用的结算留痕。
 // 成功路径：FinishReason 非空、Error 为空；失败路径：Error 非空（Code 为稳定
 // 错误码），FinishReason/Usage 可能为零值（请求未达服务端或流中途断）。流式
@@ -150,18 +170,6 @@ type LLMAttemptData struct {
 	Code         string       // 稳定错误码（context_window_exceeded/rate_limited/network_error/unknown；成功为空）
 	ContentChars int          // 结算时累计内容字符数（截断/中断诊断）
 	ToolCalls    int          // 结算时累计工具调用数
-
-	// 请求信封指纹（用于判断「用量锚点与当前请求是否同一个信封」）：
-	// 只有指纹一致时，上一次的 provider 用量才能直接当作本次压力的底数；
-	// 否则（换模型/换窗口/工具目录变了）必须退回启发式估算。
-	// 旧记录缺这两个字段 → 指纹为空 → 一律视为不可比（保守）。
-	ToolsHash     string `json:",omitempty"` // 工具目录指纹（core.ToolsFingerprint）
-	ContextWindow int    `json:",omitempty"` // 产生该用量时的上下文窗口
-
-	// SentEstimate 产生该用量时，我们对**同一请求**（消息 + 工具目录）的启发式估算。
-	// 用途：换算自采样以来的表面增量（pressure = usage + (当前估算 - 该值)），
-	// 以及 DSH 的可信度判据（usage 低于该值说明请求被改写/压缩过，不能直接当底数）。
-	SentEstimate int `json:",omitempty"`
 }
 type CompactionSummaryData struct{ Content string }
 
