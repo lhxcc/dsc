@@ -324,14 +324,16 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		mode = "emit"
 	}
 
-	// agent/pre-step 的「消息改写权」只归 compaction 字段选定的后端：多个插件可能都
-	// 声明 Provides compaction（基础压缩与上下文管理插件都会声明），
-	// 若全部采纳就会层层改写、叠加压缩，与配置选择的后端不符。
-	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、
-	// 通知型 listener 等），只是它们的 result_json 不参与载荷改写；未选后端时
-	// 一律不采纳改写，由 agent 内联压缩兜底。
+	// agent/pre-step 的「消息改写权」与 agent/request-error 的「重试决定权」都只归
+	// compaction 字段选定的后端：多个插件可能都声明 Provides compaction（基础压缩与
+	// 上下文管理插件都会声明），若全部采纳就会层层改写、叠加压缩，与配置选择的后端
+	// 不符。request-error 必须走同一采纳规则——否则后端返回的 {"retry": true}（溢出
+	// 紧急压缩后要求重试）会被丢弃，首次请求超窗时没有任何安全阀。
+	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、通知型 listener
+	// 等），只是它们的 result_json 不参与载荷改写/重试决定；未选后端时一律不采纳，
+	// 由 agent 内联压缩兜底。
 	backend := ""
-	if name == EventAgentPreStep {
+	if name == EventAgentPreStep || name == EventAgentRequestError {
 		backend = m.compactionBackendName()
 	}
 

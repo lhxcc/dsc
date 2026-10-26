@@ -173,3 +173,51 @@ func TestParsePreStepAppendsFilters(t *testing.T) {
 		t.Fatal("nil 应返回 nil")
 	}
 }
+
+// TestDispatchRequestErrorBackendRetryAdopted 溢出紧急压缩的重试决定权只采纳选定
+// 后端：后端返回 {"retry": true} 时必须被采纳，否则首次请求超窗没有安全阀（只会
+// 收到 provider 400）。
+func TestDispatchRequestErrorBackendRetryAdopted(t *testing.T) {
+	m, _ := hookManager()
+	backend := &fakeHook{events: make(chan *proto.OnEventRequest, 4), eventResult: `{"retry": true}`}
+	other := &fakeHook{events: make(chan *proto.OnEventRequest, 4), eventResult: `{"retry": true}`}
+	m.mu.Lock()
+	m.toolHookClients["dsc-system"] = backend
+	m.toolHookClients["backend-b"] = other
+	m.toolHookOrder = []string{"backend-b", "dsc-system"}
+	m.compactionBackend = "dsc-system"
+	m.mu.Unlock()
+
+	got, err := m.dispatchEventToPlugins(EventAgentRequestError, map[string]string{"code": "context_window_exceeded"})
+	if err != nil {
+		t.Fatalf("request-error 派发失败: %v", err)
+	}
+	payload, ok := got.(map[string]any)
+	if !ok || payload["retry"] != true {
+		t.Fatalf("应采纳选定后端的 retry=true, got %v", got)
+	}
+}
+
+// TestDispatchRequestErrorRetryIgnoredWithoutBackend 未配置压缩后端时，任何插件的
+// retry 都不采纳（避免非后端插件造成无意义的重试循环）。
+func TestDispatchRequestErrorRetryIgnoredWithoutBackend(t *testing.T) {
+	m, _ := hookManager()
+	h := &fakeHook{events: make(chan *proto.OnEventRequest, 1), eventResult: `{"retry": true}`}
+	m.mu.Lock()
+	m.toolHookClients["backend-b"] = h
+	m.toolHookOrder = []string{"backend-b"}
+	m.compactionBackend = ""
+	m.mu.Unlock()
+
+	got, err := m.dispatchEventToPlugins(EventAgentRequestError, map[string]string{"code": "x"})
+	if err != nil {
+		t.Fatalf("request-error 派发失败: %v", err)
+	}
+	payload, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("返回值类型异常: %T", got)
+	}
+	if payload["retry"] == true {
+		t.Fatalf("未选后端时不应采纳 retry, got %v", payload)
+	}
+}
