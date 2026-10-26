@@ -848,19 +848,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case jobDoneMsg:
-		// 后台任务完成：**立即**送达模型。
-		//   - 忙碌（thinking/streaming）：注入当前回合，下一轮 LLM 迭代即可见；
-		//   - 空闲：直接唤醒开一轮。
-		// 不再「先排队、等回合结束/下一条用户输入再一次性补发」——那会让早已完成的
-		// 任务在很久以后才爆发成一片通知。
-		m.pendingWakeups = append(m.pendingWakeups, renderJobDoneNotice(msg.snapshot))
-		m.render()
-		if m.thinking || m.streaming {
-			text := strings.Join(m.pendingWakeups, "\n\n")
-			m.pendingWakeups = nil
-			return m, m.injectJobNoticeCmd(text)
+		// 后台任务完成：**立即**送达模型（用户的显式请求，必然通知）。
+		return m, m.deliverCompletionNotice(renderJobDoneNotice(msg.snapshot))
+
+	case cronDoneMsg:
+		// 定时任务落定：**只在该任务声明了 notify 时**送达。
+		// cron 承担长期、循环的程序性工作，重要性差别很大——一律通知会让分钟级
+		// 任务每轮都消耗一次唤醒（一次唤醒 = 一轮 LLM 调用），一律不通知又会让
+		// 真正要跟进的产出没人知道。故由任务自己声明（模型 cron_add / 人 /cron add）。
+		if !msg.job.Notify {
+			return m, nil
 		}
-		return m, m.tryWakeup()
+		return m, m.deliverCompletionNotice(renderCronDoneNotice(msg.job))
+
+	case pluginAdminMsg:
+		// 插件管理命令结果：工具返回 JSON，这里只做可读化，不再解释业务含义。
+		if msg.err != nil {
+			m.appendMessage(errorSty.Render("/plugin "+msg.sub+" 失败: ") + msg.err.Error())
+			break
+		}
+		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 插件") + "\n" + renderPluginAdminResult(msg.text))
+		m.render()
+		m.virtualGotoBottom()
 
 	case jobNoticeInjectedMsg:
 		// 注入失败（agent 不在运行等）：回落到队列，由回合结束/下一条用户输入补送，
@@ -1696,7 +1705,7 @@ func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
 			// 一块」（实时视图本就只把通知渲染成系统提示）。
 			// 完成通知是给模型的唤醒信号，不是用户内容：回放同样不渲染，
 			// 否则重启后会看到一屏「background job ... finished」而没有来龙去脉。
-			_, rest := splitJobDoneNotices(msg.Content)
+			_, rest := splitCompletionNotices(msg.Content)
 			if rest = strings.TrimSpace(rest); rest != "" {
 				out = append(out, renderUserBubble(rest, w))
 			}
@@ -2533,7 +2542,9 @@ var slashCommands = []compItem{
 	{label: "/jobs", insert: "/jobs ", hint: "后台任务子命令（list / output / kill），选中进入后展开", descend: true},
 	{label: "/settings", insert: "/settings ", hint: "设置子命令（history / mouse），选中进入后展开", descend: true},
 	{label: "/sessions", insert: "/sessions", hint: "列出所有会话"},
-	{label: "/cron", insert: "/cron ", hint: "定时任务子命令（list / add / remove / on / off），选中进入后展开", descend: true},
+	{label: "/cron", insert: "/cron ", hint: "定时任务子命令（list / add / remove / on / off / notify），选中进入后展开", descend: true},
+	{label: "/plugins", insert: "/plugins", hint: "列出插件（= /plugin list，动态枚举）"},
+	{label: "/plugin", insert: "/plugin ", hint: "插件管理（list / install / remove / upgrade / load / unload）", descend: true},
 	{label: "/plan", insert: "/plan", hint: "进入 plan 模式（先探索设计，再经 exit_plan_mode 呈现计划）"},
 	{label: "/plan off", insert: "/plan off", hint: "退出 plan 模式"},
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
@@ -2635,6 +2646,7 @@ var slashGroups = []slashGroup{
 			{label: "/cron remove", insert: "/cron remove ", hint: "删除定时任务"},
 			{label: "/cron on", insert: "/cron on ", hint: "启用定时任务"},
 			{label: "/cron off", insert: "/cron off ", hint: "停用定时任务"},
+			{label: "/cron notify", insert: "/cron notify ", hint: "跑完是否即时通知模型（on/off）"},
 		},
 	},
 	{
@@ -2842,9 +2854,15 @@ func (m *Model) buildHelpText() string {
 		"  /jobs kill <id> [reason]  取消后台任务",
 		"  /sessions    列出所有会话",
 		"  /crons       列出所有定时任务",
-		"  /cron add <cron> <prompt>  添加定时任务（cron 为 5 段表达式，如 0 8 * * *）",
+		"  /plugins     列出插件（= /plugin list）",
+		"  /plugin install <name> <source> [--type tool]  安装并热加载插件",
+		"  /plugin remove <name>   卸载插件（含目录）",
+		"  /plugin upgrade <name> <version> <source>  升级插件",
+		"  /plugin load|unload <name> [--persist]  当前进程加载/卸载",
+		"  /cron add [--notify] <cron> <prompt>  添加定时任务（--notify=跑完即时告知模型）",
 		"  /cron remove <id>  删除定时任务",
 		"  /cron on|off <id>  启用/停用定时任务",
+		"  /cron notify <id> on|off  该任务跑完是否即时通知模型",
 		"  /plan       进入 plan 模式（先探索与设计，再经 exit_plan_mode 呈现完整计划）",
 		"  /plan off   退出 plan 模式",
 		"  /settings history <N|off|unlimited>  恢复历史注入条数：只影响从存档恢复的历史，当前会话内的轮次始终保留",
@@ -3019,6 +3037,15 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.render()
 		m.virtualGotoBottom()
 		return true, nil
+	case "/plugins":
+		cmd := m.runPluginAdmin("list", nil)
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, cmd
+
 	case "/crons":
 		m.appendCronList()
 		m.input.SetValue("")
@@ -3028,7 +3055,7 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	case "/cron":
-		m.appendMessage(errorSty.Render("用法: /cron list（= /crons）、add <cron(5 段)> <prompt>、remove <id>、on|off <id>"))
+		m.appendMessage(errorSty.Render("用法: /cron list（= /crons）、add [--notify] <cron(5 段)> <prompt>、remove <id>、on|off <id>、notify <id> on|off"))
 		m.input.SetValue("")
 		m.completion = completion{}
 		m.syncInputHeight()
@@ -3164,6 +3191,22 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
+	// /plugin <sub> ...（前缀匹配）：与模型同一套插件管理工具，动态枚举插件。
+	if strings.HasPrefix(cmd, "/plugin ") || cmd == "/plugin" {
+		argv := strings.Fields(strings.TrimPrefix(cmd, "/plugin"))
+		sub, args := "list", []string(nil)
+		if len(argv) > 0 {
+			sub, args = argv[0], argv[1:]
+		}
+		exec := m.runPluginAdmin(sub, args)
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, exec
+	}
+
 	// /cron add|remove|on|off（前缀匹配）
 	if strings.HasPrefix(cmd, "/cron ") {
 		rest := strings.TrimSpace(strings.TrimPrefix(cmd, "/cron "))
@@ -3171,9 +3214,20 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		case rest == "list":
 			m.appendCronList()
 		case strings.HasPrefix(rest, "add "):
-			tokens := strings.Fields(strings.TrimPrefix(rest, "add "))
+			// [--notify] 可选：该任务每次跑完是否即时通知模型。默认不通知——定时任务
+			// 多为程序性循环，一律通知会把分钟级任务变成每分钟一次唤醒（各一轮 LLM）。
+			raw := strings.Fields(strings.TrimPrefix(rest, "add "))
+			notify := false
+			tokens := make([]string, 0, len(raw))
+			for _, tk := range raw {
+				if tk == "--notify" || tk == "-n" {
+					notify = true
+					continue
+				}
+				tokens = append(tokens, tk)
+			}
 			if len(tokens) < 6 {
-				m.appendMessage(errorSty.Render("用法: /cron add <cron> <prompt>，如 /cron add \"0 8 * * *\" 写今日日报"))
+				m.appendMessage(errorSty.Render("用法: /cron add [--notify] <cron(5 段)> <prompt>，如 /cron add --notify \"0 8 * * *\" 写今日日报"))
 			} else if m.manager == nil {
 				m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
 			} else {
@@ -3182,11 +3236,12 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 					Cron:    strings.Join(tokens[:5], " "),
 					Prompt:  strings.Join(tokens[5:], " "),
 					Enabled: true,
+					Notify:  notify,
 				}
 				if err := m.manager.AddCronJob(j); err != nil {
 					m.appendMessage(errorSty.Render("添加任务失败: ") + err.Error())
 				} else {
-					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已添加任务 %s（cron: %s）。", j.ID, j.Cron))
+					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已添加任务 %s（cron: %s，完成通知: %s）。", j.ID, j.Cron, onOff(notify)))
 				}
 			}
 		case strings.HasPrefix(rest, "remove "):
@@ -3200,6 +3255,18 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			} else {
 				m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已删除任务 %s。", id))
 			}
+		case strings.HasPrefix(rest, "notify "):
+			fields := strings.Fields(strings.TrimPrefix(rest, "notify "))
+			if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
+				m.appendMessage(errorSty.Render("用法: /cron notify <任务 id> on|off（该任务跑完是否即时通知模型）"))
+			} else if m.manager == nil {
+				m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
+			} else if err := m.manager.SetCronJobNotify(fields[0], fields[1] == "on"); err != nil {
+				m.appendMessage(errorSty.Render("设置完成通知失败: ") + err.Error())
+			} else {
+				m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n任务 %s 的完成通知已%s。", fields[0], onOff(fields[1] == "on")))
+			}
+
 		case strings.HasPrefix(rest, "on ") || strings.HasPrefix(rest, "off "):
 			enabled := strings.HasPrefix(rest, "on ")
 			id := strings.TrimSpace(strings.TrimPrefix(rest, "on "))
@@ -3323,6 +3390,14 @@ type pluginCommandMsg struct {
 // pluginCommandTimeout 插件命令的超时：命令是同步 RPC，卡住不能拖死界面。
 const pluginCommandTimeout = 20 * time.Second
 
+// onOff 把布尔显示为「on/off」（cron 的 notify 等开关统一口径）。
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
 // appendCronList 输出定时任务列表（/crons 与 /cron list 共用）。
 func (m *Model) appendCronList() {
 	if m.manager == nil {
@@ -3351,7 +3426,8 @@ func (m *Model) renderCrons() string {
 				last += " @" + time.UnixMilli(j.LastRunAt).Format("15:04")
 			}
 		}
-		fmt.Fprintf(&b, "  %s  %s  [%s]  cron=%s  上次=%s\n", j.ID, j.Name, state, j.Cron, last)
+		fmt.Fprintf(&b, "  %s  %s  [%s]  cron=%s  通知=%s  上次=%s\n",
+			j.ID, j.Name, state, j.Cron, onOff(j.Notify), last)
 	}
 	return b.String()
 }
@@ -4060,6 +4136,13 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		manager.OnEvent(core.JobDoneEvent, func(ctx core.EventContext) (any, error) {
 			if s, ok := ctx.Data.(jobs.JobSnapshot); ok {
 				m.program.Send(jobDoneMsg{snapshot: s})
+			}
+			return nil, nil
+		})
+		// 定时任务落定 → 同一送达路径（是否叫醒模型由任务的 notify 决定）。
+		manager.OnEvent(core.CronDoneEvent, func(ctx core.EventContext) (any, error) {
+			if j, ok := ctx.Data.(cron.Job); ok {
+				m.program.Send(cronDoneMsg{job: j})
 			}
 			return nil, nil
 		})

@@ -42,6 +42,7 @@ func (t *cronAddTool) Description() string {
 	return "Add a DSC cron scheduled job. The cron expression is the standard 5-field form (minute hour day-of-month month day-of-week), " +
 		"e.g. \"0 8 * * *\" runs daily at 08:00. The prompt is what the cron runner executes (a subagent prompt) at each trigger; " +
 		"the job is persisted to cron.json and starts firing on schedule immediately (enabled=true by default). " +
+		"Set notify=true only when the output needs attention as soon as it lands; leave it false (default) for periodic housekeeping, since a notification costs a waking model turn on every run. " +
 		"Returns the job id and full record on success. Requires approval=never to actually execute (consistent with install/upgrade_dsc_plugin)."
 }
 
@@ -51,6 +52,7 @@ func (t *cronAddTool) ParametersSchema() json.RawMessage {
 "cron":{"type":"string","description":"Standard 5-field cron expression, e.g. \"0 8 * * *\" (daily at 08:00)."},
 "prompt":{"type":"string","description":"The prompt to execute at each trigger (a subagent prompt)."},
 "enabled":{"type":"boolean","description":"Whether the job is enabled immediately. Default true.","default":true},
+"notify":{"type":"boolean","description":"Whether to notify the model the moment each run settles (default false). Set true only for jobs whose result someone must act on soon (daily report, patrol finding); leave false for high-frequency housekeeping, because true wakes the session (one LLM turn) on every run.","default":false},
 "max_iterations":{"type":"integer","description":"Optional cap on subagent iterations per trigger. 0 means unlimited (default)."}
 },
 "required":["name","cron","prompt"],"additionalProperties":false}`)
@@ -64,6 +66,7 @@ func (t *cronAddTool) Execute(ctx context.Context, args json.RawMessage) (string
 		Cron          string `json:"cron"`
 		Prompt        string `json:"prompt"`
 		Enabled       *bool  `json:"enabled"`
+		Notify        bool   `json:"notify"`
 		MaxIterations int    `json:"max_iterations"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
@@ -87,6 +90,7 @@ func (t *cronAddTool) Execute(ctx context.Context, args json.RawMessage) (string
 		Cron:          p.Cron,
 		Prompt:        p.Prompt,
 		Enabled:       enabled,
+		Notify:        p.Notify,
 		MaxIterations: p.MaxIterations,
 	}
 	if err := t.m.AddCronJob(j); err != nil {
@@ -98,6 +102,7 @@ func (t *cronAddTool) Execute(ctx context.Context, args json.RawMessage) (string
 		"name":    j.Name,
 		"cron":    j.Cron,
 		"enabled": j.Enabled,
+		"notify":  j.Notify,
 		"note":    "已添加定时任务，按 cron 表达式自动触发；持久化于 cron.json",
 	})
 	return string(b), nil
@@ -112,6 +117,7 @@ func (t *cronAddTool) ExecuteWithView(ctx context.Context, args json.RawMessage,
 			{Key: "id", Value: extractField(result, "id")},
 			{Key: "name", Value: extractField(result, "name")},
 			{Key: "cron", Value: extractField(result, "cron")},
+			{Key: "notify", Value: extractField(result, "notify")},
 		},
 	})
 	if verr != nil {
@@ -129,7 +135,7 @@ type cronListTool struct{ m *Manager }
 func (t *cronListTool) Name() string { return "cron_list" }
 
 func (t *cronListTool) Description() string {
-	return "List all DSC cron scheduled jobs (id, name, cron expression, enabled, last_run_at, last_status, last_output). " +
+	return "List all DSC cron scheduled jobs (id, name, cron expression, enabled, notify, last_run_at, last_status, last_output). " +
 		"Use this to discover existing scheduled tasks before adding/removing; never guess an id by name."
 }
 
@@ -144,6 +150,7 @@ func (t *cronListTool) Execute(_ context.Context, _ json.RawMessage) (string, er
 		Name       string `json:"name"`
 		Cron       string `json:"cron"`
 		Enabled    bool   `json:"enabled"`
+		Notify     bool   `json:"notify"`
 		LastRunAt  int64  `json:"last_run_at"`
 		LastStatus string `json:"last_status"`
 		LastOutput string `json:"last_output"`
@@ -152,7 +159,7 @@ func (t *cronListTool) Execute(_ context.Context, _ json.RawMessage) (string, er
 	for _, j := range jobs {
 		rows = append(rows, row{
 			ID: j.ID, Name: j.Name, Cron: j.Cron,
-			Enabled: j.Enabled, LastRunAt: j.LastRunAt,
+			Enabled: j.Enabled, Notify: j.Notify, LastRunAt: j.LastRunAt,
 			LastStatus: j.LastStatus, LastOutput: j.LastOutput,
 		})
 	}
@@ -170,6 +177,7 @@ func (t *cronListTool) ExecuteWithView(ctx context.Context, args json.RawMessage
 			Name       string `json:"name"`
 			Cron       string `json:"cron"`
 			Enabled    bool   `json:"enabled"`
+			Notify     bool   `json:"notify"`
 			LastStatus string `json:"last_status"`
 		} `json:"jobs"`
 	}
@@ -183,13 +191,14 @@ func (t *cronListTool) ExecuteWithView(ctx context.Context, args json.RawMessage
 			"name":    j.Name,
 			"cron":    j.Cron,
 			"enabled": fmt.Sprint(j.Enabled),
+			"notify":  fmt.Sprint(j.Notify),
 			"last":    j.LastStatus,
 		})
 	}
 	v, verr := json.Marshal(ToolView{
 		Kind:    "table",
 		Title:   "CronJobs",
-		Columns: []ViewColumn{{Key: "id", Title: "ID"}, {Key: "name", Title: "名称"}, {Key: "cron", Title: "表达式"}, {Key: "enabled", Title: "启用"}, {Key: "last", Title: "上次状态"}},
+		Columns: []ViewColumn{{Key: "id", Title: "ID"}, {Key: "name", Title: "名称"}, {Key: "cron", Title: "表达式"}, {Key: "enabled", Title: "启用"}, {Key: "notify", Title: "通知"}, {Key: "last", Title: "上次状态"}},
 		Rows:    rows,
 	})
 	if verr != nil {
@@ -271,20 +280,23 @@ func (t *cronSetEnabledTool) ApprovalReason(_ string) string {
 }
 
 func (t *cronSetEnabledTool) Description() string {
-	return "Enable or disable a DSC cron job by id. Disabled jobs are kept in cron.json but no longer fire on schedule."
+	return "Update a DSC cron job by id: enable/disable it (disabled jobs stay in cron.json but no longer fire), " +
+		"and/or set whether each run notifies the model when it settles. Pass at least one of enabled/notify."
 }
 
 func (t *cronSetEnabledTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "id":{"type":"string","description":"Job id (returned by cron_add / cron_list)."},
-"enabled":{"type":"boolean","description":"true to enable, false to disable."}},
-"required":["id","enabled"],"additionalProperties":false}`)
+"enabled":{"type":"boolean","description":"true to enable, false to disable (omit to leave unchanged)."},
+"notify":{"type":"boolean","description":"true to notify the model when each run settles, false to stay silent (omit to leave unchanged)."}},
+"required":["id"],"additionalProperties":false}`)
 }
 
 func (t *cronSetEnabledTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		ID      string `json:"id"`
-		Enabled bool   `json:"enabled"`
+		Enabled *bool  `json:"enabled"`
+		Notify  *bool  `json:"notify"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -292,15 +304,26 @@ func (t *cronSetEnabledTool) Execute(_ context.Context, args json.RawMessage) (s
 	if p.ID == "" {
 		return "", fmt.Errorf("id is required")
 	}
-	if err := t.m.SetCronJobEnabled(p.ID, p.Enabled); err != nil {
-		return "", fmt.Errorf("set cron enabled: %w", err)
+	if p.Enabled == nil && p.Notify == nil {
+		return "", fmt.Errorf("nothing to update: pass enabled and/or notify")
 	}
-	b, _ := json.Marshal(map[string]any{
-		"ok":      true,
-		"id":      p.ID,
-		"enabled": p.Enabled,
-		"note":    "已更新任务启停状态",
-	})
+	if p.Enabled != nil {
+		if err := t.m.SetCronJobEnabled(p.ID, *p.Enabled); err != nil {
+			return "", fmt.Errorf("set cron enabled: %w", err)
+		}
+	}
+	if p.Notify != nil {
+		if err := t.m.SetCronJobNotify(p.ID, *p.Notify); err != nil {
+			return "", fmt.Errorf("set cron notify: %w", err)
+		}
+	}
+	cur, _ := t.m.cronScheduler.Get(p.ID)
+	out := map[string]any{"ok": true, "id": p.ID}
+	if cur != nil {
+		out["enabled"], out["notify"] = cur.Enabled, cur.Notify
+	}
+	out["note"] = "已更新任务设置（启停 / 完成通知）"
+	b, _ := json.Marshal(out)
 	return string(b), nil
 }
 
@@ -316,6 +339,7 @@ func (t *cronSetEnabledTool) ExecuteWithView(ctx context.Context, args json.RawM
 		Fields: []ViewField{
 			{Key: "id", Value: extractField(result, "id")},
 			{Key: "enabled", Value: extractField(result, "enabled")},
+			{Key: "notify", Value: extractField(result, "notify")},
 		},
 	})
 	if verr != nil {

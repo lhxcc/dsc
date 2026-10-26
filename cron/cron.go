@@ -15,11 +15,18 @@ import (
 
 // Job 一条定时任务定义。
 type Job struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Cron          string `json:"cron"` // 标准 5 段 cron 表达式（分 时 日 月 周）
-	Prompt        string `json:"prompt"`
-	Enabled       bool   `json:"enabled"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Cron    string `json:"cron"` // 标准 5 段 cron 表达式（分 时 日 月 周）
+	Prompt  string `json:"prompt"`
+	Enabled bool   `json:"enabled"`
+	// Notify 该任务每次运行**落定时是否即时通知模型**（默认 false = 静默，靠 cron_list 取）。
+	//
+	// 不定死一侧的理由：cron 承担的是长期、循环的程序性工作，各任务重要性差别很大。
+	// 一律通知会让分钟级任务每分钟唤醒会话（每次唤醒都是一轮 LLM 调用，纯烧钱）；
+	// 一律不通知则真正需要跟进的产出（日报、巡检结论）没人知道。故由任务自己声明，
+	// 模型（cron_add 的 notify 参数）与人（/cron add --notify、/cron notify）都能设。
+	Notify        bool   `json:"notify"`
 	MaxIterations int    `json:"max_iterations,omitempty"`
 	CreatedAt     int64  `json:"created_at"`
 	LastRunAt     int64  `json:"last_run_at,omitempty"`
@@ -112,16 +119,17 @@ func (s *Store) Save(j *Job) error {
 	return s.writeLocked()
 }
 
-// UpdateRunState 在锁内更新某任务的**运行状态**（LastRunAt/LastStatus/LastOutput/
-// LastError），任务不存在时返回 false 且**不写盘**。
+// Update 在锁内对**存储里的当前记录**应用 apply，任务不存在时返回 false 且不写盘。
+// 典型用途是更新运行状态（LastRunAt/LastStatus/LastOutput/LastError），也用于改
+// Notify 这类单个开关。
 //
 // 为什么不能在落定时直接 Save 开始前取到的副本：那份副本可能已经过期。
 //   - 运行期间任务被删除 → Save 会把它写回 cron.json（删了又活）；
 //   - 运行期间被停用 → Save 用旧副本覆盖 Enabled，磁盘上又变回启用（且调度条目
 //     已移除，表现为「停用了但重启后又开始跑」）。
 //
-// 只改运行状态字段、其余字段一律沿用存储里的当前值，两个问题一起消失。
-func (s *Store) UpdateRunState(id string, apply func(*Job)) (bool, error) {
+// 只改 apply 里碰到的字段，其余一律沿用存储里的当前值，两个问题一起消失。
+func (s *Store) Update(id string, apply func(*Job)) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j, ok := s.jobs[id]

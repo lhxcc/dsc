@@ -311,3 +311,79 @@ func TestStartResetsStaleRunning(t *testing.T) {
 		t.Fatal("不应改变 enabled")
 	}
 }
+
+// TestOnDoneFiresWithSettledSnapshot 落定回调必须带**落定后**的快照（状态与输出都是
+// 最新的），它是「完成通知」的唯一事实来源——回调里若拿到开始前的状态，通知就会说
+// 「运行中」。
+func TestOnDoneFiresWithSettledSnapshot(t *testing.T) {
+	s := newTestStore(t)
+	done := make(chan *Job, 1)
+	sch := NewScheduler(s, func(ctx context.Context, j *Job) (string, error) { return "out-ok", nil }, time.Second)
+	sch.OnDone(func(j *Job) { done <- j })
+	if err := s.Save(&Job{ID: "n1", Name: "daily", Cron: "0 8 * * *", Prompt: "p", Enabled: true, Notify: true, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	sch.fire("n1")
+
+	select {
+	case j := <-done:
+		if j.LastStatus != "success" || j.LastOutput != "out-ok" {
+			t.Fatalf("回调应拿到落定快照，got %+v", j)
+		}
+		if !j.Notify {
+			t.Fatal("notify 标记应随快照带出（消费方据此决定是否叫醒模型）")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("落定后未回调")
+	}
+}
+
+// TestOnDoneSkippedWhenRemovedDuringRun 运行期间被删除的任务不再回调：
+// 通知一条「已完成」的任务，模型只会去 cron_list 找不到它。
+func TestOnDoneSkippedWhenRemovedDuringRun(t *testing.T) {
+	s := newTestStore(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan *Job, 1)
+	sch := NewScheduler(s, blockingRunner(started, release), time.Second)
+	sch.OnDone(func(j *Job) { done <- j })
+	if err := s.Save(&Job{ID: "n2", Name: "n", Cron: "0 8 * * *", Prompt: "p", Enabled: true, Notify: true, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	sch.fire("n2")
+	<-started
+	s.Remove("n2")
+	close(release)
+
+	select {
+	case j := <-done:
+		t.Fatalf("已删除任务不应回调，got %+v", j)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestSetNotifyPersists notify 是任务属性，必须落盘（重启后仍生效）。
+func TestSetNotifyPersists(t *testing.T) {
+	s := newTestStore(t)
+	sch := NewScheduler(s, nil, 0)
+	if err := s.Save(&Job{ID: "n3", Name: "n", Cron: "0 8 * * *", Prompt: "p", Enabled: true, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sch.SetNotify("n3", true); err != nil {
+		t.Fatalf("set notify: %v", err)
+	}
+	got, _ := s.Get("n3")
+	if !got.Notify {
+		t.Fatal("notify 未写入存储")
+	}
+	// 重新打开（模拟重启）
+	s2, err := NewStore(filepath.Dir(s.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := s2.Get("n3"); !j.Notify {
+		t.Fatal("notify 未持久化到 cron.json")
+	}
+	if err := sch.SetNotify("nope", true); err == nil {
+		t.Fatal("设置不存在的任务应报错")
+	}
+}

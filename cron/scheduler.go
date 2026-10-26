@@ -29,6 +29,9 @@ type Scheduler struct {
 	runner  Runner
 	timeout time.Duration
 	entries map[string]robfigcron.EntryID // 任务 id -> 调度条目（启用且已注册时存在）
+	// onDone 运行落定回调（宿主注入：发布 cron/done 事件）。收到的是**落定后的快照**，
+	// 含 LastStatus/LastOutput，且一定是存储里的当前值（任务已被删除则不会回调）。
+	onDone func(*Job)
 }
 
 // NewScheduler 创建调度器。runner 为任务执行回调；timeout 为单次执行超时
@@ -43,6 +46,21 @@ func NewScheduler(store *Store, runner Runner, timeout time.Duration) *Scheduler
 		timeout: timeout,
 		entries: make(map[string]robfigcron.EntryID),
 	}
+}
+
+// OnDone 注册运行落定回调（宿主用于发布 cron/done 事件）。回调在任务线程外执行，
+// 参数是落定后的快照；任务若在运行期间被删除则不会回调。
+func (s *Scheduler) OnDone(fn func(*Job)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onDone = fn
+}
+
+// doneHook 取当前回调（避免在任务 goroutine 里裸读 s.onDone）。
+func (s *Scheduler) doneHook() func(*Job) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.onDone
 }
 
 // Start 启动调度：注册所有启用的任务。已启动时返回错误。
@@ -61,7 +79,7 @@ func (s *Scheduler) Start() error {
 		if j.LastStatus != "running" {
 			continue
 		}
-		_, _ = s.store.UpdateRunState(j.ID, func(x *Job) {
+		_, _ = s.store.Update(j.ID, func(x *Job) {
 			x.LastStatus = "error"
 			x.LastError = "interrupted: the host exited while this job was running"
 			x.LastOutput = ""
@@ -161,6 +179,20 @@ func (s *Scheduler) SetEnabled(id string, enabled bool) error {
 	return nil
 }
 
+// SetNotify 设置任务完成时是否即时通知模型（持久化）。任务不存在返回错误。
+func (s *Scheduler) SetNotify(id string, notify bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ok, err := s.store.Update(id, func(j *Job) { j.Notify = notify })
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("cron: job %q not found", id)
+	}
+	return nil
+}
+
 // List 返回全部任务（含运行状态快照）。
 func (s *Scheduler) List() []*Job {
 	return s.store.List()
@@ -181,8 +213,8 @@ func (s *Scheduler) fire(id string) {
 	if !ok || !job.Enabled || runner == nil {
 		return
 	}
-	// 标记运行中：只更新运行状态字段（见 Store.UpdateRunState 的说明）。
-	if _, err := s.store.UpdateRunState(id, func(j *Job) {
+	// 标记运行中：只更新运行状态字段（见 Store.Update 的说明）。
+	if _, err := s.store.Update(id, func(j *Job) {
 		j.LastRunAt = time.Now().UnixMilli()
 		j.LastStatus = "running"
 		j.LastError = ""
@@ -194,7 +226,7 @@ func (s *Scheduler) fire(id string) {
 		defer cancel()
 		output, err := runner(ctx, job)
 		// 落定同样只改运行状态：任务若在运行期间被删除/停用，这里不能把它写回去。
-		_, _ = s.store.UpdateRunState(id, func(j *Job) {
+		updated, _ := s.store.Update(id, func(j *Job) {
 			j.LastRunAt = time.Now().UnixMilli()
 			if err != nil {
 				j.LastStatus = "error"
@@ -205,6 +237,12 @@ func (s *Scheduler) fire(id string) {
 				j.LastOutput = truncate(output)
 			}
 		})
+		// 通知用**落定后的快照**（状态与输出都要最新的），且任务已被删除时不再回调。
+		if hook := s.doneHook(); hook != nil && updated {
+			if snap, ok := s.store.Get(id); ok {
+				hook(snap)
+			}
+		}
 	}()
 }
 
