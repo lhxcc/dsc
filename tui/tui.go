@@ -2642,7 +2642,7 @@ func resultGutter(body string) string {
 // 时自动出现 /mode thin。
 var slashCommands = []compItem{
 	{label: "/help", insert: "/help", hint: "显示帮助与快捷键"},
-	{label: "/clear", insert: "/clear", hint: "清空聊天记录"},
+	{label: "/clear", insert: "/clear", hint: "清屏：只清空当前显示，会话记录与模型上下文保留"},
 	{label: "/skills", insert: "/skills", hint: "列出所有已安装的技能"},
 	{label: "/sandbox read-only", insert: "/sandbox read-only", hint: "沙箱只读：拒绝一切文件写"},
 	{label: "/sandbox workspace", insert: "/sandbox workspace", hint: "沙箱工作区写：仅允许 workspace 内写（默认）"},
@@ -2962,7 +2962,7 @@ func (m *Model) buildHelpText() string {
 		"",
 		"斜杆命令:",
 		"  /help        显示本帮助",
-		"  /clear       清空聊天记录",
+		"  /clear       清屏：只清空当前显示，会话记录与模型上下文保留（重启后可回看）",
 		"  /skills      列出所有已安装的技能",
 	}
 	// /mode 行动态生成：列出所有可用模式（来自 presets 目录）
@@ -3038,6 +3038,9 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	case "/clear":
+		// 只清**显示**：不删会话记录、不动模型上下文，也不改 history_injection。
+		// 会话 .jsonl 与模型看到的历史都不受影响；重启后回放仍会显示这些内容
+		// （historyAll 清空只是让本次运行不再向上翻出旧页）。
 		m.lines = nil
 		m.lineRendered = nil
 		m.dirtyFrom = 0
