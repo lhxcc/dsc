@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	robfigcron "github.com/robfig/cron/v3"
 )
@@ -53,6 +54,19 @@ func (s *Scheduler) Start() error {
 		return fmt.Errorf("cron: scheduler already started")
 	}
 	s.cron = robfigcron.New(robfigcron.WithChain(robfigcron.SkipIfStillRunning(robfigcron.DefaultLogger)))
+	// 复位上次进程留下的「运行中」：启动这一刻不可能有任务在跑，若不清掉，
+	// /crons 与 cron_list 会永远显示 running（模型据此以为任务还活着、等一个
+	// 永远不会到的结果）。异常退出导致的运行没有输出，记 error 并说明原因。
+	for _, j := range s.store.List() {
+		if j.LastStatus != "running" {
+			continue
+		}
+		_, _ = s.store.UpdateRunState(j.ID, func(x *Job) {
+			x.LastStatus = "error"
+			x.LastError = "interrupted: the host exited while this job was running"
+			x.LastOutput = ""
+		})
+	}
 	for _, j := range s.store.List() {
 		if !j.Enabled {
 			continue
@@ -167,33 +181,42 @@ func (s *Scheduler) fire(id string) {
 	if !ok || !job.Enabled || runner == nil {
 		return
 	}
-	job.LastRunAt = time.Now().UnixMilli()
-	job.LastStatus = "running"
-	job.LastError = ""
-	if err := s.store.Save(job); err != nil {
+	// 标记运行中：只更新运行状态字段（见 Store.UpdateRunState 的说明）。
+	if _, err := s.store.UpdateRunState(id, func(j *Job) {
+		j.LastRunAt = time.Now().UnixMilli()
+		j.LastStatus = "running"
+		j.LastError = ""
+	}); err != nil {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		output, err := runner(ctx, job)
-		job.LastRunAt = time.Now().UnixMilli()
-		if err != nil {
-			job.LastStatus = "error"
-			job.LastError = err.Error()
-			job.LastOutput = ""
-		} else {
-			job.LastStatus = "success"
-			job.LastOutput = truncate(output)
-		}
-		_ = s.store.Save(job)
+		// 落定同样只改运行状态：任务若在运行期间被删除/停用，这里不能把它写回去。
+		_, _ = s.store.UpdateRunState(id, func(j *Job) {
+			j.LastRunAt = time.Now().UnixMilli()
+			if err != nil {
+				j.LastStatus = "error"
+				j.LastError = err.Error()
+				j.LastOutput = ""
+			} else {
+				j.LastStatus = "success"
+				j.LastOutput = truncate(output)
+			}
+		})
 	}()
 }
 
-// truncate 截断任务输出到 maxOutputLen。
+// truncate 截断任务输出到 maxOutputLen（按字节上限，但不切断 UTF-8 字符）。
+// 直接 s[:n] 会把多字节字符劈开，落盘后变成 U+FFFD 乱码（CJK 输出很容易踩）。
 func truncate(s string) string {
 	if len(s) <= maxOutputLen {
 		return s
 	}
-	return s[:maxOutputLen]
+	cut := maxOutputLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

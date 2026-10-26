@@ -71,13 +71,18 @@ func (s *Store) load() error {
 	return nil
 }
 
-// List 返回所有任务（按创建时间排序，稳定输出）。
+// List 返回所有任务的**副本**（按创建时间排序，稳定输出）。
+//
+// 必须是副本：调度器落定时会在后台改动运行状态（LastStatus/LastOutput），
+// 而 List 的调用方（admin /cron/list、cron_list 工具、TUI /crons）会并发读取。
+// 返回内部指针等于把无锁可变状态交给外部——那正是数据竞态的来源。
 func (s *Store) List() []*Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ordered := make([]*Job, 0, len(s.jobs))
 	for _, j := range s.jobs {
-		ordered = append(ordered, j)
+		c := *j
+		ordered = append(ordered, &c)
 	}
 	sort.Slice(ordered, func(i, k int) bool { return ordered[i].CreatedAt < ordered[k].CreatedAt })
 	return ordered
@@ -95,12 +100,36 @@ func (s *Store) Get(id string) (*Job, bool) {
 	return &c, true
 }
 
-// Save 保存任务（新增或更新）。
+// Save 保存任务（新增或更新），存**副本**。
+//
+// 存副本的理由同 List：调用方（调度器 fire 的 goroutine、工具、admin）持有
+// 该指针后仍会继续读写它，别名入表会让「锁内写入」变成谎话。
 func (s *Store) Save(j *Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.jobs[j.ID] = j
+	c := *j
+	s.jobs[c.ID] = &c
 	return s.writeLocked()
+}
+
+// UpdateRunState 在锁内更新某任务的**运行状态**（LastRunAt/LastStatus/LastOutput/
+// LastError），任务不存在时返回 false 且**不写盘**。
+//
+// 为什么不能在落定时直接 Save 开始前取到的副本：那份副本可能已经过期。
+//   - 运行期间任务被删除 → Save 会把它写回 cron.json（删了又活）；
+//   - 运行期间被停用 → Save 用旧副本覆盖 Enabled，磁盘上又变回启用（且调度条目
+//     已移除，表现为「停用了但重启后又开始跑」）。
+//
+// 只改运行状态字段、其余字段一律沿用存储里的当前值，两个问题一起消失。
+func (s *Store) UpdateRunState(id string, apply func(*Job)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[id]
+	if !ok {
+		return false, nil
+	}
+	apply(j)
+	return true, s.writeLocked()
 }
 
 // Remove 删除任务；不存在返回 false。

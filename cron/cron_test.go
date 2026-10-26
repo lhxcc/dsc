@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // newTestStore 创建临时目录下的任务存储。
@@ -160,5 +161,153 @@ func TestTruncate(t *testing.T) {
 	}
 	if truncate("short") != "short" {
 		t.Fatal("short string should be unchanged")
+	}
+}
+
+// blockingRunner 让任务卡在执行中，便于在「运行期间」修改任务表。
+func blockingRunner(started, release chan struct{}) Runner {
+	return func(ctx context.Context, j *Job) (string, error) {
+		close(started)
+		<-release
+		return "done", nil
+	}
+}
+
+// TestRemovedWhileRunningStaysRemoved 运行期间删除的任务不得被落定写回：
+// 旧实现落定时 Save 的是开始前取的副本，Save 会把它重新插回 map 并写到 cron.json
+// ——任务「删了又活」，且不带任何调度条目（重启后继续跑）。
+func TestRemovedWhileRunningStaysRemoved(t *testing.T) {
+	s := newTestStore(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	sch := NewScheduler(s, blockingRunner(started, release), time.Second)
+	if err := s.Save(&Job{ID: "j1", Name: "n", Cron: "0 8 * * *", Prompt: "p", Enabled: true, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	sch.fire("j1")
+	<-started
+	if !s.Remove("j1") {
+		t.Fatal("remove 失败")
+	}
+	close(release)
+	waitSettled(t, s, "j1")
+
+	if got, ok := s.Get("j1"); ok {
+		t.Fatalf("已删除的任务被落定写回: %+v", got)
+	}
+}
+
+// TestDisabledWhileRunningStaysDisabled 运行期间停用的任务不得被旧副本改回启用：
+// 旧实现会用开始前的 Enabled=true 覆盖磁盘，表现为「停用了，重启后又开始跑」。
+func TestDisabledWhileRunningStaysDisabled(t *testing.T) {
+	s := newTestStore(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	sch := NewScheduler(s, blockingRunner(started, release), time.Second)
+	if err := s.Save(&Job{ID: "j2", Name: "n", Cron: "0 8 * * *", Prompt: "p", Enabled: true, CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	sch.fire("j2")
+	<-started
+	if err := sch.SetEnabled("j2", false); err != nil {
+		t.Fatal(err)
+	}
+	// 同时改 prompt：落定不得用旧副本把它覆盖回去
+	cur, _ := s.Get("j2")
+	cur.Prompt = "new prompt"
+	if err := s.Save(cur); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitSettled(t, s, "j2")
+
+	got, ok := s.Get("j2")
+	if !ok {
+		t.Fatal("任务不应消失")
+	}
+	if got.Enabled {
+		t.Fatal("运行中被停用的任务被落定改回 Enabled=true")
+	}
+	if got.Prompt != "new prompt" {
+		t.Fatalf("运行期间修改的 prompt 被落定覆盖: %q", got.Prompt)
+	}
+	if got.LastStatus != "success" || got.LastOutput != "done" {
+		t.Fatalf("运行状态应写入: %+v", got)
+	}
+}
+
+// TestStoreReturnsCopies Save 入表、List 出表都必须是副本：调度器在后台改状态，
+// 外部持有内部指针就会绕过锁（数据竞态），也能无声改掉内部状态。
+func TestStoreReturnsCopies(t *testing.T) {
+	s := newTestStore(t)
+	j := &Job{ID: "c1", Name: "orig", Cron: "0 8 * * *", Prompt: "p", Enabled: true, CreatedAt: 1}
+	if err := s.Save(j); err != nil {
+		t.Fatal(err)
+	}
+	j.Name = "mutated-after-save" // 调用方继续改自己的对象
+	if got, _ := s.Get("c1"); got.Name != "orig" {
+		t.Fatalf("Save 存了调用方指针（别名）: store Name=%q", got.Name)
+	}
+	list := s.List()
+	list[0].Name = "mutated-via-list"
+	if got, _ := s.Get("c1"); got.Name != "orig" {
+		t.Fatalf("List 返回了内部指针: store Name=%q", got.Name)
+	}
+}
+
+// TestTruncateKeepsRunesValid 输出截断不能把多字节字符劈开（落盘会变成 U+FFFD）。
+func TestTruncateKeepsRunesValid(t *testing.T) {
+	long := strings.Repeat("中", maxOutputLen/3+50) // 每字 3 字节，必然落在字符中间
+	got := truncate(long)
+	if !utf8.ValidString(got) {
+		t.Fatal("截断结果不是合法 UTF-8（字符被劈开）")
+	}
+	if len(got) > maxOutputLen {
+		t.Fatalf("截断后长度 %d 超过上限 %d", len(got), maxOutputLen)
+	}
+	if strings.Trim(got, "中") != "" {
+		t.Fatalf("截断处产生了非预期内容: %q", got[len(got)-9:])
+	}
+}
+
+// waitSettled 等待任务落定（或确认任务已不存在）。
+func waitSettled(t *testing.T, s *Store, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		j, ok := s.Get(id)
+		if !ok || j.LastStatus != "running" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("任务 %s 未在期限内落定", id)
+}
+
+// TestStartResetsStaleRunning 上次进程异常退出会留下 LastStatus="running"；
+// 启动时必须复位，否则 /crons 与 cron_list 永远显示「运行中」，
+// 模型会以为任务还活着、等一个永远不会到的结果。
+func TestStartResetsStaleRunning(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Save(&Job{ID: "stale", Name: "n", Cron: "0 8 * * *", Prompt: "p",
+		Enabled: true, CreatedAt: 1, LastStatus: "running", LastRunAt: 123}); err != nil {
+		t.Fatal(err)
+	}
+	sch := NewScheduler(s, func(ctx context.Context, j *Job) (string, error) { return "", nil }, time.Second)
+	if err := sch.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop()
+
+	got, _ := s.Get("stale")
+	if got.LastStatus == "running" {
+		t.Fatal("启动后仍停留在 running：上次异常退出的残留状态未复位")
+	}
+	if got.LastStatus != "error" || !strings.Contains(got.LastError, "interrupted") {
+		t.Fatalf("应记为 interrupted error，got status=%q err=%q", got.LastStatus, got.LastError)
+	}
+	// 任务本身仍是启用的（复位的是运行状态，不是调度开关）
+	if !got.Enabled {
+		t.Fatal("不应改变 enabled")
 	}
 }
