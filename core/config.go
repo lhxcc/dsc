@@ -64,6 +64,10 @@ type Config struct {
 	//
 	// 它只作用于**从存档恢复的历史**；同一进程内已经发生的轮次属于当前上下文，
 	// 不受此设置影响（见 session.DeriveMessagesLimited）。
+	//
+	// TUI 启动时的历史回显也复用这一个值（见 core.Manager.LoadDisplayHistory）：
+	// 负值不显示、0 回显默认 HistoryShowsDefault 条、N>0 回显最近 N 条——显示量
+	// 不会超过实际注入量，因此不需要第二个「显示条数」配置项。
 	HistoryInjection int `json:"history_injection" yaml:"history_injection"`
 	// HotReload 是否启用版本化二进制自动热重载 watch：插件目录内出现版本高于当前运行的
 	// <基名>-v<版本><ext> 文件时，自动经 HotReload 换成新进程（默认关闭）。

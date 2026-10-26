@@ -274,6 +274,10 @@ type Model struct {
 	histPos int
 	draft   string
 
+	// pendingHistory 启动时从存档恢复的可显示历史（user/assistant），在首个
+	// WindowSizeMsg 拿到终端宽度后渲染到正文顶部；渲染一次后置空（见 seedHistory）。
+	pendingHistory []*core.AgentDebugMessage
+
 	// 复制提示：选区复制成功后短暂显示，由 copyNoticeSeq 防过期竞态
 	copyNotice    string
 	copyNoticeSeq int
@@ -682,6 +686,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetWidth(max(msg.Width-1, 10))
 			m.viewport.SetHeight(m.vpHeight())
 		}
+		m.seedHistory()
 		m.render()
 		m.virtualGotoBottom()
 
@@ -1628,6 +1633,29 @@ func (m *Model) appendToolFrame(rendered string) {
 	} else {
 		m.lines = append(m.lines, rendered)
 	}
+}
+
+// seedHistory 在首个窗口尺寸到达后，把启动时从存档恢复的历史渲染到正文顶部（仅
+// 一次）。历史已由宿主按 history_injection 的注入量派生并截取（见
+// core.Manager.LoadDisplayHistory），此处只负责排版：一条分隔提示 + 交替的
+// user/assistant 块，让用户一眼看出这些是「先前对话」而非本次运行的新输出。
+func (m *Model) seedHistory() {
+	if len(m.pendingHistory) == 0 {
+		return
+	}
+	msgs := m.pendingHistory
+	m.pendingHistory = nil
+	w := max(m.width-4, 20)
+	m.appendMessage(dimSty.Render(fmt.Sprintf("── 恢复的最近历史（%d 条）──", len(msgs))))
+	for _, msg := range msgs {
+		switch msg.Role {
+		case "user":
+			m.appendMessage(renderUserBubble(msg.Content, w))
+		case "assistant":
+			m.appendMessage(m.renderAssistant(renderMarkdown(msg.Content, w)))
+		}
+	}
+	m.pinnedToBottom = true
 }
 
 // scrollToBottomIfPinned 流式渲染后滚动到底：仅当用户钉在底部时自动跟随新内容；
@@ -3875,8 +3903,10 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 }
 
 // Run 运行聊天界面，阻塞直到退出
-func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int) error {
+func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, history []*core.AgentDebugMessage) error {
 	m := New(agent, manager, ctx, modelName, mode, contextWindow)
+	// 启动时从存档恢复的可显示历史，首个窗口尺寸到达后渲染（见 seedHistory）。
+	m.pendingHistory = history
 	p := tea.NewProgram(m)
 	m.program = p
 	// 注册用户评审 provider：agent 侧 exit_plan_mode 等经宿主向 TUI 提问
