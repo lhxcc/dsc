@@ -268,3 +268,21 @@ func TestLoadHistoryReplay(t *testing.T) {
 		t.Fatalf("inject<0 应返回 nil, got %+v", r)
 	}
 }
+
+// TestSeedSessionPromptFromLog 重启恢复时从会话日志恢复上次成功请求的 prompt
+// 用量，供 pre-step 的 LastUsageTokens 使用（避免首发把全量估算当已用）。
+func TestSeedSessionPromptFromLog(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	s := session.New()
+	s.Append(session.LLMAttempt, &session.LLMAttemptData{Turn: 1, Step: 1,
+		Usage: &proto.Usage{PromptTokens: 40347, TotalTokens: 40864}}, nil)
+	// 之后一次失败：无 prompt 用量，不应覆盖
+	s.Append(session.LLMAttempt, &session.LLMAttemptData{Turn: 2, Step: 1,
+		Error: "context_window_exceeded"}, nil)
+
+	const key = "sess-x"
+	m.seedSessionPromptFromLog(key, s)
+	if got := m.lastSessionPrompt(key); got != 40347 {
+		t.Fatalf("lastSessionPrompt = %d, want 40347", got)
+	}
+}

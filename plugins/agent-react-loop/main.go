@@ -342,6 +342,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				restored.Len(), a.turnCounter)
 		}
 		a.sess = restored
+		// 重启恢复：把上次成功请求的用量锚点也恢复出来。否则首发请求没有服务端
+		// usage 可依，TokenMeter 会退回「全量派生估算」——把模型根本看不到的、已被
+		// 压缩后端遮蔽的历史也算进「已用」，标题虚高，还可能误判超窗/误触发压缩。
+		// 用锚点后 Project 退化为该实测值，与上次请求的读数一致。
+		a.seedUsageFromHistory(restored)
 		a.goalActivation = false // 恢复/切换后停用续行（对齐 DSH session-start disarm）
 		a.sysPrompt = a.buildSystemPrompt(ctx, toolClient)
 		// resume 后 surface 已含上次提交的 system/message 节点（v3）；
@@ -1849,6 +1854,31 @@ func (a *ReactLoopAgent) tokenMeter() *dsc.TokenMeter {
 		a.meter = dsc.NewTokenMeter(a.contextWindow)
 	}
 	return a.meter
+}
+
+// seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
+// 服务端 usage 可依）。取最后一条无错误、带 prompt 用量的 llm/attempt：
+//   - lastPromptTokens/lastUsage 供 usageSnapshot 上报「已用」；
+//   - tokenMeter().UpdateUsage 建立锚点，使 Project 退化为该实测值，而不是把全量
+//     派生历史（含被压缩后端遮蔽、模型看不到的部分）当作已用。
+func (a *ReactLoopAgent) seedUsageFromHistory(sess *session.Session) {
+	if sess == nil {
+		return
+	}
+	evs := sess.Events()
+	for i := len(evs) - 1; i >= 0; i-- {
+		d, ok := evs[i].Data.(*session.LLMAttemptData)
+		if !ok || d.Error != "" || d.Usage == nil || d.Usage.PromptTokens <= 0 {
+			continue
+		}
+		a.usageMu.Lock()
+		a.lastPromptTokens = d.Usage.PromptTokens
+		a.lastUsage = dsc.UsageFromProto(d.Usage)
+		u := a.lastUsage
+		a.usageMu.Unlock()
+		a.tokenMeter().UpdateUsage(u)
+		return
+	}
 }
 
 // newAgent 从宿主注入的环境变量构建 ReactLoopAgent（配置读取 + 会话存储初始化）。

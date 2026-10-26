@@ -63,10 +63,15 @@ func (m *Manager) LoadHistoryReplay(historyInjection, historyShows int) *History
 	if err != nil {
 		return nil
 	}
-	sess, err := st.Load(session.SessionKeyForProject(WorkspaceRoot))
+	key := session.SessionKeyForProject(WorkspaceRoot)
+	sess, err := st.Load(key)
 	if err != nil || sess == nil {
 		return nil
 	}
+	// 重启恢复：用会话日志里上次成功请求的 prompt 用量重建宿主侧读数，供 pre-step
+	// 的 LastUsageTokens 使用。否则首发判定退回全量派生估算（把压缩后端遮蔽、模型
+	// 看不到的历史也算进去），压缩压力虚高、可能误触发压缩/超窗。
+	m.seedSessionPromptFromLog(key, sess)
 	inject := historyInjection
 	if limit, ok := session.FoldHistoryLimit(sess.Events()); ok {
 		inject = limit // 会话内 /settings history 覆盖配置缺省（与 agent 一致）
@@ -116,4 +121,23 @@ func displayableMessages(msgs []*proto.Message) []*AgentDebugMessage {
 		out = append(out, &AgentDebugMessage{Role: msg.Role, Content: msg.Content})
 	}
 	return out
+}
+
+// seedSessionPromptFromLog 从会话日志恢复上次成功请求的 prompt 用量，写入宿主侧
+// per-session 读数（pre-step 事件的 LastUsageTokens 即来源于此）。重启后的首发请求
+// 没有服务端 usage 可依，若不恢复，压缩插件会把全量派生历史当作已用（其中大部分
+// 已被压缩后端遮蔽、模型根本看不到），压缩压力虚高。
+func (m *Manager) seedSessionPromptFromLog(sessionID string, sess *session.Session) {
+	if m == nil || sess == nil {
+		return
+	}
+	evs := sess.Events()
+	for i := len(evs) - 1; i >= 0; i-- {
+		d, ok := evs[i].Data.(*session.LLMAttemptData)
+		if !ok || d.Error != "" || d.Usage == nil || d.Usage.PromptTokens <= 0 {
+			continue
+		}
+		m.recordSessionUsage(sessionID, d.Usage.PromptTokens)
+		return
+	}
 }
