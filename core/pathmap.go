@@ -180,15 +180,22 @@ func resolveDriveRoot(rest, _, _ string) (string, bool) {
 	return driveToRoot(drive, after)
 }
 
-// resolveDriveLetterRoot 单字母盘符别名：/c/Users → C:/Users、/c/ → C:/（仅 Windows 入表）。
+// resolveDriveLetterRoot 单字母盘符别名：/c/Users → C:/Users、/c/ → C:/、/c:/ → C:/、
+// /c:/Users → C:/Users（仅 Windows 入表）。
 //
-// rest 形如 "/c/Users" 或 "/c/"。**裸 /c（rest 即 "/c"、after 为空）不匹配**：Windows
-// 命令的单字母开关也是 /F、/c、/S 这种形状（taskkill /F、cmd /c、xcopy /S），shell AST
-// 重写会把每个字面量过一遍虚拟根表，裸 /<letter> 一旦被别名化，命令开关就被改写成盘符
-// 路径（taskkill /F → taskkill F:/），命令整体失效（已在会话日志实测：taskkill 报
-// 「无效参数/选项 - '//F'」）。rest 后面不是分隔符的（/cdrom、/dev/null）同样不匹配——
-// 真实根语义下它们是当前盘根下的路径，不能当成盘符别名。引用盘符根目录请用 /c/ 或
-// /mnt/c 或 C:/，三者都仍映射到 C:/。
+// 接受的形态有两种（都指同一个盘符根或子路径）：
+//   - /c/…    （Git Bash / MSYS 风格，最常见，结尾斜杆可省略指根：/c/ = C:/）
+//   - /c:/…   （斜杆 + 盘符 + 冒号 + 结尾斜杆，模型自然写法；冒号被当作驱动器分隔符吃掉）
+//   - /mnt/c  （WSL 风格，由 resolveDriveRoot 处理）
+//
+// **裸 /c（after 为空、无冒号）不匹配**：Windows 命令的单字母开关也是 /F、/c、/S 这种
+// 形状（taskkill /F、cmd /c、xcopy /S），shell AST 重写会把每个字面量过一遍虚拟根表，
+// 裸 /<letter> 一旦被别名化，命令开关就被改写成盘符路径（taskkill /F → taskkill F:/），
+// 命令整体失效（已在会话日志实测：taskkill 报「无效参数/选项 - '//F'」）。
+//
+// 冒号形态**必须带结尾斜杆**：/c:/ 或 /c:/Users 才映射，**裸 /c: 不映射**——它省略了
+// 结尾斜杆，与 /x: 形状难以区分，且盘符根本就应用 /c/ 或 /c:/ 显式写出。rest 后面不是
+// 分隔符的（/cdrom、/c:foo）同样不匹配。引用盘符根目录可用 /c/、/c:/、/mnt/c 或 C:/。
 func resolveDriveLetterRoot(rest, _, _ string) (string, bool) {
 	body := strings.TrimPrefix(rest, "/")
 	if body == "" {
@@ -199,12 +206,17 @@ func resolveDriveLetterRoot(rest, _, _ string) (string, bool) {
 		return "", false
 	}
 	after := body[1:]
+	// /c:/… 形态：把冒号当作驱动器分隔符吃掉，之后与 /c/… 同构；
+	// /c:/Users → after="/Users"，/c:/ → after="/"。裸 /c:（冒号后为空）不映射。
+	if after != "" && after[0] == ':' {
+		after = after[1:]
+	}
 	if after == "" {
-		// 裸 /<letter> 是命令开关（taskkill /F、cmd /c），不是盘符别名。
+		// 裸 /<letter> 或裸 /<letter>: 都是命令开关形态，不是盘符别名。
 		return "", false
 	}
 	if !strings.HasPrefix(after, "/") {
-		return "", false // /cdrom 不是盘符别名
+		return "", false // /cdrom、/c:foo 不是盘符别名
 	}
 	return driveToRoot(drive, after)
 }
