@@ -1686,6 +1686,19 @@ func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
 			}
 		case "assistant":
 			out = append(out, m.renderAssistant(renderMarkdown(msg.Content, w)))
+		case "tool":
+			// 回放里的工具过程分两条目：调用卡与结果卡，渲染器与实时视图同一套
+			// （renderToolCall / renderToolResult），保证「重启前后看到的是同一个样子」。
+			switch msg.Kind {
+			case core.DebugKindToolCall:
+				if card := renderToolCall(msg.ToolName, msg.ToolArgs); card != "" {
+					out = append(out, card)
+				}
+			case core.DebugKindToolResult:
+				if card := renderToolResult(msg.Content, msg.IsError); card != "" {
+					out = append(out, card)
+				}
+			}
 		}
 	}
 	return out

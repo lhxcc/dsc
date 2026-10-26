@@ -74,7 +74,22 @@ type Agent interface {
 type AgentDebugMessage struct {
 	Role    string `json:"role"` // "system" | "user" | "assistant" | "tool"
 	Content string `json:"content"`
+
+	// Kind 区分「历史回放」条目的类型（空 = 普通文本气泡）：
+	//   DebugKindToolCall   工具调用（ToolName/ToolArgs 有值，Content 空）
+	//   DebugKindToolResult 工具结果（Content 为结果文本，IsError 标记失败）
+	// 实时视图不走这里（它消费 streamFrame，带结构化 view），本字段只服务启动回放。
+	Kind     string `json:"kind,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
+	ToolArgs string `json:"tool_args,omitempty"`
+	IsError  bool   `json:"is_error,omitempty"`
 }
+
+// 历史回放条目类型（AgentDebugMessage.Kind）。
+const (
+	DebugKindToolCall   = "tool_call"
+	DebugKindToolResult = "tool_result"
+)
 
 // AgentGoalDebugInfo 目标的调试信息（对齐 session.Goal 的可观察字段）。
 type AgentGoalDebugInfo struct {

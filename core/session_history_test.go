@@ -2,6 +2,7 @@ package core
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dsc/proto"
@@ -33,7 +34,9 @@ func TestResolveHistoryShowsCount(t *testing.T) {
 	}
 }
 
-// TestDisplayableMessages 只保留有正文的 user/assistant，过滤 system/tool/空正文。
+// TestDisplayableMessages 回放条目的基本筛选：system 与空正文丢弃，
+// user/assistant 文本保留，tool 结果保留为结果卡（过程必须可见，见
+// TestDisplayableMessagesExpandsToolProcess）。
 func TestDisplayableMessages(t *testing.T) {
 	msgs := []*proto.Message{
 		{Role: "system", Content: "sys"},
@@ -43,8 +46,11 @@ func TestDisplayableMessages(t *testing.T) {
 		{Role: "user", Content: "   "},
 	}
 	got := displayableMessages(msgs)
-	if len(got) != 2 || got[0].Role != "user" || got[1].Role != "assistant" {
-		t.Fatalf("displayableMessages = %+v, want [user, assistant]", got)
+	if len(got) != 3 {
+		t.Fatalf("displayableMessages = %+v, want 3 条（user + 工具结果 + assistant）", got)
+	}
+	if got[0].Role != "user" || got[1].Kind != DebugKindToolResult || got[2].Role != "assistant" {
+		t.Fatalf("条目类型不符: %+v", got)
 	}
 }
 
@@ -293,5 +299,77 @@ func TestSeedSessionPromptFromLog(t *testing.T) {
 	// 信封指纹必须一并恢复，否则重启后首发的锚点会被判为不可比。
 	if a.toolsHash != "abc123" || a.sentEstimate != 37790 || a.contextWindow != 1048576 || a.model != "deepseek-test" {
 		t.Fatalf("锚点信封字段未恢复: %+v", a)
+	}
+}
+
+// TestDisplayableMessagesExpandsToolProcess 回放必须带上工具过程：
+// 助手正文 → 它的每个调用卡 → 对应的结果卡（失败按 exit_code 标红）。
+// 此前只挑 user/assistant 正文，重启后只剩「结论」，看不到模型改代码/跑命令的过程。
+func TestDisplayableMessagesExpandsToolProcess(t *testing.T) {
+	msgs := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "看看这个文件"},
+		// 只有工具调用、没有正文的助手消息：不得产生空气泡，但调用卡必须在
+		{Role: "assistant", ToolCalls: []*proto.ToolCall{{
+			Name:          "str_replace_editor",
+			ArgumentsJson: `{"command":"str_replace","path":"a.go"}`,
+		}}},
+		{Role: "tool", Content: "done\n[exit_code: 0]\n"},
+		{Role: "tool", Content: "boom\n[exit_code: 2]\n"},
+		{Role: "assistant", Content: "改完了"},
+	}
+
+	got := displayableMessages(msgs)
+	if len(got) != 5 {
+		t.Fatalf("条目数 = %d, want 5（user + 调用卡 + 两个结果卡 + assistant）: %+v", len(got), got)
+	}
+	if got[0].Role != "user" || got[0].Kind != "" {
+		t.Fatalf("第 1 条应为 user 气泡: %+v", got[0])
+	}
+	if got[1].Role != "tool" || got[1].Kind != DebugKindToolCall || got[1].ToolName != "str_replace_editor" {
+		t.Fatalf("第 2 条应为工具调用卡: %+v", got[1])
+	}
+	if !strings.Contains(got[1].ToolArgs, "str_replace") {
+		t.Fatalf("调用卡应带参数 JSON: %+v", got[1])
+	}
+	if got[2].Kind != DebugKindToolResult || got[2].IsError {
+		t.Fatalf("exit_code: 0 应判成功: %+v", got[2])
+	}
+	if got[3].Kind != DebugKindToolResult || !got[3].IsError {
+		t.Fatalf("exit_code: 2 应判失败: %+v", got[3])
+	}
+	if got[4].Role != "assistant" || got[4].Content != "改完了" {
+		t.Fatalf("末条应为 assistant 气泡: %+v", got[4])
+	}
+}
+
+// TestReplayInitialKeepsToolsWithTheirMessage history_shows 数的是**对话条数**：
+// 工具卡不占名额，但要随所属消息一起进入初始切片（否则重启后首屏只有一两句结论）。
+func TestReplayInitialKeepsToolsWithTheirMessage(t *testing.T) {
+	entries := []*AgentDebugMessage{
+		{Role: "user", Content: "u1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "tool", Kind: DebugKindToolCall, ToolName: "x"},
+		{Role: "tool", Kind: DebugKindToolResult, Content: "r1"},
+		{Role: "user", Content: "u2"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "tool", Kind: DebugKindToolCall, ToolName: "y"},
+		{Role: "tool", Kind: DebugKindToolResult, Content: "r2"},
+	}
+	if n := countConversationMessages(entries); n != 4 {
+		t.Fatalf("对话条数 = %d, want 4（工具卡不算）", n)
+	}
+	// 最近 2 条对话消息 = u2 + a2，连同它们的 2 张卡 = 4 个条目
+	if n := tailEntryCountForMessages(entries, 2); n != 4 {
+		t.Fatalf("最近 2 条消息覆盖 %d 个条目, want 4", n)
+	}
+	if n := tailEntryCountForMessages(entries, 1); n != 3 {
+		t.Fatalf("最近 1 条消息应覆盖 a2 + 两张卡 = 3 个条目, got %d", n)
+	}
+	if n := tailEntryCountForMessages(entries, 99); n != len(entries) {
+		t.Fatalf("请求超过总条数时应返回全部条目, got %d", n)
+	}
+	if n := tailEntryCountForMessages(entries, 0); n != 0 {
+		t.Fatalf("0 条应返回 0, got %d", n)
 	}
 }
