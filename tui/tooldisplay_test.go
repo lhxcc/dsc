@@ -159,3 +159,14 @@ func TestToolErrorText(t *testing.T) {
 		t.Fatalf("toolErrorText = %q, want %q", got, "Shell > command not found: foo")
 	}
 }
+
+// job 工具族必须在卡片括号里带任务标识符：现场「● JobOutput」看不出是哪一条任务，
+// 模型/用户都得回头翻调用参数。job_output/job_kill 的主参是 job_id。
+func TestJobToolCardShowsJobID(t *testing.T) {
+	for _, name := range []string{"job_output", "job_kill"} {
+		card := renderToolCall(name, `{"job_id":"shell-3","wait":true}`)
+		if !strings.Contains(card, "shell-3") {
+			t.Fatalf("%s 卡片应含任务标识 shell-3, got %q", name, card)
+		}
+	}
+}

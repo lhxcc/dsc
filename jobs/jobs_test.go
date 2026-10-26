@@ -358,3 +358,50 @@ func TestRegistryHostView(t *testing.T) {
 	}
 	waitHost(id2, StatusKilled)
 }
+
+// TestWaitSuppressesDoneNotification 有人在 Wait 上等时不再发「任务完成」通知：
+// 该调用方落定后直接取回输出，再唤醒模型只会让它重复读到刚收集过的内容
+// （现场：模型先 job_output(wait) 收了构建输出，随后又收到三条完成通知，
+// 回它「這些都是我已經讀過的構建任務通知，沒有新信息」）。
+func TestWaitSuppressesDoneNotification(t *testing.T) {
+	r := NewRegistry()
+	notified := make(chan JobSnapshot, 4)
+	r.OnJobDone(func(s JobSnapshot) { notified <- s })
+
+	done := make(chan JobOutcome, 1)
+	id, err := r.Start(StartSpec{
+		Kind: "shell", Label: "shell: build",
+		Start: func() (JobHooks, error) {
+			return JobHooks{Done: done}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// 先挂一个 Wait（模拟 job_output wait:true），再让任务落定
+	returned := make(chan JobSnapshot, 1)
+	go func() {
+		snap, _ := r.Wait(id, 2*time.Second, "")
+		returned <- snap
+	}()
+	// 给 Wait 一点时间进入阻塞（注册 Awaited）
+	time.Sleep(20 * time.Millisecond)
+	done <- JobOutcome{Status: StatusCompleted, Output: "ok"}
+
+	select {
+	case snap := <-returned:
+		if snap.Status != StatusCompleted || !snap.Awaited || !snap.Reported {
+			t.Fatalf("wait 返回 %+v，应已落定且标记 awaited/reported", snap)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait 未被唤醒")
+	}
+
+	select {
+	case s := <-notified:
+		t.Fatalf("等待中的任务不应再发完成通知，却收到 %+v", s)
+	case <-time.After(100 * time.Millisecond):
+		// 期望：没有通知
+	}
+}

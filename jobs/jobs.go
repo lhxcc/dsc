@@ -90,6 +90,9 @@ type JobSnapshot struct {
 	FinishedAt       time.Time // 零值 = 未落定
 	// Reported kill/read/wait 触及终态时置位，供完成通知抑制重复。
 	Reported bool
+	// Awaited 有调用方正阻塞在 Wait 上。落定后由该调用方直接取回输出，
+	// 再发一次「任务完成」唤醒纯属重复（模型会收到自己刚读过的内容）。
+	Awaited bool
 }
 
 // Registry 后台任务注册表（线程安全）。
@@ -215,6 +218,9 @@ func (r *Registry) Start(spec StartSpec) (string, error) {
 			listeners = append(listeners, fn)
 		}
 		snap := j.snapshot
+		if snap.Awaited {
+			listeners = nil // 等待方会直接取回输出，无需唤醒
+		}
 		r.mu.Unlock()
 		for _, fn := range listeners {
 			func() {
@@ -386,6 +392,9 @@ func (r *Registry) Wait(id string, timeout time.Duration, caller string) (JobSna
 		return j.snapshot, nil
 	}
 	settled := j.settled
+	// 必须在解锁/阻塞**之前**登记：落定广播在 close(settled) 之后立刻触发，
+	// 等到 <-settled 再置位就已经晚了一步（通知已经发出去了）。
+	j.snapshot.Awaited = true
 	r.mu.Unlock()
 
 	select {

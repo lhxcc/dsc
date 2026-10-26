@@ -1679,10 +1679,9 @@ func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
 			// 唤醒机制会把后台任务完成通知前置拼进用户消息；重放时按同一形态拆开：
 			// 通知按系统提示渲染，其余才是用户气泡——避免「通知与用户消息粘连成
 			// 一块」（实时视图本就只把通知渲染成系统提示）。
-			notices, rest := splitJobDoneNotices(msg.Content)
-			for _, n := range notices {
-				out = append(out, noticeBubble(n))
-			}
+			// 完成通知是给模型的唤醒信号，不是用户内容：回放同样不渲染，
+			// 否则重启后会看到一屏「background job ... finished」而没有来龙去脉。
+			_, rest := splitJobDoneNotices(msg.Content)
 			if rest = strings.TrimSpace(rest); rest != "" {
 				out = append(out, renderUserBubble(rest, w))
 			}
@@ -1915,6 +1914,8 @@ var toolArgKey = map[string]string{
 	"skill":                "name",
 	"install_skill":        "name",
 	"uninstall_skill":      "name",
+	"job_output":           "job_id",
+	"job_kill":             "job_id",
 	"load_dsc_plugin":      "name",
 	"unload_dsc_plugin":    "name",
 	"install_dsc_plugin":   "name",
@@ -2123,7 +2124,10 @@ func renderToolResult(result string, isErr bool) string {
 	if !isErr {
 		diffStart = diffBlockStart(lines)
 	}
-	indent := strings.Repeat(" ", len(connector))
+	// 缩进必须按**显示宽度**算：connector（"  └ "）含 └（U+2514，3 字节），
+	// len() 会得到 6，续行就比首行多缩 2 格——实测「首行从第 4 列、后续行从第 6 列」，
+	// 视觉上一整块向右歪。lipgloss.Width 按单元格宽度算（4），与终端一致。
+	indent := strings.Repeat(" ", lipgloss.Width(connector))
 	var b strings.Builder
 	b.WriteString(dimSty.Render(connector))
 	if isErr {
@@ -2481,7 +2485,10 @@ func renderPlainView(v *core.ToolView) string {
 // resultGutter 为多行结果/卡片套用「└」gutter 与续行缩进（首行带 gutter，后续行对齐）。
 func resultGutter(body string) string {
 	lines := strings.Split(body, "\n")
-	indent := strings.Repeat(" ", len(connector))
+	// 缩进必须按**显示宽度**算：connector（"  └ "）含 └（U+2514，3 字节），
+	// len() 会得到 6，续行就比首行多缩 2 格——实测「首行从第 4 列、后续行从第 6 列」，
+	// 视觉上一整块向右歪。lipgloss.Width 按单元格宽度算（4），与终端一致。
+	indent := strings.Repeat(" ", lipgloss.Width(connector))
 	var b strings.Builder
 	b.WriteString(dimSty.Render(connector))
 	for i, ln := range lines {

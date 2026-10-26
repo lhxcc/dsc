@@ -32,9 +32,10 @@ func TestWakeup(t *testing.T) {
 	if len(m.pendingWakeups) != 0 {
 		t.Fatalf("notifications should be consumed by wakeup, got %+v", m.pendingWakeups)
 	}
-	// 通知渲染为系统提示行
-	if full := strings.Join(m.lines, "\n"); !strings.Contains(full, "background job workflow-1") {
-		t.Fatalf("notice should render, got: %q", full)
+	// 通知是给模型的唤醒信号，**不打印到对话区**（此前渲染成 dim 系统提示，
+	// 用户看到一屏 background job 噪音）。
+	if full := strings.Join(m.lines, "\n"); strings.Contains(full, "background job workflow-1") {
+		t.Fatalf("notice 不应打印到前端, got: %q", full)
 	}
 
 	// 忙碌时收到通知 → 排队，不自动发
@@ -86,23 +87,27 @@ func TestSplitJobDoneNoticesReplay(t *testing.T) {
 	})
 	content := n1 + "\n\n" + n2 + "\n\n量这条边际成本曲线"
 
+	// 完成通知是给模型的唤醒信号，不当用户内容渲染：回放只剩用户气泡本身。
+	// （旧行为是把它们渲染成 dim 系统提示，重启后会看到一屏 background job 噪音。）
 	blocks := m.renderHistoryBlocks([]*core.AgentDebugMessage{{Role: "user", Content: content}})
-	if len(blocks) != 3 {
-		t.Fatalf("应为 2 条通知 + 1 个用户气泡, got %d: %#v", len(blocks), blocks)
+	if len(blocks) != 1 {
+		t.Fatalf("应只剩 1 个用户气泡（通知不打印）, got %d: %#v", len(blocks), blocks)
 	}
-	for i := 0; i < 2; i++ {
-		if !strings.Contains(blocks[i], "background job") {
-			t.Fatalf("第 %d 块应为通知, got %q", i, blocks[i])
-		}
-		if strings.Contains(blocks[i], "量这条边际成本曲线") {
-			t.Fatalf("通知块不应含用户正文, got %q", blocks[i])
-		}
+	if !strings.Contains(blocks[0], "量这条边际成本曲线") {
+		t.Fatalf("用户气泡应含用户正文, got %q", blocks[0])
 	}
-	if !strings.Contains(blocks[2], "量这条边际成本曲线") {
-		t.Fatalf("用户气泡应含用户正文, got %q", blocks[2])
+	if strings.Contains(blocks[0], "background job") {
+		t.Fatalf("用户气泡不应含通知文本, got %q", blocks[0])
 	}
-	if strings.Contains(blocks[2], "background job") {
-		t.Fatalf("用户气泡不应含通知, got %q", blocks[2])
+}
+
+// 纯通知（无用户正文）不得产生任何块，否则回放会出现一屏无来龙去脉的噪声。
+func TestReplayPureNoticeRendersNothing(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	m.width = 80
+	n := renderJobDoneNotice(jobs.JobSnapshot{ID: "shell-9", Kind: "shell", Label: "shell: make", Status: jobs.StatusCompleted})
+	if blocks := m.renderHistoryBlocks([]*core.AgentDebugMessage{{Role: "user", Content: n}}); len(blocks) != 0 {
+		t.Fatalf("纯通知不应渲染任何块, got %#v", blocks)
 	}
 }
 

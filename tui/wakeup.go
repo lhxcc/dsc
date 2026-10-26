@@ -63,16 +63,14 @@ func splitJobDoneNotices(content string) (notices []string, rest string) {
 	return notices, rest
 }
 
-// noticeBubble 渲染完成通知行（系统提示样式，不冒充用户消息）。
-func noticeBubble(text string) string {
-	return dimSty.Render(text)
-}
-
 // startTurn 启动一轮 agent 运行（Enter 用户输入与完成通知唤醒共用）。
 // images 为本轮附带的图像 data URL（唤醒场景为 nil）；warning 非空时在用户消息
 // 之后追加一条系统提示（如「图片未随消息发送」），唤醒场景为空。
 func (m *Model) startTurn(text string, images []string, rendered string, warning string) tea.Cmd {
-	m.appendMessage(rendered)
+	// rendered 为空 = 本轮没有要显示的东西（如后台任务完成唤醒：通知只给模型看）。
+	if strings.TrimSpace(rendered) != "" {
+		m.appendMessage(rendered)
+	}
 	if warning != "" {
 		m.appendMessage(warnSty.Render(warning))
 	}
@@ -126,5 +124,8 @@ func (m *Model) tryWakeup() tea.Cmd {
 	m.wakeBudget--
 	text := strings.Join(m.pendingWakeups, "\n\n")
 	m.pendingWakeups = nil
-	return m.startTurn(text, nil, noticeBubble(text), "")
+	// 通知**不进对话区**：它是给模型的唤醒信号，不是用户消息。以前这里渲染
+	// noticeBubble(text)，用户看到一屏「background job ... finished」。
+	// 模型侧内容照旧（text 作为本轮输入），只是不打印。
+	return m.startTurn(text, nil, "", "")
 }
