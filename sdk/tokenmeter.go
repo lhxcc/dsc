@@ -62,6 +62,13 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 	return core.EstimateProtoMessagesTokens(msgs)
 }
 
+// EstimateProtoToolTokens 估算 proto 形态工具目录的 token 数。
+//
+// 工具目录是**每次请求都携带**的固定成本，必须与消息估算相加后再判定压力/裁剪；
+// 只算消息会系统性地低估一截（插件多时可达上万 token），窗口将满仍会判「还宽裕」。
+// 与 core.EstimateToolTokens 共用同一单项公式。
+func EstimateProtoToolTokens(tools []*proto.Tool) int { return core.EstimateProtoToolTokens(tools) }
+
 // FormatPressure 把压力比格式化为百分数文本（"82.3%"），供日志/提示统一口径。
 func FormatPressure(pressure float64) string { return core.FormatPressure(pressure) }
 

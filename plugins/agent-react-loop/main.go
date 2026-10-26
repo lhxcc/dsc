@@ -492,7 +492,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 被判超窗，每轮都裁历史并打印提示。
 		meter := a.tokenMeter()
 		meter.UpdateContextWindow(a.contextWindow)
-		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs)
+		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
 		// 决策用的这个数同时是展示口径：随帧上报宿主（见 usageSnapshot）
 		a.usageMu.Lock()
@@ -527,7 +527,8 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 裁完仍超窗口：只可能是「单轮内容本身超窗」（例如一次粘贴 200K tokens），
 		// 无论怎么丢历史都塞不进。此时明确报错，而不是把注定被 provider 拒绝的请求发出去。
 		if a.contextWindow > 0 {
-			if est := a.tokenMeter().Project(dsc.EstimateProtoMessagesTokens(msgs)); est > a.contextWindow {
+			// 工具目录同样占窗口：只算消息会把「单轮超窗」判晚。
+			if est := a.tokenMeter().Project(dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)); est > a.contextWindow {
 				err := fmt.Errorf("单轮内容超出上下文窗口（约 %d > %d tokens）：请拆分输入、减少一次性粘贴的内容，或改用更大窗口的模型", est, a.contextWindow)
 				if emit != nil {
 					emit(&dsc.RunStreamResponse{Status: "error", Error: err.Error()})
@@ -630,7 +631,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			// 压缩后若注入计数把历史又拉回超窗（historyInjection>0 时压缩不被跳过，
 			// 但尾部逐字保留区仍可能很大），再裁一次兜底，保证发出去的一定在窗口内。
 			// 这里没有服务端值可用（刚压缩完，上一发的用量已不代表新列表），故只传估算。
-			msgs, _ = fitMessagesToWindow(msgs, a.contextWindow, dsc.EstimateProtoMessagesTokens(msgs))
+			msgs, _ = fitMessagesToWindow(msgs, a.contextWindow, dsc.EstimateProtoMessagesTokens(msgs)+dsc.EstimateProtoToolTokens(availableTools))
 		}
 
 		// 稳定排序工具目录（按名称），消除无关的顺序差异导致请求前缀字节变化、
@@ -657,9 +658,10 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		}
 		seenInjects = iterPendingInjects
 		firstRequest = false
-		// 本次请求实际发出的消息估算：服务端回报用量时与它配对写入计量锚点
-		// （增量基线必须与被测请求同源，否则投影会算错）。
-		sentEstimate := dsc.EstimateProtoMessagesTokens(msgs)
+		// 本次请求实际发出的**整体**估算（消息 + 工具目录）：服务端回报用量时与它配对
+		// 写入计量锚点，两边必须同源同口径——provider 的 prompt 计数本身就含工具定义，
+		// 只算消息会让锚点与后续增量不在同一尺度上。
+		sentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		// 步开始信号帧：在 LLM 请求真实发出前发射（emit 包装器自动携带
 		// Turn/Step 编号），TUI 以此时刻测 TTFT/初速——覆盖 prompt 处理
 		// 与排队等待；仅靠首个内容帧打点会把这部分首响等待低估为零。
@@ -1444,6 +1446,9 @@ func fitMessagesToWindow(msgs []*proto.Message, window, effectiveTokens int) (ou
 	}
 	budget := int(float64(window) * oversizeTrimRatio)
 	if effectiveTokens <= 0 {
+		// 兜底只算消息：本函数看不到工具目录。调用方应传入「消息 + 工具目录」的
+		// 整体估算（dsc.EstimateProtoMessagesTokens + dsc.EstimateProtoToolTokens），
+		// 否则预算里会少算工具目录那一截。
 		effectiveTokens = dsc.EstimateProtoMessagesTokens(msgs)
 	}
 	// 用「已用容量」而不是「消息总估算」决定是否裁剪：前者含服务端上报值，最接近真实；
@@ -1493,7 +1498,9 @@ func (a *ReactLoopAgent) compactHistory(ctx context.Context, llmClient proto.LLM
 	if a.contextWindow <= 0 {
 		return "", nil
 	}
-	inputTokens := dsc.EstimateProtoMessagesTokens(msgs) + compactionInstructionOverheadTokens
+	// 压缩请求本身也携带工具目录（下面 req.Tools = tools），预算必须一并计入，
+	// 否则 max_tokens 会被高估、摘要可能超出窗口被截断。
+	inputTokens := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools) + compactionInstructionOverheadTokens
 	remaining := a.contextWindow - inputTokens
 	if remaining < compactionRetainMinTokens {
 		remaining = compactionRetainMinTokens

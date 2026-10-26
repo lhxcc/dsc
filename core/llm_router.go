@@ -200,7 +200,8 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	// 估算当前 token 数（复用 core 公用启发式 EstimateProtoMessagesTokens，
 	// CJK 感知 + 角色开销 + 图像 + 工具参数，供插件 nudge 决策）——
 	// 与压缩插件同一估算口径，避免各处字节/4 粗略估算漂移。
-	tokenCount := EstimateProtoMessagesTokens(req.Messages)
+	// 必须把工具目录一起算：它每次请求都随载荷发出，只算消息会系统性低估压力。
+	tokenCount := EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools)
 	result, err := s.m.dispatchEventToPlugins(EventAgentPreStep, AgentPreStepEvent{
 		Agent:           s.m.GetMainAgentName(),
 		Session:         req.GetSessionId(),

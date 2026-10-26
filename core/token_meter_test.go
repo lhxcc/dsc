@@ -318,3 +318,32 @@ func TestPromptSideTokens(t *testing.T) {
 		t.Fatalf("nil usage 应为 0，got %d", got)
 	}
 }
+
+// TestEstimateProtoToolTokens 工具目录必须计入请求成本，且两种入参形态
+// （core.Tool / proto.Tool）必须算出同一个数——宿主 pre-step 用 proto 形态、
+// 内部工具表用 core 形态，两侧若各自算一套就会出现两个压力值。
+func TestEstimateProtoToolTokens(t *testing.T) {
+	coreTools := []Tool{
+		{Name: "read_file", Description: "Read a file from the workspace", ParametersJSON: `{"type":"object","properties":{"path":{"type":"string"}}}`},
+		{Name: "shell", Description: "Execute a shell command", ParametersJSON: `{"type":"object","properties":{"command":{"type":"string"}}}`},
+	}
+	protoTools := []*proto.Tool{
+		{Name: coreTools[0].Name, Description: coreTools[0].Description, ParametersJson: coreTools[0].ParametersJSON},
+		{Name: coreTools[1].Name, Description: coreTools[1].Description, ParametersJson: coreTools[1].ParametersJSON},
+	}
+
+	if got, want := EstimateProtoToolTokens(protoTools), EstimateToolTokens(coreTools); got != want {
+		t.Fatalf("两种形态必须同口径: proto=%d core=%d", got, want)
+	}
+	// 空目录必须是 0：没有工具时不能凭空加固定开销，否则压力被虚抬。
+	if got := EstimateProtoToolTokens(nil); got != 0 {
+		t.Fatalf("nil 工具目录应为 0，got %d", got)
+	}
+	// schema 变大必须单调增长（防止有人把参数 JSON 从公式里漏掉）。
+	one := protoTools[:1]
+	big := []*proto.Tool{{Name: one[0].Name, Description: one[0].Description, ParametersJson: strings.Repeat("x", 2000)}}
+	if EstimateProtoToolTokens(big) <= EstimateProtoToolTokens(one) {
+		t.Fatalf("参数 schema 变大后估算应增长: big=%d one=%d",
+			EstimateProtoToolTokens(big), EstimateProtoToolTokens(one))
+	}
+}

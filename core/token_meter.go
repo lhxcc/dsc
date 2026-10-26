@@ -371,12 +371,40 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 func EstimateToolTokens(tools []Tool) int {
 	total := 0
 	for _, t := range tools {
-		toks := EstimateTextTokens(t.Name) + EstimateTextTokens(t.Description) + EstimateTextTokens(t.ParametersJSON)
-		toks += 16 // JSON schema 结构开销
-		total += toks
+		total += estimateOneToolTokens(t.Name, t.Description, t.ParametersJSON)
 	}
 	return total
 }
+
+// EstimateProtoToolTokens 估算 proto 形态的工具目录 token 数（宿主 pre-step 与 agent
+// 请求构造拿到的就是 proto.Tool）。
+//
+// 为什么必须单独算：工具目录是**每一次请求都携带**的固定成本，且不随会话增长消失。
+// 此前所有压力估算都只算消息（EstimateProtoMessagesTokens），工具目录从未计入——
+// 插件多的配置下这块可达数千到上万 token，等于压力永远被低估一截：窗口快满时仍判
+// 「还宽裕」，该压缩不压。DSH 的 tokenMeter.measure 把 estimateToolsTokens(header)
+// 计入 baseline，此处对齐同一口径。
+//
+// 与 EstimateToolTokens 共用同一个单项公式（estimateOneToolTokens），两种入参形态不会
+// 算出两个数。
+func EstimateProtoToolTokens(tools []*proto.Tool) int {
+	total := 0
+	for _, t := range tools {
+		total += estimateOneToolTokens(t.GetName(), t.GetDescription(), t.GetParametersJson())
+	}
+	return total
+}
+
+// estimateOneToolTokens 单个工具定义的 token 估算（唯一公式）：
+// name + description + parameters JSON 的文本估算 + JSON schema 结构开销。
+func estimateOneToolTokens(name, description, parametersJSON string) int {
+	return EstimateTextTokens(name) + EstimateTextTokens(description) +
+		EstimateTextTokens(parametersJSON) + toolDefinitionOverheadTokens
+}
+
+// toolDefinitionOverheadTokens 单个工具定义的固定结构开销（外层对象、字段名、
+// 分隔符等），与具体 schema 无关的常量部分。
+const toolDefinitionOverheadTokens = 16
 
 // FormatPressure 格式化压力比为人读字符串（如 "78%"）。
 func FormatPressure(pressure float64) string {
