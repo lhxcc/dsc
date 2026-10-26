@@ -76,6 +76,14 @@ type AgentPreStepEvent struct {
 	// 压缩插件以「上次上报 + 自采样以来启发式增量」判定压力，避免纯启发式估算
 	//（不含工具定义、CJK 字节/4 低估）在真实用量已超阈值时不触发压缩。
 	LastUsageTokens int `json:"last_usage_tokens"`
+	// ProjectedTokens 宿主给出的**本轮压力投影**（唯一口径，压缩后端直接用它做阈值判定，
+	// 不要再自己合成）：表面大小 = 消息 + 工具目录；若上一次请求的用量锚点与本请求
+	// 信封可比（工具目录/窗口一致，且该用量不低于当时的启发式价），则以实测用量为底数
+	// 加上自采样以来的表面差量，否则退回纯估算。对齐 DSH tokenMeter.measure。
+	ProjectedTokens int `json:"projected_tokens"`
+	// EnvelopeMatched 用量锚点与本次请求是否同一信封（工具目录 + 窗口一致）。
+	// false 时 ProjectedTokens 就是纯启发式估算，插件如需区分可参考此位。
+	EnvelopeMatched bool `json:"envelope_matched"`
 	// UserInput 自上一请求以来有新用户输入进入会话（回合开场输入或运行中注入）。
 	// 对齐 DSH agent/pre-step 的 inbox claim 语义：循环检测类插件据此重置
 	// per-session 循环链（用户插话改变了上下文，跨插话的重复不是循环）。

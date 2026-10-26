@@ -123,19 +123,27 @@ func displayableMessages(msgs []*proto.Message) []*AgentDebugMessage {
 	return out
 }
 
-// seedSessionPromptFromLog 从会话日志恢复上次成功请求的 prompt 用量，写入宿主侧
-// per-session 读数（pre-step 事件的 LastUsageTokens 即来源于此）。重启后的首发请求
+// seedSessionPromptFromLog 从会话日志恢复上次成功请求的用量锚点（含请求信封指纹），
+// 写入宿主侧 per-session 锚点表（pre-step 的投影压力即来源于此）。重启后的首发请求
 // 没有服务端 usage 可依，若不恢复，压缩插件会把全量派生历史当作已用（其中大部分
 // 已被压缩后端遮蔽、模型根本看不到），压缩压力虚高。
 //
-// 倒查逻辑本身在 session.LastPromptUsage（唯一实现，agent 插件经 sdk 调用同一份），
-// 这里只负责把结果写进宿主的 per-session 读数表。
+// 注意：旧记录没有信封指纹（ToolsHash 为空）→ 锚点会被判为不可比，首发的压力退回
+// 纯估算。这是刻意的保守取舍：拿不可比的用量当底数会把压力算小。
+//
+// 倒查逻辑本身在 session.LastUsageAnchor（唯一实现，agent 插件经 sdk 调用同一份）。
 func (m *Manager) seedSessionPromptFromLog(sessionID string, sess *session.Session) {
 	if m == nil {
 		return
 	}
-	// recordSessionUsage 沿用 proto.Usage 的 int32 口径（与 ChatStream 结算处同一入参类型）。
-	if promptTokens, _, ok := session.LastPromptUsage(sess); ok {
-		m.recordSessionUsage(sessionID, int32(promptTokens))
+	a, ok := session.LastUsageAnchor(sess)
+	if !ok {
+		return
 	}
+	m.recordSessionAnchor(sessionID, sessionUsageAnchor{
+		promptTokens:  a.PromptTokens,
+		sentEstimate:  a.SentEstimate,
+		toolsHash:     a.ToolsHash,
+		contextWindow: a.ContextWindow,
+	})
 }

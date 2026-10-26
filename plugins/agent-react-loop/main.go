@@ -693,6 +693,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				Code:         dsc.ClassifyLLMErrorCode(llmErr),
 				ContentChars: len(content),
 				ToolCalls:    len(toolCalls),
+				// 请求信封指纹 + 当次表面估算：宿主据此判断「下次请求能否沿用这次
+				// 的用量做压力底数」，并在重启后从日志恢复同一判断（唯一实现在
+				// core，经 sdk 转发）。
+				ToolsHash:     dsc.ToolsFingerprint(availableTools),
+				ContextWindow: a.contextWindow,
+				SentEstimate:  sentEstimate,
 			}, nil)
 		}
 		if emit == nil {

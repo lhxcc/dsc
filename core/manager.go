@@ -136,13 +136,17 @@ type Manager struct {
 	sessionApproval   map[string]ApprovalPolicy
 	sessionApprovalMu sync.RWMutex
 
-	// sessionLastPrompt 按会话记录最近一次成功 LLM 请求的服务端上报 prompt 用量
-	//（per-session，对齐 DSH tokenMeter 的 pressureTokens 语义）。供 agent/pre-step
-	// 分发时透传：压缩插件以「上次上报 + 自采样以来启发式增量」判定压力，而非仅靠
-	// 纯启发式估算（不含工具定义、CJK 字节/4 低估 → 真实用量已超阈值也不触发压缩）。
-	// 仅流式请求（ChatStream 回传 usage）记录；非流式 Chat 不携带 usage，保持 0。
-	sessionLastPrompt   map[string]int32
-	sessionLastPromptMu sync.RWMutex
+	// contextWindow 宿主侧已知的上下文窗口（0 = 未知）：仅用于判断用量锚点与当前
+	// 请求是否同一个信封（换模型/换窗口后锚点作废）。
+	contextWindow int
+
+	// sessionAnchors 按会话记录最近一次成功 LLM 请求的用量锚点：provider 实测 prompt
+	// 大小 + 产生它时的请求信封指纹（工具目录 + 窗口）+ 当时的启发式估算。
+	// 供 agent/pre-step 计算投影压力（对齐 DSH tokenMeter.measure 的 baseline+delta）：
+	// 只有信封可比时才把用量当底数，否则退回启发式估算。
+	// 仅流式请求（ChatStream 回传 usage）记录；非流式 Chat 不携带 usage。
+	sessionAnchors  map[string]sessionUsageAnchor
+	sessionAnchorMu sync.RWMutex
 
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
 	stopHooks map[string][]func() error
@@ -247,7 +251,13 @@ func (m *Manager) ResetContextMeters(sessionID string) {
 
 // SetContextWindow 更新上下文窗口（模型切换后同步给宿主计量实例）。
 func (m *Manager) SetContextWindow(window int) {
-	if m == nil || m.ctxMeters == nil {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.contextWindow = window
+	m.mu.Unlock()
+	if m.ctxMeters == nil {
 		return
 	}
 	m.ctxMeters.SetWindow(window)
@@ -301,7 +311,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		events:              NewEventBus(),
 		policyOff:           make(map[string][]func()),
 		sessionApproval:     make(map[string]ApprovalPolicy),
-		sessionLastPrompt:   make(map[string]int32),
+		sessionAnchors:      make(map[string]sessionUsageAnchor),
 		jobs:                jobs.NewRegistry(),
 	}
 	m.jobs.SetLogger(m.logger)

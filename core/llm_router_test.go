@@ -159,7 +159,7 @@ func TestLLMRouteOrderSkipsUnloaded(t *testing.T) {
 // 覆盖跨层字段保真：Manager 记录 → llmAggregateServer.applyPreStepHook → 插件事件 JSON。
 func TestApplyPreStepHookCarriesLastUsageTokens(t *testing.T) {
 	m := newRouterManager()
-	m.recordSessionUsage("sess-x", 90000)
+	m.recordSessionAnchor("sess-x", sessionUsageAnchor{promptTokens: 90000})
 
 	f := &fakeHook{events: make(chan *proto.OnEventRequest, 1)}
 	m.toolHookClients["p1"] = f
@@ -192,12 +192,67 @@ func TestApplyPreStepHookCarriesLastUsageTokens(t *testing.T) {
 }
 
 // TestRecordSessionUsageRequiresPositive 空会话 id / 非正用量不记录（内部调用与非流式请求
-// 不污染会话状态），lastSessionPrompt 返回 0 由插件退回启发式。
+// 不污染会话状态），lastSessionAnchor 返回空锚点由 pre-step 退回启发式估算。
 func TestRecordSessionUsageRequiresPositive(t *testing.T) {
 	m := newRouterManager()
-	m.recordSessionUsage("", 90000)
-	m.recordSessionUsage("sess-y", 0)
-	if got := m.lastSessionPrompt("sess-y"); got != 0 {
-		t.Fatalf("lastSessionPrompt = %d, want 0", got)
+	m.recordSessionAnchor("", sessionUsageAnchor{promptTokens: 90000})
+	m.recordSessionAnchor("sess-y", sessionUsageAnchor{promptTokens: 0})
+	if a, ok := m.lastSessionAnchor("sess-y"); ok || a.promptTokens != 0 {
+		t.Fatalf("lastSessionAnchor = %+v ok=%v, want 空锚点", a, ok)
+	}
+}
+
+// TestApplyPreStepHookProjectsPressure 跨层回归：宿主把「锚点 + 当前表面」合成投影压力
+// 并随 pre-step 事件下发（projected_tokens / envelope_matched），压缩插件直接读它。
+// 两种情形都要对：
+//   - 信封一致且上次用量未被改写（usage >= 当次估算）→ 实测底数 + 差量；
+//   - 工具目录变了 → 判定不可比，退回纯估算（不能拿过期锚点掩盖更大的表面）。
+func TestApplyPreStepHookProjectsPressure(t *testing.T) {
+	m := newRouterManager()
+	f := &fakeHook{events: make(chan *proto.OnEventRequest, 4)}
+	m.toolHookClients["p1"] = f
+	m.toolHookOrder = []string{"p1"}
+	srv := &llmAggregateServer{m: m}
+
+	// 真实会话量级：消息 913354 + 工具目录 10037
+	msgs := []*proto.Message{{Role: "user", Content: "hi"}}
+	tools := []*proto.Tool{{Name: "shell", Description: "run", ParametersJson: `{"type":"object"}`}}
+	curEstimate := EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
+
+	// 情形 1：同信封，上次实测 900（>= 当次估算）→ 投影 = 900 + (cur - 800)
+	fp := ToolsFingerprint(tools)
+	m.recordSessionAnchor("sess-p", sessionUsageAnchor{
+		promptTokens: 900, sentEstimate: 800, toolsHash: fp,
+	})
+	req := &proto.ChatRequest{SessionId: "sess-p", Messages: msgs, Tools: tools}
+	_ = srv.applyPreStepHook(context.Background(), req)
+	ev := <-f.events
+	var payload AgentPreStepEvent
+	if err := json.Unmarshal([]byte(ev.GetDataJson()), &payload); err != nil {
+		t.Fatalf("parse event: %v", err)
+	}
+	if !payload.EnvelopeMatched {
+		t.Fatal("工具目录相同应判定信封一致")
+	}
+	if want := 900 + (curEstimate - 800); payload.ProjectedTokens != want {
+		t.Fatalf("projected_tokens = %d, want %d", payload.ProjectedTokens, want)
+	}
+	if payload.LastUsageTokens != 900 {
+		t.Fatalf("last_usage_tokens = %d, want 900", payload.LastUsageTokens)
+	}
+
+	// 情形 2：换工具目录 → 不可比，投影退回当前估算
+	otherTools := []*proto.Tool{{Name: "shell2", Description: "run2", ParametersJson: `{"type":"object"}`}}
+	req2 := &proto.ChatRequest{SessionId: "sess-p", Messages: msgs, Tools: otherTools}
+	_ = srv.applyPreStepHook(context.Background(), req2)
+	ev2 := <-f.events
+	var payload2 AgentPreStepEvent
+	if err := json.Unmarshal([]byte(ev2.GetDataJson()), &payload2); err != nil {
+		t.Fatalf("parse event: %v", err)
+	}
+	want2 := EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(otherTools)
+	if payload2.EnvelopeMatched || payload2.ProjectedTokens != want2 {
+		t.Fatalf("信封变化后应退回估算 %d：matched=%v projected=%d",
+			want2, payload2.EnvelopeMatched, payload2.ProjectedTokens)
 	}
 }

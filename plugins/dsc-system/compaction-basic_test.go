@@ -79,7 +79,10 @@ func mustPreStepSession(t *testing.T, s *compactionBasicServer, sess string, msg
 }
 
 // mustPreStepUsage 携带 last_usage_tokens（宿主透传的上次服务端上报用量）的 pre-step。
-func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, lastUsage int) string {
+// mustPreStepProjected 构造 pre-step 事件并带上宿主给的投影压力。
+// 本插件只认 projected_tokens（压力合成在宿主，见 core.projectPressure）；
+// last_usage_tokens 仍照旧带上，用于确认插件**没有**再自作主张用它。
+func mustPreStepProjected(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, projected, lastUsage int) string {
 	t.Helper()
 	msgsJSON, err := json.Marshal(msgs)
 	if err != nil {
@@ -87,7 +90,7 @@ func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs 
 	}
 	evJSON, err := json.Marshal(map[string]any{
 		"agent": "agent-react-loop", "session": sess, "messages_json": string(msgsJSON),
-		"last_usage_tokens": lastUsage,
+		"projected_tokens": projected, "last_usage_tokens": lastUsage,
 	})
 	if err != nil {
 		t.Fatalf("marshal event: %v", err)
@@ -97,6 +100,11 @@ func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs 
 		t.Fatalf("pre-step: %v", err)
 	}
 	return res
+}
+
+func mustPreStepUsage(t *testing.T, s *compactionBasicServer, sess string, msgs []*proto.Message, lastUsage int) string {
+	t.Helper()
+	return mustPreStepProjected(t, s, sess, msgs, lastUsage, lastUsage)
 }
 
 // parseRewrite 解析 {"messages": [...]} 改写结果（非空且含至少一条消息）。
@@ -282,47 +290,30 @@ func TestCompactionBasicTriggersOnReportedUsage(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicGrowthSinceReportedUsage 增量回归（对齐 DSH tokenMeter
-// projectedTokens = pressureTokens + surfaceTokens - sampledSurfaceTokens）：
-// 上次上报低于阈值，但自上次请求以来消息显著增长（启发式增量补足差量）时必须触发；
-// 无增量且低于阈值时不得误触发。
-func TestCompactionBasicGrowthSinceReportedUsage(t *testing.T) {
+// TestCompactionBasicObeysHostProjection 压力合成归宿主（core.projectPressure），
+// 本插件只按 projected_tokens 决策，**不得**自己再算一遍：
+//   - 消息很短、但宿主投影已超阈值 → 必须压缩（锚点/增量都在宿主侧）；
+//   - 消息很长、但宿主投影低于阈值 → 不得压缩（哪怕本地估算超阈值也不许自作主张）。
+//
+// 反例若成立，说明插件又偷偷用了自己的估算或 last_usage_tokens。
+func TestCompactionBasicObeysHostProjection(t *testing.T) {
 	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000
 	s.llm = &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
 
-	msgs1 := bigMsgs(4, 1200) // 每条 1204，共 4816
-	if res := mustPreStepUsage(t, s, "sess-g1", msgs1, 7000); res != "" {
-		t.Fatalf("上报 7000 < 阈值 8000 且无增量时不应改写, got %q", res)
-	}
-	msgs2 := append(append([]*proto.Message{}, msgs1...), bigMsgs(4, 1200)...) // 增量 +4816 估算
-	res := mustPreStepUsage(t, s, "sess-g1", msgs2, 7000)
+	// ① 本地估算很小（4 条 × 1204 ≈ 4816），宿主投影 9000（含工具目录与增量）→ 压缩
+	small := bigMsgs(4, 1200)
+	res := mustPreStepProjected(t, s, "sess-proj-1", small, 9000, 9000)
 	if res == "" {
-		t.Fatalf("上报 7000 + 增量 4816 = 11816 >= 阈值 8000，必须触发压缩")
+		t.Fatalf("宿主投影 9000 >= 阈值 8000 时必须压缩，与本地估算无关")
 	}
-	got := parseRewrite(t, res)
-	if len(got) >= len(msgs2) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
-		t.Fatalf("rewrite 未落地：%d msgs, head=%q", len(got), got[0].GetContent())
+	if got := parseRewrite(t, res); len(got) >= len(small) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
+		t.Fatalf("rewrite 未落地：%d msgs", len(got))
 	}
-}
 
-// TestCompactionBasicColdStartAnchorMustNotHideFullHistory 回归「重启后旧锚点掩盖
-// 全量历史」：宿主现在会从会话日志恢复上次请求的真实 prompt 作为锚点
-// （last_usage_tokens）。若上一次运行由压缩后端把请求压到 ~42k，恢复出的锚点就是
-// 42k，而冷启动时本插件还没有任何 records（视图仍是 900k+ 全量历史）。直接把锚点
-// 当压力会判成「远低于阈值」而跳过压缩，把全量历史发给 provider → 400
-// （prompt is too long）。必须取 max(启发式, 锚点)。
-func TestCompactionBasicColdStartAnchorMustNotHideFullHistory(t *testing.T) {
-	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000
-	s.llm = &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
-
-	msgs := bigMsgs(8, 1200) // 启发式 9632 token >= 阈值 8000
-	res := mustPreStepUsage(t, s, "sess-cold-start", msgs, 42)
-	if res == "" {
-		t.Fatalf("冷启动时启发式已超阈值，不能因旧锚点只有 42 而跳过压缩")
-	}
-	got := parseRewrite(t, res)
-	if len(got) >= len(msgs) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
-		t.Fatalf("rewrite 未落地：%d msgs, head=%q", len(got), got[0].GetContent())
+	// ② 本地估算很大（8 × 1204 ≈ 9632 > 阈值），但宿主投影 7000 < 阈值 → 不压缩
+	big := bigMsgs(8, 1200)
+	if res := mustPreStepProjected(t, s, "sess-proj-2", big, 7000, 7000); res != "" {
+		t.Fatalf("宿主投影 7000 < 阈值 8000 时不得压缩（插件不得用本地估算越权决策），got %q", res)
 	}
 }
 

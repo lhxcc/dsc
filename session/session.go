@@ -150,6 +150,18 @@ type LLMAttemptData struct {
 	Code         string       // 稳定错误码（context_window_exceeded/rate_limited/network_error/unknown；成功为空）
 	ContentChars int          // 结算时累计内容字符数（截断/中断诊断）
 	ToolCalls    int          // 结算时累计工具调用数
+
+	// 请求信封指纹（用于判断「用量锚点与当前请求是否同一个信封」）：
+	// 只有指纹一致时，上一次的 provider 用量才能直接当作本次压力的底数；
+	// 否则（换模型/换窗口/工具目录变了）必须退回启发式估算。
+	// 旧记录缺这两个字段 → 指纹为空 → 一律视为不可比（保守）。
+	ToolsHash     string `json:",omitempty"` // 工具目录指纹（core.ToolsFingerprint）
+	ContextWindow int    `json:",omitempty"` // 产生该用量时的上下文窗口
+
+	// SentEstimate 产生该用量时，我们对**同一请求**（消息 + 工具目录）的启发式估算。
+	// 用途：换算自采样以来的表面增量（pressure = usage + (当前估算 - 该值)），
+	// 以及 DSH 的可信度判据（usage 低于该值说明请求被改写/压缩过，不能直接当底数）。
+	SentEstimate int `json:",omitempty"`
 }
 type CompactionSummaryData struct{ Content string }
 

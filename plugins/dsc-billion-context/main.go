@@ -635,9 +635,10 @@ func (bc *BillionContext) setSessionID(id string) {
 // 主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`（上一轮
 // provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
 //
-// 注意这里**不能**套 dsc.PressureTokens（max(估值, 锚点)）：那是给「要发的表面 ≈ 原始
-// 历史」的后端用的；本插件会把大部分历史遮蔽掉，真实载荷就是压缩后视图，原始历史
-// 的估值根本不是要发的量。provider 不报用量时退回旧口径（估算）。
+// 注意这里**不能**直接用宿主的 ev.ProjectedTokens：那是按「原始消息列表 + 工具」算的
+// 表面（约 900k），而本插件会把大部分历史遮蔽掉，真实载荷是压缩后视图（约 40k）。
+// 用它只会让提示每轮都喊「该压缩了」。只有 provider 实测用量（= 上一次真正发出去的
+// 载荷）才是本插件表面的规模；不报用量时退回估算。
 func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
 	if ev.LastUsageTokens > 0 {
 		return ev.LastUsageTokens
