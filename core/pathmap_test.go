@@ -103,18 +103,25 @@ func TestMapModelPathComposition(t *testing.T) {
 	}
 }
 
-// TestDriveLetterAlias 单字母盘符别名（仅 Windows）：/c/Users → C:/Users、/d → D:/。
+// TestDriveLetterAlias 单字母盘符别名（仅 Windows）：/c/Users → C:/Users、/c/ → C:/。
 // 关键约束是**表内顺序**：这条前缀只有一个 "/"，若排在 /tmp、/workspace 之前，
 // 会把 /tmp 吃成 T:/mp、/workspace 吃成 W:/orkspace。
+//
+// 另：**裸 /<letter> 不当盘符别名**——它是 Windows 命令的单字母开关（taskkill /F、
+// cmd /c、xcopy /S），若别名化会被 shell AST 重写改成盘符路径而令命令失效。下例
+// 的 /F、/c、/S 必须原样返回。
 func TestDriveLetterAlias(t *testing.T) {
 	const root, temp = "G:/ws", "G:/tmp/dsc"
 	cases := []struct{ in, want string }{
-		{"/c", "C:/"},
 		{"/c/", "C:/"},
 		{"/c/Users/foo", "C:/Users/foo"},
-		{"/d", "D:/"},
 		{"/z/data", "Z:/data"},
 		{`\e\proj`, "E:/proj"},
+		// 裸 /<letter> 是命令开关，不是盘符别名（必须原样）
+		{"/c", "/c"},
+		{"/d", "/d"},
+		{"/F", "/F"},
+		{"/S", "/S"},
 		// 不是盘符别名：前缀后不是分隔符
 		{"/cdrom/x", "/cdrom/x"},
 		{"/dev/null", "/dev/null"},

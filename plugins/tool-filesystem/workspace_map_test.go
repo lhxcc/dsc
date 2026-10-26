@@ -183,6 +183,44 @@ func TestMapWorkspaceASTBareRoot(t *testing.T) {
 	}
 }
 
+// TestMapWorkspaceASTKeepsCommandFlags 回归：shell AST 重写不得把 Windows 命令的
+// 单字母开关误当盘符别名。taskkill /F、cmd /c 中的 /F、/c 是开关，必须原样；
+// 多字母开关（/IM）本就不命中盘符规则，也一并确认。盘符引用（/c/Users）仍正常映射。
+// 仅 Windows 生效（盘符别名规则只在 Windows 入表）。
+func TestMapWorkspaceASTKeepsCommandFlags(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("盘符别名规则仅 Windows 入表，跳过")
+	}
+	cases := []struct{ in, want string }{
+		{`taskkill /F /IM strada-serve.exe`, `taskkill /F /IM strada-serve.exe`},
+		{`cd /workspace && cmd /c "taskkill /F /IM strada-serve.exe"`, `cd /tmp/myws && cmd /c "taskkill /F /IM strada-serve.exe"`},
+		{`xcopy /S /E src dst`, `xcopy /S /E src dst`},
+		{`robocopy /E a b`, `robocopy /E a b`},
+		// 盘符引用仍映射（带路径成分）
+		{`ls /c/Users/foo`, `ls C:/Users/foo`},
+		{`cat /c/x.txt`, `cat C:/x.txt`},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			setRoot(t, "/tmp/myws")
+			parser := syntax.NewParser()
+			file, err := parser.Parse(strings.NewReader(c.in+"\n"), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mapWorkspacePaths(file)
+			var sb strings.Builder
+			if err := syntax.NewPrinter().Print(&sb, file); err != nil {
+				t.Fatal(err)
+			}
+			got := strings.TrimSpace(sb.String())
+			if got != c.want {
+				t.Fatalf("mapWorkspacePaths(%q)\n got: %q\nwant: %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // TestTempRootRuleViaSharedTable /tmp 虚拟根现在由 core 的虚拟根表决定（本插件不再
 // 自带规则）。这里直接验证共享表本体：Windows 映射到临时目录，Unix 原样，边界不误判。
 func TestTempRootRuleViaSharedTable(t *testing.T) {
