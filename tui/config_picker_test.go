@@ -197,3 +197,75 @@ func TestOpenConfigPickerWithoutManager(t *testing.T) {
 		t.Fatalf("应提示管理器不可用:\n%s", joined)
 	}
 }
+
+// TestConfigPickerCursorOffset 选单展开时真实光标必须仍在 composer 里：
+// viewport 会等量收缩（syncInputHeight → vpHeight），所以光标的**绝对行**不变；
+// 若光标算式漏算选单行数，它会上移一个选单高度、正好落在选单第一行上
+// （现场：那个闪动方块压在 ▸ 上，第一个条目看起来没有选中标记）。
+func TestConfigPickerCursorOffset(t *testing.T) {
+	m, active := newConfigTestModel(t)
+	dir := filepath.Dir(active)
+	for _, n := range []string{"config.A.yaml", "config.B.yaml"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("model: x\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.input.Focus() // 输入框聚焦才有真实光标（真实运行时打开选单前它一直是聚焦的）
+	base := m.inputCursorAbs()
+	if base == nil {
+		t.Fatal("空闲时应有真实光标")
+	}
+
+	m.openConfigPicker()
+	if m.configPicker == nil {
+		t.Fatal("应打开选单")
+	}
+	rows := m.configPickerRows()
+	after := m.inputCursorAbs()
+	if after == nil {
+		t.Fatal("选单展开时仍应有真实光标（只是位置要算对）")
+	}
+
+	// ① 选单高度必须与真实渲染行数一致，否则下面的判断只是自洽而非正确。
+	if n := strings.Count(m.configPickerView(), "\n") + 1; n != rows {
+		t.Fatalf("configPickerRows()=%d 与渲染行数 %d 不一致", rows, n)
+	}
+	// ② composer 位置不变（viewport 已等量收缩）
+	if after.Y != base.Y {
+		t.Fatalf("光标绝对行变化 %d → %d（viewport 收缩与选单高度不相等）", base.Y, after.Y)
+	}
+	// ③ 光标必须落在选单**下方**（漏算选单行数时它会上移进选单区）
+	pickerBottom := titleRows + m.viewport.Height() + rows
+	if after.Y <= pickerBottom {
+		t.Fatalf("光标 Y=%d 落在选单区内（选单底行 %d）——这就是「光标错位」", after.Y, pickerBottom)
+	}
+
+	// Esc 收起后回到原位
+	m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if back := m.inputCursorAbs(); back == nil || back.Y != base.Y {
+		t.Fatalf("收起选单后光标未复位: %+v, want Y=%d", back, base.Y)
+	}
+}
+
+// TestConfigPickerMarkerRendered 选中行要有 ▸ 标记（现场它被错位光标盖住了，
+// 看起来像「没有选中项」）。
+func TestConfigPickerMarkerRendered(t *testing.T) {
+	m, active := newConfigTestModel(t)
+	dir := filepath.Dir(active)
+	for _, n := range []string{"config.A.yaml", "config.B.yaml"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("model: x\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.openConfigPicker()
+	v := m.configPickerView()
+	if strings.Count(v, "▸") != 1 {
+		t.Fatalf("选单应有且仅有一个 ▸ 选中标记:\n%s", v)
+	}
+	// 下移后标记跟着走
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	v2 := m.configPickerView()
+	if strings.Count(v2, "▸") != 1 || v == v2 {
+		t.Fatalf("下移后标记应移动:\n%s", v2)
+	}
+}

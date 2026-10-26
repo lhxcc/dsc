@@ -4226,6 +4226,11 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 	if q := m.questionView(); q != "" {
 		y += strings.Count(q, "\n") + 1
 	}
+	if rows := m.configPickerRows(); rows > 0 {
+		// 配置档选单同样排在 viewport 之后、composer 之前：漏算这一项，真实光标就会
+		// 上移选单那么多行，正好落在选单第一行上（视觉上「光标错位」，还把 ▸ 盖住）。
+		y += rows
+	}
 	if m.workingLineVisible() {
 		y += thinkingRow
 	}
