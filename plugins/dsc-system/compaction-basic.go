@@ -206,15 +206,13 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		pressure = ev.LastUsageTokens + delta
 	} else if ev.LastUsageTokens > 0 {
 		// 冷启动 / 换会话：锚点是**上一次运行**某次请求的真实 prompt，而当前视图
-		// 尚未被本插件改写（records 可能为空），两者不可比。此时必须取较大者：
-		// 宿主现会从会话日志恢复锚点（seedSessionPromptFromLog），若压缩后端在此之前
-		// 把历史压到 ~42k，恢复出的锚点也是 42k，而当前要发的仍是 900k+ 的全量历史
+		// 尚未被本插件改写（records 可能为空），两者不可比。规则用 SDK 的唯一实现
+		// （dsc.PressureTokens = max(估值, 锚点)，对齐 DSH tokenMeter.measure 的
+		// baseline 选择）：宿主现会从会话日志恢复锚点，若上一次运行由压缩后端把
+		// 请求压到 ~42k，恢复出的锚点也是 42k，而当前要发的仍是 900k+ 全量历史
 		// ——直接用锚点会把压力算小、跳过压缩，把全量历史发给 provider（400
-		// prompt is too long）。取 max 后：锚点更大就按锚点（真实用量超出启发式），
-		// 启发式更大就按启发式（视图确实变大了）。
-		if pressure < ev.LastUsageTokens {
-			pressure = ev.LastUsageTokens
-		}
+		// prompt is too long）。
+		pressure = dsc.PressureTokens(pressure, ev.LastUsageTokens)
 	}
 	if pressure < s.pressureThreshold() {
 		if len(records) > 0 {

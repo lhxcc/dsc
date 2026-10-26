@@ -127,17 +127,15 @@ func displayableMessages(msgs []*proto.Message) []*AgentDebugMessage {
 // per-session 读数（pre-step 事件的 LastUsageTokens 即来源于此）。重启后的首发请求
 // 没有服务端 usage 可依，若不恢复，压缩插件会把全量派生历史当作已用（其中大部分
 // 已被压缩后端遮蔽、模型根本看不到），压缩压力虚高。
+//
+// 倒查逻辑本身在 session.LastPromptUsage（唯一实现，agent 插件经 sdk 调用同一份），
+// 这里只负责把结果写进宿主的 per-session 读数表。
 func (m *Manager) seedSessionPromptFromLog(sessionID string, sess *session.Session) {
-	if m == nil || sess == nil {
+	if m == nil {
 		return
 	}
-	evs := sess.Events()
-	for i := len(evs) - 1; i >= 0; i-- {
-		d, ok := evs[i].Data.(*session.LLMAttemptData)
-		if !ok || d.Error != "" || d.Usage == nil || d.Usage.PromptTokens <= 0 {
-			continue
-		}
-		m.recordSessionUsage(sessionID, d.Usage.PromptTokens)
-		return
+	// recordSessionUsage 沿用 proto.Usage 的 int32 口径（与 ChatStream 结算处同一入参类型）。
+	if promptTokens, _, ok := session.LastPromptUsage(sess); ok {
+		m.recordSessionUsage(sessionID, int32(promptTokens))
 	}
 }

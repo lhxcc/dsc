@@ -25,6 +25,7 @@ package dsc
 import (
 	"dsc/core"
 	"dsc/proto"
+	"dsc/session"
 )
 
 // TokenMeter 上下文占用计量器（唯一实现，见 core.TokenMeter）。
@@ -63,3 +64,34 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 
 // FormatPressure 把压力比格式化为百分数文本（"82.3%"），供日志/提示统一口径。
 func FormatPressure(pressure float64) string { return core.FormatPressure(pressure) }
+
+// PressureTokens 把「启发式估值」与「上次 provider 上报的 prompt 用量」合成一个
+// 压力基数：取两者较大者。
+//
+// 规则来源：DSH tokenMeter.measure 的 baseline 选择——只有「上报用量 ≥ 该请求的
+// 全量启发式价格」时才采用用量做锚点，否则退回估值。原因是一个小锚点（上一次请求
+// 已被压到 42K）不能用来判断当前要发的表面（900K+ 原始历史）——否则会跳过压缩，
+// 把全量历史发给 provider（400 prompt is too long）。
+//
+// **适用范围**：只在「当前要发的表面 ≈ 原始历史」的压缩后端使用（如基础压缩）。
+// 若后端的渲染结果已经把大部分历史遮蔽掉（真实载荷就是压缩后视图），此时估值
+// 描述的不是真实载荷，必须直接用 LastPromptUsage 的读数，不能套这条规则。
+func PressureTokens(estimate, lastUsage int) int {
+	if lastUsage > estimate {
+		return lastUsage
+	}
+	return estimate
+}
+
+// LastPromptUsage 从会话事件里倒查最近一次成功且带 prompt 用量的 LLM 调用
+// （唯一实现在 session.LastPromptUsage）。重启后的首发请求没有服务端锚点，
+// 用它把计量器接上「上次真实值」，不要在插件里自己遍历事件。
+//
+// 用法：拿到会话后 `meter.UpdateUsage(usage)`，之后 Project 即为「实测 + 增量」。
+func LastPromptUsage(sess *session.Session) (int, *Usage, bool) {
+	promptTokens, usage, ok := session.LastPromptUsage(sess)
+	if !ok {
+		return 0, nil, false
+	}
+	return promptTokens, UsageFromProto(usage), true
+}

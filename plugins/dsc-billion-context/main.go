@@ -624,19 +624,9 @@ func (bc *BillionContext) setSessionID(id string) {
 	bc.mu.Unlock()
 }
 
-// estimateTokens 估算 proto.Message 列表的总 token 数。
-// estimateTokens 估算消息列表 token（转调 SDK 的唯一实现）。
-//
-// 本地曾写 len(content)/4：对 CJK 低估 4 倍（UTF-8 一个汉字 3 字节），与 acp 包
-// 里另一份「max(bytes/4, runes)」（对 ASCII 高估 4~5 倍）方向相反——同一个插件里
-// 两个口径打架，阈值到底偏哪边取决于走哪条路径。统一由 SDK 计算。
-func estimateTokens(msgs []*proto.Message) int {
-	return dsc.EstimateProtoMessagesTokens(msgs)
-}
-
 // usageTokens 选本次压缩决策用的上下文用量。
 //
-// 优先级：**上一轮 provider 上报的 prompt 用量** > 宿主对原始历史的估算 > 本地估算。
+// 优先级：**上一轮 provider 上报的 prompt 用量** > 宿主对原始历史的估算 > SDK 估算。
 //
 // 为什么不能直接用 ev.TokenCount：它是宿主对 req.Messages 的估算，而那是 agent 的
 // append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent 侧「有后端时
@@ -645,7 +635,9 @@ func estimateTokens(msgs []*proto.Message) int {
 // 主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`（上一轮
 // provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
 //
-// provider 不报用量时退回旧口径（原始历史估算）——行为不变，不会比现在更差。
+// 注意这里**不能**套 dsc.PressureTokens（max(估值, 锚点)）：那是给「要发的表面 ≈ 原始
+// 历史」的后端用的；本插件会把大部分历史遮蔽掉，真实载荷就是压缩后视图，原始历史
+// 的估值根本不是要发的量。provider 不报用量时退回旧口径（估算）。
 func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
 	if ev.LastUsageTokens > 0 {
 		return ev.LastUsageTokens
@@ -653,7 +645,7 @@ func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
 	if ev.TokenCount > 0 {
 		return ev.TokenCount
 	}
-	return estimateTokens(msgs)
+	return dsc.EstimateProtoMessagesTokens(msgs)
 }
 
 // containsStr 报告 s 是否包含 sub（轻量实现，避免引入 strings 包）。

@@ -1857,28 +1857,23 @@ func (a *ReactLoopAgent) tokenMeter() *dsc.TokenMeter {
 }
 
 // seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
-// 服务端 usage 可依）。取最后一条无错误、带 prompt 用量的 llm/attempt：
+// 服务端 usage 可依）：
 //   - lastPromptTokens/lastUsage 供 usageSnapshot 上报「已用」；
 //   - tokenMeter().UpdateUsage 建立锚点，使 Project 退化为该实测值，而不是把全量
 //     派生历史（含被压缩后端遮蔽、模型看不到的部分）当作已用。
+//
+// 倒查逻辑在 dsc.LastPromptUsage（唯一实现，宿主 core 用同一份），此处不再自己
+// 遍历事件——同一规则写两遍就会出现「宿主和插件挑到不同锚点」的漂移。
 func (a *ReactLoopAgent) seedUsageFromHistory(sess *session.Session) {
-	if sess == nil {
+	promptTokens, usage, ok := dsc.LastPromptUsage(sess)
+	if !ok {
 		return
 	}
-	evs := sess.Events()
-	for i := len(evs) - 1; i >= 0; i-- {
-		d, ok := evs[i].Data.(*session.LLMAttemptData)
-		if !ok || d.Error != "" || d.Usage == nil || d.Usage.PromptTokens <= 0 {
-			continue
-		}
-		a.usageMu.Lock()
-		a.lastPromptTokens = d.Usage.PromptTokens
-		a.lastUsage = dsc.UsageFromProto(d.Usage)
-		u := a.lastUsage
-		a.usageMu.Unlock()
-		a.tokenMeter().UpdateUsage(u)
-		return
-	}
+	a.usageMu.Lock()
+	a.lastPromptTokens = int32(promptTokens)
+	a.lastUsage = usage
+	a.usageMu.Unlock()
+	a.tokenMeter().UpdateUsage(usage)
 }
 
 // newAgent 从宿主注入的环境变量构建 ReactLoopAgent（配置读取 + 会话存储初始化）。
