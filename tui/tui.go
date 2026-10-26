@@ -274,9 +274,13 @@ type Model struct {
 	histPos int
 	draft   string
 
-	// pendingHistory 启动时从存档恢复的可显示历史（user/assistant），在首个
-	// WindowSizeMsg 拿到终端宽度后渲染到正文顶部；渲染一次后置空（见 seedHistory）。
-	pendingHistory []*core.AgentDebugMessage
+	// 启动回显与向上翻页：historyAll 是完整可显示历史（旧→新），historyLoaded 是
+	// 已渲染到正文的尾部条数，historyPage 是每次向前回填的条数。首个 WindowSizeMsg
+	// 后先渲染尾部 historyPage 条（见 seedHistory），用户滚到顶部时再回填一页
+	// （见 loadOlderHistory）。
+	historyAll    []*core.AgentDebugMessage
+	historyLoaded int
+	historyPage   int
 
 	// 复制提示：选区复制成功后短暂显示，由 copyNoticeSeq 防过期竞态
 	copyNotice    string
@@ -794,6 +798,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// viewport 只装可视窗口，滚动由虚拟窗口 viewStart 驱动。
 		switch msg.Button {
 		case tea.MouseWheelUp:
+			if m.viewStart <= 0 && m.loadOlderHistory() {
+				// 已到顶：回填一页更旧的历史，本帧保持在原位置（旧顶部）；
+				// 下一次上滚再进入新加载的内容。
+				m.pinnedToBottom = false
+				m.render()
+				return m, nil
+			}
 			m.setVirtualYOffset(m.viewStart - m.viewport.MouseWheelDelta)
 		case tea.MouseWheelDown:
 			m.setVirtualYOffset(m.viewStart + m.viewport.MouseWheelDelta)
@@ -1635,27 +1646,105 @@ func (m *Model) appendToolFrame(rendered string) {
 	}
 }
 
-// seedHistory 在首个窗口尺寸到达后，把启动时从存档恢复的历史渲染到正文顶部（仅
-// 一次）。历史已由宿主按 history_injection 的注入量派生并截取（见
-// core.Manager.LoadDisplayHistory），此处只负责排版：一条分隔提示 + 交替的
-// user/assistant 块，让用户一眼看出这些是「先前对话」而非本次运行的新输出。
+// seedHistory 在首个窗口尺寸到达后渲染初始历史：只取完整历史尾部 historyPage 条，
+// 让用户先看到「模型也记得的最近对话」。更早的消息由 loadOlderHistory 在滚到顶部
+// 时按页向前回填。不再打印分隔提示——正文直接就是对话本身。
 func (m *Model) seedHistory() {
-	if len(m.pendingHistory) == 0 {
+	if !m.ready || m.historyLoaded > 0 {
 		return
 	}
-	msgs := m.pendingHistory
-	m.pendingHistory = nil
+	n := m.historyPage
+	if n > len(m.historyAll) {
+		n = len(m.historyAll)
+	}
+	if n <= 0 {
+		return
+	}
+	start := len(m.historyAll) - n
+	for _, block := range m.renderHistoryBlocks(m.historyAll[start:]) {
+		m.appendMessage(block)
+	}
+	m.historyLoaded = n
+	m.pinnedToBottom = true
+}
+
+// renderHistoryBlocks 把一段历史消息渲染为正文块（user 气泡 / assistant markdown）。
+// 不含用于分隔的前导空行——间距由 appendMessage / prependBlocks 负责。
+func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
 	w := max(m.width-4, 20)
-	m.appendMessage(dimSty.Render(fmt.Sprintf("── 恢复的最近历史（%d 条）──", len(msgs))))
+	out := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "user":
-			m.appendMessage(renderUserBubble(msg.Content, w))
+			out = append(out, renderUserBubble(msg.Content, w))
 		case "assistant":
-			m.appendMessage(m.renderAssistant(renderMarkdown(msg.Content, w)))
+			out = append(out, m.renderAssistant(renderMarkdown(msg.Content, w)))
 		}
 	}
-	m.pinnedToBottom = true
+	return out
+}
+
+// loadOlderHistory 用户滚到顶部时向前回填一页更旧的消息；返回是否真的加载了。
+// 回填后平移 viewStart，保持用户当前看到的那一行不动（不断跳到最旧处）；若内容
+// 尚未填满一屏则从顶部显示。没有初始历史或已无更旧消息时返回 false。
+func (m *Model) loadOlderHistory() bool {
+	if !m.ready || m.historyLoaded == 0 || m.historyPage <= 0 {
+		return false
+	}
+	end := len(m.historyAll) - m.historyLoaded
+	if end <= 0 {
+		return false
+	}
+	start := end - m.historyPage
+	if start < 0 {
+		start = 0
+	}
+	if start == end {
+		return false
+	}
+	oldTotal := len(m.wrappedLines)
+	oldStart := m.viewStart
+	added := m.prependBlocks(m.renderHistoryBlocks(m.historyAll[start:end]))
+	if added <= 0 {
+		return false
+	}
+	m.historyLoaded += end - start
+	if oldTotal+added > m.viewport.Height() {
+		m.viewStart = oldStart + added // 内容可滚动：把视口钉回原来的行
+	} else {
+		m.viewStart = 0 // 仍不满一屏：从顶部整体显示
+	}
+	return true
+}
+
+// prependBlocks 把渲染块整体插到正文最前面，并全量失效换行缓存（分页是低频操作，
+// 接受一次 O(全部行) 重建）。返回新增的可视行数，供调用方平移 viewStart。
+func (m *Model) prependBlocks(blocks []string) int {
+	if len(blocks) == 0 {
+		return 0
+	}
+	w := m.vpWidth()
+	prep := make([]string, len(blocks))
+	added := 0
+	for i, b := range blocks {
+		if i > 0 {
+			b = "\n" + b // 块间空行，与 appendMessage 的间距约定一致
+		}
+		prep[i] = b
+		added += len(strings.Split(lipgloss.NewStyle().Width(w).Render(b), "\n"))
+	}
+	// 旧首块原本没有前导空行；前面插入新块后它不再居首，补一个空行分隔。
+	if len(m.lines) > 0 && !strings.HasPrefix(m.lines[0], "\n") {
+		m.lines[0] = "\n" + m.lines[0]
+		added++
+	}
+	m.lines = append(prep, m.lines...)
+	// 全量失效：lineRendered 与 m.lines 的下标已整体平移。
+	m.lineRendered = nil
+	m.wrappedLines = nil
+	m.lineRowStart = nil
+	m.dirtyFrom = 0
+	return added
 }
 
 // scrollToBottomIfPinned 流式渲染后滚动到底：仅当用户钉在底部时自动跟随新内容；
@@ -2761,6 +2850,10 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.lines = nil
 		m.lineRendered = nil
 		m.dirtyFrom = 0
+		// 清屏后不再保留启动回显的分页数据，避免向上滚又把旧历史拉回来。
+		m.historyAll = nil
+		m.historyLoaded = 0
+		m.historyPage = 0
 		m.input.SetValue("")
 		m.completion = completion{}
 		m.syncInputHeight()
@@ -3903,10 +3996,13 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 }
 
 // Run 运行聊天界面，阻塞直到退出
-func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, history []*core.AgentDebugMessage) error {
+func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, replay *core.HistoryReplay) error {
 	m := New(agent, manager, ctx, modelName, mode, contextWindow)
-	// 启动时从存档恢复的可显示历史，首个窗口尺寸到达后渲染（见 seedHistory）。
-	m.pendingHistory = history
+	// 启动回显数据：完整可显示历史 + 初始渲染条数（首个窗口尺寸后渲染，见 seedHistory）。
+	if replay != nil {
+		m.historyAll = replay.Messages
+		m.historyPage = replay.Initial
+	}
 	p := tea.NewProgram(m)
 	m.program = p
 	// 注册用户评审 provider：agent 侧 exit_plan_mode 等经宿主向 TUI 提问

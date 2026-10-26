@@ -1024,11 +1024,12 @@ func main() {
 		if mainCfg != nil {
 			histShows = mainCfg.HistoryShows
 		}
-		displayHistory := mgr.LoadDisplayHistory(histInj, histShows)
-		if n := len(displayHistory); n > 0 {
-			logger.Info("tui history display", "messages", n, "history_injection", histInj, "history_shows", histShows)
+		replay := mgr.LoadHistoryReplay(histInj, histShows)
+		if replay != nil {
+			logger.Info("tui history replay", "total", len(replay.Messages), "initial", replay.Initial,
+				"history_injection", histInj, "history_shows", histShows)
 		}
-		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, displayHistory); err != nil {
+		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, replay); err != nil {
 			logger.Error("tui run failed", "error", err)
 			exitCode = 1
 		}

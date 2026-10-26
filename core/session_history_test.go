@@ -225,3 +225,46 @@ func TestLoadDisplayHistoryNoSession(t *testing.T) {
 		t.Fatalf("nil manager 应返回 nil, got %+v", got)
 	}
 }
+
+// TestLoadHistoryReplay 全量历史 + 初始条数：Messages 为全量可显示消息（供向上
+// 翻页），Initial 受 history_shows 与注入量共同封顶。
+func TestLoadHistoryReplay(t *testing.T) {
+	origRoot := WorkspaceRoot
+	WorkspaceRoot = t.TempDir()
+	defer func() { WorkspaceRoot = origRoot }()
+
+	m := stageDisplaySession(t, func(sess *session.Session) {
+		appendUser(sess, "u1")
+		appendAssistant(sess, "a1")
+		appendUser(sess, "u2")
+		appendAssistant(sess, "a2")
+		appendUser(sess, "u3")
+		appendAssistant(sess, "a3")
+	})
+
+	// 注入最近 2 条、显示默认 20 → Initial 被注入量封顶为 2；Messages 仍是全量 6。
+	r := m.LoadHistoryReplay(2, 0)
+	if r == nil {
+		t.Fatal("LoadHistoryReplay(2,0) = nil")
+	}
+	if len(r.Messages) != 6 {
+		t.Fatalf("Messages 应为全量 6 条, got %d", len(r.Messages))
+	}
+	if r.Initial != 2 {
+		t.Fatalf("Initial 应被注入量封顶为 2, got %d", r.Initial)
+	}
+
+	// 注入不限制、显示 3 → Initial=3。
+	r = m.LoadHistoryReplay(0, 3)
+	if r == nil || r.Initial != 3 || len(r.Messages) != 6 {
+		t.Fatalf("LoadHistoryReplay(0,3) = %+v, want Initial=3, Messages=6", r)
+	}
+
+	// 显示关闭 / 注入关闭 → nil。
+	if r := m.LoadHistoryReplay(0, -1); r != nil {
+		t.Fatalf("shows<0 应返回 nil, got %+v", r)
+	}
+	if r := m.LoadHistoryReplay(-1, 20); r != nil {
+		t.Fatalf("inject<0 应返回 nil, got %+v", r)
+	}
+}

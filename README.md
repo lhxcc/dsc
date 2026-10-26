@@ -128,6 +128,8 @@ DSC 以自身語言棧為準，理由只有一條：**Go 的零值就是 0**。�
 
 例：`history_injection: 0`（不限制注入）+ `history_shows: 5` → 模型拿全部恢復歷史，界面只回顯最近 5 條。
 
+**向上翻頁**：滾輪滾到頂部時自動向前回填一頁（每頁 = `history_shows` 條，0 時按默認 20），可一直讀到會話開頭。回填讀的是**全量**會話歷史，不受 `history_injection` 注入上限約束——注入上限只決定首屏先顯示多少；`/clear` 後清空分頁資料。
+
 ### 功能對齊程度
 
 - **完全對齊（概念同構）**：事件溯源會話、審批策略按會話（`/approval` 設當前會話，缺省 ask；策略亦寫入會話日誌 `approval/policy`，resume/fork 後摺疊恢復，並隨每次工具調用由 agent 轉發——宿主重啟後 per-session 策略即恢復、無需重設）、**沙箱↔審批 preset 綁定**（`danger-full-access→never`、`read-only/workspace-write→ask`，未顯式設置時生效；顯式 `DSC_APPROVAL`/`/approval`/會話覆蓋優先，對齊 DSH permission-presets）、沙箱三檔策略語義、沙箱升級審批（`approveEscalation`：被拒操作攜 `sandbox_permissions`+`justification` 升級重試 → `ask` 審人 / `never` 自動拒，非嚴格加寬執行前拒絕；`sandbox_permissions`/`justification` 已發佈入沙箱約束工具族 (`shell`/`str_replace_editor`) 的參數 schema，模型可發現性同構）、工具聲明審批（`ApprovalRequester`，對齊 DSH tools `kind:'ask'`/`serviceAsk` 入口②；DSC 插件管理變更類工具 `install/load/unload/uninstall/upgrade_dsc_plugin` 已接入，`list` 只讀不審）、審批提問接入取消信號、升級提示 subject 按工具族（shell→`command` / 其餘→`operation`）、審批審計寫入會話日誌（`approval/asked`+`approval/decided`）、上下文壓縮（pre-step 壓力檢查 + 尾部保留）、plan/goal/todo 領域、以真實路徑呈現 workspace 根給模型、`approval:policy` 運行時上下文（反映當前會話真實策略）、技能注入。

@@ -33,20 +33,29 @@ func resolveHistoryShowsCount(shows, injectCount int) int {
 	}
 }
 
-// LoadDisplayHistory 加载当前工作区项目会话，按历史注入设置派生消息，并截取最近
-// resolveHistoryShowsCount(historyShows, historyInjection) 条可显示消息（仅
-// user/assistant，跳过 system/tool），供 TUI 启动时在正文区回显——避免用户重启后
-// 面对空白界面、想不起先前的对话。
+// HistoryReplay 启动回显所需的完整可显示历史与初始渲染条数。
 //
-// 与 agent 视角严格对齐（这三点保证「显示的就是模型也看得到的那部分恢复历史」）：
+// Messages 是**全量**可显示历史（旧→新，不受 history_injection 上限约束），供
+// TUI 向上翻页时逐页回填；Initial 是启动时先渲染的尾部条数（受 history_shows
+// 与注入量共同约束）。这样初始屏幕上看到的是「模型也看得到的那部分」，而向上
+// 滚动可以继续读到更早的完整对话。
+type HistoryReplay struct {
+	Messages []*AgentDebugMessage `json:"messages"`
+	Initial  int                  `json:"initial"`
+}
+
+// LoadHistoryReplay 加载当前工作区项目会话，构造启动回显数据：
+//   - Messages 取全量可显示消息（user/assistant，不含 system/tool）；
+//   - Initial 取 resolveHistoryShowsCount(historyShows, historyInjection)，并再以
+//     「注入视角下的可显示条数」封顶，保证初始显示不超过实际注入量。
+//
+// 与 agent 视角严格对齐：
 //   - 会话键与 agent 相同：session.SessionKeyForProject(WorkspaceRoot)；
 //   - 注入条数以会话内 history/limit 事件优先（/settings history 持久化），无记录
-//     时回退 historyInjection 配置值——agent 每次 Run 也是这样折叠的；
-//   - 派生走同一个 session.DeriveMessagesLimited，因此「注入关闭 = 不显示」与
-//     「显示不超过实际注入量」天然成立，不需要在此另做上限换算。
+//     时回退 historyInjection 配置值——agent 每次 Run 也是这样折叠的。
 //
 // 返回 nil 表示无需回显（无会话、注入关闭、显示关闭、或没有可显示消息）。
-func (m *Manager) LoadDisplayHistory(historyInjection, historyShows int) []*AgentDebugMessage {
+func (m *Manager) LoadHistoryReplay(historyInjection, historyShows int) *HistoryReplay {
 	if m == nil {
 		return nil
 	}
@@ -66,12 +75,31 @@ func (m *Manager) LoadDisplayHistory(historyInjection, historyShows int) []*Agen
 	if count == 0 {
 		return nil
 	}
-	// DeriveMessagesLimited 已按 inject 截好「恢复历史」，此处只做可读性过滤。
-	out := displayableMessages(sess.DeriveMessagesLimited(inject))
-	if len(out) > count {
-		out = out[len(out)-count:]
+	// 初始显示量封顶在「注入视角下的可显示条数」：DeriveMessagesLimited(inject)
+	// 只截掉头部，其尾部与全量历史的尾部一致，故取尾部即与注入历史对齐。
+	injected := displayableMessages(sess.DeriveMessagesLimited(inject))
+	initial := count
+	if initial > len(injected) {
+		initial = len(injected)
 	}
-	return out
+	if initial == 0 {
+		return nil
+	}
+	all := displayableMessages(sess.DeriveMessages())
+	if len(all) == 0 {
+		return nil
+	}
+	return &HistoryReplay{Messages: all, Initial: initial}
+}
+
+// LoadDisplayHistory 返回启动时初始渲染的那段切片（LoadHistoryReplay 的尾部
+// Initial 条）。保留此便捷方法供只关心首屏的调用方与测试使用。
+func (m *Manager) LoadDisplayHistory(historyInjection, historyShows int) []*AgentDebugMessage {
+	r := m.LoadHistoryReplay(historyInjection, historyShows)
+	if r == nil {
+		return nil
+	}
+	return r.Messages[len(r.Messages)-r.Initial:]
 }
 
 // displayableMessages 从派生消息里挑出适合给用户看的（user/assistant，且正文非空）。
