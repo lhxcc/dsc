@@ -2308,7 +2308,9 @@ func writeJSONObject(b *strings.Builder, obj map[string]any, depth int) {
 	width := 0
 	for _, k := range keys {
 		if isJSONScalar(obj[k]) {
-			if l := runeLen(k); l > width {
+			// 键名同样是「显示宽度」对齐：JSON 里的中文键按字符数算会少一列，
+			// 值起点就逐行错开（与表格列对齐同一个坑）。
+			if l := lipgloss.Width(k); l > width {
 				width = l
 			}
 		}
@@ -2316,7 +2318,7 @@ func writeJSONObject(b *strings.Builder, obj map[string]any, depth int) {
 	for _, k := range keys {
 		v := obj[k]
 		if isJSONScalar(v) {
-			pad := strings.Repeat(" ", width-runeLen(k))
+			pad := strings.Repeat(" ", width-lipgloss.Width(k))
 			b.WriteString(indent + k + pad + ": " + jsonScalar(v) + "\n")
 			continue
 		}
@@ -2376,9 +2378,6 @@ func isJSONScalar(v any) bool {
 }
 
 // runeLen 返回字符串按 rune 计的长度（用于对齐计算，兼容非 ASCII 键名）。
-func runeLen(s string) int {
-	return len([]rune(s))
-}
 
 // sortedJSONKeys 返回 map 按键名排序后的切片，保证卡片输出顺序稳定。
 func sortedJSONKeys(m map[string]any) []string {
@@ -2493,14 +2492,14 @@ func renderViewSpec(viewJSON string) string {
 func renderCardView(v *core.ToolView) string {
 	maxKey := 0
 	for _, f := range v.Fields {
-		if l := runeLen(f.Key); l > maxKey {
+		if l := lipgloss.Width(f.Key); l > maxKey {
 			maxKey = l
 		}
 	}
 	var b strings.Builder
 	b.WriteString(viewHead(v))
 	for _, f := range v.Fields {
-		pad := strings.Repeat(" ", maxKey-runeLen(f.Key))
+		pad := strings.Repeat(" ", maxKey-lipgloss.Width(f.Key))
 		val := f.Value
 		if f.Tone != "" {
 			val = viewToneSty(f.Tone, false).Render(val)
@@ -2517,14 +2516,36 @@ func renderCardView(v *core.ToolView) string {
 // 避免单列撑爆终端。整表剩余部分由 viewport 折行兜底。
 const tableColMax = 40
 
+// truncateDisplay 把字符串截到**不超过 width 列**（按显示宽度走 rune，
+// 不切断宽字符，也不会切出半个中文）。
+func truncateDisplay(s string, width int) string {
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := lipgloss.Width(string(r))
+		if used+w > width {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String()
+}
+
 // tableCell 按列宽截断并对齐单元格：返回「样式化文本 + 补齐空格」。
-// 宽度按纯文本计（ANSI 转义零宽），保证带色单元格也对齐。
+//
+// 宽度按**显示宽度**计（lipgloss.Width：ANSI 转义零宽、CJK 每字两列）。用字符数
+// 会把每个中文字少算一列，列头「名称/类型/状态」这类 CJK 表头就会逐列右移，
+// 数据看着没跟表头对齐（与 /plugins 列表同一个坑）。
 func tableCell(cell string, width int, tone string, bold bool) string {
-	pad := width - runeLen(cell)
+	pad := width - lipgloss.Width(cell)
 	if pad < 0 {
-		// 超长：截断为 width-1 字符 + …（总显示宽恰为 width）
+		// 超长：按显示宽度截断到 width-1 列 + …（不能按 rune 切，会切出半宽）
 		if width > 1 {
-			cell = string([]rune(cell)[:width-1]) + "…"
+			cell = truncateDisplay(cell, width-1) + "…"
 		} else {
 			cell = "…"
 		}
@@ -2545,10 +2566,10 @@ func renderTableView(v *core.ToolView) string {
 	}
 	widths := make([]int, len(v.Columns))
 	for i, c := range v.Columns {
-		w := runeLen(colTitle(c))
+		w := lipgloss.Width(colTitle(c))
 		for _, r := range v.Rows {
-			if cell, ok := r[c.Key]; ok && runeLen(cell) > w {
-				w = runeLen(cell)
+			if cell, ok := r[c.Key]; ok && lipgloss.Width(cell) > w {
+				w = lipgloss.Width(cell)
 			}
 		}
 		if w > tableColMax {

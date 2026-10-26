@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"charm.land/lipgloss/v2"
 )
 
 // TestPluginAdminArgsBuild 每条斜杆子命令都必须映射到宿主**已有的**工具与参数形状：
@@ -154,5 +156,93 @@ func TestRenderPluginAdminResultList(t *testing.T) {
 	// 非 JSON（工具报错文本）原样返回，不做二次解析
 	if got := renderPluginAdminResult("boom: not json"); got != "boom: not json" {
 		t.Fatalf("非 JSON 应原样返回, got %q", got)
+	}
+}
+
+// textAtColumn 取某条渲染行中「从第 col 列开始的 n 列」的文本（按显示宽度走 rune，
+// 中文按两列计），去掉两端空白后即该单元格的值。用于独立核对列对齐，而不是拿同一个
+// cell() 再算一遍。
+func textAtColumn(line string, col, n int) string {
+	var b strings.Builder
+	width := 0
+	for _, r := range line {
+		w := lipgloss.Width(string(r))
+		if width >= col && width < col+n {
+			b.WriteRune(r)
+		}
+		width += w
+		if width >= col+n {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// columnOf 返回子串首字符所在的显示列（用于从表头取列起点）。
+func columnOf(line, sub string) int {
+	i := strings.Index(line, sub)
+	if i < 0 {
+		return -1
+	}
+	return lipgloss.Width(line[:i])
+}
+
+// TestPluginTableColumnsAlign 表格数据列必须与表头三列对齐。
+//
+// 回归：原先用 fmt 的 %-*s 补空格——它按**字符数**补，而 CJK 表头「名称/类型/状态」
+// 每字占两列，于是三列表头相对数据行逐列右移 2/4/6 列（现场截图：数据整体比表头
+// 偏左，类型列看起来被吃掉首字符）。现在统一用显示宽度补齐。
+func TestPluginTableColumnsAlign(t *testing.T) {
+	raw := `{"plugins":[` +
+		`{"name":"agent-react-loop","type":"agent","state":"loaded","enabled":true},` +
+		`{"name":"tool-str-replace-editor","type":"tool","state":"orphan","enabled":false},` +
+		`{"name":"音乐播放插件","type":"tool","state":"configured","enabled":true}],` +
+		`"count":3}`
+	out := renderPluginAdminResult(raw)
+	lines := strings.Split(out, "\n")
+	if len(lines) < 4 {
+		t.Fatalf("输出行数不足: %q", out)
+	}
+
+	hType := columnOf(lines[0], "类型")
+	hState := columnOf(lines[0], "状态")
+	hEnabled := columnOf(lines[0], "启用")
+	if hType < 0 || hState < 0 || hEnabled < 0 {
+		t.Fatalf("表头缺列: %q", lines[0])
+	}
+
+	want := [][3]string{
+		{"agent", "loaded", "true"},
+		{"tool", "orphan", "false"},
+		{"tool", "configured", "true"},
+	}
+	for i, w := range want {
+		ln := lines[i+1]
+		if got := textAtColumn(ln, hType, hState-hType); got != w[0] {
+			t.Fatalf("第 %d 行类型列 = %q, want %q（未与表头对齐）:\n%s", i+1, got, w[0], ln)
+		}
+		if got := textAtColumn(ln, hState, hEnabled-hState); got != w[1] {
+			t.Fatalf("第 %d 行状态列 = %q, want %q:/n%s", i+1, got, w[1], ln)
+		}
+		if got := textAtColumn(ln, hEnabled, 14); got != w[2] {
+			t.Fatalf("第 %d 行启用列 = %q, want %q:/n%s", i+1, got, w[2], ln)
+		}
+	}
+	// 中文插件名按两列计宽：名字后面那列必须仍是空白（不因宽字符把类型列挤歪）
+	if !strings.Contains(out, "音乐播放插件") {
+		t.Fatalf("中文插件名丢失:\n%s", out)
+	}
+}
+
+// TestCellPadsByDisplayWidth cell() 是表格对齐的唯一实现：中文按两列补。
+func TestCellPadsByDisplayWidth(t *testing.T) {
+	if got := cell("名称", 6); lipgloss.Width(got) != 6 {
+		t.Fatalf("中文单元格宽度 = %d, want 6（按显示宽度补齐）", lipgloss.Width(got))
+	}
+	if got := cell("abcdef", 6); got != "abcdef" {
+		t.Fatalf("刚好等宽不应补空格: %q", got)
+	}
+	if got := cell("abcdefgh", 6); got != "abcdefgh" {
+		t.Fatalf("超宽不应截断: %q", got)
 	}
 }

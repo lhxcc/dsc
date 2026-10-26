@@ -257,12 +257,24 @@ func renderPluginRows(rows []any, all map[string]any) string {
 		wState = max(wState, lipgloss.Width(r.state))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-*s  %-*s  %-*s  %s\n", wName, "名称", wType, "类型", wState, "状态", "启用")
+	b.WriteString(cell("名称", wName) + "  " + cell("类型", wType) + "  " + cell("状态", wState) + "  启用\n")
 	for _, r := range recs {
-		fmt.Fprintf(&b, "%-*s  %-*s  %-*s  %s\n", wName, r.name, wType, r.typ, wState, r.state, r.enabled)
+		b.WriteString(cell(r.name, wName) + "  " + cell(r.typ, wType) + "  " + cell(r.state, wState) + "  " + r.enabled + "\n")
 	}
 	if n, ok := all["count"]; ok {
 		fmt.Fprintf(&b, "\n共 %v 个（state: loaded=已加载; configured=配置未加载; orphan=磁盘未配置）", n)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// cell 按**显示宽度**左对齐补空格（表格列对齐的唯一实现）。
+//
+// 不能用 fmt 的 %-*s：它按字符数补，而 CJK 字符每字占两列——表头「名称/类型/状态」
+// 每个中文字都让后续列比数据行右移两列（实测三列表头分别右移 2/4/6 列），表格看起来
+// 像数据没跟表头对齐。lipgloss.Width 与终端口径一致，中文插件名也不会错位。
+func cell(s string, width int) string {
+	if pad := width - lipgloss.Width(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
 }
