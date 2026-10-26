@@ -1269,13 +1269,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if toolLine == "" {
 				// 回退原文同样要归一 \r：进度条式输出含 CR，直接吐给终端会把光标
 				// 拉回第 0 列覆盖左边距（见 collapseCarriageReturns）。
-				toolLine = dimSty.Render(strings.TrimSpace(core.CollapseCarriageReturns(f.Output)))
+				// 注意：**先判空再上色**。dimSty.Render("") 不是空串（它会套一层 ANSI
+				// 转义），若先上色再判空，空帧会被当成「有内容」，白落一行空白。
+				if raw := strings.TrimSpace(core.CollapseCarriageReturns(f.Output)); raw != "" {
+					toolLine = dimSty.Render(raw)
+				}
+			}
+			if toolLine == "" {
+				// 空帧（既无调用信息、也无结果内容）：什么都不追加。此前会走到
+				// appendToolFrame("")，它追加的是一行纯 "\n" —— 实测表现为调用卡与
+				// 它的结果之间凭空多出一个空行。同时不改 toolCallOpen：后面的真结果
+				// 仍要能紧贴调用标题。
+				m.render()
+				m.scrollToBottomIfPinned()
+				return m, m.pumpStream(msg.input, msg.ch)
 			}
 			// 帧布局：工具调用标题紧随其结果帧时连成一体（两者间不留空行，
 			// 把「● Verb(arg)」与下方「└ 结果」紧贴展示）；其余情况（独立结果帧、
 			// 调用帧、相邻两帧）按原逻辑以空行分隔。
+			//
+			// 只有**调用帧**（有工具名、无结果）才开启「结果紧贴标题」的状态；
+			// 状态通知帧（[上下文压缩…]/[输出被截断…] 这类只有 Output 的 tool 帧）
+			// 必须把它关掉——否则它们会顶替调用标题，让下一个结果贴到通知上。
+			isCall := f.ToolName != "" && f.ToolResult == ""
 			joinUnderCall := f.ToolResult != "" && m.toolCallOpen
-			m.toolCallOpen = !joinUnderCall && f.ToolResult == ""
+			m.toolCallOpen = isCall
 			if !(len(m.lines) > 0 && m.lines[len(m.lines)-1] == "\n"+toolLine) {
 				if joinUnderCall {
 					// 紧跟调用标题追加，不加空行
@@ -1685,46 +1703,75 @@ func (m *Model) seedHistory() {
 		return
 	}
 	start := len(m.historyAll) - n
-	for _, block := range m.renderHistoryBlocks(m.historyAll[start:]) {
-		m.appendMessage(block)
+	for _, it := range m.renderHistoryItems(m.historyAll[start:]) {
+		if it.tight && len(m.lines) > 0 {
+			// 工具结果紧贴它的调用标题（与实时视图的「● Verb(arg) / └ 结果」一致），
+			// 否则两者之间会多出一个空行。
+			m.lines = append(m.lines, it.text)
+			continue
+		}
+		m.appendMessage(it.text)
 	}
 	m.historyLoaded = n
 	m.pinnedToBottom = true
 }
 
-// renderHistoryBlocks 把一段历史消息渲染为正文块（user 气泡 / assistant markdown）。
-// 不含用于分隔的前导空行——间距由 appendMessage / prependBlocks 负责。
+// histItem 一条回放块。tight=true 表示它要**紧贴**上一块（工具的调用标题与它的
+// 结果之间不留空行，与实时视图同一形态）。
+type histItem struct {
+	text  string
+	tight bool
+}
+
+// renderHistoryBlocks 把一段历史消息渲染为正文块（user 气泡 / assistant markdown /
+// 工具卡）。不含分隔用的前导空行——间距由 appendMessage / prependBlocks 负责。
+// 需要「结果紧贴调用标题」这类拼接信息时用 renderHistoryItems（本函数会丢掉它）。
 func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
+	items := m.renderHistoryItems(msgs)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.text)
+	}
+	return out
+}
+
+// renderHistoryItems 渲染回放块并标注拼接方式：工具结果紧跟它的调用标题时 tight，
+// 由调用方（seedHistory / prependBlocks）决定是否省略分隔空行。
+func (m *Model) renderHistoryItems(msgs []*core.AgentDebugMessage) []histItem {
 	w := max(m.width-4, 20)
-	out := make([]string, 0, len(msgs))
+	out := make([]histItem, 0, len(msgs))
+	lastWasCall := false
+	push := func(text string, tight bool) {
+		if text == "" {
+			return
+		}
+		out = append(out, histItem{text: text, tight: tight})
+	}
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "user":
-			// 唤醒机制会把后台任务完成通知前置拼进用户消息；重放时按同一形态拆开：
-			// 通知按系统提示渲染，其余才是用户气泡——避免「通知与用户消息粘连成
-			// 一块」（实时视图本就只把通知渲染成系统提示）。
-			// 完成通知是给模型的唤醒信号，不是用户内容：回放同样不渲染，
-			// 否则重启后会看到一屏「background job ... finished」而没有来龙去脉。
+			// 唤醒机制会把完成通知前置拼进用户消息；重放时按同一形态拆开并丢弃：
+			// 通知是给模型的信号，不是用户内容，渲染出来只会成为一屏没有来龙去脉的
+			// 「background job ... finished」（实时视图同样不渲染）。
 			_, rest := splitCompletionNotices(msg.Content)
 			if rest = strings.TrimSpace(rest); rest != "" {
-				out = append(out, renderUserBubble(rest, w))
+				push(renderUserBubble(rest, w), false)
 			}
 		case "assistant":
-			out = append(out, m.renderAssistant(renderMarkdown(msg.Content, w)))
+			push(m.renderAssistant(renderMarkdown(msg.Content, w)), false)
 		case "tool":
 			// 回放里的工具过程分两条目：调用卡与结果卡，渲染器与实时视图同一套
 			// （renderToolCall / renderToolResult），保证「重启前后看到的是同一个样子」。
 			switch msg.Kind {
 			case core.DebugKindToolCall:
-				if card := renderToolCall(msg.ToolName, msg.ToolArgs); card != "" {
-					out = append(out, card)
-				}
+				push(renderToolCall(msg.ToolName, msg.ToolArgs), false)
 			case core.DebugKindToolResult:
-				if card := renderToolResult(msg.Content, msg.IsError); card != "" {
-					out = append(out, card)
-				}
+				// 结果紧贴它的调用标题：与实时视图「● Verb(arg) / └ 结果」一致，
+				// 中间不留空行。
+				push(renderToolResult(msg.Content, msg.IsError), lastWasCall)
 			}
 		}
+		lastWasCall = msg.Kind == core.DebugKindToolCall
 	}
 	return out
 }
@@ -1749,7 +1796,7 @@ func (m *Model) loadOlderHistory() bool {
 	}
 	oldTotal := len(m.wrappedLines)
 	oldStart := m.viewStart
-	added := m.prependBlocks(m.renderHistoryBlocks(m.historyAll[start:end]))
+	added := m.prependBlocks(m.renderHistoryItems(m.historyAll[start:end]))
 	if added <= 0 {
 		return false
 	}
@@ -1764,15 +1811,16 @@ func (m *Model) loadOlderHistory() bool {
 
 // prependBlocks 把渲染块整体插到正文最前面，并全量失效换行缓存（分页是低频操作，
 // 接受一次 O(全部行) 重建）。返回新增的可视行数，供调用方平移 viewStart。
-func (m *Model) prependBlocks(blocks []string) int {
-	if len(blocks) == 0 {
+func (m *Model) prependBlocks(items []histItem) int {
+	if len(items) == 0 {
 		return 0
 	}
 	w := m.vpWidth()
-	prep := make([]string, len(blocks))
+	prep := make([]string, len(items))
 	added := 0
-	for i, b := range blocks {
-		if i > 0 {
+	for i, it := range items {
+		b := it.text
+		if i > 0 && !it.tight {
 			b = "\n" + b // 块间空行，与 appendMessage 的间距约定一致
 		}
 		prep[i] = b
