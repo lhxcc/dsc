@@ -353,10 +353,18 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 			next = func() (string, error) {
 				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
 				if err != nil {
-					return "", err
+					// 传输层失败 ≠ veto：该插件只是没参与本轮（进程刚退出、
+					// 二进制未升级导致收包上限偏小、超时等）。此前这里直接短路，
+					// 于是一个**无关插件**的失败会把压缩后端的改写整条丢掉，
+					// 宿主随即把未改写的全量历史发给 provider → 400
+					// （prompt is too long）。记录并交给下游继续。
+					m.logger.Warn("plugin event transport error, continuing chain",
+						"event", string(name), "plugin", nc.name, "error", err.Error())
+					return innerNext()
 				}
 				if resp.GetError() != "" {
-					return "", fmt.Errorf("%s", resp.GetError())
+					// 应用层显式报错仍是 veto：插件确实拒绝处理该事件。
+					return "", fmt.Errorf("%s: %s", nc.name, resp.GetError())
 				}
 				if r := resp.GetResultJson(); r != "" {
 					// 插播消息：任何插件都可请求（只影响消息尾部，不改写既有内容），

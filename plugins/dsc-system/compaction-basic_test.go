@@ -305,6 +305,27 @@ func TestCompactionBasicGrowthSinceReportedUsage(t *testing.T) {
 	}
 }
 
+// TestCompactionBasicColdStartAnchorMustNotHideFullHistory 回归「重启后旧锚点掩盖
+// 全量历史」：宿主现在会从会话日志恢复上次请求的真实 prompt 作为锚点
+// （last_usage_tokens）。若上一次运行由压缩后端把请求压到 ~42k，恢复出的锚点就是
+// 42k，而冷启动时本插件还没有任何 records（视图仍是 900k+ 全量历史）。直接把锚点
+// 当压力会判成「远低于阈值」而跳过压缩，把全量历史发给 provider → 400
+// （prompt is too long）。必须取 max(启发式, 锚点)。
+func TestCompactionBasicColdStartAnchorMustNotHideFullHistory(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000
+	s.llm = &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
+
+	msgs := bigMsgs(8, 1200) // 启发式 9632 token >= 阈值 8000
+	res := mustPreStepUsage(t, s, "sess-cold-start", msgs, 42)
+	if res == "" {
+		t.Fatalf("冷启动时启发式已超阈值，不能因旧锚点只有 42 而跳过压缩")
+	}
+	got := parseRewrite(t, res)
+	if len(got) >= len(msgs) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
+		t.Fatalf("rewrite 未落地：%d msgs, head=%q", len(got), got[0].GetContent())
+	}
+}
+
 // TestCompactionWindowFromContextWindowEnv 窗口来源优先级回归：宿主把有效窗口
 // （配置 context_window / 端点探测值）以 DSC_CONTEXT_WINDOW 注入所有插件，压缩器
 // 必须采信——此前只认自己的专属键，云端 1M 窗口仍按 128K 判压力，几步就压缩。

@@ -210,7 +210,15 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		UserInput:       req.GetNewUserInput(),
 	})
 	if err != nil {
-		s.m.logger.Warn("agent/pre-step hook vetoed request", "error", err.Error())
+		// 回退语义是「按未改写的原始请求发出」——对长会话等于把全量历史直接怼给
+		// provider（压缩后端白跑）。所以记 ERROR 而不是 WARN，并带上规模，
+		// 便于把 provider 的 4xx 与这里的失败对上（gRPC 4 MiB 收包上限曾是元凶）。
+		s.m.logger.Error("agent/pre-step hook failed; sending UNREWRITTEN request",
+			"error", err.Error(),
+			"session", req.GetSessionId(),
+			"messages", len(req.Messages),
+			"messages_bytes", len(msgsJSON),
+			"estimated_tokens", tokenCount)
 		return req
 	}
 	// 解析改写后的消息列表
