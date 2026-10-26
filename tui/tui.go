@@ -1243,7 +1243,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				toolLine = renderToolCall(f.ToolName, f.ToolArgs)
 			}
 			if toolLine == "" {
-				toolLine = dimSty.Render(strings.TrimSpace(f.Output))
+				// 回退原文同样要归一 \r：进度条式输出含 CR，直接吐给终端会把光标
+				// 拉回第 0 列覆盖左边距（见 collapseCarriageReturns）。
+				toolLine = dimSty.Render(strings.TrimSpace(collapseCarriageReturns(f.Output)))
 			}
 			// 帧布局：工具调用标题紧随其结果帧时连成一体（两者间不留空行，
 			// 把「● Verb(arg)」与下方「└ 结果」紧贴展示）；其余情况（独立结果帧、
@@ -2090,7 +2092,35 @@ func ensureExitCodeLine(result string) string {
 
 // renderToolResult 以 REX 式 gutter 渲染工具结果：首行「└ 首行」，后续行缩进对齐下方。
 // isErr 时整块用错误色强调。空结果返回空串。
+// collapseCarriageReturns 归一「就地刷新」式输出：git/npm/pip 的进度条用 \r 回到行首
+// 覆盖同一行。把这些 \r 原样交给终端，光标会跳回**第 0 列**，把卡片的左边距一并覆盖，
+// 还留下上一段没被盖住的残字——实测 `git worktree add` 的进度条把整块文字拉到最左边、
+// 前面露出「Upd」「Un-」之类的碎片。每条物理行只保留最后一个非空 \r 段，那才是
+// 人眼最终看到的状态；CRLF 也顺带归一。
+func collapseCarriageReturns(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if !strings.ContainsRune(ln, '\r') {
+			continue
+		}
+		segs := strings.Split(ln, "\r")
+		last := ""
+		for j := len(segs) - 1; j >= 0; j-- {
+			if strings.TrimSpace(segs[j]) != "" {
+				last = segs[j]
+				break
+			}
+		}
+		lines[i] = last
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderToolResult(result string, isErr bool) string {
+	result = collapseCarriageReturns(result)
 	result = strings.TrimSpace(result)
 	if result == "" {
 		return ""
