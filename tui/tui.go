@@ -696,17 +696,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.PasteMsg:
 		// 终端括号粘贴（如 Windows Terminal 的 Ctrl+V）插入到输入框。
-		// 回答模型提问（自定义输入模式）时模型的回合仍在进行中（thinking/streaming
-		// 为真），此时输入框就是回答框，必须照常接收粘贴——否则「@截图路径」这类
-		// 只能粘贴的内容完全无法输入。
+		// 模型工作期间同样允许：打字本就允许（运行中输入走实时注入），粘贴不应被
+		// 单独拦掉——输入框只是下一轮草稿，不打断当前工作；流式泵取由 streamFrame
+		// 自身的续帧链维持，与这条消息无关。
 		if m.question != nil && m.question.customMode {
 			m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
 			m.syncInputHeight()
 			m.updateCompletion()
 			m.render()
-			return m, nil
-		}
-		if m.thinking || m.streaming {
 			return m, nil
 		}
 		m.input.InsertString(strings.ReplaceAll(msg.Content, "\r\n", "\n"))
@@ -716,9 +713,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseClickMsg:
 		mm := msg.Mouse()
-		// 滚动条拖拽在模型工作期间同样可用（点按滚动条进入拖拽即手动翻阅，
-		// 从「自动跟随底部」脱离）；正文拖选复制仍仅在空闲时生效（避免流式
-		// 渲染期间行号变化导致选区漂移）。
+		// 滚动条拖拽与正文拖选在工作期间都可用；开始正文选区时脱离底部跟随，
+		// 避免流式新内容顶走视口。注意：若拖选进入正在流式增长的助手块，该块
+		// 每帧重排可能令选区漂移——选中已稳定的上方内容不受影响。
 		if mm.Button == tea.MouseLeft && m.inScrollbar(mm.X, mm.Y) {
 			// 按住滚动条列：进入拖拽模式（不产生正文选区）
 			m.sel = selection{}
@@ -729,13 +726,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.render()
 			return m, nil
 		}
-		if m.thinking || m.streaming {
-			return m, nil
-		}
 		if mm.Button == tea.MouseLeft {
 			if m.inBody(mm.X, mm.Y) {
 				at := m.transcriptCaret(mm.X, mm.Y)
 				m.sel = selection{active: true, anchor: at, head: at}
+				if m.thinking || m.streaming {
+					// 工作态开始选区：脱离底部跟随（发送消息时 startTurn 会重新钉底）。
+					m.pinnedToBottom = false
+				}
 			} else {
 				// 点按输入框或状态区等非正文区域 → 清除正文选区
 				m.sel = selection{}

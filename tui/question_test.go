@@ -376,7 +376,8 @@ func TestQuestionCustomModeOverlayHides(t *testing.T) {
 
 // TestQuestionCustomInputAcceptsPaste 回答模型提问时（模型回合仍在进行，thinking/
 // streaming 为真）粘贴必须进入回答框：截图路径这类内容只能粘贴，此前被
-// 「运行中忽略粘贴」直接丢弃。
+// 「运行中忽略粘贴」直接丢弃。运行期（无提问）同样接受粘贴——工作态打字本就允许
+// （走实时注入），粘贴是下一轮草稿的一部分，不应被单独丢弃。
 func TestQuestionCustomInputAcceptsPaste(t *testing.T) {
 	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
 	ansCh := make(chan *userquestions.Answer, 1)
@@ -394,11 +395,11 @@ func TestQuestionCustomInputAcceptsPaste(t *testing.T) {
 		t.Fatalf("粘贴内容应进入回答框，got %q", got)
 	}
 
-	// 运行期（无提问）仍按原语义忽略粘贴，避免污染排队中的输入
+	// 运行期（无提问）同样接受粘贴：与「工作态允许打字」一致，作为下一轮草稿。
 	m.question = nil
 	m.Update(tea.PasteMsg{Content: "noise"})
-	if got := m.input.Value(); got != "C://shot//a.png" {
-		t.Fatalf("运行期不应接受粘贴，got %q", got)
+	if got := m.input.Value(); got != "C://shot//a.pngnoise" {
+		t.Fatalf("运行期应接受粘贴并追加到输入框，got %q", got)
 	}
 }
 
