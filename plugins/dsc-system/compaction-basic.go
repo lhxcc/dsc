@@ -189,22 +189,30 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 
 	// 复用既有压缩后的用量评估：低于阈值则直接返回改写（或无记录时不改写）
 	rewritten := applyRecords(msgs, records)
-	// 压力判定：**直接使用宿主给出的投影值**（ev.ProjectedTokens）。
+	// 压力 = **我们即将发出的那个表面**的大小（message + 工具目录）。这不是可选项：
+	// 压缩后视图只剩「摘要 + 保留尾部」，若拿原始列表（或按原始列表算出的宿主投影）
+	// 当压力，压完永远是 900k → 每步再压一次（实测：渲染后仅 2 条消息仍触发第二次
+	// 摘要，等于把 80% 阈值变成「保留区一满就压」）。
 	//
-	// 这个数由宿主统一计算（对齐 DSH tokenMeter.measure）：表面 = 消息 + 工具目录；
-	// 上次请求的用量锚点与本请求信封可比（工具目录/窗口一致、且该用量不低于当时的
-	// 启发式价）时，以实测用量为底数加上表面差量，否则退回纯估算。
-	// 插件不再自己做「锚点 + 增量」的合成——同一策略写两遍就会出现两个压力值。
+	// 所以分两种情况，各自用有效的那个数：
+	//   - 尚无压缩记录：我们的表面 == 请求表面 → 用宿主投影（ev.ProjectedTokens，
+	//     含工具目录、含信封可比性判据），比本地估算更准；
+	//   - 已有压缩记录：表面已被我们改写，宿主看不到 → 自测改写后的表面。
+	// 无论哪条，词元估算都走 SDK 唯一实现（不新增公式）。
+	toolTokens := ev.TokenCount - dsc.EstimateProtoMessagesTokens(msgs)
+	if toolTokens < 0 {
+		toolTokens = 0 // 旧宿主 TokenCount 不含工具
+	}
 	var pressure int
-	if ev.ProjectedTokens > 0 {
+	switch {
+	case len(records) > 0:
+		pressure = dsc.EstimateProtoMessagesTokens(rewritten) + toolTokens
+	case ev.ProjectedTokens > 0:
 		pressure = ev.ProjectedTokens
-	} else {
-		// 旧宿主未提供投影值：退回本次表面估算（仍用**原始** msgs，绝不用压缩记录
-		// 应用后的列表，否则压完必然「变轻」而永不触发下一次）。
+	case ev.TokenCount > 0:
 		pressure = ev.TokenCount
-		if pressure <= 0 {
-			pressure = dsc.EstimateProtoMessagesTokens(msgs)
-		}
+	default:
+		pressure = dsc.EstimateProtoMessagesTokens(rewritten) + toolTokens
 	}
 	if pressure < s.pressureThreshold() {
 		if len(records) > 0 {

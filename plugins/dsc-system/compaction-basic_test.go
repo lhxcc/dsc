@@ -290,30 +290,52 @@ func TestCompactionBasicTriggersOnReportedUsage(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicObeysHostProjection 压力合成归宿主（core.projectPressure），
-// 本插件只按 projected_tokens 决策，**不得**自己再算一遍：
-//   - 消息很短、但宿主投影已超阈值 → 必须压缩（锚点/增量都在宿主侧）；
-//   - 消息很长、但宿主投影低于阈值 → 不得压缩（哪怕本地估算超阈值也不许自作主张）。
-//
-// 反例若成立，说明插件又偷偷用了自己的估算或 last_usage_tokens。
-func TestCompactionBasicObeysHostProjection(t *testing.T) {
+// TestCompactionBasicMeasuresItsOwnSurface 压力必须按「本插件要发出的表面」算：
+//   - 尚无压缩记录时，其表面 == 请求表面 → 采信宿主投影（含工具目录与信封判据）；
+//   - 已有压缩记录时，表面已被改写（摘要 + 保留尾部），宿主投影仍按原始列表算，
+//     若照用会把已压到 ~2 条的视图当成 900k → 每步再摘要一次（回归：把 80% 阈值
+//     退化成「保留区一满就压」，实测会多打一次 LLM）。
+func TestCompactionBasicMeasuresItsOwnSurface(t *testing.T) {
 	s := newTestCompactionBasicServer(t, 10000) // 阈值 8000
-	s.llm = &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
+	fake := &fakeCompactionBasicLLM{content: "LLM-SUMMARY"}
+	s.llm = fake
 
-	// ① 本地估算很小（4 条 × 1204 ≈ 4816），宿主投影 9000（含工具目录与增量）→ 压缩
+	// ① 无记录：宿主投影 9000 ≥ 阈值 → 压缩（哪怕本地估算只有 ~4.8k）
 	small := bigMsgs(4, 1200)
-	res := mustPreStepProjected(t, s, "sess-proj-1", small, 9000, 9000)
+	res := mustPreStepProjected(t, s, "sess-own-1", small, 9000, 9000)
 	if res == "" {
-		t.Fatalf("宿主投影 9000 >= 阈值 8000 时必须压缩，与本地估算无关")
+		t.Fatal("宿主投影 9000 ≥ 阈值时必须压缩")
 	}
-	if got := parseRewrite(t, res); len(got) >= len(small) || !strings.Contains(got[0].GetContent(), "LLM-SUMMARY") {
-		t.Fatalf("rewrite 未落地：%d msgs", len(got))
+	if fake.calls != 1 {
+		t.Fatalf("应只摘要一次，got %d", fake.calls)
 	}
 
-	// ② 本地估算很大（8 × 1204 ≈ 9632 > 阈值），但宿主投影 7000 < 阈值 → 不压缩
+	// ② 无记录：宿主投影 7000 < 阈值 → 不压缩（插件不得用本地估算越权决策）
 	big := bigMsgs(8, 1200)
-	if res := mustPreStepProjected(t, s, "sess-proj-2", big, 7000, 7000); res != "" {
-		t.Fatalf("宿主投影 7000 < 阈值 8000 时不得压缩（插件不得用本地估算越权决策），got %q", res)
+	if res := mustPreStepProjected(t, s, "sess-own-2", big, 7000, 7000); res != "" {
+		t.Fatalf("宿主投影低于阈值时不得压缩，got %q", res)
+	}
+
+	// ③ 有记录：尾部只略增（渲染后远低于阈值），宿主投影仍按原始 19k 给 →
+	// 允许返回既有改写（隐藏已压段），但**不得新增摘要**。
+	msgs := bigMsgs(16, 1200)
+	if mustPreStepProjected(t, s, "sess-own-3", msgs, 19000, 19000) == "" {
+		t.Fatal("首次应压缩")
+	}
+	before := fake.calls
+	tailPlus2 := append(append([]*proto.Message{}, msgs...), bigMsgs(2, 1200)...)
+	if res := mustPreStepProjected(t, s, "sess-own-3", tailPlus2, 21000, 21000); res == "" {
+		t.Fatal("有记录时应返回既有改写（否则模型看到未压缩的全量历史）")
+	}
+	if fake.calls != before {
+		t.Fatalf("渲染后表面 ~2.4k << 阈值 8000，不得再摘要；摘要次数 %d → %d", before, fake.calls)
+	}
+
+	// ④ 尾部长到渲染后表面超阈值 → 允许再摘要
+	tailPlus8 := append(append([]*proto.Message{}, msgs...), bigMsgs(8, 1200)...)
+	mustPreStepProjected(t, s, "sess-own-3", tailPlus8, 27000, 27000)
+	if fake.calls <= before {
+		t.Fatalf("渲染后表面超过阈值时应再次摘要，摘要次数仍为 %d", fake.calls)
 	}
 }
 
