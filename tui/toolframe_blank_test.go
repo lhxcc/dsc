@@ -101,3 +101,25 @@ func TestReplayCallAndResultAreTight(t *testing.T) {
 		t.Fatalf("回放缺块:\n%v", m.lines)
 	}
 }
+
+// TestAppendMessageSkipsEmptyBlocks 空块不入列：空串 / 只有换行 / 只有 ANSI 转义
+// 的渲染结果都没有可读内容，写入只会在消息之间多出一个空行。用可见宽度判定，
+// 而不是比较空串（dimSty.Render("") 就不是空串）。
+func TestAppendMessageSkipsEmptyBlocks(t *testing.T) {
+	m := New(&stubAgent{}, nil, context.Background(), "m", "minimal", 131072)
+	before := len(m.lines)
+	for _, empty := range []string{"", "\n", dimSty.Render("")} {
+		m.appendMessage(empty)
+	}
+	if len(m.lines) != before {
+		t.Fatalf("空块被写入: %d → %d", before, len(m.lines))
+	}
+	// 有内容的照旧追加（并且补一个分隔空行）
+	m.appendMessage("正文")
+	if len(m.lines) != before+1 {
+		t.Fatalf("正常消息未写入: %d → %d", before, len(m.lines))
+	}
+	if before > 0 && !strings.HasPrefix(m.lines[len(m.lines)-1], "\n") {
+		t.Fatalf("非首条消息应带分隔空行: %q", m.lines[len(m.lines)-1])
+	}
+}

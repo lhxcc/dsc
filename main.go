@@ -1015,7 +1015,12 @@ func main() {
 			logger.Info("tui history replay", "total", len(replay.Messages), "initial", replay.Initial,
 				"history_injection", histInj, "history_shows", histShows)
 		}
-		if err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, replay); err != nil {
+		// 退出提示（如 /config 切换了配置）：TUI 退出后屏幕已还原，由这里打印。
+		note, err := tui.Run(agent, mgr, ctx, llmModelName, mode, contextWindow, replay)
+		if note != "" {
+			fmt.Println(note)
+		}
+		if err != nil {
 			logger.Error("tui run failed", "error", err)
 			exitCode = 1
 		}

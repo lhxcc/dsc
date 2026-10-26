@@ -374,6 +374,11 @@ type Model struct {
 	program  *tea.Program
 	question *pendingQuestion
 
+	// configPicker 配置档选单（/config）。非 nil 时接管按键，并在 View 里占独立区域。
+	configPicker *configPicker
+	// exitNote 退出程序后要打印的提示（配置切换需重启加载，见 /config）。
+	exitNote string
+
 	// 后台任务完成通知唤醒（对齐 DSH completionDelivery: wakeup）：
 	// pendingWakeups 待送达的任务完成通知：忙碌时走实时注入，注入失败才回落到这里，
 	// 在回合结束/下一条用户消息时补送。
@@ -618,6 +623,10 @@ func (m *Model) vpHeight() int {
 	if m.workingLineVisible() {
 		h -= thinkingRow
 	}
+	if rows := m.configPickerRows(); rows > 0 {
+		// 配置档选单同样位于 viewport 之后，必须等量收缩（否则被 AltScreen 截断）。
+		h -= rows
+	}
 	if rows := m.questionRows(); rows > 0 {
 		// 问题覆盖层占独立行（View 组装位于 viewport 之后）：viewport 必须等量收缩，
 		// 否则覆盖层被推到终端可视区之外（AltScreen 截断）——提问弹出后界面无任何
@@ -861,6 +870,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.deliverCompletionNotice(renderCronDoneNotice(msg.job))
 
+	case configSwitchMsg:
+		if msg.err != nil {
+			m.appendMessage(errorSty.Render("切换配置失败: ") + msg.err.Error())
+			m.render()
+			m.virtualGotoBottom()
+			return m, nil
+		}
+		// 整份 config.yaml 无法热生效（provider/插件表都已装配在进程里）：切换成功后
+		// 退出，由用户重新启动加载。若当前回合还在跑，先不退出——不能为了换配置
+		// 丢掉进行中的工作；提示里写明重启即可。
+		m.exitNote = fmt.Sprintf("配置已切换为 %s（原配置已备份到 %s）。重新启动 DSC 即加载新配置。",
+			msg.name, msg.backup)
+		if m.thinking || m.streaming {
+			m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 配置") +
+				"\n" + m.exitNote + "（本轮仍在进行，结束后请手动重启）")
+			m.render()
+			m.virtualGotoBottom()
+			return m, nil
+		}
+		return m, tea.Quit
+
 	case pluginAdminMsg:
 		// 插件管理命令结果：工具返回 JSON，这里只做可读化，不再解释业务含义。
 		if msg.err != nil {
@@ -880,6 +910,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.tryWakeup()
 
 	case tea.KeyPressMsg:
+		// 配置档选单激活时，按键只用于选择/翻页/确认/取消。
+		if m.configPicker != nil {
+			return m.handleConfigPickerKey(msg)
+		}
 		// 问题覆盖层激活时，按键只用于选择/确认/放弃
 		if m.question != nil {
 			return m.handleQuestionKey(msg)
@@ -1670,8 +1704,15 @@ func renderUserBubble(text string, width int) string {
 }
 
 // appendMessage 追加一条已渲染消息；非首条消息前补一个空行，使消息之间留有间距。
+//
+// 空块不留位：宽为 0 的渲染结果（空串、只有换行、只有 ANSI 转义——例如
+// dimSty.Render("") 这种「看似有内容」的串）没有可读内容，写入只会让两条消息
+// 之间多出一个空行。用 lipgloss.Width 判「可见宽度」，比比较空串可靠。
 func (m *Model) appendMessage(rendered string) {
 	m.toolCallOpen = false // 非工具帧打断「调用标题→结果」的连续布局
+	if lipgloss.Width(rendered) == 0 {
+		return
+	}
 	if len(m.lines) > 0 {
 		m.lines = append(m.lines, "\n"+rendered)
 		return
@@ -2592,6 +2633,7 @@ var slashCommands = []compItem{
 	{label: "/sessions", insert: "/sessions", hint: "列出所有会话"},
 	{label: "/cron", insert: "/cron ", hint: "定时任务子命令（list / add / remove / on / off / notify），选中进入后展开", descend: true},
 	{label: "/plugins", insert: "/plugins", hint: "列出插件（= /plugin list，动态枚举）"},
+	{label: "/config", insert: "/config", hint: "切换 config/config.*.yaml 配置档（列表可选、可翻页，切换后需重启）"},
 	{label: "/plugin", insert: "/plugin ", hint: "插件管理（list / install / remove / upgrade / load / unload）", descend: true},
 	{label: "/plan", insert: "/plan", hint: "进入 plan 模式（先探索设计，再经 exit_plan_mode 呈现计划）"},
 	{label: "/plan off", insert: "/plan off", hint: "退出 plan 模式"},
@@ -2903,6 +2945,7 @@ func (m *Model) buildHelpText() string {
 		"  /sessions    列出所有会话",
 		"  /crons       列出所有定时任务",
 		"  /plugins     列出插件（= /plugin list）",
+		"  /config      切换 config/config.*.yaml 配置档（选择后需重启生效）",
 		"  /plugin install <name> <source> [--type tool]  安装并热加载插件",
 		"  /plugin remove <name>   卸载插件（含目录）",
 		"  /plugin upgrade <name> <version> <source>  升级插件",
@@ -3085,6 +3128,14 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.render()
 		m.virtualGotoBottom()
 		return true, nil
+	case "/config":
+		m.openConfigPicker()
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.virtualGotoBottom()
+		return true, nil
+
 	case "/plugins":
 		cmd := m.runPluginAdmin("list", nil)
 		m.input.SetValue("")
@@ -3239,6 +3290,25 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
+	// /config <name> | list：直选某个配置档（列表由磁盘决定，不硬编码档名）。
+	if strings.HasPrefix(cmd, "/config ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(cmd, "/config "))
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		var exec tea.Cmd
+		if arg == "" || arg == "list" {
+			m.openConfigPicker()
+		} else if m.manager == nil {
+			m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
+		} else {
+			exec = m.switchConfigProfileCmd(arg)
+		}
+		m.render()
+		m.virtualGotoBottom()
+		return true, exec
+	}
+
 	// /plugin <sub> ...（前缀匹配）：与模型同一套插件管理工具，动态枚举插件。
 	if strings.HasPrefix(cmd, "/plugin ") || cmd == "/plugin" {
 		argv := strings.Fields(strings.TrimPrefix(cmd, "/plugin"))
@@ -4080,6 +4150,9 @@ func (m *Model) View() tea.View {
 	if q := m.questionView(); q != "" {
 		parts = append(parts, q)
 	}
+	if cp := m.configPickerView(); cp != "" {
+		parts = append(parts, cp)
+	}
 	if m.workingLineVisible() {
 		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
 		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
@@ -4165,7 +4238,9 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 }
 
 // Run 运行聊天界面，阻塞直到退出
-func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, replay *core.HistoryReplay) error {
+// Run 运行聊天界面，阻塞直到退出。第二个返回值是退出提示（如 /config 切换了配置、
+// 需要重启才生效）——TUI 退出后屏幕已还原，提示必须由调用方在终端打印。
+func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, replay *core.HistoryReplay) (string, error) {
 	m := New(agent, manager, ctx, modelName, mode, contextWindow)
 	// 启动回显数据：完整可显示历史 + 初始渲染条数（首个窗口尺寸后渲染，见 seedHistory）。
 	if replay != nil {
@@ -4196,5 +4271,5 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		})
 	}
 	_, err := p.Run()
-	return err
+	return m.exitNote, err
 }
