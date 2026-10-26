@@ -1631,7 +1631,8 @@ func (a *ReactLoopAgent) SetPlanMode(ctx context.Context, active bool) error {
 // SetHistoryInjection 设置当前会话的历史注入条数上限：追加 log-only history/limit
 // 事件并落盘（事件溯源：恢复/切换/fork 都能折叠还原），无需重建 system prompt。
 // 同时立即更新内存值（当前 Run 后续 step 即按新值派生，无需等下一次 Run 折叠）。
-// count < 0 表示不限制；0 表示不注入历史；> 0 表示只注入最近 count 条派生消息。
+// count < 0 不注入恢复历史；count == 0 未定义（按默认 = 不限制）；count > 0 只注入
+// 最近 count 条派生消息。与 DSH 相反（DSH：count < 0 不限制、count == 0 不注入）。
 func (a *ReactLoopAgent) SetHistoryInjection(ctx context.Context, count int) error {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()

@@ -163,7 +163,9 @@ type SystemMessageData struct {
 }
 
 // HistoryLimitData history/limit 事件载荷（log-only）：历史注入条数上限。
-// Count < 0 表示不限制（缺省）；0 表示不注入历史；>0 表示只注入最近 Count 条。
+// 沿用 DSC 全仓统一三值（刻意与 DSH 相反）：Count < 0 不注入恢复历史；
+// Count == 0 未定义（按默认 = 不限制，注入全部恢复历史）；Count > 0 只注入
+// 恢复历史中最近 Count 条。Go 零值即 0，把 0 当「关闭」会让漏写配置意外关掉历史。
 type HistoryLimitData struct {
 	Count int
 }
