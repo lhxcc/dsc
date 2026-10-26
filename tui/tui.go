@@ -2671,38 +2671,54 @@ var slashCommands = []compItem{
 // Manager 不可用或 presets 目录为空时，回退到内置默认模式列表，保证菜单
 // 在 minimal 启动 / 配置缺失场景下仍可用。
 func (m *Model) slashCommandItems() []compItem {
-	modes := m.availableModes()
-	modeItems := make([]compItem, 0, len(modes))
-	for _, mode := range modes {
-		modeItems = append(modeItems, compItem{
+	out := make([]compItem, 0, len(slashCommands)+8)
+
+	// 内置命令（声明顺序会在最后被重排，此处顺序不重要）。
+	out = append(out, slashCommands...)
+
+	// 动态 /mode 项：来自 presets 目录，用户新增 preset 就自动出现。
+	for _, mode := range m.availableModes() {
+		out = append(out, compItem{
 			label:  "/mode " + mode,
 			insert: "/mode " + mode,
 			hint:   modeHint(mode),
 		})
 	}
-	// 把 /mode 项插到 /skills 之后、/sandbox 之前，保持原有位置习惯
-	out := make([]compItem, 0, len(slashCommands)+len(modeItems))
-	inserted := false
-	for _, it := range slashCommands {
-		if !inserted && strings.HasPrefix(it.label, "/sandbox") {
-			out = append(out, modeItems...)
-			inserted = true
-		}
-		out = append(out, it)
-	}
-	if !inserted {
-		out = append(out, modeItems...)
-	}
+
 	// 插件声明的命令：菜单内容来自宿主的声明汇总，前端不认识任何具体命令。
-	if plugins := m.pluginCommands(); len(plugins) > 0 {
-		items := make([]compItem, 0, len(plugins))
-		for _, c := range plugins {
-			items = append(items, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
-		}
-		// 插到 "/export" 之前，保持内置命令的收尾顺序（/export、/exit 在最后）
-		out = append(out, items...)
+	for _, c := range m.pluginCommands() {
+		out = append(out, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
 	}
-	return out
+
+	return sortSlashItems(out)
+}
+
+// sortSlashItems 按命令名的字母序重排菜单，/exit 固定最后。
+//
+// 只按**第一个词**比较（/sandbox read-only 与 /sandbox workspace 视为同一族），
+// 同族内保持声明顺序：这些写法本身有语义次序——/sandbox 的三档是权限递增
+// （read-only → workspace → full-access）、/jobs 是 list → output → kill、
+// /cron 是 list → add → remove → on/off → notify，按字母打散反而更难选。
+// 用 SliceStable 正是为了保住这个次序。大小写不敏感（插件声明的命令可能含大写）。
+func sortSlashItems(items []compItem) []compItem {
+	name := func(it compItem) string {
+		label := strings.TrimPrefix(strings.TrimSpace(it.label), "/")
+		if i := strings.IndexAny(label, " \t"); i >= 0 {
+			label = label[:i]
+		}
+		return strings.ToLower(label)
+	}
+	rest := make([]compItem, 0, len(items))
+	exit := make([]compItem, 0, 1)
+	for _, it := range items {
+		if name(it) == "exit" {
+			exit = append(exit, it)
+			continue
+		}
+		rest = append(rest, it)
+	}
+	sort.SliceStable(rest, func(i, k int) bool { return name(rest[i]) < name(rest[k]) })
+	return append(rest, exit...)
 }
 
 // pluginCommands 返回宿主侧汇总的插件命令声明（无 manager 时为空）。
