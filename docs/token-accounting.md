@@ -119,6 +119,12 @@ type TokenMeter struct {
 `Project` 的差量**可以为负**：压缩让表面变小时，"已用"要跟着回落，否则永远在喊"该压缩了"。
 `ShouldCompact(currentEstimate, ratio)` 只在 `window>0` 时给出判断。
 
+**锚点自身超窗时退回纯估算**（`window>0 && pressureTokens > window`）：上一次实测已经
+大于窗口，说明窗口配置（或探测值）小于 provider 实际接受的规模。继续以它为底数，会把
+之后每一次请求都判成超窗——历史裁到只剩最近几条也照样报错，而 provider 明明一直在接收。
+这种锚点不再描述"现在要发的请求"，判定退回 `currentEstimate`。窗口未知（0）时无从比较，
+维持差量语义。
+
 `PromptSideTokens` 返回 **prompt_tokens**，不叠加 `cacheRead/cacheWrite`：OpenAI 兼容端点
 的 prompt 已含缓存命中，相加会把命中缓存的请求算成近两倍（历史 bug，commit `1de5494`）。
 
@@ -288,6 +294,8 @@ default:
 - 估算只用 `core/token_meter.go` 的公式，插件经 `dsc.Estimate*`。
 - 「请求大小」= 消息 + 工具目录，任何压力/裁剪/预算都不得漏工具。
 - 压力必须量在"将要发出的表面"上（§7）；改写者自测。
+- **裁剪与超窗判定必须同一口径**：裁剪按消息估算选起点，判定读投影值，两者可能差数倍，
+  故裁剪要闭环（裁完用 `projectedFit` 复核，不满足就收紧预算再裁，见 §11「动裁剪逻辑」）。
 - 新增会话事件：`EventType` 常量 + `Data` 结构 + `session/persist.go` 解码注册，三处齐。
 - 用量锚点只能通过 `session.LastUsageAnchor` 取（宿主与 agent 共用一份）。
 - log-only 事件必须以 `Append(..., nil)` 写入（不进 surface）。
@@ -297,6 +305,7 @@ default:
 - 在插件里写 `len/4`、`max(bytes/4,runes)` 之类公式。
 - 把 `llm/attempt` 当信封用，或把信封字段塞回 `llm/attempt`。
 - 用 `projected_tokens` 代替"自己渲染后的表面"（会压过头）。
+- 裁一次就判定超窗（估算与投影分叉时会误报；见 §10）。
 - 宿主按插件名分发用量相关能力（应走声明式/事件）。
 
 **守卫测试**（改坏了会红）：`plugin_names_guard_test.go`、`TestToolsFingerprint`、
@@ -339,6 +348,13 @@ default:
 **调阈值**：窗口 `DSC_CONTEXT_WINDOW`（宿主注入）/ `DSC_COMPACTION_BASIC_CONTEXT_WINDOW`（插件专属，优先）；
 触发比例 `DSC_COMPACTION_BASIC_THRESHOLD`（默认 0.80）；保留尾部 `DSC_COMPACTION_BASIC_RETAIN_RATIO`（默认 0.16）。
 注意阈值比较的是"投影压力"，不是原始历史大小。
+
+**动裁剪逻辑**（`trimToWindow` / `fitMessagesToWindow*`）：裁剪按消息估算选起点，超窗判定
+却读投影值，两者口径不同（差两三倍并不罕见）。所以裁剪是**闭环**的：裁一次 → 用
+`projectedFit`（投影口径，含工具目录）复核 → 不满足就按
+`oversizeTrimFallbackRatios`（0.90 → 0.60 → 0.35 → 0.15）逐档收紧再裁，直到装得进或
+无历史可裁。改动时不得退回"裁一次就判超窗"——那正是「省略六千多条之后还报 441195 /
+131072」的成因；也不得让提示帧回显裁剪前的占用（那会让人以为裁剪没执行）。
 
 ---
 

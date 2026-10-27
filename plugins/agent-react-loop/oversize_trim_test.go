@@ -439,3 +439,37 @@ func TestUsageFramesCarryContextTokens(t *testing.T) {
 		t.Fatal("未发出任何带 usage 的帧")
 	}
 }
+
+// TestTrimToWindowClosesLoopWhenProjectionFarAboveEstimate 投影值远高于消息估算时，
+// 裁剪必须收敛到判定口径，而不是「裁一次就判超窗」。
+//
+// 修复前的真实行为：裁剪按消息估算算预算，超窗判定却读投影值（实测锚点 + 差量）。
+// 两者差两三倍时会出现「已省略最早 6384 条消息」之后仍然报 441195 > 131072——消息区
+// 看着像裁剪没执行，其实是裁完仍不满足判定口径。闭环收紧让两边收敛到同一个数。
+func TestTrimToWindowClosesLoopWhenProjectionFarAboveEstimate(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 10000
+	a.meter = dsc.NewTokenMeter(10000)
+	// 锚点仍在窗口内（不触发「锚点超窗」降级），但 provider 实测是启发式估算的 3 倍
+	a.meter.SampleUsage(9000, 3000)
+
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: strings.Repeat("内容", 100)})
+	}
+	projected := a.projectedFit(msgs, nil)
+	if projected <= a.contextWindow {
+		t.Fatalf("夹具无效：裁前应超窗，got %d", projected)
+	}
+
+	out, dropped := a.trimToWindow(msgs, nil, projected)
+	if dropped == 0 {
+		t.Fatal("应发生裁剪")
+	}
+	if fit := a.projectedFit(out, nil); fit > a.contextWindow {
+		t.Fatalf("闭环裁剪后仍超窗 %d > %d（说明只裁了一次就判超窗）", fit, a.contextWindow)
+	}
+	if len(out) == 0 || out[0].Role != "system" {
+		t.Fatalf("system 消息不得被裁掉，got %d 条，首条 %v", len(out), out)
+	}
+}

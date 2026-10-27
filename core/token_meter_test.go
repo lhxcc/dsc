@@ -347,3 +347,28 @@ func TestEstimateProtoToolTokens(t *testing.T) {
 			EstimateProtoToolTokens(big), EstimateProtoToolTokens(one))
 	}
 }
+
+// TestProjectFallsBackWhenAnchorExceedsWindow 锚点自身已超出窗口时退回纯估算。
+//
+// 现实触发：窗口配置（或探测值）小于 provider 实际接受的规模，于是上一次请求的实测
+// 用量本身就大于窗口。继续以它为底数做「实测 + 差量」，会把之后每一次请求都判成超窗
+// ——历史被裁到只剩最近几条也照样报错，而 provider 明明一直在接收。这种锚点已经不
+// 描述「现在要发的请求」，判定应退回估算。窗口未知（0）时无从比较，维持原语义。
+func TestProjectFallsBackWhenAnchorExceedsWindow(t *testing.T) {
+	tm := NewTokenMeter(1000)
+	tm.SampleUsage(5000, 4000) // 实测 5000 > 窗口 1000
+	if got := tm.Project(800); got != 800 {
+		t.Fatalf("锚点超窗时应退回估算 800，got %d", got)
+	}
+	tm0 := NewTokenMeter(0)
+	tm0.SampleUsage(5000, 4000)
+	if got := tm0.Project(800); got != 1800 {
+		t.Fatalf("窗口未知时应照常做差量合成（5000 + (800-4000)），got %d", got)
+	}
+	// 锚点在窗口内时照旧：这是正常路径，不得被上面的降级影响
+	tm2 := NewTokenMeter(1000)
+	tm2.SampleUsage(900, 800)
+	if got := tm2.Project(1000); got != 1100 {
+		t.Fatalf("正常锚点应照旧合成 1100，got %d", got)
+	}
+}

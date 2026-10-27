@@ -216,6 +216,13 @@ func (tm *TokenMeter) projectLocked(currentEstimate int) int {
 	if !tm.hasSample {
 		return currentEstimate
 	}
+	// 锚点自身已超出窗口：说明窗口配置小于 provider 实际接受的规模（探测值偏小，
+	// 或 usage 口径含缓存/思考 token）。继续以它为底数，会把**之后每一次**请求都判成
+	// 超窗——历史被裁到只剩最近几条也照样报错，而 provider 明明一直在接收。
+	// 这种锚点不再描述「现在的请求」，退回纯估算（与无锚点时同样的下界语义）。
+	if tm.contextWindow > 0 && tm.pressureTokens > tm.contextWindow {
+		return currentEstimate
+	}
 	delta := 0
 	if tm.sampledEstimate > 0 {
 		delta = currentEstimate - tm.sampledEstimate
