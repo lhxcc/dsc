@@ -234,7 +234,18 @@ func (m *Manager) NoteContextUsage(sessionID string, u *Usage, reportedContextTo
 	m.ctxMeters.NoteUsage(sessionID, u, reportedContextTokens)
 }
 
-// ContextTokens 返回某会话展示用的上下文占用（agent 投影值优先，退回实测 prompt）。
+// NoteActualSurface 记录本步 pre-step 改写后实际发出的表面大小（0 = 本步未改写）。
+// 展示用的上下文占用以它为准：压缩后端把 900k 压成 40k 之后，界面必须跟着降下来，
+// 否则「都 90% 了还不压缩」只是显示口径在描述一个没发出去的请求。
+func (m *Manager) NoteActualSurface(sessionID string, tokens int) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.NoteActualSurface(sessionID, tokens)
+}
+
+// ContextTokens 返回某会话展示用的上下文占用（实际发出的表面优先，其次 agent 投影，
+// 再退回实测 prompt）。
 func (m *Manager) ContextTokens(sessionID string) int {
 	if m == nil || m.ctxMeters == nil {
 		return 0

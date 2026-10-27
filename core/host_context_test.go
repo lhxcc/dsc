@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"dsc/proto"
 	"dsc/proto/metadata"
 	"dsc/userquestions"
 )
@@ -37,6 +39,74 @@ func TestHostContextMetersPrefersReported(t *testing.T) {
 	h.NoteUsage("s2", &Usage{PromptTokens: 1000}, 0)
 	if got := h.ContextTokens("s1"); got != 512_000 {
 		t.Fatalf("另一会话的帧不应改写 s1，got %d", got)
+	}
+}
+
+// TestHostContextMetersPrefersActualSurface 本步被插件改写过请求时，展示口径必须
+// 跟着「真正发出去的东西」走：压缩后端把 900k 压成 40k 之后，界面若还显示 900k，
+// 用户看到的就是「都 90% 了还不压缩」，而压缩插件按 40k 判断根本没到阈值。
+func TestHostContextMetersPrefersActualSurface(t *testing.T) {
+	h := NewHostContextMeters(1_000_000)
+	h.NoteUsage("s1", &Usage{PromptTokens: 900_000, ContextTokens: 900_000}, 900_000)
+	if got := h.ContextTokens("s1"); got != 900_000 {
+		t.Fatalf("改写前应显示上报投影 900000，got %d", got)
+	}
+
+	// 本步压缩成 40k：实际发出的表面优先
+	h.NoteActualSurface("s1", 40_000)
+	if got := h.ContextTokens("s1"); got != 40_000 {
+		t.Fatalf("改写后应显示实际表面 40000，got %d", got)
+	}
+
+	// 下一步没有改写 → 清掉实际表面，回到上报投影
+	h.NoteActualSurface("s1", 0)
+	if got := h.ContextTokens("s1"); got != 900_000 {
+		t.Fatalf("未改写的一步应回到上报投影 900000，got %d", got)
+	}
+}
+
+// TestPreStepRewriteUpdatesDisplayedSurface 压缩后端经 pre-step 改写请求后，宿主记录
+// 的「实际发出的表面」必须立刻成为展示值；下一步没有改写则退回 agent 上报的投影。
+// 这是「到了 80% 却不压缩」的直接解药：那个 80% 描述的是一个没发出去的请求。
+func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
+	m := newRouterManager()
+	m.ctxMeters = NewHostContextMeters(200_000)
+	m.ctxMeters.NoteUsage("sess-x", &Usage{PromptTokens: 180_000, ContextTokens: 180_000}, 180_000)
+
+	tools := []*proto.Tool{{Name: "shell", Description: "run", ParametersJson: `{"type":"object"}`}}
+	big := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: strings.Repeat("長", 4000)},
+	}
+	f := &fakeHook{
+		events:      make(chan *proto.OnEventRequest, 4),
+		eventResult: `{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"tail"}]}`,
+	}
+	m.toolHookClients["p1"] = f
+	m.toolHookOrder = []string{"p1"}
+	// 只有配置选定的压缩后端才有「改写请求」的采纳权（避免多个声明 compaction 的
+	// 插件层层改写），故这里把它指定为后端。
+	m.compactionBackend = "p1"
+
+	srv := &llmAggregateServer{m: m}
+	req := &proto.ChatRequest{SessionId: "sess-x", Messages: big, Tools: tools}
+	out := srv.applyPreStepHook(context.Background(), req)
+	if len(out.Messages) != 2 || out.Messages[1].Content != "tail" {
+		t.Fatalf("改写未生效: %+v", out.Messages)
+	}
+	want := EstimateProtoMessagesTokens(out.Messages) + EstimateProtoToolTokens(tools)
+	if want >= 180_000 {
+		t.Fatalf("夹具无效：改写后的表面 %d 没有明显变小", want)
+	}
+	if got := m.ContextTokens("sess-x"); got != want {
+		t.Fatalf("展示值 = %d，期望按实际发出的表面 %d", got, want)
+	}
+
+	// 下一步没有插件改写（result 为空）：展示退回 agent 上报的投影
+	f.eventResult = ""
+	_ = srv.applyPreStepHook(context.Background(), req)
+	if got := m.ContextTokens("sess-x"); got != 180_000 {
+		t.Fatalf("未改写的一步应回到上报投影 180000，got %d", got)
 	}
 }
 

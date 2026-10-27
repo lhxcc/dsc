@@ -202,6 +202,7 @@ func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatReque
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
 func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) *proto.ChatRequest {
 	if len(s.m.hookClientsSnapshot()) == 0 {
+		s.m.NoteActualSurface(req.GetSessionId(), 0) // 无插件改写：展示回到上报值
 		return req // 无插件监听：直接返回，零开销
 	}
 	msgsJSON, _ := json.Marshal(req.Messages)
@@ -220,6 +221,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		Session:         req.GetSessionId(),
 		MessagesJSON:    string(msgsJSON),
 		TokenCount:      tokenCount,
+		ToolTokens:      EstimateProtoToolTokens(req.Tools),
 		LastUsageTokens: anchor.promptTokens,
 		ProjectedTokens: projected,
 		EnvelopeMatched: matched,
@@ -238,6 +240,9 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		return req
 	}
 	// 解析改写后的消息列表
+	// 本步没有插件改写请求：展示口径回到 agent 上报的投影值（清掉上一步的
+	// 「实际表面」，否则一份过时的数字会一直压着界面）。
+	s.m.NoteActualSurface(req.GetSessionId(), 0)
 	if result == nil {
 		return req
 	}
@@ -265,6 +270,12 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	if !changed {
 		return req
 	}
+	// 记录本步**实际发出**的表面（消息 + 工具目录）。压缩后端改写请求之后
+	// （900k → 摘要 + 尾部），宿主与 agent 看到的仍是未改写的全量历史：展示若照用
+	// 那个数，界面会一直显示 90% 而压缩插件按 40% 判断「还没到阈值」，看起来就是
+	// 「到了阈值却不动」。展示口径必须跟真正发出去的东西走。
+	s.m.NoteActualSurface(req.GetSessionId(),
+		EstimateProtoMessagesTokens(msgs)+EstimateProtoToolTokens(req.Tools))
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
 	return &proto.ChatRequest{

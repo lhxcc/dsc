@@ -199,9 +199,15 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	//     含工具目录、含信封可比性判据），比本地估算更准；
 	//   - 已有压缩记录：表面已被我们改写，宿主看不到 → 自测改写后的表面。
 	// 无论哪条，词元估算都走 SDK 唯一实现（不新增公式）。
-	toolTokens := ev.TokenCount - dsc.EstimateProtoMessagesTokens(msgs)
-	if toolTokens < 0 {
-		toolTokens = 0 // 旧宿主 TokenCount 不含工具
+	// 工具目录开销：优先用宿主直接给出的 tool_tokens。旧宿主没有该字段时才反推
+	// （TokenCount - 本地消息估算）——同一条瀑布里若有别的插件先改写过消息，
+	// 这个减法会把差额算成工具开销，甚至算成负数。
+	toolTokens := ev.ToolTokens
+	if toolTokens <= 0 {
+		toolTokens = ev.TokenCount - dsc.EstimateProtoMessagesTokens(msgs)
+		if toolTokens < 0 {
+			toolTokens = 0
+		}
 	}
 	var pressure int
 	switch {
