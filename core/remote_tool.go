@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"dsc/proto"
 )
@@ -89,4 +90,20 @@ func (r *RemoteTool) ExecuteWithViewAndImages(ctx context.Context, args json.Raw
 func (r *RemoteTool) ExecuteWithView(ctx context.Context, args json.RawMessage) (result string, viewJSON string, errRet error) {
 	result, viewJSON, _, err := r.ExecuteWithViewAndImages(ctx, args)
 	return result, viewJSON, err
+}
+
+// LastActivity 查询本次调用最近一次活动时间（插件侧 GetActivity）。
+//
+// 用于「活跃续命」：宿主的前台等待预算按「距上次活动」计算，有输出就继续等，
+// 持续无输出才把任务转入后台。旧插件没实现该方法（Unimplemented）时返回 false，
+// 调用方退回固定预算——两侧互不因缺对方而失败。
+func (r *RemoteTool) LastActivity(ctx context.Context, callID string) (time.Time, bool) {
+	if r.client == nil || callID == "" {
+		return time.Time{}, false
+	}
+	resp, err := r.client.GetActivity(ctx, &proto.GetActivityRequest{ToolCallId: callID})
+	if err != nil || resp.GetLastActivityUnixMs() <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(resp.GetLastActivityUnixMs()), true
 }

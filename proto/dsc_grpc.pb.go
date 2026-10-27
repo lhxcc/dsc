@@ -1039,6 +1039,7 @@ const (
 	ToolService_ListTools_FullMethodName       = "/dsc.ToolService/ListTools"
 	ToolService_ListContext_FullMethodName     = "/dsc.ToolService/ListContext"
 	ToolService_SetInterconnect_FullMethodName = "/dsc.ToolService/SetInterconnect"
+	ToolService_GetActivity_FullMethodName     = "/dsc.ToolService/GetActivity"
 )
 
 // ToolServiceClient is the client API for ToolService service.
@@ -1056,6 +1057,13 @@ type ToolServiceClient interface {
 	// 与事件总线，无需在插件启动时注入 env（避开握手时序）。
 	// 旧插件未实现时返回 Unimplemented，宿主应跳过。
 	SetInterconnect(ctx context.Context, in *InterconnectRequest, opts ...grpc.CallOption) (*InterconnectResponse, error)
+	// GetActivity 查询某次工具调用最近一次活动的时间（由执行方在产生输出/进度时上报）。
+	//
+	// 存在的理由：活跃续命看门狗的判定在宿主（它决定「还要不要继续等」），而活动信号
+	// 只在执行方产生。ctx 跨 gRPC 传递时不会带上 ctx value，插件里的 TouchActivity 拿到
+	// 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
+	// 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
+	GetActivity(ctx context.Context, in *GetActivityRequest, opts ...grpc.CallOption) (*GetActivityResponse, error)
 }
 
 type toolServiceClient struct {
@@ -1106,6 +1114,16 @@ func (c *toolServiceClient) SetInterconnect(ctx context.Context, in *Interconnec
 	return out, nil
 }
 
+func (c *toolServiceClient) GetActivity(ctx context.Context, in *GetActivityRequest, opts ...grpc.CallOption) (*GetActivityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetActivityResponse)
+	err := c.cc.Invoke(ctx, ToolService_GetActivity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ToolServiceServer is the server API for ToolService service.
 // All implementations must embed UnimplementedToolServiceServer
 // for forward compatibility.
@@ -1121,6 +1139,13 @@ type ToolServiceServer interface {
 	// 与事件总线，无需在插件启动时注入 env（避开握手时序）。
 	// 旧插件未实现时返回 Unimplemented，宿主应跳过。
 	SetInterconnect(context.Context, *InterconnectRequest) (*InterconnectResponse, error)
+	// GetActivity 查询某次工具调用最近一次活动的时间（由执行方在产生输出/进度时上报）。
+	//
+	// 存在的理由：活跃续命看门狗的判定在宿主（它决定「还要不要继续等」），而活动信号
+	// 只在执行方产生。ctx 跨 gRPC 传递时不会带上 ctx value，插件里的 TouchActivity 拿到
+	// 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
+	// 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
+	GetActivity(context.Context, *GetActivityRequest) (*GetActivityResponse, error)
 	mustEmbedUnimplementedToolServiceServer()
 }
 
@@ -1142,6 +1167,9 @@ func (UnimplementedToolServiceServer) ListContext(context.Context, *ListContextR
 }
 func (UnimplementedToolServiceServer) SetInterconnect(context.Context, *InterconnectRequest) (*InterconnectResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetInterconnect not implemented")
+}
+func (UnimplementedToolServiceServer) GetActivity(context.Context, *GetActivityRequest) (*GetActivityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetActivity not implemented")
 }
 func (UnimplementedToolServiceServer) mustEmbedUnimplementedToolServiceServer() {}
 func (UnimplementedToolServiceServer) testEmbeddedByValue()                     {}
@@ -1236,6 +1264,24 @@ func _ToolService_SetInterconnect_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ToolService_GetActivity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetActivityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ToolServiceServer).GetActivity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ToolService_GetActivity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ToolServiceServer).GetActivity(ctx, req.(*GetActivityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ToolService_ServiceDesc is the grpc.ServiceDesc for ToolService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1258,6 +1304,10 @@ var ToolService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetInterconnect",
 			Handler:    _ToolService_SetInterconnect_Handler,
+		},
+		{
+			MethodName: "GetActivity",
+			Handler:    _ToolService_GetActivity_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

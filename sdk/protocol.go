@@ -155,8 +155,14 @@ func WithIdleDeadline(ctx context.Context, idle time.Duration) (context.Context,
 	return core.WithIdleDeadline(ctx, idle)
 }
 
-// TouchActivity 标记上下文有新活动（重置空闲计时）。
-func TouchActivity(ctx context.Context) { core.TouchActivity(ctx) }
+// TouchActivity 标记上下文有新活动：重置本进程的执行域看门狗，并登记到跨进程
+// 活动表——宿主的活跃续命判定只能靠轮询 GetActivity（ctx value 过不了 gRPC）。
+func TouchActivity(ctx context.Context) {
+	core.TouchActivity(ctx)
+	if info, ok := CallInfoFrom(ctx); ok {
+		recordActivity(info.ToolCallID)
+	}
+}
 
 // IdleDeadlineExceeded 报告上下文是否因空闲超时被取消。
 func IdleDeadlineExceeded(ctx context.Context) bool { return core.IdleDeadlineExceeded(ctx) }
