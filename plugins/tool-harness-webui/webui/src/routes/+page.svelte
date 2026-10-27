@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { apiChat, apiDebugger, apiPlugins } from '$lib/api';
+	import { apiChat, apiDebugger, apiGet, apiPlugins } from '$lib/api';
 	import type { ChatResult, DebuggerSnapshot, HealthResult, PluginItem } from '$lib/api';
 
 	// ---- 状态 ----
