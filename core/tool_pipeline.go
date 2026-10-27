@@ -192,7 +192,7 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 	tool, ok := m.toolRegistry.Get(toolName)
 	if !ok {
 		m.logger.Warn("tool execution failed", "tool", toolName, "duration_ms", time.Since(start).Milliseconds(), "error", "tool not found")
-		return fmt.Errorf("tool not found: %s", toolName)
+		return m.toolNotFoundError(toolName)
 	}
 	// timeout-policy：声明 timeoutMs 的工具设置协作式截止时间（对齐 DSH）
 	execCtx, timeoutMs := ctx, 0
