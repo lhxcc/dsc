@@ -51,3 +51,5 @@ node_modules/
 bun.lock
 bun.lockb
 /dist/
+# 用户贴图的临时目录（截图不是源码，勿提交）
+/ERRRRR/
