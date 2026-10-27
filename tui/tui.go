@@ -329,6 +329,11 @@ type Model struct {
 	// 当前一轮的流式通道暂存：供运行中输入（注入）时维持泵取，避免流式流停滞
 	streamInput string
 	streamCh    <-chan *core.RunStreamResponse
+	// pumpInflight 已发起、尚未回收的读流次数。通道只能有一个读取者：一旦出现
+	// 两个 goroutine 同时 <-streamCh，增量帧的到达顺序就不再等于生成顺序，
+	// 渲染出来就是「个别词句语序颠倒」（buffer 里被拼成 B+A）。所以每个发起读的
+	// 地方（pumpStream）在这里计数，处理帧时回收；pumpStreamIfOpen 只在为 0 时补泵。
+	pumpInflight int
 
 	// 思考过程（reasoning）渲染状态：reasoningBuffer 累积增量，
 	// reasoningOpen 标记当前正文块是否处于思考状态；transition 到答案时
@@ -518,8 +523,13 @@ func (m *Model) submitCmd(input string, images []string) tea.Cmd {
 	}
 }
 
-// pumpStream 读取通道的下一帧
+// pumpStream 读取通道的下一帧。
+//
+// 每次调用都在这里登记「一个读在途」：通道是单消费者语义，两个并发读会让增量帧
+// 的到达顺序不再等于生成顺序（A、B 两帧逆序回来，buffer 就拼成 B+A）。登记由
+// Update 处理 streamFrame 时回收，见 pumpInflight 的注释。
 func (m *Model) pumpStream(input string, ch <-chan *core.RunStreamResponse) tea.Cmd {
+	m.pumpInflight++
 	return func() tea.Msg {
 		frame, ok := <-ch
 		if !ok {
@@ -533,11 +543,20 @@ func (m *Model) pumpStream(input string, ch <-chan *core.RunStreamResponse) tea.
 func (m *Model) clearStream() {
 	m.streamInput = ""
 	m.streamCh = nil
+	m.pumpInflight = 0
 }
 
-// pumpStreamIfOpen 若当前存在进行中的流式通道，返回继续泵取的命令；
-// 否则返回 nil。用于运行中输入（注入/编辑）时维持流式流不断。
+// pumpStreamIfOpen 若当前存在进行中的流式通道**且没有读在途**，返回继续泵取的命令；
+// 否则返回 nil。
+//
+// 「没有读在途」这个条件是必需的：运行中按键（打字、注入、翻历史…）都会顺手调用
+// 本函数想把流续上，但此时上一个读往往还阻塞在 <-streamCh 上——再起一个读就成了
+// 双消费者，帧顺序随机交错，表现为「个别词句语序颠倒」。链式泵本身不会断（处理完
+// 一帧才返回下一个泵），因此这里只需在断链时兜底。
 func (m *Model) pumpStreamIfOpen() tea.Cmd {
+	if m.pumpInflight > 0 {
+		return nil
+	}
 	if m.streamCh != nil && m.streamInput != "" {
 		return m.pumpStream(m.streamInput, m.streamCh)
 	}
@@ -1111,6 +1130,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamFrame:
+		// 一帧回来了 = 一次在途读取完成（first 帧来自提交命令而非泵取，
+		// 那时计数为 0，不会误减）。
+		if m.pumpInflight > 0 {
+			m.pumpInflight--
+		}
 		// 已被 Ctrl+C 中断本轮的残留帧直接丢弃，停止泵取。
 		// 注意：仅丢弃「非 first」残留帧——新轮的 first 帧必须放行，进入下方 first
 		// 分支复位 streamCancelled；否则 streamCancelled 永不复位，之后所有轮的
