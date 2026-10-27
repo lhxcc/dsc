@@ -515,7 +515,7 @@ func TestCronCasesDeclared(t *testing.T) {
 	}
 }
 
-// TestCronCasesRegexAcceptsValidID 新增的 CRON 用例的 regex 应接受形如 cron-<digits>
+// TestCronCasesRegexAcceptsValidID 新增的 CRON 用例的 regex 应接受形如 cron-<7 位小写十六进制>
 // 的合法任务 ID（由宿主在 cron_add 成功后分配），并拒绝任何不含此形式的字符串——
 // 防止模型绕过真实调用凭空捏造 ID。
 func TestCronCasesRegexAcceptsValidID(t *testing.T) {
@@ -528,25 +528,27 @@ func TestCronCasesRegexAcceptsValidID(t *testing.T) {
 		if !ok {
 			t.Fatalf("缺少用例 %s", id)
 		}
-		// 合法 ID 形如 cron-1234567890（cron-<digits>）
+		// 合法 ID 形如 cron-51cb632（cron-<7 位小写十六进制短哈希>）
 		valid := []string{
-			"cron-1",
-			"cron-1234567890",
-			"cron-9999999999999",
+			"cron-51cb632",
+			"cron-0000000",
+			"cron-abcdef1",
 		}
 		for _, v := range valid {
 			if ok, _ := matchCaseText(c, v); !ok {
 				t.Errorf("%s: 合法 id %q 应命中 regex %q", c.ID, v, c.Expected)
 			}
 		}
-		// 非法：模型凭空捏造（非 cron- 前缀或无数字）
+		// 非法：模型凭空捏造（非 cron- 前缀、长度不对、含大写或非十六进制字符）
 		invalid := []string{
 			"",
 			"cron-",
 			"cron-abc",
+			"cron-1234567890",
 			"1234567890",
 			"bench-cron-test",
 			"cron-1-2",
+			"cron-51CB632",
 			" Cron-123 ",
 		}
 		for _, v := range invalid {
@@ -557,7 +559,7 @@ func TestCronCasesRegexAcceptsValidID(t *testing.T) {
 	}
 }
 
-// TestNoAnswerLeakCronCases 防作弊守卫：CRON 用例的期望 regex（cron-\d+）
+// TestNoAnswerLeakCronCases 防作弊守卫：CRON 用例的期望 regex（cron-[0-9a-f]{7}）
 // 不会因出现在任务陈述中而被判泄漏——这些用例的 NoLeak=true（期望格式即任务规格）。
 func TestNoAnswerLeakCronCases(t *testing.T) {
 	for _, c := range benchCases {

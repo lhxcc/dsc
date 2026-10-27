@@ -413,3 +413,67 @@ func TestWaitSuppressesDoneNotification(t *testing.T) {
 		// 期望：没有通知
 	}
 }
+
+// TestRegistryReadCount 终态输出重复读取要能数出来：模型连读同一个任务是常见
+// 现象（它不记得自己读过），调用方据此在结果里提示「第 N 次、内容未变」。
+func TestRegistryReadCount(t *testing.T) {
+	r := NewRegistry()
+	id, err := r.Start(StartSpec{Kind: "build", Start: func() (JobHooks, error) {
+		return finishOutcome(StatusCompleted, "", "done"), nil
+	}})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitStatus(t, r, id, StatusCompleted)
+
+	rd1, err := r.Read(id, "")
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	rd2, err := r.Read(id, "")
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if rd1.ReadCount != 1 || rd2.ReadCount != 2 {
+		t.Fatalf("读取计数 = %d, %d，期望 1, 2", rd1.ReadCount, rd2.ReadCount)
+	}
+	if rd1.Text != "done" || rd2.Text != rd1.Text {
+		t.Fatalf("幂等读的内容应一致: %q / %q", rd1.Text, rd2.Text)
+	}
+}
+
+// TestWaitTimeoutReleasesClaim 等待超时必须撤回「有人认领结果」的标记：
+// 不撤回的话任务稍后落定不会发通知，等待方只能再 wait 一次——又一次阻塞，
+// 而它要等的其实早就完成了。
+func TestWaitTimeoutReleasesClaim(t *testing.T) {
+	r := NewRegistry()
+	release := make(chan JobOutcome, 1)
+	id, err := r.Start(StartSpec{Kind: "slow", Start: func() (JobHooks, error) {
+		return JobHooks{Done: release}, nil
+	}})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	notified := make(chan JobSnapshot, 1)
+	r.OnJobDone(func(s JobSnapshot) { notified <- s })
+
+	// 任务还没落定，等待 30ms 后超时返回
+	snap, err := r.Wait(id, 30*time.Millisecond, "")
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if snap.Status != StatusRunning {
+		t.Fatalf("超时返回的应是 running 快照，got %s", snap.Status)
+	}
+
+	// 随后任务落定：必须收到完成通知
+	release <- JobOutcome{Status: StatusCompleted, Output: "ok"}
+	select {
+	case got := <-notified:
+		if got.Status != StatusCompleted {
+			t.Fatalf("通知状态 = %s", got.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待超时后任务落定仍未发通知（Awaited 没有撤回）")
+	}
+}

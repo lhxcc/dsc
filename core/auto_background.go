@@ -26,7 +26,12 @@ import (
 const CapabilityAutoBackground = "auto-background"
 
 // defaultAutoBackgroundGrace 前台宽限期：命令在这个时间内跑完就同步返回结果。
-const defaultAutoBackgroundGrace = 30 * time.Second
+//
+// 刻意取小（5s）：「启动一个任务」的体验必须是**立刻把控制权还给模型**。宽限期越
+// 长，模型在工具调用里干等的时间就越长，而等待期间它不能推理、任何通知与用户插话
+// 都递不进来——用户看到的就是「一说启动就卡住，直到那张结果卡消失」。5s 足够覆盖
+// ls/cat/git status 这类即时应答，真正的构建/测试/起服务会立刻转后台。
+const defaultAutoBackgroundGrace = 5 * time.Second
 
 // autoBackgroundGrace 生效的前台宽限期（0 = 关闭自动后台）。
 // 可用 DSC_AUTO_BACKGROUND_SECS 覆盖（正数秒数；0 或负数表示关闭）。

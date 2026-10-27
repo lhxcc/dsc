@@ -70,7 +70,12 @@ type AgentPreStepEvent struct {
 	Turn         int    `json:"turn"`          // 当前回合号（1-based）
 	Step         int    `json:"step"`          // 当前步号（1-based，回合内递增）
 	MessagesJSON string `json:"messages_json"` // 本步消息列表 JSON（proto.Message 数组序列化）
-	TokenCount   int    `json:"token_count"`   // 估算的当前上下文 token 数（供 nudge 决策）
+	TokenCount   int    `json:"token_count"`   // 估算的当前上下文 token 数（消息 + 工具目录）
+	// ToolTokens 工具目录单独占的部分（TokenCount 减去消息估算）。
+	// 压缩后端在「已改写请求」时要用「改写后消息 + 工具目录」自测表面：工具部分必须
+	// 来自宿主，不能拿 TokenCount 减去本地消息估算反推——同一条瀑布里若有别的插件
+	// 先改写过消息（图像卸载、插播），这个减法会算出错误甚至负数的工具开销。
+	ToolTokens int `json:"tool_tokens"`
 	// LastUsageTokens 该会话最近一次成功请求的服务端上报 prompt 用量（0 = 无上报记录，
 	// 如首次请求/重启恢复）。对齐 DSH tokenMeter 的 pressureTokens 语义：精确底数，
 	// 压缩插件以「上次上报 + 自采样以来启发式增量」判定压力，避免纯启发式估算

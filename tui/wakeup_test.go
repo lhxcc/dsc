@@ -119,3 +119,31 @@ func TestRenderJobDoneNoticeNoDupKind(t *testing.T) {
 		t.Fatalf("应为 (shell: ls), got %q", s)
 	}
 }
+
+// TestDropNoticeAfterResultConsumed 模型已经把某个任务的终态结果拿到手，队列里
+// 还没送出的那条完成通知必须作废——通知是「结果已就绪」的通讯，结果已上屏后
+// 再补送只会让它重复读一遍。
+func TestDropNoticeAfterResultConsumed(t *testing.T) {
+	notices := []string{
+		"background job shell-51cb632 (shell: go build ./...) finished [status: completed]. Read its output with job_output.",
+		"background job shell-a1b2c3d (shell: go test ./...) finished [status: completed]. Read its output with job_output.",
+	}
+	got := dropNoticeFor(notices, "shell-51cb632")
+	if len(got) != 1 || !strings.Contains(got[0], "shell-a1b2c3d") {
+		t.Fatalf("只应删掉已消费的那条，got %v", got)
+	}
+	// 只有终态才等于「结果已经拿到手」；running 的读取不作废通知。
+	if jobOutputTerminal("(no output yet)\n[status: running]") {
+		t.Fatal("running 不应视为已拿到结果")
+	}
+	if !jobOutputTerminal("BUILD OK\n[status: completed]") {
+		t.Fatal("completed 应视为已拿到结果")
+	}
+	// 参数解析：拿不到 job_id 时不动队列
+	if id := jobIDFromToolArgs(`{"job_id":"shell-51cb632"}`); id != "shell-51cb632" {
+		t.Fatalf("job_id 解析失败: %q", id)
+	}
+	if kept := dropNoticeFor(notices, jobIDFromToolArgs(`{}`)); len(kept) != len(notices) {
+		t.Fatalf("无 job_id 时不应删除任何通知: %v", kept)
+	}
+}

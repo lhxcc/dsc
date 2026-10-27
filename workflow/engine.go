@@ -8,14 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"dsc/jobs"
 	"dsc/lualib"
 	lua "github.com/wippyai/go-lua"
 	"github.com/wippyai/go-lua/compiler/parse"
 )
 
-// newID 生成运行 id：时间戳毫秒。
+// newID 生成运行 id：<wf>-<7 位小写十六进制短哈希>（与后台任务、cron 任务同一形态）。
 func newID() string {
-	return fmt.Sprintf("wf-%d", time.Now().UnixMilli())
+	return jobs.ShortID("wf")
 }
 
 // checkScriptSyntax 语法预检（Start 同步执行）：只编译包装后的脚本，不运行。

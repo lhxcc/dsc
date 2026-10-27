@@ -54,3 +54,7 @@ bun.lockb
 
 .DS_Store
 git-dev.md
+
+# 用户贴图的临时目录（截图不是源码，勿提交）
+/ERRRRR/
+

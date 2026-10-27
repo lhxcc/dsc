@@ -24,6 +24,25 @@ type hostMeterState struct {
 	// 决策发生在 agent 进程，那个值才是"下一次请求会占多少"的权威估计；
 	// 宿主只做保管与对外发布，不重新算一遍。
 	reported int
+	// actual 是本步 pre-step 改写后**真正发出去**的表面（消息 + 工具目录）。
+	// 0 = 本步没有插件改写请求，展示沿用 reported。
+	//
+	// 为什么需要它：压缩后端改写请求后（900k → 摘要 + 尾部 ≈ 40k），宿主与 agent
+	// 看到的仍是「未改写的全量历史」，于是界面上一直显示 90%，而压缩插件按自己的
+	// 真实表面判断「还没到阈值」——用户看到的现象就是「都 90% 了还不压缩」。
+	// 展示口径必须跟真正发出去的东西走，否则数字只是在描述一个不存在的请求。
+	actual int
+}
+
+// NoteActualSurface 记录本步改写后实际发出的表面大小（消息 + 工具目录，同一个
+// core 估算口径）；传 0 表示本步没有改写，展示退回 agent 上报的投影值。
+func (h *HostContextMeters) NoteActualSurface(sessionID string, n int) {
+	if sessionID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stateLocked(sessionID).actual = n
 }
 
 // NewHostContextMeters 创建宿主侧计量集合；window 为上下文窗口（0 = 未知）。
@@ -67,15 +86,19 @@ func (h *HostContextMeters) NoteUsage(sessionID string, u *Usage, reportedContex
 }
 
 // ContextTokens 返回展示用的上下文占用：
-//   - agent 上报过投影值 → 用它（与决策同源）
-//   - 否则退回实测 prompt 侧用量
-//   - 两者都没有 → 0（前端显示"未知"而不是 0%）
+//   - 本步有插件改写过请求 → 用实际发出的表面（否则压缩后数字永远虚高）
+//   - 否则用 agent 上报的投影值（与决策同源）
+//   - 都没有 → 退回实测 prompt 侧用量
+//   - 全无 → 0（前端显示"未知"而不是 0%）
 func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st, ok := h.bySess[sessionID]
 	if !ok {
 		return 0
+	}
+	if st.actual > 0 {
+		return st.actual
 	}
 	if st.reported > 0 {
 		return st.reported
