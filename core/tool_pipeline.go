@@ -361,6 +361,13 @@ func (m *Manager) bridgePolicyToPipeline(name string, pc proto.PolicyServiceClie
 		if base == nil {
 			base = context.Background()
 		}
+		// 后台任务不装空闲看门狗：它的语义是「已交给后台，模型可以干别的」，
+		// 用「一段时间没输出」判死它既有害（构建/测试几十秒不吐字是常态），
+		// 也和前台宽限期自相矛盾（那时它正被允许安静地跑）。终止只走 job_kill。
+		if IsBackgroundJob(base) {
+			m.logger.Info("idle watchdog skipped for background job", "policy", name, "tool", inv.ToolName)
+			return next(ctx)
+		}
 		idle := time.Duration(spec.GetIdleMs()) * time.Millisecond
 		execCtx, cancel := WithIdleDeadline(base, idle)
 		defer cancel()
@@ -538,7 +545,10 @@ func detachJobContext(ctx context.Context) context.Context {
 	if pol := ApprovalPolicyFromContext(ctx); pol != "" {
 		dctx = WithApprovalPolicy(dctx, pol)
 	}
-	return dctx
+	// 打上后台任务标记：装空闲看门狗的一律跳过（见 background_ctx.go）。
+	// 后台任务已经交出去了，用「无输出」判死它既有害也自相矛盾——几十秒不吐字的
+	// 构建/测试是常态，而前台等待阶段本来就是允许它安静跑着的。
+	return WithBackgroundJob(dctx)
 }
 
 // executeBackgroundPipeline 在后台执行完整工具流水线（不含 run_in_background 检测，
