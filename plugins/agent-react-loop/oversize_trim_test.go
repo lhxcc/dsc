@@ -207,9 +207,10 @@ func TestOversizeTrimKeepsUserBoundary(t *testing.T) {
 	}
 }
 
-// TestSingleTurnOverflowReportsError 单轮自身就超窗（当前输入一次 60k token 到 50k 窗口）：
-// 历史怎么丢都救不回来，必须明确报错且不发出请求，而不是盲发给 provider 被拒。
-func TestSingleTurnOverflowReportsError(t *testing.T) {
+// TestSingleTurnOverflowFoldsAndContinues 单轮自身就超窗（当前输入一次 60k token 到
+// 50k 窗口）：历史怎么丢都救不回来，但把这条过长的消息折叠（保留首尾、省略中间）之后
+// 请求照发——会话继续走下去，而不是整轮失败。
+func TestSingleTurnOverflowFoldsAndContinues(t *testing.T) {
 	a := newTestAgent(t)
 	a.contextWindow = 50000
 	a.llmServiceID, a.toolServiceID = 1, 1
@@ -223,33 +224,47 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	var mu sync.Mutex
-	var errs []string
-	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *dsc.RunStreamResponse) {
-		if f.Error != "" {
-			mu.Lock()
-			errs = append(errs, f.Error)
-			mu.Unlock()
-		}
-	})
-	if err == nil {
-		t.Fatal("单轮超窗应报错")
+	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *dsc.RunStreamResponse) {})
+	if err != nil {
+		t.Fatalf("折叠后应能继续（原先是整轮报错），实际: %v", err)
 	}
-	if !strings.Contains(err.Error(), "单轮内容超出上下文窗口") {
-		t.Fatalf("错误文案应说明单轮超窗，实际 %v", err)
-	}
-
 	llm.mu.Lock()
 	streamCalls := len(llm.streamIn)
+	folded := false
+	for _, m := range llm.streamMsgs {
+		if strings.Contains(m.GetContent(), "已折叠") {
+			folded = true
+		}
+	}
 	llm.mu.Unlock()
-	if streamCalls != 0 {
-		t.Fatalf("单轮超窗不应发出请求，实际发了 %d 次", streamCalls)
+	if streamCalls == 0 {
+		t.Fatal("应发出请求（折叠后装进窗口）")
 	}
-	mu.Lock()
-	if len(errs) == 0 {
-		t.Fatal("应向上层报错误帧")
+	if !folded {
+		t.Fatal("过长的那条消息应被折叠（保留首尾）后再发出")
 	}
-	mu.Unlock()
+}
+
+// TestFoldOversizeMessagesHasFloor 折叠有下限：过短的消息不值得折（超窗不来自消息正文
+// 时反复折叠只会破坏上下文），且折叠绝不能丢掉 tool_call_id——那是结果配对的凭据。
+func TestFoldOversizeMessagesHasFloor(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 200
+	msgs := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "短"},
+		{Role: "tool", Content: "结果", ToolCallId: "c1"},
+	}
+	out, n := a.foldOversizeMessages(msgs, nil)
+	if n != 0 {
+		t.Fatalf("过短消息不应折叠，got %d", n)
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("条数不得变化: %d", len(out))
+	}
+	if out[2].GetToolCallId() != "c1" {
+		t.Fatalf("折叠不得丢失 tool_call_id: %q", out[2].GetToolCallId())
+	}
 }
 
 // TestNoTrimForAsciiHistoryWithinWindow 纯 ASCII/代码会话不得被误判超窗。
