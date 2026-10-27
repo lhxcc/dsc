@@ -215,3 +215,22 @@ func TestDetachJobContextSurvivesTurnCancel(t *testing.T) {
 		t.Fatalf("approval policy = %q, want ask", got)
 	}
 }
+
+// TestRenderJobOutputMarksRepeatRead 第二次读同一个任务要明说「内容未变」：
+// 最终输出任务是幂等的，模型却不知道（也不记得）自己已经读过，于是反复读——
+// 界面上表现为两张一模一样的输出卡，看起来像渲染重复。
+func TestRenderJobOutputMarksRepeatRead(t *testing.T) {
+	rd := jobs.Read{Text: "boom", Snapshot: jobs.JobSnapshot{Status: jobs.StatusCompleted}, ReadCount: 1}
+	first := renderJobOutput(rd)
+	if strings.Contains(first, "read #") {
+		t.Fatalf("首次读取不应带重复提示: %q", first)
+	}
+	rd.ReadCount = 2
+	second := renderJobOutput(rd)
+	if !strings.Contains(second, "read #2") || !strings.Contains(second, "not changed") {
+		t.Fatalf("第二次读取应标注重复: %q", second)
+	}
+	if !strings.Contains(second, "boom") || !strings.Contains(second, "[status: completed]") {
+		t.Fatalf("输出与状态行不得被提示挤掉: %q", second)
+	}
+}

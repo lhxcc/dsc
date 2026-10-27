@@ -166,6 +166,10 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 
 // renderJobOutput 渲染 job_output 结果（对齐 DSH：输出 + [status: ...] 结尾；
 // 空输出用 (no output yet)）。
+//
+// 重复读取要明说：最终输出任务是幂等的，模型连读两次拿到的是同一段文字，而它
+// 无从知道自己已经读过（实测表现为同一个任务被反复读取、界面上出现两张一模一样
+// 输出卡）。这里在第 2 次及以后的读取尾部标注次数与「内容未变」，模型据此收手。
 func renderJobOutput(rd jobs.Read) string {
 	var b strings.Builder
 	if rd.Text != "" {
@@ -176,6 +180,9 @@ func renderJobOutput(rd jobs.Read) string {
 	b.WriteString("\n[status: " + string(rd.Snapshot.Status) + "]")
 	if rd.Snapshot.Detail != "" {
 		b.WriteString(" " + rd.Snapshot.Detail)
+	}
+	if rd.ReadCount > 1 {
+		fmt.Fprintf(&b, "\n[note: read #%d of this job's final output; it has not changed since your previous read — no need to read it again]", rd.ReadCount)
 	}
 	return b.String()
 }

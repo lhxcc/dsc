@@ -77,6 +77,11 @@ type StartSpec struct {
 type Read struct {
 	Text     string
 	Snapshot JobSnapshot
+	// ReadCount 该任务终态输出被读取的次数（1 = 第一次读到终态）。
+	// 最终输出任务读起来是幂等的，模型却不知道自己已经读过——同一个任务被连读
+	// 两三次、每次都拿到同样一段输出，界面看起来就像"重复渲染"。这个计数让
+	// 调用方能在返回里点明"这是第 N 次，内容没变"。
+	ReadCount int
 }
 
 // JobSnapshot 任务只读快照（每次 fresh 投影，非活跃注册表状态）。
@@ -101,7 +106,7 @@ type JobSnapshot struct {
 type Registry struct {
 	mu            sync.Mutex
 	jobs          map[string]*Job
-	order         []string // 启动顺序（List 按此返回）
+	order         []string                  // 启动顺序（List 按此返回）
 	doneListeners map[int]func(JobSnapshot) // 完成监听器（contained，落定时通知）
 	nextListener  int
 	logger        hclog.Logger // 监听器 panic 等内部错误的日志出口；nil 则静默
@@ -183,11 +188,12 @@ func isTerminalStatus(s JobStatus) bool {
 
 // Job 注册表内部记录（公开快照经 Snapshot 投影）。
 type Job struct {
-	snapshot   JobSnapshot
-	output     string // final-output 终态输出（幂等读）
-	cancel     func(reason string)
-	readOutput func() string // nil = final-output-only
-	settled    chan struct{} // 落定后 close
+	snapshot      JobSnapshot
+	output        string // final-output 终态输出（幂等读）
+	terminalReads int    // 终态输出被读次数（见 Read.ReadCount）
+	cancel        func(reason string)
+	readOutput    func() string // nil = final-output-only
+	settled       chan struct{} // 落定后 close
 }
 
 // Start 预检 + 同步启动 + 登记（对齐 DSH）：预检失败或 Start 抛错都不产生
@@ -345,7 +351,8 @@ func (r *Registry) readLocked(j *Job) Read {
 	}
 	if j.snapshot.Status != StatusRunning && j.snapshot.Status != StatusStopping {
 		j.snapshot.Reported = true
-		return Read{Text: j.output, Snapshot: j.snapshot}
+		j.terminalReads++
+		return Read{Text: j.output, Snapshot: j.snapshot, ReadCount: j.terminalReads}
 	}
 	return Read{Text: "", Snapshot: j.snapshot}
 }
