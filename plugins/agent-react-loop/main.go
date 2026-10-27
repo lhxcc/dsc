@@ -87,6 +87,14 @@ type ReactLoopAgent struct {
 	// 快照后有新注入，说明存在尚未发送给模型的新消息，须继续下一轮而不是结束本轮。
 	pendingInjects int
 
+	// runActive 表示当前是否有 runLoop 正在消费会话（sessMu 保护）。
+	// InjectMessage 只在此为真时才有意义：消息写进会话表面后，必须有循环在
+	// 下一次派生请求历史时把它发给模型。若循环已退出（本轮收尾与 TUI 收到
+	// done 帧之间的窗口、或 TUI 状态判断失误），静默追加只会让这条消息沉睡——
+	// 直到用户下次说话才被顺带发出。此时宁可返回错误，让调用方走「唤醒开新轮」，
+	// 也不要制造「消息已发出、工作却没发生」的假象。
+	runActive bool
+
 	// 多会话事件日志存储（DSC_SESSION_DIR，缺省 ./sessions）；固定使用 default 会话
 	store *session.Store
 
@@ -253,6 +261,9 @@ func (a *ReactLoopAgent) RunStream(ctx context.Context, input string, images []s
 func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []string, emit func(*dsc.RunStreamResponse)) (*dsc.AgentResult, error) {
 	// 创建一个可取消的 context，保存 cancelFunc
 	ctx, cancel := context.WithCancel(ctx)
+	a.sessMu.Lock()
+	a.runActive = true
+	a.sessMu.Unlock()
 	a.mu.Lock()
 	// 如果已有 cancelFunc，先取消（防止并发 Run）
 	if a.cancelFunc != nil {
@@ -262,6 +273,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 	a.mu.Unlock()
 
 	defer func() {
+		a.sessMu.Lock()
+		a.runActive = false
+		a.sessMu.Unlock()
 		a.mu.Lock()
 		a.cancelFunc = nil
 		a.mu.Unlock()
@@ -950,12 +964,46 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 
 		// 执行每个工具并追加结果
 		concludeTurn := false // 宿主 goal 工具 complete/blocked 后结束物理轮次（对齐 DSH concludeTurn）
-		for _, tc := range toolCalls {
+		for i, tc := range toolCalls {
 			// 检查 ctx.Done()
 			select {
 			case <-ctx.Done():
 				return cancelResult()
 			default:
+			}
+
+			// 批内插入窗口：一个 step = 一次请求 + 该请求要求的**全部**工具执行，
+			// 若整批跑完才看注入，一批长工具能把一条通知压到几十秒后（模型不在推理，
+			// 任何东西都插不进去）。故这里把窗口细化到「单个工具」：本批已至少执行
+			// 一个工具、且此后又有新注入，就把**剩余未执行的调用**补成 skipped 的
+			// tool/result（tool_use 必须有配对结果，否则下一次请求协议非法），立刻
+			// 收口本步、进入下一步请求——新消息在下一步即可见。
+			//
+			// 至少执行第一个工具是有意的：注入可能在本步请求期间（流式输出时）
+			// 到达，若因此把整批调用全废掉，等于模型刚决定要做的事被无声撤销；
+			// 跳过「尚未开始」的调用则没有副作用。
+			if i > 0 && a.hasNewInjectedSince(iterPendingInjects) {
+				reason := "Skipped: a new message arrived while this step was running; this call was not executed. Re-issue it if still needed."
+				a.logger.Info("step interrupted by inject", "turn", turnNo, "step", stepNo,
+					"skippedFrom", i, "skippedTools", len(toolCalls)-i)
+				for _, rest := range toolCalls[i:] {
+					// log-only 的调用记录与下方正常路径保持一致，便于 /export 复盘
+					sess.Append(session.ToolCallEvent, &session.ToolCallData{
+						Turn: turnNo, Step: stepNo, CallID: rest.Id, Name: rest.Name, Arguments: rest.ArgumentsJson,
+					}, nil)
+					sess.Append(session.ToolResult, &session.ToolResultData{
+						Turn: turnNo, Step: stepNo, CallID: rest.Id,
+						Content: reason, Error: reason,
+					}, &session.SurfaceOp{Op: session.SurfaceAppend})
+					if emit != nil {
+						emit(&dsc.RunStreamResponse{
+							Output: fmt.Sprintf("\n[工具结果: %s 已跳过] %s\n", rest.Name, reason),
+							Status: "tool", ToolName: rest.Name, ToolArgs: rest.ArgumentsJson,
+							ToolResult: reason, Error: reason, Usage: a.usageSnapshot(),
+						})
+					}
+				}
+				break
 			}
 
 			// 标记本轮执行了工具（单轮模式下据此判定为正常完成）
@@ -1711,6 +1759,11 @@ func (a *ReactLoopAgent) InjectMessage(ctx context.Context, content string, imag
 	defer a.sessMu.Unlock()
 	if a.sess == nil {
 		return fmt.Errorf("inject message: session not loaded")
+	}
+	// 没有活跃循环时追加等于把消息丢进黑洞：写进去了，却没有任何一步会把它
+	// 发给模型（模型"看不到"用户明明发过的消息）。调用方（TUI）据此改走唤醒。
+	if !a.runActive {
+		return fmt.Errorf("inject message: no active run")
 	}
 	a.sess.Append(session.UserMessage,
 		&session.UserMessageData{Content: content, Source: "user", Images: images},

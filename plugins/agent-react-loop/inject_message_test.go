@@ -19,6 +19,10 @@ func TestInjectMessageVisibleOnNextDerive(t *testing.T) {
 		&session.UserMessageData{Content: "开始：帮我写个 hello", Source: "user"},
 		&session.SurfaceOp{Op: session.SurfaceAppend})
 
+	// 模拟「有 runLoop 正在消费会话」：注入的语义前提（否则注入会明确报错，
+	// 见 runActive 注释——没有循环在跑时注入等于把消息丢进黑洞）。
+	a.runActive = true
+
 	// 注入一条运行中的实时消息
 	got := a.sess.Events()
 	if err := a.InjectMessage(context.Background(), "顺便再打印当前时间", nil); err != nil {
