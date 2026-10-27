@@ -905,20 +905,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 注入失败（agent 不在运行等）：回落到队列，由回合结束/下一条用户输入补送，
 		// 不静默丢掉一条「任务已完成」的通知。
 		//
-		// 失败必须可见：注入是「通知能否在下一步被模型看到」的唯一通道，它失败时
-		// 用户看到的只是「任务早就完成了，模型却一直不知道」，无从判断是模型忽略
-		// 了通知还是通知根本没送进去。故回队之外还要把原因摆到对话区（仅当本轮
-		// 仍在运行时——那时本该注入成功；回合刚结束的竞态由队列补送，属正常）。
+		// 这是运维性事实，不是对话内容：只记宿主日志（受 -log 门控），不进对话区。
+		// 通知通道失败时用户能从「模型一直不知道」看出来，界面上再糊一条错误行
+		// 只会污染正文（历史教训：把日志当前端消息打印，用户只看到莫名其妙的告警）。
 		if msg.err != nil && msg.text != "" {
-			m.pendingWakeups = append(m.pendingWakeups, msg.text)
-			cmd := m.tryWakeup()
-			if cmd == nil && (m.thinking || m.streaming) {
-				m.appendMessage(warnSty.Render(
-					"完成通知未能注入当前回合（" + msg.err.Error() + "），本轮结束后补送。"))
-				m.render()
-				m.virtualGotoBottom()
+			if m.manager != nil {
+				m.manager.HostLogger().Warn("completion notice inject failed, requeued",
+					"err", msg.err.Error(), "active", m.thinking || m.streaming)
 			}
-			return m, cmd
+			m.pendingWakeups = append(m.pendingWakeups, msg.text)
 		}
 		return m, m.tryWakeup()
 

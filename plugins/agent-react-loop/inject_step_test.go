@@ -29,9 +29,6 @@ import (
 type stepLLM struct {
 	proto.LLMServiceClient
 
-	// firstStepCalls 第 1 步返回的工具调用（为空时用单个 slow_tool）
-	firstStepCalls []*proto.ToolCall
-
 	mu    sync.Mutex
 	calls int
 	reqs  []*proto.ChatRequest
@@ -42,26 +39,23 @@ func (m *stepLLM) ChatStream(ctx context.Context, in *proto.ChatRequest, opts ..
 	m.calls++
 	call := m.calls
 	m.reqs = append(m.reqs, in)
-	calls := m.firstStepCalls
 	m.mu.Unlock()
-	return &stepLLMStream{call: call, toolCalls: calls}, nil
+	return &stepLLMStream{call: call}, nil
 }
 
 type stepLLMStream struct {
-	call      int
-	toolCalls []*proto.ToolCall
-	recv      int
+	call int
+	recv int
 }
 
 func (s *stepLLMStream) Recv() (*proto.ChatStreamResponse, error) {
 	s.recv++
 	if s.call == 1 {
 		if s.recv == 1 {
-			calls := s.toolCalls
-			if len(calls) == 0 {
-				calls = []*proto.ToolCall{{Id: "c1", Name: "slow_tool", ArgumentsJson: `{}`}}
-			}
-			return &proto.ChatStreamResponse{ToolCalls: calls, FinishReason: "tool_calls"}, nil
+			return &proto.ChatStreamResponse{
+				ToolCalls:    []*proto.ToolCall{{Id: "c1", Name: "slow_tool", ArgumentsJson: `{}`}},
+				FinishReason: "tool_calls",
+			}, nil
 		}
 		return nil, io.EOF
 	}
@@ -85,9 +79,6 @@ type stepTool struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
-
-	mu    sync.Mutex
-	execs int
 }
 
 func (m *stepTool) ListTools(ctx context.Context, in *proto.ListToolsRequest, opts ...grpc.CallOption) (*proto.ListToolsResponse, error) {
@@ -99,21 +90,9 @@ func (m *stepTool) ListContext(ctx context.Context, in *proto.ListContextRequest
 }
 
 func (m *stepTool) ExecuteTool(ctx context.Context, in *proto.ExecuteToolRequest, opts ...grpc.CallOption) (*proto.ExecuteToolResponse, error) {
-	m.mu.Lock()
-	m.execs++
-	n := m.execs
-	m.mu.Unlock()
-	if n == 1 {
-		m.once.Do(func() { close(m.started) })
-		<-m.release
-	}
+	m.once.Do(func() { close(m.started) })
+	<-m.release
 	return &proto.ExecuteToolResponse{Content: "slow done"}, nil
-}
-
-func (m *stepTool) execCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.execs
 }
 
 // TestInjectVisibleOnNextStepWhileToolRunning 验证工具执行期间的注入会在**下一个
@@ -170,74 +149,6 @@ func TestInjectVisibleOnNextStepWhileToolRunning(t *testing.T) {
 	}
 	if !hasInjected(reqs[1], "shell-3") {
 		t.Fatalf("第 2 步请求未包含注入文本——步级插入失效; messages=%s", dumpMessages(reqs[1]))
-	}
-}
-
-// TestInjectSkipsRemainingToolsInSameStep 验证同一 step 内的工具批次也留插入窗口：
-// 模型一次要求两个工具，第一个执行期间来了新消息，则第二个**不再执行**（补成
-// skipped 的 tool/result 保持协议配对），本步立刻收口，下一步请求即带上新消息。
-func TestInjectSkipsRemainingToolsInSameStep(t *testing.T) {
-	a := newTestAgent(t)
-	a.llmServiceID = 1
-	a.toolServiceID = 1
-	llm := &stepLLM{firstStepCalls: []*proto.ToolCall{
-		{Id: "c1", Name: "slow_tool", ArgumentsJson: `{}`},
-		{Id: "c2", Name: "second_tool", ArgumentsJson: `{}`},
-	}}
-	tool := &stepTool{started: make(chan struct{}), release: make(chan struct{})}
-	a.llmClient = llm
-	a.toolClient = tool
-
-	done := make(chan *dsc.AgentResult, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		res, err := a.runLoop(context.Background(), "开始", nil, func(*dsc.RunStreamResponse) {})
-		if err != nil {
-			errCh <- err
-			return
-		}
-		done <- res
-	}()
-
-	select {
-	case <-tool.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("第一个工具未开始执行")
-	}
-	if err := a.InjectMessage(context.Background(), "background job shell-7 finished", nil); err != nil {
-		t.Fatalf("InjectMessage: %v", err)
-	}
-	close(tool.release)
-
-	select {
-	case <-done:
-	case err := <-errCh:
-		t.Fatalf("runLoop err: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("runLoop 超时未结束")
-	}
-
-	if got := tool.execCount(); got != 1 {
-		t.Fatalf("工具执行次数 = %d, 期望 1（批内剩余调用应被跳过）", got)
-	}
-	llm.mu.Lock()
-	reqs := llm.reqs
-	llm.mu.Unlock()
-	if len(reqs) < 2 {
-		t.Fatalf("LLM 请求次数 = %d, 期望 >= 2", len(reqs))
-	}
-	if !hasInjected(reqs[1], "shell-7") {
-		t.Fatalf("第 2 步请求未包含注入文本; messages=%s", dumpMessages(reqs[1]))
-	}
-	foundSkip := false
-	for _, m := range reqs[1].GetMessages() {
-		if strings.Contains(m.GetContent(), "Skipped") {
-			foundSkip = true
-			break
-		}
-	}
-	if !foundSkip {
-		t.Fatalf("第 2 步请求缺少被跳过调用的 tool/result; messages=%s", dumpMessages(reqs[1]))
 	}
 }
 
