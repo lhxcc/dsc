@@ -215,3 +215,32 @@ func TestToOpenAIMessagesToolImagesVisionOff(t *testing.T) {
 		t.Fatalf("视觉关闭应仅 tool 消息本体, got %+v", msgs)
 	}
 }
+
+// TestAssistantToolCallMessageKeepsContentField 回归 llama.cpp 等端点的
+// 「messages[N]: missing field `content`」422：assistant 回带 tool_calls 时正文为空，
+// 序列化仍必须带 content 字段（空串），不能靠 omitempty 省掉。
+func TestAssistantToolCallMessageKeepsContentField(t *testing.T) {
+	p := &OpenAIProvider{}
+	calls := []dsc.ToolCall{{ID: "call_1", Name: "shell", Arguments: map[string]any{"command": "ls"}}}
+	msgs := p.toOpenAIMessages([]dsc.Message{
+		{Role: "user", Content: "看看目录"},
+		{Role: "assistant", ToolCalls: calls},
+	})
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
+	}
+	raw, err := json.Marshal(msgs[1])
+	if err != nil {
+		t.Fatalf("marshal assistant message: %v", err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal marshalled message: %v", err)
+	}
+	if _, ok := body["content"]; !ok {
+		t.Fatalf("assistant tool_calls 消息必须携带 content 字段, got %s", raw)
+	}
+	if len(msgs[1].ToolCalls) != 1 || msgs[1].ToolCalls[0].ID != "call_1" {
+		t.Fatalf("tool_calls 应原样回带, got %+v", msgs[1].ToolCalls)
+	}
+}

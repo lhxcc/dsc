@@ -106,7 +106,7 @@ type ChatMessagePart struct {
 
 type ChatCompletionMessage struct {
 	Role         string `json:"role"`
-	Content      string `json:"content,omitempty"`
+	Content      string `json:"content"`
 	Refusal      string `json:"refusal,omitempty"`
 	MultiContent []ChatMessagePart
 
@@ -131,6 +131,13 @@ type ChatCompletionMessage struct {
 	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
+// MarshalJSON 始终输出 content 字段（无内容时为空串），不做 omitempty。
+//
+// 原因：assistant 消息回带 tool_calls 时正文通常为空，省略 content 会被部分
+// OpenAI 兼容端点（如 llama.cpp server 的 serde 反序列化）以
+// 「messages[N]: missing field `content`」直接 422 拒绝整轮请求——工具执行完
+// 再请求这一步是最常见的路径。空串与省略在语义上等价（tool_calls 携带正文），
+// 但对端要求字段必须存在。
 func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
 	if m.Content != "" && m.MultiContent != nil {
 		return nil, ErrContentFieldsMisused
@@ -152,7 +159,7 @@ func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
 
 	msg := struct {
 		Role             string            `json:"role"`
-		Content          string            `json:"content,omitempty"`
+		Content          string            `json:"content"`
 		Refusal          string            `json:"refusal,omitempty"`
 		MultiContent     []ChatMessagePart `json:"-"`
 		Name             string            `json:"name,omitempty"`

@@ -871,7 +871,9 @@ func TestMultipartChatMessageSerialization(t *testing.T) {
 		t.Fatalf("Unexpected error")
 	}
 	res = strings.ReplaceAll(string(s), " ", "")
-	if res != `{"role":"user"}` {
+	// 本仓 fork：content 字段恒输出（空串），不再 omitempty——llama.cpp 等端点会以
+	// 「missing field `content`」422 拒绝省略该字段的 assistant/tool 消息。
+	if res != `{"role":"user","content":""}` {
 		t.Fatalf("invalid message: %s", string(s))
 	}
 }
