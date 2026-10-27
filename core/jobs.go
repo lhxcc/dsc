@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,11 +86,33 @@ func (m *Manager) OnEvent(name EventName, fn Listener) func() {
 // 后台任务由 Manager.jobs 注册表承载（owner 隔离 + 消费式游标；v1 生产方：
 // workflow background）。caller（调用方会话）经工具调用链路注入 ctx。
 
-// defaultWaitTimeout 与 maxWaitTimeout job_output 的 wait 默认/上限等待时间（对齐 DSH）。
+// defaultWaitTimeout 与 maxWaitTimeout job_output 的 wait 默认/上限等待时间。
+//
+// 上限刻意压到 60s（对齐「不阻塞模型」的语义）：wait 是同步工具调用，等多久
+// 模型就多久不能动——期间任何通知、任何用户插话都进不来。等待超时会把认领撤回，
+// 任务落定时照常发完成通知，所以「等到一半放弃」不会丢结果。
 const (
 	defaultWaitTimeout = 30 * time.Second
-	maxWaitTimeout     = 600 * time.Second
+	maxWaitTimeout     = 60 * time.Second
 )
+
+// jobWaitCap 生效的 wait 上限。DSC_JOB_WAIT_MAX_SECS 可覆盖：
+// 设为 0（或负数）即彻底禁止阻塞式等待——此时 wait:true 会被直接拒绝并提示
+// 「完成会通知你」，适合完全不允许工具调用占死模型的场景。
+func jobWaitCap() time.Duration {
+	v := os.Getenv("DSC_JOB_WAIT_MAX_SECS")
+	if v == "" {
+		return maxWaitTimeout
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return maxWaitTimeout
+	}
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
+}
 
 type jobTool struct {
 	m    *Manager
@@ -100,7 +124,7 @@ func (t *jobTool) Name() string { return t.name }
 func (t *jobTool) Description() string {
 	switch t.name {
 	case "job_output":
-		return "Read a background job's output and status. Non-blocking by default; set wait:true to block until the job settles (bounded by timeout_ms, capped at 600000). Stream jobs return the next output delta; final-output jobs return the terminal output once settled. Responses end with [status: ...]."
+		return "Read a background job's output and status. NON-BLOCKING by default — do not poll or sleep: when the job finishes, a completion notice is delivered to you automatically, so you can keep working meanwhile. Only use wait:true when you genuinely cannot take another step without the result; it is synchronous and blocks you (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
@@ -149,8 +173,16 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 	if deadline <= 0 {
 		deadline = defaultWaitTimeout
 	}
-	if deadline > maxWaitTimeout {
-		deadline = maxWaitTimeout
+	waitDropped := false
+	if waitCap := jobWaitCap(); waitCap <= 0 {
+		if p.Wait {
+			// 禁止阻塞：把「等」变成「现在读 + 完成会通知」。先返回当前快照，
+			// 让模型立刻拿回控制权，而不是卡在这里。
+			p.Wait = false
+			waitDropped = true
+		}
+	} else if deadline > waitCap {
+		deadline = waitCap
 	}
 	if p.Wait {
 		if _, err := t.m.jobs.Wait(p.JobID, deadline, caller); err != nil {
@@ -161,7 +193,11 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 	if err != nil {
 		return "", fmt.Errorf("job_output: %w", err)
 	}
-	return renderJobOutput(rd), nil
+	out := renderJobOutput(rd)
+	if waitDropped {
+		out += "\n[note: blocking wait is disabled on this host; returned the current state instead. You will be notified when the job finishes.]"
+	}
+	return out, nil
 }
 
 // renderJobOutput 渲染 job_output 结果（对齐 DSH：输出 + [status: ...] 结尾；

@@ -1318,6 +1318,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.todoArgs = f.ToolArgs
 				m.syncInputHeight() // 面板行数变化 → 重算 viewport 高度并滚到底
 			}
+			// 消费即撤销：模型已经读到该任务的终态输出（结果已上屏），队列里还没送出
+			// 的完成通知就地作废。通知是一次「结果已就绪」的通讯，不是永久订阅；
+			// 结果已在眼前时再补送，只会让模型把同一段输出再读一遍。
+			if f.ToolName == "job_output" && f.ToolResult != "" && jobOutputTerminal(f.ToolResult) {
+				m.pendingWakeups = dropNoticeFor(m.pendingWakeups, jobIDFromToolArgs(f.ToolArgs))
+			}
 			// 工具结果帧（ToolResult 非空）以「└」gutter 缩进展示，错误时用错误色；
 			// 调用帧（ToolName 非空）以「● Verb(arg)」卡片展示；均无结构化信息时回退原文。
 			toolLine := ""

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -175,8 +176,7 @@ func (m *Model) injectJobNoticeCmd(text string) tea.Cmd {
 	}
 }
 
-// deliverCompletionNotice 把一条完成通知立即送达模型，返回需要执行的命令。
-//   - 忙碌（thinking/streaming）：注入当前回合，下一轮 LLM 迭代即可见；
+// deliverCompletionNotice 把一条完成通知立即送达模型，返回需要执行的命令。//   - 忙碌（thinking/streaming）：注入当前回合，下一轮 LLM 迭代即可见；
 //   - 空闲：直接唤醒开一轮。
 //
 // 不再「先排队、等回合结束/下一条用户输入再一次性补发」——那会让早已完成的任务在
@@ -190,4 +190,45 @@ func (m *Model) deliverCompletionNotice(text string) tea.Cmd {
 		return m.injectJobNoticeCmd(batch)
 	}
 	return m.tryWakeup()
+}
+
+// jobIDFromToolArgs 从 job_output 工具参数里取 job_id（解析失败返回空）。
+func jobIDFromToolArgs(argsJSON string) string {
+	var p struct {
+		JobID string `json:"job_id"`
+	}
+	if json.Unmarshal([]byte(argsJSON), &p) != nil {
+		return ""
+	}
+	return p.JobID
+}
+
+// jobOutputTerminal 判断一次 job_output 的返回是否已经是终态输出
+// （completed/failed/killed）——只有终态才等于「结果已经拿到手」。
+func jobOutputTerminal(result string) bool {
+	for _, s := range []string{"[status: completed]", "[status: failed]", "[status: killed]"} {
+		if strings.Contains(result, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropNoticeFor 丢掉队列里提到该任务的通知。
+//
+// 通知是「结果已就绪」的一次通讯，不是永久订阅：模型已经通过 job_output 把终态
+// 结果拿到手（卡片就在屏幕上），队列里那条还没送出的完成通知就没有意义了——
+// 补送只会让模型再读一遍同样的内容。
+func dropNoticeFor(notices []string, jobID string) []string {
+	if jobID == "" || len(notices) == 0 {
+		return notices
+	}
+	kept := notices[:0]
+	for _, n := range notices {
+		if strings.Contains(n, "job "+jobID+" ") || strings.Contains(n, "job "+jobID+"\n") {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept
 }

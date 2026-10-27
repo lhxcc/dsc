@@ -524,6 +524,14 @@ func (r *Registry) Wait(id string, timeout time.Duration, caller string) (JobSna
 	case <-time.After(timeout):
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		// 等待超时 = 这次等待没拿到结果，必须把认领撤掉：否则任务稍后落定时
+		// 会因为 Awaited 仍然为真而不发完成通知，等待方白白错过「它已经完了」
+		// ——于是只能再 wait 一次，又一次阻塞。没消费成功，就不算送达。
+		if j.snapshot.Status == StatusRunning || j.snapshot.Status == StatusStopping {
+			j.snapshot.Awaited = false
+		} else {
+			j.snapshot.Reported = true // 恰好在超时瞬间落定：这次等待已经读到终态
+		}
 		return j.snapshot, nil
 	}
 }

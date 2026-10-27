@@ -441,3 +441,39 @@ func TestRegistryReadCount(t *testing.T) {
 		t.Fatalf("幂等读的内容应一致: %q / %q", rd1.Text, rd2.Text)
 	}
 }
+
+// TestWaitTimeoutReleasesClaim 等待超时必须撤回「有人认领结果」的标记：
+// 不撤回的话任务稍后落定不会发通知，等待方只能再 wait 一次——又一次阻塞，
+// 而它要等的其实早就完成了。
+func TestWaitTimeoutReleasesClaim(t *testing.T) {
+	r := NewRegistry()
+	release := make(chan JobOutcome, 1)
+	id, err := r.Start(StartSpec{Kind: "slow", Start: func() (JobHooks, error) {
+		return JobHooks{Done: release}, nil
+	}})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	notified := make(chan JobSnapshot, 1)
+	r.OnJobDone(func(s JobSnapshot) { notified <- s })
+
+	// 任务还没落定，等待 30ms 后超时返回
+	snap, err := r.Wait(id, 30*time.Millisecond, "")
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if snap.Status != StatusRunning {
+		t.Fatalf("超时返回的应是 running 快照，got %s", snap.Status)
+	}
+
+	// 随后任务落定：必须收到完成通知
+	release <- JobOutcome{Status: StatusCompleted, Output: "ok"}
+	select {
+	case got := <-notified:
+		if got.Status != StatusCompleted {
+			t.Fatalf("通知状态 = %s", got.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待超时后任务落定仍未发通知（Awaited 没有撤回）")
+	}
+}
