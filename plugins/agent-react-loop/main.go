@@ -130,9 +130,11 @@ type ReactLoopAgent struct {
 	// TUI 显示的就是这个数——与裁剪/压缩决策同源，不再另算一套。
 	lastContextTokens int
 
-	// lastTrimDropped 上一轮超窗裁剪省略的消息条数（0 = 未裁剪）。仅用于提示去重：
-	// 真超窗时每轮都会裁掉同样一段，逐轮打印提示只会刷屏。
-	lastTrimDropped int
+	// trimNoticeSession / foldNoticeSession：裁剪与折叠提示已提示过的会话 id。
+	// 小窗口读越窗口的会话是常态（一个项目积累数月的会话），逐轮提示等于刷屏；
+	// 每个会话只说明一次，之后静默。会话 id 变化（切会话）即自然重置。
+	trimNoticeSession string
+	foldNoticeSession string
 
 	// meter 上下文占用的唯一计量（dsc.TokenMeter）：实测锚点 + 启发式增量。
 	// 裁剪/压缩/提示文案/单轮超窗判定全部读它，不得各自再用估算另算一遍。
@@ -518,33 +520,21 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 掉的内容重新装回去——等于白折。
 		historySlimmed := droppedMsgs > 0
 		if droppedMsgs > 0 {
-			if len(msgs) > 0 && msgs[0].Role == "system" {
-				// 重新构造而非复制：proto.Message 内含 protobuf 的内部状态（含 mutex），
-				// 值拷贝会触发 vet 的 copylocks 告警；system 消息只用到 role+content。
-				msgs[0] = &proto.Message{
-					Role: msgs[0].Role,
-					Content: strings.TrimRight(msgs[0].Content, "\n") + fmt.Sprintf(
-						"\n\n（注意：因当前上下文窗口仅 %d tokens，本次请求已省略较早的 %d 条对话记录；"+
-							"如需那些内容请重新读取相关文件或改用更大窗口的模型。）\n", a.contextWindow, droppedMsgs),
-				}
-			}
-			// 同一「省略条数」只在首次裁剪时提示一次：真需要裁剪时（历史确实超窗）
-			// 每轮都会裁掉同样的一段，逐轮重复打印只会把消息区刷满，没有新信息。
-			// 条数变化（历史继续增长）时才再次提示。
+			// 不往 system 里追加「已省略 N 条」的说明：system 是缓存前缀，每次改写都会
+			// 让整段前缀缓存失效；而且小窗口读越窗口的会话是常态（一个项目积累数月的
+			// 会话），这句话会一直挂在每一轮里。信息改由下面的提示帧一次性给出。
 			//
-			// 提示里的占用是**裁剪后**的值：裁完还是 441K 这种数只有两种来源——要么裁完
-			// 仍超窗（下面会报错），要么投影口径与估算差很远；两种都必须如实呈现给使用者，
-			// 不能回显裁剪前的数（那会让人以为裁剪根本没执行）。
-			if emit != nil && droppedMsgs != a.lastTrimDropped {
+			// 提示只在本会话**第一次**裁剪时出现：常态事件不该反复出声，用户需要知道的
+			// 是「这个会话被裁了」这一件事，不是每轮的省略条数。
+			if emit != nil && trimNoticeEnabled() && a.trimNoticeSession != a.sess.ID() {
+				a.trimNoticeSession = a.sess.ID()
 				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文裁剪: 预计占用 %d / %d tokens，已省略最早 %d 条消息（会话记录未删除）]\n",
-						a.projectedFit(msgs, availableTools), a.contextWindow, droppedMsgs),
+					Output: fmt.Sprintf("\n[上下文裁剪: 本会话历史超出 %d tokens 窗口，较早的记录将只随本次请求省略（会话记录未删除）；"+
+						"本提示只出现一次。当前预计占用 %d / %d。]\n",
+						a.contextWindow, a.projectedFit(msgs, availableTools), a.contextWindow),
 					Status: "tool",
 				})
 			}
-			a.lastTrimDropped = droppedMsgs
-		} else {
-			a.lastTrimDropped = 0
 		}
 		// 历史已裁到无可再裁，仍然超窗 → 折叠过长的单条消息（保留首尾）。
 		//
@@ -555,9 +545,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			if folded, n := a.foldOversizeMessages(msgs, availableTools); n > 0 {
 				msgs = folded
 				historySlimmed = true
-				if emit != nil {
+				// 同样只提示一次，理由同上（常态事件不出声）。
+				if emit != nil && trimNoticeEnabled() && a.foldNoticeSession != a.sess.ID() {
+					a.foldNoticeSession = a.sess.ID()
 					emit(&dsc.RunStreamResponse{
-						Output: fmt.Sprintf("\n[上下文折叠: %d 条过长消息已保留首尾（预计占用 %d / %d tokens）]\n",
+						Output: fmt.Sprintf("\n[上下文折叠: %d 条过长消息已保留首尾（预计占用 %d / %d tokens）；本提示只出现一次。]\n",
 							n, a.projectedFit(msgs, availableTools), a.contextWindow),
 						Status: "tool",
 					})
@@ -1481,6 +1473,15 @@ var oversizeTrimRatio = 0.90
 // ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
 var oversizeTrimTriggerRatio = 0.95
 
+// trimNoticeEnabled 是否输出裁剪/折叠的提示帧。
+//
+// 默认关闭：小窗口读超窗口的会话是**常态**——一个项目积累数月的会话，配 128K 窗口
+// 就是一台滑动窗口机器，每轮都在把最早的一段滑出去。常态事件不该出声，否则消息区
+// 会被同一句话刷满，而它从不携带新信息。需要核对时设 DSC_TRIM_NOTICE=1。
+func trimNoticeEnabled() bool {
+	return os.Getenv("DSC_TRIM_NOTICE") == "1"
+}
+
 // oversizeTrimFallbackRatios 闭环裁剪时逐档收紧的目标比例。
 //
 // 为什么要多档：裁剪按**消息估算**算预算，而超窗判定读的是 TokenMeter 的投影值
@@ -1699,7 +1700,8 @@ func (a *ReactLoopAgent) SwitchSession(ctx context.Context, sessionID string) er
 	a.usageMu.Lock()
 	a.lastPromptTokens = 0
 	a.lastUsage = nil
-	a.lastTrimDropped = 0
+	a.trimNoticeSession = ""
+	a.foldNoticeSession = ""
 	a.usageMu.Unlock()
 	a.tokenMeter().Reset()
 	fmt.Printf("[Agent Loop] switched to session %s (%d events, last turn %d)\n",

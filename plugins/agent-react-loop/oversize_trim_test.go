@@ -141,10 +141,14 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 		t.Fatal("最早一轮的历史应从会话中仍然可派生（切回大窗口时应原样恢复）")
 	}
 
-	// 4) 模型被明确告知历史被省略（否则它以为自己看到了全部）
-	if len(streamMsgs) == 0 || streamMsgs[0].Role != "system" ||
-		!strings.Contains(streamMsgs[0].Content, "已省略") {
-		t.Fatalf("system 应说明历史被省略，实际首条 = %+v", streamMsgs[0])
+	// 4) system 保持原样，不追加「已省略 N 条」的说明：它是 prompt 缓存前缀，每次改写
+	//    都会让整段前缀失效；而且小窗口读越窗口会话是滑动窗口式常态，这句话会挂在
+	//    每一轮里，价值却为零（模型并不需要知道省略了几条）。
+	if len(streamMsgs) == 0 || streamMsgs[0].Role != "system" {
+		t.Fatalf("首条应为 system，实际 = %+v", streamMsgs[0])
+	}
+	if strings.Contains(streamMsgs[0].Content, "已省略") {
+		t.Fatalf("system 不得被追加省略说明（破坏前缀缓存且是常态噪声）: %q", streamMsgs[0].Content)
 	}
 
 	// 5) 用户可见提示
@@ -157,8 +161,8 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 		}
 	}
 	mu.Unlock()
-	if !notified {
-		t.Fatal("未输出上下文裁剪提示帧")
+	if notified {
+		t.Fatal("默认不应输出裁剪提示帧：小窗口读越窗口会话是滑动窗口式常态")
 	}
 }
 
@@ -352,12 +356,17 @@ func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
 		return n
 	}
 
-	if got := countTrimFrames(); got != 1 {
-		t.Fatalf("首次裁剪应提示 1 次，实际 %d 次", got)
-	}
-	// 第二轮：历史结构不变（只是多了当前用户消息与助手回复），省略条数应相同 → 不再提示
+	// 默认静默：小窗口读越窗口的会话是常态（滑动窗口式工作），提示帧不该打扰
 	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("同一省略条数不应重复提示，第二轮实际提示 %d 次", got)
+		t.Fatalf("默认不应输出裁剪提示帧（滑动窗口是常态），实际 %d 次", got)
+	}
+	// 显式开启后：每会话只提示一次，第二轮不再重复
+	t.Setenv("DSC_TRIM_NOTICE", "1")
+	if got := countTrimFrames(); got != 1 {
+		t.Fatalf("开启提示后首次裁剪应提示 1 次，实际 %d 次", got)
+	}
+	if got := countTrimFrames(); got != 0 {
+		t.Fatalf("同一会话不应重复提示，第二轮实际提示 %d 次", got)
 	}
 }
 
@@ -371,10 +380,11 @@ func TestSwitchSessionResetsUsage(t *testing.T) {
 	a.contextWindow = 1000000
 	a.llmServiceID, a.toolServiceID = 1, 1
 
-	// 模拟上一会话已用到 900K，且上一轮做过裁剪
+	// 模拟上一会话已用到 900K，且上一会话已经提示过裁剪
 	a.usageMu.Lock()
 	a.lastPromptTokens = 900000
-	a.lastTrimDropped = 93
+	a.trimNoticeSession = "prev-session"
+	a.foldNoticeSession = "prev-session"
 	a.usageMu.Unlock()
 
 	if err := a.SwitchSession(context.Background(), "another-session"); err != nil {
@@ -382,13 +392,13 @@ func TestSwitchSessionResetsUsage(t *testing.T) {
 	}
 
 	a.usageMu.Lock()
-	gotTokens, gotDropped := a.lastPromptTokens, a.lastTrimDropped
+	gotTokens, gotTrim, gotFold := a.lastPromptTokens, a.trimNoticeSession, a.foldNoticeSession
 	a.usageMu.Unlock()
 	if gotTokens != 0 {
 		t.Fatalf("切会话后 lastPromptTokens 应清零，实际 %d", gotTokens)
 	}
-	if gotDropped != 0 {
-		t.Fatalf("切会话后裁剪提示状态应清零，实际 %d", gotDropped)
+	if gotTrim != "" || gotFold != "" {
+		t.Fatalf("切会话后裁剪/折叠提示状态应清零（新会话要能再提示一次），实际 %q / %q", gotTrim, gotFold)
 	}
 }
 
