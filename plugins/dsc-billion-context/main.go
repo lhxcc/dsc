@@ -135,7 +135,7 @@ func main() {
 	// 注册 4 个工具
 	sdkInst.Tool(dsc.Tool{
 		Name:        "compress",
-		Description: "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed (no longer needed for the current task step). The session's first user message (the original request) is never compressible — it stays verbatim, so you always know what this session is for. Batch form: content=[{startId,endId,summary,topic?}].",
+		Description: "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed (no longer needed for the current task step). Before discarding a range, make sure your summary carries forward the user's CURRENT most urgent task/matter — what they are working on now, where it is stuck, and the next step — so the compressed context still knows what to do. Do NOT keep a message just because it appears early in the session; early messages are often stale old requests from weeks ago and should be compressed like any other. Batch form: content=[{startId,endId,summary,topic?}].",
 		Handler:     bc.handleCompress,
 		Schema: json.RawMessage(`{
   "type": "object",

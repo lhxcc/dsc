@@ -499,21 +499,18 @@ func TestTrimToWindowClosesLoopWhenProjectionFarAboveEstimate(t *testing.T) {
 	}
 }
 
-// TestOversizeTrimKeepsOriginalRequest 裁剪不得丢掉会话的第一条 user 消息——原始需求。
-//
-// 现实触发：超长会话被裁到只剩最近一段时，最早的「要做什么」一起消失，压缩后的上下文
-// 里便只剩工具调用记录。模型于是反过来问用户「我确认一下现在要做的是哪件事」：不是它
-// 记性差，是需求被我们裁掉了。system 之后的第一条 user 与 system 同级保护。
-func TestOversizeTrimKeepsOriginalRequest(t *testing.T) {
+// TestOversizeTrimIsSlidingWindow 裁剪是滑动窗口：超窗时从最旧处丢轮次，system 与最近
+// 一段保留，最早的用户消息（往往是很久以前的旧需求）可以被丢弃——这正是小窗口读超长
+// 会话的常态，不该靠程序钉死「首条消息」。当前任务靠模型自身的压缩选择保留，不靠这里。
+func TestOversizeTrimIsSlidingWindow(t *testing.T) {
 	const window = 10000
 	msgs := []*proto.Message{
 		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "原始需求：修好 X 模块的 Y 行为并补测试"},
+		{Role: "user", Content: "很久以前的旧需求"},
 	}
 	for i := 0; i < 40; i++ {
 		msgs = append(msgs, &proto.Message{Role: "user", Content: strings.Repeat("内容", 200)})
 	}
-	// 预估远超窗口，确保进入裁剪
 	if got := dsc.EstimateProtoMessagesTokens(msgs); got <= window {
 		t.Fatalf("夹具无效：应超窗，got %d", got)
 	}
@@ -521,10 +518,14 @@ func TestOversizeTrimKeepsOriginalRequest(t *testing.T) {
 	if dropped == 0 {
 		t.Fatal("应发生裁剪")
 	}
+	// system 必须保留在最前
+	if out[0].Role != "system" {
+		t.Fatalf("system 必须保留在最前，实际首条 %v", out[0].Role)
+	}
+	// 滑动窗口下最早的旧需求应可被丢弃（这才是本来行为）
 	for _, m := range out {
-		if m.Role == "user" && strings.Contains(m.Content, "原始需求") {
-			return
+		if m.Role == "user" && strings.Contains(m.Content, "很久以前的旧需求") {
+			t.Fatalf("滑动窗口下最早的旧需求应可被丢弃，但它被保留了（dropped=%d）", dropped)
 		}
 	}
-	t.Fatalf("原始需求不得被裁掉（dropped=%d，剩 %d 条）", dropped, len(out))
 }

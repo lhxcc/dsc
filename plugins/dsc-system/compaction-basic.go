@@ -347,8 +347,11 @@ func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.M
 
 // llmSummary 构建压缩请求并调用聚合 LLM（提示词与宿主原引擎逐字一致）。
 func (s *compactionBasicServer) llmSummary(ctx context.Context, llm llmChat, region []*proto.Message) (string, error) {
-	prompt := "你是对话压缩器。请将下面的对话历史压缩成一段精简但信息完整的摘要，" +
-		"保留关键信息（用户意图、重要决策、工具结果要点），去除冗余细节。只输出摘要，不添加额外解释。\n\n--- 对话历史 ---\n"
+	prompt := "你是对话压缩器。请将下面的对话历史压缩成一段精简但信息完整的摘要。\n" +
+		"压缩优先级：① 永远先保留用户【当前正在推进的最紧要任务/事项】——压缩后模型仍须明确知道" +
+		"现在要做什么、卡在哪、下一步是什么；② 保留重要决策、关键结论、工具结果与文件路径等后续仍要用的事实；" +
+		"③ 早期已完成、与当前任务不再相关的内容可大幅精简甚至丢弃。不要因为某条消息「位置靠前」就保留它——" +
+		"在超长会话里那往往是很久以前的失效旧需求。只输出摘要，不添加额外解释。\n\n--- 对话历史 ---\n"
 	for _, msg := range region {
 		prompt += fmt.Sprintf("[%s] %s\n", msg.GetRole(), msg.GetContent())
 	}
