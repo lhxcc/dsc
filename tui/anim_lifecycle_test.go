@@ -72,11 +72,18 @@ func TestWakeupAfterSuccessFrame(t *testing.T) {
 	m := New(&stubAgent{frames: []*core.RunStreamResponse{{Status: "success"}}}, nil, context.Background(), "m", "minimal", 131072)
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 
-	// 本轮进行中，任务完成 → 通知排队
+	// 本轮进行中，任务完成 → 立即注入当前回合（下一轮迭代可见），不排队
 	m.thinking = true
-	m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-9")})
+	if _, cmd := m.Update(jobDoneMsg{snapshot: wakeSnap("workflow-9")}); cmd == nil {
+		t.Fatal("忙碌时应立即注入，返回注入命令")
+	}
+	if len(m.pendingWakeups) != 0 {
+		t.Fatalf("通知已交给注入通道，不应留在队列，got %+v", m.pendingWakeups)
+	}
+	// 注入失败 → 回落队列，等本轮收尾再补送（避免通知丢失）
+	m.Update(jobNoticeInjectedMsg{text: "notice-9", err: context.Canceled})
 	if len(m.pendingWakeups) != 1 {
-		t.Fatalf("忙碌时通知应排队，got %+v", m.pendingWakeups)
+		t.Fatalf("注入失败应回落队列，got %+v", m.pendingWakeups)
 	}
 
 	// success 收尾 → 自动唤醒（把通知作为新一轮输入）

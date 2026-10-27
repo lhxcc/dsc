@@ -231,7 +231,18 @@ func main() {
 			"filesystem": "true",
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "shell", Description: description, Schema: schema, Handler: handler, ViewFn: shellView, Capabilities: []string{"writes-unknown"}})
+	// shell 可能长时间阻塞（起服务、等端口、跑测试）：声明自动后台能力，由宿主
+	// 按「后台登记 + 前台宽限期」执行——宽限内跑完是普通工具结果，超时转后台并
+	// 返回 job id，完成时照常通知。不这样的话一条长命令会占死整个 step，
+	// 期间任何插话/完成通知都只能等它跑完。
+	sdk.Tool(dsc.Tool{
+		Name:         "shell",
+		Description:  description,
+		Schema:       schema,
+		Handler:      handler,
+		ViewFn:       shellView,
+		Capabilities: []string{"writes-unknown", dsc.CapabilityAutoBackground},
+	})
 	sdk.Serve()
 }
 
@@ -321,6 +332,11 @@ func shellView(_ context.Context, _ json.RawMessage, result string) (json.RawMes
 // 「工具沒抓到輸出」，往往把乾淨工作區的 `git status` 當成工具壞了、反复重跑。
 // 明確寫出無輸出，配合退出碼即可唯一確定「跑成功了，只是沒有任何輸出」。
 func formatShellResult(output string, exitCode int32) string {
+	// 进度条式输出先归一（ 重绘只保留最终帧，CRLF 归一为 LF）：这些中间帧模型
+	// 永远用不上，却可能占掉结果的绝大部分（实测一条 git 结果 2415 字符里 2112 是
+	// 中间帧）。渲染侧同样会归一，这里做在出口上让「模型看到＝人眼看到」。
+	// 唯一实现见 core.CollapseCarriageReturns（经 sdk 转发）。
+	output = dsc.CollapseCarriageReturns(output)
 	empty := strings.TrimSpace(output) == ""
 	if exitCode != 0 {
 		if empty {

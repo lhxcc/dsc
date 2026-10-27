@@ -8,6 +8,14 @@ import (
 	"dsc/cron"
 )
 
+// CronDoneEvent 定时任务运行落定事件（宿主事件总线发布；域事件，任何 UI/插件可订阅）。
+//
+// 与 JobDoneEvent 的区别是**送达策略由任务自己声明**：定时任务承担长期、循环的
+// 程序性工作，重要性差别很大——一律通知会让分钟级任务每分钟唤醒会话（每次唤醒
+// 一轮 LLM 调用），一律不通知则真正要跟进的产出没人知道。故事件总是发布（事实是
+// 「一次运行落定了」），而「是否该把模型叫醒」看 Job.Notify，由消费方过滤。
+const CronDoneEvent EventName = "cron/done"
+
 // StartCron 启动 cron 定时任务调度器。任务执行经 subagent 工具走宿主工具流水线
 // （沙箱/审批门/策略插件裁决含 timeout-policy 的活跃续命超时），不占用主 agent
 // 的交互会话；任务定义持久化于 ExecDir/cron/cron.json。
@@ -22,6 +30,11 @@ func (m *Manager) StartCron() error {
 		return fmt.Errorf("cron: %w", err)
 	}
 	sch := cron.NewScheduler(store, m.runCronJob, 0)
+	// 落定事件：携带落定后的任务快照（含 last_status / last_output）。
+	// 这里不做 Notify 过滤——事件是事实，过滤属于「叫醒谁」的送达策略（见 CronDoneEvent）。
+	sch.OnDone(func(j *cron.Job) {
+		m.events.Emit(CronDoneEvent, EventContext{Data: *j})
+	})
 	if err := sch.Start(); err != nil {
 		return fmt.Errorf("cron: %w", err)
 	}
@@ -87,6 +100,16 @@ func (m *Manager) ListCronJobs() []*cron.Job {
 		return nil
 	}
 	return m.cronScheduler.List()
+}
+
+// SetCronJobNotify 设置任务完成时是否即时通知模型（由任务自己声明重要性）。
+func (m *Manager) SetCronJobNotify(id string, notify bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cronScheduler == nil {
+		return fmt.Errorf("cron: scheduler not started")
+	}
+	return m.cronScheduler.SetNotify(id, notify)
 }
 
 // SetCronJobEnabled 启用/停用定时任务。

@@ -375,10 +375,15 @@ type Model struct {
 	program  *tea.Program
 	question *pendingQuestion
 
+	// configPicker 配置档选单（/config）。非 nil 时接管按键，并在 View 里占独立区域。
+	configPicker *configPicker
+	// exitNote 退出程序后要打印的提示（配置切换需重启加载，见 /config）。
+	exitNote string
+
 	// 后台任务完成通知唤醒（对齐 DSH completionDelivery: wakeup）：
-	// wakeBudget 连续唤醒预算（用户消息恢复），pendingWakeups 忙碌/预算耗尽时排队
+	// pendingWakeups 待送达的任务完成通知：忙碌时走实时注入，注入失败才回落到这里，
+	// 在回合结束/下一条用户消息时补送。
 	// 的通知（下一条用户消息前置注入）。
-	wakeBudget     int
 	pendingWakeups []string
 }
 
@@ -470,7 +475,6 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		spinner:          s,
 		thinkAnim:        thinkAnim{kind: randThinkKind()},
 		currentSessionID: defaultSessionID(manager),
-		wakeBudget:       maxConsecutiveWakes,
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
@@ -700,6 +704,10 @@ func (m *Model) vpHeight() int {
 	h := m.high - titleRows - statusRows - infoRows - boxBorder - m.input.Height()
 	if m.workingLineVisible() {
 		h -= thinkingRow
+	}
+	if rows := m.configPickerRows(); rows > 0 {
+		// 配置档选单同样位于 viewport 之后，必须等量收缩（否则被 AltScreen 截断）。
+		h -= rows
 	}
 	if rows := m.questionRows(); rows > 0 {
 		// 问题覆盖层占独立行（View 组装位于 viewport 之后）：viewport 必须等量收缩，
@@ -944,12 +952,71 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case jobDoneMsg:
-		// 后台任务完成：排队通知并尝试唤醒（空闲自动开启一轮）
-		m.pendingWakeups = append(m.pendingWakeups, renderJobDoneNotice(msg.snapshot))
+		// 后台任务完成：**立即**送达模型（用户的显式请求，必然通知）。
+		return m, m.deliverCompletionNotice(renderJobDoneNotice(msg.snapshot))
+
+	case cronDoneMsg:
+		// 定时任务落定：**只在该任务声明了 notify 时**送达。
+		// cron 承担长期、循环的程序性工作，重要性差别很大——一律通知会让分钟级
+		// 任务每轮都消耗一次唤醒（一次唤醒 = 一轮 LLM 调用），一律不通知又会让
+		// 真正要跟进的产出没人知道。故由任务自己声明（模型 cron_add / 人 /cron add）。
+		if !msg.job.Notify {
+			return m, nil
+		}
+		return m, m.deliverCompletionNotice(renderCronDoneNotice(msg.job))
+
+	case configSwitchMsg:
+		if msg.err != nil {
+			m.appendMessage(errorSty.Render("切换配置失败: ") + msg.err.Error())
+			m.render()
+			m.virtualGotoBottom()
+			return m, nil
+		}
+		// 整份 config.yaml 无法热生效（provider/插件表都已装配在进程里）：切换成功后
+		// 退出，由用户重新启动加载。若当前回合还在跑，先不退出——不能为了换配置
+		// 丢掉进行中的工作；提示里写明重启即可。
+		m.exitNote = fmt.Sprintf("配置已切换为 %s（原配置已备份到 %s）。重新启动 DSC 即加载新配置。",
+			msg.name, msg.backup)
+		if m.thinking || m.streaming {
+			m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 配置") +
+				"\n" + m.exitNote + "（本轮仍在进行，结束后请手动重启）")
+			m.render()
+			m.virtualGotoBottom()
+			return m, nil
+		}
+		return m, tea.Quit
+
+	case pluginAdminMsg:
+		// 插件管理命令结果：工具返回 JSON，这里只做可读化，不再解释业务含义。
+		if msg.err != nil {
+			m.appendMessage(errorSty.Render("/plugin "+msg.sub+" 失败: ") + msg.err.Error())
+			break
+		}
+		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 插件") + "\n" + renderPluginAdminResult(msg.text))
 		m.render()
+		m.virtualGotoBottom()
+
+	case jobNoticeInjectedMsg:
+		// 注入失败（agent 不在运行等）：回落到队列，由回合结束/下一条用户输入补送，
+		// 不静默丢掉一条「任务已完成」的通知。
+		//
+		// 这是运维性事实，不是对话内容：只记宿主日志（受 -log 门控），不进对话区。
+		// 通知通道失败时用户能从「模型一直不知道」看出来，界面上再糊一条错误行
+		// 只会污染正文（历史教训：把日志当前端消息打印，用户只看到莫名其妙的告警）。
+		if msg.err != nil && msg.text != "" {
+			if m.manager != nil {
+				m.manager.HostLogger().Warn("completion notice inject failed, requeued",
+					"err", msg.err.Error(), "active", m.thinking || m.streaming)
+			}
+			m.pendingWakeups = append(m.pendingWakeups, msg.text)
+		}
 		return m, m.tryWakeup()
 
 	case tea.KeyPressMsg:
+		// 配置档选单激活时，按键只用于选择/翻页/确认/取消。
+		if m.configPicker != nil {
+			return m.handleConfigPickerKey(msg)
+		}
 		// 问题覆盖层激活时，按键只用于选择/确认/放弃
 		if m.question != nil {
 			return m.handleQuestionKey(msg)
@@ -1072,7 +1139,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.draft = ""
 			m.input.SetValue("")
 			m.completion = completion{}
-			m.wakeBudget = maxConsecutiveWakes // 用户消息恢复唤醒预算（对齐 DSH）
 			// 解析 @文件引用（图片→dsc-img 多模态；文本→dsc-txt 注入内容）；解析出
 			// 图片但当前 LLM 不支持图像时明确提示，避免静默丢图（纯文本引用不提示）；
 			// @图片 解析失败（文件缺失/附件库写失败等）同样可见提示，供诊断
@@ -1338,13 +1404,33 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				toolLine = renderToolCall(f.ToolName, f.ToolArgs)
 			}
 			if toolLine == "" {
-				toolLine = dimSty.Render(strings.TrimSpace(f.Output))
+				// 回退原文同样要归一 \r：进度条式输出含 CR，直接吐给终端会把光标
+				// 拉回第 0 列覆盖左边距（见 collapseCarriageReturns）。
+				// 注意：**先判空再上色**。dimSty.Render("") 不是空串（它会套一层 ANSI
+				// 转义），若先上色再判空，空帧会被当成「有内容」，白落一行空白。
+				if raw := strings.TrimSpace(core.CollapseCarriageReturns(f.Output)); raw != "" {
+					toolLine = dimSty.Render(raw)
+				}
+			}
+			if toolLine == "" {
+				// 空帧（既无调用信息、也无结果内容）：什么都不追加。此前会走到
+				// appendToolFrame("")，它追加的是一行纯 "\n" —— 实测表现为调用卡与
+				// 它的结果之间凭空多出一个空行。同时不改 toolCallOpen：后面的真结果
+				// 仍要能紧贴调用标题。
+				m.render()
+				m.scrollToBottomIfPinned()
+				return m, m.pumpStream(msg.input, msg.ch)
 			}
 			// 帧布局：工具调用标题紧随其结果帧时连成一体（两者间不留空行，
 			// 把「● Verb(arg)」与下方「└ 结果」紧贴展示）；其余情况（独立结果帧、
 			// 调用帧、相邻两帧）按原逻辑以空行分隔。
+			//
+			// 只有**调用帧**（有工具名、无结果）才开启「结果紧贴标题」的状态；
+			// 状态通知帧（[上下文压缩…]/[输出被截断…] 这类只有 Output 的 tool 帧）
+			// 必须把它关掉——否则它们会顶替调用标题，让下一个结果贴到通知上。
+			isCall := f.ToolName != "" && f.ToolResult == ""
 			joinUnderCall := f.ToolResult != "" && m.toolCallOpen
-			m.toolCallOpen = !joinUnderCall && f.ToolResult == ""
+			m.toolCallOpen = isCall
 			if !(len(m.lines) > 0 && m.lines[len(m.lines)-1] == "\n"+toolLine) {
 				if joinUnderCall {
 					// 紧跟调用标题追加，不加空行
@@ -1721,8 +1807,15 @@ func renderUserBubble(text string, width int) string {
 }
 
 // appendMessage 追加一条已渲染消息；非首条消息前补一个空行，使消息之间留有间距。
+//
+// 空块不留位：宽为 0 的渲染结果（空串、只有换行、只有 ANSI 转义——例如
+// dimSty.Render("") 这种「看似有内容」的串）没有可读内容，写入只会让两条消息
+// 之间多出一个空行。用 lipgloss.Width 判「可见宽度」，比比较空串可靠。
 func (m *Model) appendMessage(rendered string) {
 	m.toolCallOpen = false // 非工具帧打断「调用标题→结果」的连续布局
+	if lipgloss.Width(rendered) == 0 {
+		return
+	}
 	if len(m.lines) > 0 {
 		m.lines = append(m.lines, "\n"+rendered)
 		return
@@ -1754,34 +1847,75 @@ func (m *Model) seedHistory() {
 		return
 	}
 	start := len(m.historyAll) - n
-	for _, block := range m.renderHistoryBlocks(m.historyAll[start:]) {
-		m.appendMessage(block)
+	for _, it := range m.renderHistoryItems(m.historyAll[start:]) {
+		if it.tight && len(m.lines) > 0 {
+			// 工具结果紧贴它的调用标题（与实时视图的「● Verb(arg) / └ 结果」一致），
+			// 否则两者之间会多出一个空行。
+			m.lines = append(m.lines, it.text)
+			continue
+		}
+		m.appendMessage(it.text)
 	}
 	m.historyLoaded = n
 	m.pinnedToBottom = true
 }
 
-// renderHistoryBlocks 把一段历史消息渲染为正文块（user 气泡 / assistant markdown）。
-// 不含用于分隔的前导空行——间距由 appendMessage / prependBlocks 负责。
+// histItem 一条回放块。tight=true 表示它要**紧贴**上一块（工具的调用标题与它的
+// 结果之间不留空行，与实时视图同一形态）。
+type histItem struct {
+	text  string
+	tight bool
+}
+
+// renderHistoryBlocks 把一段历史消息渲染为正文块（user 气泡 / assistant markdown /
+// 工具卡）。不含分隔用的前导空行——间距由 appendMessage / prependBlocks 负责。
+// 需要「结果紧贴调用标题」这类拼接信息时用 renderHistoryItems（本函数会丢掉它）。
 func (m *Model) renderHistoryBlocks(msgs []*core.AgentDebugMessage) []string {
+	items := m.renderHistoryItems(msgs)
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.text)
+	}
+	return out
+}
+
+// renderHistoryItems 渲染回放块并标注拼接方式：工具结果紧跟它的调用标题时 tight，
+// 由调用方（seedHistory / prependBlocks）决定是否省略分隔空行。
+func (m *Model) renderHistoryItems(msgs []*core.AgentDebugMessage) []histItem {
 	w := max(m.width-4, 20)
-	out := make([]string, 0, len(msgs))
+	out := make([]histItem, 0, len(msgs))
+	lastWasCall := false
+	push := func(text string, tight bool) {
+		if text == "" {
+			return
+		}
+		out = append(out, histItem{text: text, tight: tight})
+	}
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "user":
-			// 唤醒机制会把后台任务完成通知前置拼进用户消息；重放时按同一形态拆开：
-			// 通知按系统提示渲染，其余才是用户气泡——避免「通知与用户消息粘连成
-			// 一块」（实时视图本就只把通知渲染成系统提示）。
-			notices, rest := splitJobDoneNotices(msg.Content)
-			for _, n := range notices {
-				out = append(out, noticeBubble(n))
-			}
+			// 唤醒机制会把完成通知前置拼进用户消息；重放时按同一形态拆开并丢弃：
+			// 通知是给模型的信号，不是用户内容，渲染出来只会成为一屏没有来龙去脉的
+			// 「background job ... finished」（实时视图同样不渲染）。
+			_, rest := splitCompletionNotices(msg.Content)
 			if rest = strings.TrimSpace(rest); rest != "" {
-				out = append(out, renderUserBubble(rest, w))
+				push(renderUserBubble(rest, w), false)
 			}
 		case "assistant":
-			out = append(out, m.renderAssistant(renderMarkdown(msg.Content, w)))
+			push(m.renderAssistant(renderMarkdown(msg.Content, w)), false)
+		case "tool":
+			// 回放里的工具过程分两条目：调用卡与结果卡，渲染器与实时视图同一套
+			// （renderToolCall / renderToolResult），保证「重启前后看到的是同一个样子」。
+			switch msg.Kind {
+			case core.DebugKindToolCall:
+				push(renderToolCall(msg.ToolName, msg.ToolArgs), false)
+			case core.DebugKindToolResult:
+				// 结果紧贴它的调用标题：与实时视图「● Verb(arg) / └ 结果」一致，
+				// 中间不留空行。
+				push(renderToolResult(msg.Content, msg.IsError), lastWasCall)
+			}
 		}
+		lastWasCall = msg.Kind == core.DebugKindToolCall
 	}
 	return out
 }
@@ -1806,7 +1940,7 @@ func (m *Model) loadOlderHistory() bool {
 	}
 	oldTotal := len(m.wrappedLines)
 	oldStart := m.viewStart
-	added := m.prependBlocks(m.renderHistoryBlocks(m.historyAll[start:end]))
+	added := m.prependBlocks(m.renderHistoryItems(m.historyAll[start:end]))
 	if added <= 0 {
 		return false
 	}
@@ -1821,15 +1955,16 @@ func (m *Model) loadOlderHistory() bool {
 
 // prependBlocks 把渲染块整体插到正文最前面，并全量失效换行缓存（分页是低频操作，
 // 接受一次 O(全部行) 重建）。返回新增的可视行数，供调用方平移 viewStart。
-func (m *Model) prependBlocks(blocks []string) int {
-	if len(blocks) == 0 {
+func (m *Model) prependBlocks(items []histItem) int {
+	if len(items) == 0 {
 		return 0
 	}
 	w := m.vpWidth()
-	prep := make([]string, len(blocks))
+	prep := make([]string, len(items))
 	added := 0
-	for i, b := range blocks {
-		if i > 0 {
+	for i, it := range items {
+		b := it.text
+		if i > 0 && !it.tight {
 			b = "\n" + b // 块间空行，与 appendMessage 的间距约定一致
 		}
 		prep[i] = b
@@ -1995,6 +2130,8 @@ var toolArgKey = map[string]string{
 	"skill":                "name",
 	"install_skill":        "name",
 	"uninstall_skill":      "name",
+	"job_output":           "job_id",
+	"job_kill":             "job_id",
 	"load_dsc_plugin":      "name",
 	"unload_dsc_plugin":    "name",
 	"install_dsc_plugin":   "name",
@@ -2173,6 +2310,7 @@ func ensureExitCodeLine(result string) string {
 // renderToolResult 以 REX 式 gutter 渲染工具结果：首行「└ 首行」，后续行缩进对齐下方。
 // isErr 时整块用错误色强调。空结果返回空串。
 func renderToolResult(result string, isErr bool) string {
+	result = core.CollapseCarriageReturns(result)
 	result = strings.TrimSpace(result)
 	if result == "" {
 		return ""
@@ -2202,7 +2340,10 @@ func renderToolResult(result string, isErr bool) string {
 	if !isErr {
 		diffStart = diffBlockStart(lines)
 	}
-	indent := strings.Repeat(" ", len(connector))
+	// 缩进必须按**显示宽度**算：connector（"  └ "）含 └（U+2514，3 字节），
+	// len() 会得到 6，续行就比首行多缩 2 格——实测「首行从第 4 列、后续行从第 6 列」，
+	// 视觉上一整块向右歪。lipgloss.Width 按单元格宽度算（4），与终端一致。
+	indent := strings.Repeat(" ", lipgloss.Width(connector))
 	var b strings.Builder
 	b.WriteString(dimSty.Render(connector))
 	if isErr {
@@ -2270,7 +2411,9 @@ func writeJSONObject(b *strings.Builder, obj map[string]any, depth int) {
 	width := 0
 	for _, k := range keys {
 		if isJSONScalar(obj[k]) {
-			if l := runeLen(k); l > width {
+			// 键名同样是「显示宽度」对齐：JSON 里的中文键按字符数算会少一列，
+			// 值起点就逐行错开（与表格列对齐同一个坑）。
+			if l := lipgloss.Width(k); l > width {
 				width = l
 			}
 		}
@@ -2278,7 +2421,7 @@ func writeJSONObject(b *strings.Builder, obj map[string]any, depth int) {
 	for _, k := range keys {
 		v := obj[k]
 		if isJSONScalar(v) {
-			pad := strings.Repeat(" ", width-runeLen(k))
+			pad := strings.Repeat(" ", width-lipgloss.Width(k))
 			b.WriteString(indent + k + pad + ": " + jsonScalar(v) + "\n")
 			continue
 		}
@@ -2338,9 +2481,6 @@ func isJSONScalar(v any) bool {
 }
 
 // runeLen 返回字符串按 rune 计的长度（用于对齐计算，兼容非 ASCII 键名）。
-func runeLen(s string) int {
-	return len([]rune(s))
-}
 
 // sortedJSONKeys 返回 map 按键名排序后的切片，保证卡片输出顺序稳定。
 func sortedJSONKeys(m map[string]any) []string {
@@ -2455,14 +2595,14 @@ func renderViewSpec(viewJSON string) string {
 func renderCardView(v *core.ToolView) string {
 	maxKey := 0
 	for _, f := range v.Fields {
-		if l := runeLen(f.Key); l > maxKey {
+		if l := lipgloss.Width(f.Key); l > maxKey {
 			maxKey = l
 		}
 	}
 	var b strings.Builder
 	b.WriteString(viewHead(v))
 	for _, f := range v.Fields {
-		pad := strings.Repeat(" ", maxKey-runeLen(f.Key))
+		pad := strings.Repeat(" ", maxKey-lipgloss.Width(f.Key))
 		val := f.Value
 		if f.Tone != "" {
 			val = viewToneSty(f.Tone, false).Render(val)
@@ -2479,14 +2619,36 @@ func renderCardView(v *core.ToolView) string {
 // 避免单列撑爆终端。整表剩余部分由 viewport 折行兜底。
 const tableColMax = 40
 
+// truncateDisplay 把字符串截到**不超过 width 列**（按显示宽度走 rune，
+// 不切断宽字符，也不会切出半个中文）。
+func truncateDisplay(s string, width int) string {
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := lipgloss.Width(string(r))
+		if used+w > width {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String()
+}
+
 // tableCell 按列宽截断并对齐单元格：返回「样式化文本 + 补齐空格」。
-// 宽度按纯文本计（ANSI 转义零宽），保证带色单元格也对齐。
+//
+// 宽度按**显示宽度**计（lipgloss.Width：ANSI 转义零宽、CJK 每字两列）。用字符数
+// 会把每个中文字少算一列，列头「名称/类型/状态」这类 CJK 表头就会逐列右移，
+// 数据看着没跟表头对齐（与 /plugins 列表同一个坑）。
 func tableCell(cell string, width int, tone string, bold bool) string {
-	pad := width - runeLen(cell)
+	pad := width - lipgloss.Width(cell)
 	if pad < 0 {
-		// 超长：截断为 width-1 字符 + …（总显示宽恰为 width）
+		// 超长：按显示宽度截断到 width-1 列 + …（不能按 rune 切，会切出半宽）
 		if width > 1 {
-			cell = string([]rune(cell)[:width-1]) + "…"
+			cell = truncateDisplay(cell, width-1) + "…"
 		} else {
 			cell = "…"
 		}
@@ -2507,10 +2669,10 @@ func renderTableView(v *core.ToolView) string {
 	}
 	widths := make([]int, len(v.Columns))
 	for i, c := range v.Columns {
-		w := runeLen(colTitle(c))
+		w := lipgloss.Width(colTitle(c))
 		for _, r := range v.Rows {
-			if cell, ok := r[c.Key]; ok && runeLen(cell) > w {
-				w = runeLen(cell)
+			if cell, ok := r[c.Key]; ok && lipgloss.Width(cell) > w {
+				w = lipgloss.Width(cell)
 			}
 		}
 		if w > tableColMax {
@@ -2560,7 +2722,10 @@ func renderPlainView(v *core.ToolView) string {
 // resultGutter 为多行结果/卡片套用「└」gutter 与续行缩进（首行带 gutter，后续行对齐）。
 func resultGutter(body string) string {
 	lines := strings.Split(body, "\n")
-	indent := strings.Repeat(" ", len(connector))
+	// 缩进必须按**显示宽度**算：connector（"  └ "）含 └（U+2514，3 字节），
+	// len() 会得到 6，续行就比首行多缩 2 格——实测「首行从第 4 列、后续行从第 6 列」，
+	// 视觉上一整块向右歪。lipgloss.Width 按单元格宽度算（4），与终端一致。
+	indent := strings.Repeat(" ", lipgloss.Width(connector))
 	var b strings.Builder
 	b.WriteString(dimSty.Render(connector))
 	for i, ln := range lines {
@@ -2580,7 +2745,7 @@ func resultGutter(body string) string {
 // 时自动出现 /mode thin。
 var slashCommands = []compItem{
 	{label: "/help", insert: "/help", hint: "显示帮助与快捷键"},
-	{label: "/clear", insert: "/clear", hint: "清空聊天记录"},
+	{label: "/clear", insert: "/clear", hint: "清屏：只清空当前显示，会话记录与模型上下文保留"},
 	{label: "/skills", insert: "/skills", hint: "列出所有已安装的技能"},
 	{label: "/sandbox read-only", insert: "/sandbox read-only", hint: "沙箱只读：拒绝一切文件写"},
 	{label: "/sandbox workspace", insert: "/sandbox workspace", hint: "沙箱工作区写：仅允许 workspace 内写（默认）"},
@@ -2590,7 +2755,10 @@ var slashCommands = []compItem{
 	{label: "/jobs", insert: "/jobs ", hint: "后台任务子命令（list / output / kill），选中进入后展开", descend: true},
 	{label: "/settings", insert: "/settings ", hint: "设置子命令（history / mouse），选中进入后展开", descend: true},
 	{label: "/sessions", insert: "/sessions", hint: "列出所有会话"},
-	{label: "/cron", insert: "/cron ", hint: "定时任务子命令（list / add / remove / on / off），选中进入后展开", descend: true},
+	{label: "/cron", insert: "/cron ", hint: "定时任务子命令（list / add / remove / on / off / notify），选中进入后展开", descend: true},
+	{label: "/plugins", insert: "/plugins", hint: "列出插件（= /plugin list，动态枚举）"},
+	{label: "/config", insert: "/config", hint: "切换 config/config.*.yaml 配置档（列表可选、可翻页，切换后需重启）"},
+	{label: "/plugin", insert: "/plugin ", hint: "插件管理（list / install / remove / upgrade / load / unload）", descend: true},
 	{label: "/plan", insert: "/plan", hint: "进入 plan 模式（先探索设计，再经 exit_plan_mode 呈现计划）"},
 	{label: "/plan off", insert: "/plan off", hint: "退出 plan 模式"},
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
@@ -2606,38 +2774,54 @@ var slashCommands = []compItem{
 // Manager 不可用或 presets 目录为空时，回退到内置默认模式列表，保证菜单
 // 在 minimal 启动 / 配置缺失场景下仍可用。
 func (m *Model) slashCommandItems() []compItem {
-	modes := m.availableModes()
-	modeItems := make([]compItem, 0, len(modes))
-	for _, mode := range modes {
-		modeItems = append(modeItems, compItem{
+	out := make([]compItem, 0, len(slashCommands)+8)
+
+	// 内置命令（声明顺序会在最后被重排，此处顺序不重要）。
+	out = append(out, slashCommands...)
+
+	// 动态 /mode 项：来自 presets 目录，用户新增 preset 就自动出现。
+	for _, mode := range m.availableModes() {
+		out = append(out, compItem{
 			label:  "/mode " + mode,
 			insert: "/mode " + mode,
 			hint:   modeHint(mode),
 		})
 	}
-	// 把 /mode 项插到 /skills 之后、/sandbox 之前，保持原有位置习惯
-	out := make([]compItem, 0, len(slashCommands)+len(modeItems))
-	inserted := false
-	for _, it := range slashCommands {
-		if !inserted && strings.HasPrefix(it.label, "/sandbox") {
-			out = append(out, modeItems...)
-			inserted = true
-		}
-		out = append(out, it)
-	}
-	if !inserted {
-		out = append(out, modeItems...)
-	}
+
 	// 插件声明的命令：菜单内容来自宿主的声明汇总，前端不认识任何具体命令。
-	if plugins := m.pluginCommands(); len(plugins) > 0 {
-		items := make([]compItem, 0, len(plugins))
-		for _, c := range plugins {
-			items = append(items, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
-		}
-		// 插到 "/export" 之前，保持内置命令的收尾顺序（/export、/exit 在最后）
-		out = append(out, items...)
+	for _, c := range m.pluginCommands() {
+		out = append(out, compItem{label: c.Usage, insert: c.Usage, hint: c.Summary})
 	}
-	return out
+
+	return sortSlashItems(out)
+}
+
+// sortSlashItems 按命令名的字母序重排菜单，/exit 固定最后。
+//
+// 只按**第一个词**比较（/sandbox read-only 与 /sandbox workspace 视为同一族），
+// 同族内保持声明顺序：这些写法本身有语义次序——/sandbox 的三档是权限递增
+// （read-only → workspace → full-access）、/jobs 是 list → output → kill、
+// /cron 是 list → add → remove → on/off → notify，按字母打散反而更难选。
+// 用 SliceStable 正是为了保住这个次序。大小写不敏感（插件声明的命令可能含大写）。
+func sortSlashItems(items []compItem) []compItem {
+	name := func(it compItem) string {
+		label := strings.TrimPrefix(strings.TrimSpace(it.label), "/")
+		if i := strings.IndexAny(label, " \t"); i >= 0 {
+			label = label[:i]
+		}
+		return strings.ToLower(label)
+	}
+	rest := make([]compItem, 0, len(items))
+	exit := make([]compItem, 0, 1)
+	for _, it := range items {
+		if name(it) == "exit" {
+			exit = append(exit, it)
+			continue
+		}
+		rest = append(rest, it)
+	}
+	sort.SliceStable(rest, func(i, k int) bool { return name(rest[i]) < name(rest[k]) })
+	return append(rest, exit...)
 }
 
 // pluginCommands 返回宿主侧汇总的插件命令声明（无 manager 时为空）。
@@ -2692,6 +2876,7 @@ var slashGroups = []slashGroup{
 			{label: "/cron remove", insert: "/cron remove ", hint: "删除定时任务"},
 			{label: "/cron on", insert: "/cron on ", hint: "启用定时任务"},
 			{label: "/cron off", insert: "/cron off ", hint: "停用定时任务"},
+			{label: "/cron notify", insert: "/cron notify ", hint: "跑完是否即时通知模型（on/off）"},
 		},
 	},
 	{
@@ -2880,7 +3065,7 @@ func (m *Model) buildHelpText() string {
 		"",
 		"斜杆命令:",
 		"  /help        显示本帮助",
-		"  /clear       清空聊天记录",
+		"  /clear       清屏：只清空当前显示，会话记录与模型上下文保留（重启后可回看）",
 		"  /skills      列出所有已安装的技能",
 	}
 	// /mode 行动态生成：列出所有可用模式（来自 presets 目录）
@@ -2899,9 +3084,16 @@ func (m *Model) buildHelpText() string {
 		"  /jobs kill <id> [reason]  取消后台任务",
 		"  /sessions    列出所有会话",
 		"  /crons       列出所有定时任务",
-		"  /cron add <cron> <prompt>  添加定时任务（cron 为 5 段表达式，如 0 8 * * *）",
+		"  /plugins     列出插件（= /plugin list）",
+		"  /config      切换 config/config.*.yaml 配置档（选择后需重启生效）",
+		"  /plugin install <name> <source> [--type tool]  安装并热加载插件",
+		"  /plugin remove <name>   卸载插件（含目录）",
+		"  /plugin upgrade <name> <version> <source>  升级插件",
+		"  /plugin load|unload <name> [--persist]  当前进程加载/卸载",
+		"  /cron add [--notify] <cron> <prompt>  添加定时任务（--notify=跑完即时告知模型）",
 		"  /cron remove <id>  删除定时任务",
 		"  /cron on|off <id>  启用/停用定时任务",
+		"  /cron notify <id> on|off  该任务跑完是否即时通知模型",
 		"  /plan       进入 plan 模式（先探索与设计，再经 exit_plan_mode 呈现完整计划）",
 		"  /plan off   退出 plan 模式",
 		"  /settings history <N|off|unlimited>  恢复历史注入条数：只影响从存档恢复的历史，当前会话内的轮次始终保留",
@@ -2956,6 +3148,9 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	case "/clear":
+		// 只清**显示**：不删会话记录、不动模型上下文，也不改 history_injection。
+		// 会话 .jsonl 与模型看到的历史都不受影响；重启后回放仍会显示这些内容
+		// （historyAll 清空只是让本次运行不再向上翻出旧页）。
 		m.lines = nil
 		m.lineRendered = nil
 		m.dirtyFrom = 0
@@ -3080,6 +3275,25 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.render()
 		m.virtualGotoBottom()
 		return true, nil
+	case "/config":
+		m.openConfigPicker()
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.virtualGotoBottom()
+		return true, nil
+
+	// /export 已在 switch 之前按前缀拦截（支持 /export [id]），此处不再重复一个
+	// 只认当前会话的精确匹配分支。
+	case "/plugins":
+		cmd := m.runPluginAdmin("list", nil)
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, cmd
+
 	case "/crons":
 		m.appendCronList()
 		m.input.SetValue("")
@@ -3089,7 +3303,7 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	case "/cron":
-		m.appendMessage(errorSty.Render("用法: /cron list（= /crons）、add <cron(5 段)> <prompt>、remove <id>、on|off <id>"))
+		m.appendMessage(errorSty.Render("用法: /cron list（= /crons）、add [--notify] <cron(5 段)> <prompt>、remove <id>、on|off <id>、notify <id> on|off"))
 		m.input.SetValue("")
 		m.completion = completion{}
 		m.syncInputHeight()
@@ -3225,6 +3439,41 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		m.virtualGotoBottom()
 		return true, nil
 	}
+	// /config <name> | list：直选某个配置档（列表由磁盘决定，不硬编码档名）。
+	if strings.HasPrefix(cmd, "/config ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(cmd, "/config "))
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		var exec tea.Cmd
+		if arg == "" || arg == "list" {
+			m.openConfigPicker()
+		} else if m.manager == nil {
+			m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
+		} else {
+			exec = m.switchConfigProfileCmd(arg)
+		}
+		m.render()
+		m.virtualGotoBottom()
+		return true, exec
+	}
+
+	// /plugin <sub> ...（前缀匹配）：与模型同一套插件管理工具，动态枚举插件。
+	if strings.HasPrefix(cmd, "/plugin ") || cmd == "/plugin" {
+		argv := strings.Fields(strings.TrimPrefix(cmd, "/plugin"))
+		sub, args := "list", []string(nil)
+		if len(argv) > 0 {
+			sub, args = argv[0], argv[1:]
+		}
+		exec := m.runPluginAdmin(sub, args)
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+		m.virtualGotoBottom()
+		return true, exec
+	}
+
 	// /cron add|remove|on|off（前缀匹配）
 	if strings.HasPrefix(cmd, "/cron ") {
 		rest := strings.TrimSpace(strings.TrimPrefix(cmd, "/cron "))
@@ -3232,9 +3481,20 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 		case rest == "list":
 			m.appendCronList()
 		case strings.HasPrefix(rest, "add "):
-			tokens := strings.Fields(strings.TrimPrefix(rest, "add "))
+			// [--notify] 可选：该任务每次跑完是否即时通知模型。默认不通知——定时任务
+			// 多为程序性循环，一律通知会把分钟级任务变成每分钟一次唤醒（各一轮 LLM）。
+			raw := strings.Fields(strings.TrimPrefix(rest, "add "))
+			notify := false
+			tokens := make([]string, 0, len(raw))
+			for _, tk := range raw {
+				if tk == "--notify" || tk == "-n" {
+					notify = true
+					continue
+				}
+				tokens = append(tokens, tk)
+			}
 			if len(tokens) < 6 {
-				m.appendMessage(errorSty.Render("用法: /cron add <cron> <prompt>，如 /cron add \"0 8 * * *\" 写今日日报"))
+				m.appendMessage(errorSty.Render("用法: /cron add [--notify] <cron(5 段)> <prompt>，如 /cron add --notify \"0 8 * * *\" 写今日日报"))
 			} else if m.manager == nil {
 				m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
 			} else {
@@ -3243,11 +3503,12 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 					Cron:    strings.Join(tokens[:5], " "),
 					Prompt:  strings.Join(tokens[5:], " "),
 					Enabled: true,
+					Notify:  notify,
 				}
 				if err := m.manager.AddCronJob(j); err != nil {
 					m.appendMessage(errorSty.Render("添加任务失败: ") + err.Error())
 				} else {
-					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已添加任务 %s（cron: %s）。", j.ID, j.Cron))
+					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已添加任务 %s（cron: %s，完成通知: %s）。", j.ID, j.Cron, onOff(notify)))
 				}
 			}
 		case strings.HasPrefix(rest, "remove "):
@@ -3261,6 +3522,18 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 			} else {
 				m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n已删除任务 %s。", id))
 			}
+		case strings.HasPrefix(rest, "notify "):
+			fields := strings.Fields(strings.TrimPrefix(rest, "notify "))
+			if len(fields) != 2 || (fields[1] != "on" && fields[1] != "off") {
+				m.appendMessage(errorSty.Render("用法: /cron notify <任务 id> on|off（该任务跑完是否即时通知模型）"))
+			} else if m.manager == nil {
+				m.appendMessage(errorSty.Render("錯誤: 插件管理器不可用"))
+			} else if err := m.manager.SetCronJobNotify(fields[0], fields[1] == "on"); err != nil {
+				m.appendMessage(errorSty.Render("设置完成通知失败: ") + err.Error())
+			} else {
+				m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 定时任务") + fmt.Sprintf("\n任务 %s 的完成通知已%s。", fields[0], onOff(fields[1] == "on")))
+			}
+
 		case strings.HasPrefix(rest, "on ") || strings.HasPrefix(rest, "off "):
 			enabled := strings.HasPrefix(rest, "on ")
 			id := strings.TrimSpace(strings.TrimPrefix(rest, "on "))
@@ -3384,6 +3657,14 @@ type pluginCommandMsg struct {
 // pluginCommandTimeout 插件命令的超时：命令是同步 RPC，卡住不能拖死界面。
 const pluginCommandTimeout = 20 * time.Second
 
+// onOff 把布尔显示为「on/off」（cron 的 notify 等开关统一口径）。
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
 // appendCronList 输出定时任务列表（/crons 与 /cron list 共用）。
 func (m *Model) appendCronList() {
 	if m.manager == nil {
@@ -3412,7 +3693,8 @@ func (m *Model) renderCrons() string {
 				last += " @" + time.UnixMilli(j.LastRunAt).Format("15:04")
 			}
 		}
-		fmt.Fprintf(&b, "  %s  %s  [%s]  cron=%s  上次=%s\n", j.ID, j.Name, state, j.Cron, last)
+		fmt.Fprintf(&b, "  %s  %s  [%s]  cron=%s  通知=%s  上次=%s\n",
+			j.ID, j.Name, state, j.Cron, onOff(j.Notify), last)
 	}
 	return b.String()
 }
@@ -4017,6 +4299,9 @@ func (m *Model) View() tea.View {
 	if q := m.questionView(); q != "" {
 		parts = append(parts, q)
 	}
+	if cp := m.configPickerView(); cp != "" {
+		parts = append(parts, cp)
+	}
 	if m.workingLineVisible() {
 		// 一行分三段上色：spinner、动画文字（每轮随机中/英文案，见 thinking.go）、
 		// 耗时与取消提示。整行套 dimSty 会把动画文字一起压暗，「更明显」就落空了，
@@ -4090,6 +4375,11 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 	if q := m.questionView(); q != "" {
 		y += strings.Count(q, "\n") + 1
 	}
+	if rows := m.configPickerRows(); rows > 0 {
+		// 配置档选单同样排在 viewport 之后、composer 之前：漏算这一项，真实光标就会
+		// 上移选单那么多行，正好落在选单第一行上（视觉上「光标错位」，还把 ▸ 盖住）。
+		y += rows
+	}
 	if m.workingLineVisible() {
 		y += thinkingRow
 	}
@@ -4102,7 +4392,9 @@ func (m *Model) inputCursorAbs() *tea.Cursor {
 }
 
 // Run 运行聊天界面，阻塞直到退出
-func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, replay *core.HistoryReplay) error {
+// Run 运行聊天界面，阻塞直到退出。第二个返回值是退出提示（如 /config 切换了配置、
+// 需要重启才生效）——TUI 退出后屏幕已还原，提示必须由调用方在终端打印。
+func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName, mode string, contextWindow int, replay *core.HistoryReplay) (string, error) {
 	m := New(agent, manager, ctx, modelName, mode, contextWindow)
 	// 启动回显数据：完整可显示历史 + 初始渲染条数（首个窗口尺寸后渲染，见 seedHistory）。
 	if replay != nil {
@@ -4124,7 +4416,14 @@ func Run(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 			}
 			return nil, nil
 		})
+		// 定时任务落定 → 同一送达路径（是否叫醒模型由任务的 notify 决定）。
+		manager.OnEvent(core.CronDoneEvent, func(ctx core.EventContext) (any, error) {
+			if j, ok := ctx.Data.(cron.Job); ok {
+				m.program.Send(cronDoneMsg{job: j})
+			}
+			return nil, nil
+		})
 	}
 	_, err := p.Run()
-	return err
+	return m.exitNote, err
 }

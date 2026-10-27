@@ -80,13 +80,24 @@ func TestWorkflowToolBackground(t *testing.T) {
 		"background": true,
 	})
 	out, err := tool.Execute(context.Background(), args)
-	if err != nil || !strings.Contains(out, "started in background (job workflow-1)") {
+	if err != nil || !strings.Contains(out, "started in background (job workflow-") {
 		t.Fatalf("background start = %q, %v", out, err)
+	}
+	// 标识是随机短哈希（Git 风格），从返回文本里取实际 id
+	jobID := ""
+	if i := strings.Index(out, "(job "); i >= 0 {
+		rest := out[i+len("(job "):]
+		if j := strings.Index(rest, ")"); j > 0 {
+			jobID = rest[:j]
+		}
+	}
+	if jobID == "" {
+		t.Fatalf("background start 未带 job id: %q", out)
 	}
 
 	// 后台任务完成 → job_output 取回结果
-	waitJobStatus(t, m, "workflow-1", jobs.StatusCompleted)
-	out, err = outTool.Execute(context.Background(), []byte(`{"job_id":"workflow-1"}`))
+	waitJobStatus(t, m, jobID, jobs.StatusCompleted)
+	out, err = outTool.Execute(context.Background(), []byte(`{"job_id":"`+jobID+`"}`))
 	if err != nil || !strings.Contains(out, `"sum": 5`) || !strings.Contains(out, "[status: completed]") {
 		t.Fatalf("background output = %q, %v", out, err)
 	}

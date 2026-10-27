@@ -355,6 +355,14 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
+		// 已完成却只会造成重复唤醒的两种情形直接丢弃：
+		//   Reported —— 调用方已拿到终态（kill/read/wait 触及），再通知就是「读过的东西再说一遍」；
+		//   Awaited  —— 有调用方正阻塞在 Wait 上，落定后它自己就取回输出。
+		// 此前 Reported 只被赋值、无人读取（注释写了用途但没接线），于是模型每次都会
+		// 收到自己刚收集过的任务完成通知。
+		if s.Reported || s.Awaited {
+			return
+		}
 		m.events.Emit(JobDoneEvent, EventContext{Data: s})
 	})
 	// 宿主事件 → 插件分发（互通机制 3：插件经 PluginHookService.OnEvent 订阅）

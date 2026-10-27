@@ -88,6 +88,14 @@ type ReactLoopAgent struct {
 	// 快照后有新注入，说明存在尚未发送给模型的新消息，须继续下一轮而不是结束本轮。
 	pendingInjects int
 
+	// runActive 表示当前是否有 runLoop 正在消费会话（sessMu 保护）。
+	// InjectMessage 只在此为真时才有意义：消息写进会话表面后，必须有循环在
+	// 下一次派生请求历史时把它发给模型。若循环已退出（本轮收尾与 TUI 收到
+	// done 帧之间的窗口、或 TUI 状态判断失误），静默追加只会让这条消息沉睡——
+	// 直到用户下次说话才被顺带发出。此时宁可返回错误，让调用方走「唤醒开新轮」，
+	// 也不要制造「消息已发出、工作却没发生」的假象。
+	runActive bool
+
 	// 多会话事件日志存储（DSC_SESSION_DIR，缺省 ./sessions）；固定使用 default 会话
 	store *session.Store
 
@@ -254,6 +262,9 @@ func (a *ReactLoopAgent) RunStream(ctx context.Context, input string, images []s
 func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []string, emit func(*dsc.RunStreamResponse)) (*dsc.AgentResult, error) {
 	// 创建一个可取消的 context，保存 cancelFunc
 	ctx, cancel := context.WithCancel(ctx)
+	a.sessMu.Lock()
+	a.runActive = true
+	a.sessMu.Unlock()
 	a.mu.Lock()
 	// 如果已有 cancelFunc，先取消（防止并发 Run）
 	if a.cancelFunc != nil {
@@ -263,6 +274,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 	a.mu.Unlock()
 
 	defer func() {
+		a.sessMu.Lock()
+		a.runActive = false
+		a.sessMu.Unlock()
 		a.mu.Lock()
 		a.cancelFunc = nil
 		a.mu.Unlock()
@@ -1739,6 +1753,11 @@ func (a *ReactLoopAgent) InjectMessage(ctx context.Context, content string, imag
 	defer a.sessMu.Unlock()
 	if a.sess == nil {
 		return fmt.Errorf("inject message: session not loaded")
+	}
+	// 没有活跃循环时追加等于把消息丢进黑洞：写进去了，却没有任何一步会把它
+	// 发给模型（模型"看不到"用户明明发过的消息）。调用方（TUI）据此改走唤醒。
+	if !a.runActive {
+		return fmt.Errorf("inject message: no active run")
 	}
 	a.sess.Append(session.UserMessage,
 		&session.UserMessageData{Content: content, Source: "user", Images: images},

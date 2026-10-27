@@ -20,37 +20,48 @@ func TestRunJobsCommand(t *testing.T) {
 	// 启动一个后台 workflow（真实 job，脚本立即返回）
 	out, err := m.manager.ExecuteTool(context.Background(), "workflow",
 		json.RawMessage(`{"meta":{"name":"test-wf","description":"test"},"script":"return 1","background":true}`))
-	if err != nil || !strings.Contains(out, "workflow-1") {
+	if err != nil || !strings.Contains(out, "started in background") {
 		t.Fatalf("start bg workflow = %q, %v", out, err)
+	}
+	// 任务标识是随机短哈希（Git 风格），从返回文本取实际 id 而不是硬编码序号
+	jobID := ""
+	if i := strings.Index(out, "(job "); i >= 0 {
+		rest := out[i+len("(job "):]
+		if j := strings.Index(rest, ")"); j > 0 {
+			jobID = rest[:j]
+		}
+	}
+	if jobID == "" {
+		t.Fatalf("start bg workflow 未带 job id: %q", out)
 	}
 
 	// list：默认子命令（空）与 "list" 等价
 	m.runJobsCommand("")
 	joined := strings.Join(m.lines, "\n")
-	if !strings.Contains(joined, "workflow-1") || !strings.Contains(joined, "[workflow]") {
+	if !strings.Contains(joined, jobID) || !strings.Contains(joined, "[workflow]") {
 		t.Fatalf("jobs list missing task: %s", joined)
 	}
 
 	// output
 	before := len(m.lines)
-	m.runJobsCommand("output workflow-1")
+	m.runJobsCommand("output " + jobID)
 	if len(m.lines) <= before {
 		t.Fatal("jobs output produced no message")
 	}
 	joined = strings.Join(m.lines, "\n")
-	if !strings.Contains(joined, "job workflow-1") || !strings.Contains(joined, "[status:") {
+	if !strings.Contains(joined, "job "+jobID) || !strings.Contains(joined, "[status:") {
 		t.Fatalf("jobs output missing: %s", joined)
 	}
 
 	// 等待 job 落定，再 kill 验证 already-finished 路径
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if rd, err := m.manager.ReadJob("workflow-1"); err == nil && rd.Snapshot.Status == jobs.StatusCompleted {
+		if rd, err := m.manager.ReadJob(jobID); err == nil && rd.Snapshot.Status == jobs.StatusCompleted {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	m.runJobsCommand("kill workflow-1")
+	m.runJobsCommand("kill " + jobID)
 	joined = strings.Join(m.lines, "\n")
 	if !strings.Contains(joined, "已结束") {
 		t.Fatalf("jobs kill finished should report already-finished: %s", joined)

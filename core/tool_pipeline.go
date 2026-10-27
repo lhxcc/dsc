@@ -119,6 +119,16 @@ func (m *Manager) ExecuteToolWithView(ctx context.Context, toolName string, args
 		return res, view, nil, nil, err // 后台路径立即返回 job_id，图像与 notices 不适用
 	}
 
+	// 自动后台（声明式能力 auto-background）：声明该能力的工具不再直接同步执行，
+	// 而是先登记成后台任务、再给一个前台宽限期。宽限内跑完 = 普通工具结果；
+	// 超时 = 返回 job_id 转入后台。目的见 CapabilityAutoBackground 的注释：
+	// 长命令占死一个 step 时，任何注入都要等它跑完才可能被模型看到。
+	if m.jobs != nil && m.autoBackgroundable(toolName) {
+		if res, view, handled, err := m.runWithGrace(ctx, toolName, argsJSON, CallerFromContext(ctx)); handled {
+			return res, view, nil, nil, err
+		}
+	}
+
 	inv := &ToolInvocation{ToolName: toolName, ArgumentsJSON: string(argsJSON), SessionID: CallerFromContext(ctx), ApprovalPolicy: ApprovalPolicyFromContext(ctx)}
 
 	// pre-execute（waterfall）：守卫。不调 next 即 veto（阻止执行，execute 不运行）。
@@ -446,6 +456,19 @@ func isBackgroundRequest(argsJSON json.RawMessage) bool {
 // 立即返回 job_id（对齐 DSH bash run_in_background）。
 // 模型可用 job_output/job_list/job_kill 管理后台任务。
 func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, argsJSON json.RawMessage, caller string) (string, string, error) {
+	jobID, err := m.startBackgroundJob(ctx, toolName, argsJSON, caller, nil)
+	if err != nil {
+		return "", "", err
+	}
+	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
+	return result, "", nil
+}
+
+// startBackgroundJob 登记后台任务并返回 job id（不生成对模型的提示文本）。
+// 显式 run_in_background 与自动后台（宽限期超时）共用这一条登记路径。
+// sink 非空时把管道产生的结构化视图（ViewJson）记录进去——宽限期路径要在
+// job 之外把视图原样交回调用方（否则 TUI 的工具卡会丢掉结构化视图）。
+func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJSON json.RawMessage, caller string, sink *bgResult) (string, error) {
 	label := toolName
 	// 尝试从参数中提取 command 作为 label 更友好的展示
 	var p struct {
@@ -478,7 +501,9 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 			go func() {
 				defer cancel()
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
-				result, _, err := m.executeBackgroundPipeline(runCtx, toolName, argsJSON)
+				result, view, err := m.executeBackgroundPipeline(runCtx, toolName, argsJSON)
+				// 视图与管道错误交回宽限期路径（jobs.JobOutcome 只带输出文本）。
+				sink.set(view, err)
 				mu.Lock()
 				reason := cancelReason
 				mu.Unlock()
@@ -512,11 +537,9 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 		},
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("start background job: %w", err)
+		return "", fmt.Errorf("start background job: %w", err)
 	}
-
-	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
-	return result, "", nil
+	return jobID, nil
 }
 
 // exitCodeMarkRe 匹配工具结果尾部追加的退出码标记（Shell 工具的结果约定：

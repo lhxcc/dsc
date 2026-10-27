@@ -36,7 +36,7 @@ func resolveHistoryShowsCount(shows, injectCount int) int {
 // HistoryReplay 启动回显所需的完整可显示历史与初始渲染条数。
 //
 // Messages 是**全量**可显示历史（旧→新，不受 history_injection 上限约束），供
-// TUI 向上翻页时逐页回填；Initial 是启动时先渲染的尾部条数（受 history_shows
+// TUI 向上翻页时逐页回填；Initial 是启动时先渲染的尾部**条目数**（受 history_shows
 // 与注入量共同约束）。这样初始屏幕上看到的是「模型也看得到的那部分」，而向上
 // 滚动可以继续读到更早的完整对话。
 type HistoryReplay struct {
@@ -45,9 +45,10 @@ type HistoryReplay struct {
 }
 
 // LoadHistoryReplay 加载当前工作区项目会话，构造启动回显数据：
-//   - Messages 取全量可显示消息（user/assistant，不含 system/tool）；
-//   - Initial 取 resolveHistoryShowsCount(historyShows, historyInjection)，并再以
-//     「注入视角下的可显示条数」封顶，保证初始显示不超过实际注入量。
+//   - Messages 取全量回放条目：user/assistant 文本 + 工具调用/结果（不含 system）；
+//   - Initial 取「最近 N 条对话消息」所覆盖的条目数（N 由 resolveHistoryShowsCount
+//     决定，并以「注入视角下的对话条数」封顶）——工具卡不占名额，但会随所属消息
+//     一起进入初始切片。
 //
 // 与 agent 视角严格对齐：
 //   - 会话键与 agent 相同：session.SessionKeyForProject(WorkspaceRoot)；
@@ -80,18 +81,24 @@ func (m *Manager) LoadHistoryReplay(historyInjection, historyShows int) *History
 	if count == 0 {
 		return nil
 	}
-	// 初始显示量封顶在「注入视角下的可显示条数」：DeriveMessagesLimited(inject)
+	// 初始显示量封顶在「注入视角下可显示的**对话条数**」：DeriveMessagesLimited(inject)
 	// 只截掉头部，其尾部与全量历史的尾部一致，故取尾部即与注入历史对齐。
+	// 注意按对话消息计数，不把工具卡算进名额（否则 history_shows=20 只够三四个来回）。
 	injected := displayableMessages(sess.DeriveMessagesLimited(inject))
-	initial := count
-	if initial > len(injected) {
-		initial = len(injected)
+	shows := count
+	if conv := countConversationMessages(injected); shows > conv {
+		shows = conv
 	}
-	if initial == 0 {
+	if shows == 0 {
 		return nil
 	}
 	all := displayableMessages(sess.DeriveMessages())
 	if len(all) == 0 {
+		return nil
+	}
+	// Initial 是**条目数**（TUI 按条目切片）：最近 shows 条对话消息 + 它们的工具卡。
+	initial := tailEntryCountForMessages(all, shows)
+	if initial <= 0 {
 		return nil
 	}
 	return &HistoryReplay{Messages: all, Initial: initial}
@@ -107,20 +114,95 @@ func (m *Manager) LoadDisplayHistory(historyInjection, historyShows int) []*Agen
 	return r.Messages[len(r.Messages)-r.Initial:]
 }
 
-// displayableMessages 从派生消息里挑出适合给用户看的（user/assistant，且正文非空）。
-// system 是内部提示、tool 是过程产物，回显它们只会淹没对话主线。
+// displayableMessages 把派生消息展开成**回放条目**：文本气泡 + 工具过程。
+//
+// system 是内部提示，不回显；但 tool 过程必须回显——否则重启后只剩「结论」，
+// 看不到模型改代码、跑命令的过程（用户实测正是这个缺口）。展开规则：
+//   - user/assistant 正文非空 → 一条文本气泡（正文为空但有工具调用的助手消息不产生气泡）；
+//   - assistant 的每个 ToolCalls → 一条 DebugKindToolCall（名称 + 参数 JSON）；
+//   - role=="tool" → 一条 DebugKindToolResult（结果文本，失败按 exit_code 判定）。
+//
+// 条目顺序即真实发生顺序：助手文字 → 它的若干调用 → 对应结果 → 下一条消息。
 func displayableMessages(msgs []*proto.Message) []*AgentDebugMessage {
 	out := make([]*AgentDebugMessage, 0, len(msgs))
 	for _, msg := range msgs {
-		if msg.Role != "user" && msg.Role != "assistant" {
-			continue
+		switch msg.GetRole() {
+		case "user", "assistant":
+			if strings.TrimSpace(msg.GetContent()) != "" {
+				out = append(out, &AgentDebugMessage{Role: msg.GetRole(), Content: msg.GetContent()})
+			}
+			for _, tc := range msg.GetToolCalls() {
+				out = append(out, &AgentDebugMessage{
+					Role:     "tool", // 语义角色仍是 tool（Kind 再细分调用/结果）
+					Kind:     DebugKindToolCall,
+					ToolName: tc.GetName(),
+					ToolArgs: tc.GetArgumentsJson(),
+				})
+			}
+		case "tool":
+			out = append(out, &AgentDebugMessage{
+				Role:    "tool",
+				Kind:    DebugKindToolResult,
+				Content: msg.GetContent(),
+				IsError: toolResultIsError(msg.GetContent()),
+			})
 		}
-		if strings.TrimSpace(msg.Content) == "" {
-			continue
-		}
-		out = append(out, &AgentDebugMessage{Role: msg.Role, Content: msg.Content})
 	}
 	return out
+}
+
+// isConversationEntry 报告是否为「一条对话消息」（文本气泡）。
+// 工具卡是某条消息的附属过程，不占 history_shows 的名额——否则 20 条里只能塞下
+// 三四个来回，回显量骤减。
+func isConversationEntry(m *AgentDebugMessage) bool {
+	return m != nil && m.Kind == "" && (m.Role == "user" || m.Role == "assistant")
+}
+
+// countConversationMessages 数回放条目里的对话消息条数（忽略工具卡）。
+func countConversationMessages(entries []*AgentDebugMessage) int {
+	n := 0
+	for _, e := range entries {
+		if isConversationEntry(e) {
+			n++
+		}
+	}
+	return n
+}
+
+// tailEntryCountForMessages 从尾部数 n 条对话消息，返回它们（含各自工具卡）占用的
+// 条目数，用于「初始只显示最近 n 条消息」。不足 n 条时返回全部条目数。
+func tailEntryCountForMessages(entries []*AgentDebugMessage, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	seen := 0
+	for i := len(entries) - 1; i >= 0; i-- {
+		if !isConversationEntry(entries[i]) {
+			continue
+		}
+		seen++
+		if seen == n {
+			return len(entries) - i
+		}
+	}
+	return len(entries)
+}
+
+// toolResultIsError 判定工具结果是否失败：工具统一在结果尾部附 [exit_code: N]
+// （见各工具的结果格式化），N != 0 即失败。没有该标记的一律按成功处理。
+func toolResultIsError(content string) bool {
+	const marker = "[exit_code: "
+	i := strings.LastIndex(content, marker)
+	if i < 0 {
+		return false
+	}
+	rest := content[i+len(marker):]
+	end := strings.IndexByte(rest, ']')
+	if end < 0 {
+		return false
+	}
+	code := strings.TrimSpace(rest[:end])
+	return code != "" && code != "0"
 }
 
 // seedSessionPromptFromLog 从会话日志恢复上次成功请求的用量锚点（含请求信封指纹），

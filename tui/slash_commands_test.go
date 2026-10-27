@@ -74,10 +74,10 @@ func TestSlashCompletionGroupFolding(t *testing.T) {
 	// 进入 /cron 分组 → 展示全部子命令
 	m.input.SetValue("/cron ")
 	m.updateCompletion()
-	if !m.completion.active || len(m.completion.items) != 5 {
-		t.Fatalf("/cron 子菜单 = %+v, want 5 个子命令", m.completion.items)
+	if !m.completion.active || len(m.completion.items) != 6 {
+		t.Fatalf("/cron 子菜单 = %+v, want 6 个子命令", m.completion.items)
 	}
-	for _, want := range []string{"/cron list", "/cron add", "/cron remove", "/cron on", "/cron off"} {
+	for _, want := range []string{"/cron list", "/cron add", "/cron remove", "/cron on", "/cron off", "/cron notify"} {
 		found := false
 		for _, it := range m.completion.items {
 			if it.label == want {
