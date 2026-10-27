@@ -2119,12 +2119,43 @@ func toolArgValue(name, argsJSON string) string {
 	return ""
 }
 
-// clampToolArg 把工具主参截断到最大宽度，避免超长命令占满整行。
+// clampToolArg 把工具主参**折叠成单行**并截断到最大宽度。
+//
+// 折叠换行不是美化，是布局正确性：参数里带 \n（`powershell -Command "…"` 的
+// 多行脚本、heredoc 命令）时，第二行会从终端第 0 列开始输出，卡片那条「● Verb(arg)」
+// 的左边距被撕开，看上去就是整块向左歪。卡片是单行结构，任何换行都必须在进卡片前
+// 变成空格。
 func clampToolArg(arg string, max int) string {
+	arg = singleLine(arg)
 	if r := []rune(arg); len(r) > max {
 		return string(r[:max]) + "…"
 	}
 	return arg
+}
+
+// singleLine 把任意文本压成一行：CR / LF / TAB 与连续空白统一折叠为一个空格。
+// 与 core.CollapseCarriageReturns 的分工：那个保留「一行内最后一个 \r 段」（进度条
+// 语义），这里是把整个文本变成一行（卡片标题语义）。
+func singleLine(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	pendingSpace := false
+	for _, r := range s {
+		switch r {
+		case '\r', '\n', '\t', ' ':
+			pendingSpace = true
+			continue
+		}
+		if pendingSpace && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		pendingSpace = false
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // renderToolCall 以 REX 式卡片渲染工具调用：● Verb(arg)。
