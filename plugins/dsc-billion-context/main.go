@@ -135,7 +135,7 @@ func main() {
 	// 注册 4 个工具
 	sdkInst.Tool(dsc.Tool{
 		Name:        "compress",
-		Description: "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed (no longer needed for the current task step). Batch form: content=[{startId,endId,summary,topic?}].",
+		Description: "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed (no longer needed for the current task step). The session's first user message (the original request) is never compressible — it stays verbatim, so you always know what this session is for. Batch form: content=[{startId,endId,summary,topic?}].",
 		Handler:     bc.handleCompress,
 		Schema: json.RawMessage(`{
   "type": "object",
@@ -148,7 +148,7 @@ func main() {
         "properties": {
           "startId": {"type": "string", "description": "Message ref of range start (mNNNNN or bN for tier escalation)"},
           "endId":   {"type": "string", "description": "Message ref of range end (inclusive)"},
-          "summary": {"type": "string", "description": "Your detailed summary of the range (preserves key facts, decisions, code references)"},
+          "summary": {"type": "string", "description": "Your detailed summary of the range. Must preserve, in this order of importance: the task goal and any acceptance criteria stated in it, decisions made, key facts and values, exact paths:lines, and code references. A summary that only lists tool calls is useless — the next turn needs to know what the work is for."},
           "topic":   {"type": "string", "description": "Optional topic label for the block (helps later search)"}
         },
         "required": ["startId", "endId", "summary"]

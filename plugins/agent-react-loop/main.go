@@ -1537,6 +1537,15 @@ func fitMessagesToWindowTo(msgs []*proto.Message, window, effectiveTokens, budge
 	if msgs[0].Role == "system" {
 		head = 1
 	}
+	// 不可裁的头部，除了 system 还要保住**第一条 user 消息**：它是原始需求的载体。
+	// 丢历史可以，丢"这一轮到底要做什么"不行——裁掉之后，压缩过的上下文里剩下的
+	// 就只有工具调用记录，模型于是反过来问用户「我确认一下现在要做的是哪件事」。
+	for head < len(msgs) && msgs[head].Role != "user" {
+		head++
+	}
+	if head < len(msgs) {
+		head++ // 含首条 user 自身
+	}
 	// 逐条 token 与后缀累计，避免对每个候选起点重算整段
 	toks := make([]int, len(msgs))
 	for i, m := range msgs {
