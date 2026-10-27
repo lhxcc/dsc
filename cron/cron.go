@@ -10,7 +10,8 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"time"
+
+	"dsc/jobs"
 )
 
 // Job 一条定时任务定义。
@@ -174,7 +175,9 @@ func (s *Store) writeLocked() error {
 	return nil
 }
 
-// newID 生成任务 id：时间戳毫秒（调用方保证单进程内唯一）。
+// newID 生成任务 id：<cron>-<7 位小写十六进制短哈希>。
+// 标识必须跨进程、跨会话唯一——旧的毫秒时间戳虽然不重号，但长得没法在通知和
+// 斜杆命令里一眼对上；短哈希与后台任务、workflow 运行同一套形态。
 func newID() string {
-	return fmt.Sprintf("cron-%d", time.Now().UnixMilli())
+	return jobs.ShortID("cron")
 }

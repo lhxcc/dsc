@@ -107,23 +107,28 @@ type Registry struct {
 	logger        hclog.Logger // 监听器 panic 等内部错误的日志出口；nil 则静默
 }
 
-// newJobID 生成 Git 风格的短哈希任务标识：<kind>-<7 位十六进制>。
+// ShortID 生成 Git 风格的短哈希标识：<kind>-<7 位小写十六进制>。
 //
-// 旧实现用注册表内自增序号（shell-1、shell-2、…）：序号在每个进程里都从 1 重新
-// 开始，于是一个超长会话跨几次重启就会攒出十几个 shell-1，完成通知里
-// 「background job shell-1 finished」根本指认不出是哪一个任务，job_output 也会
-// 指到别的世代上。短哈希每次生成都独立（28 位熵，取自 crypto/rand），与进程、
-// 会话长度都无关；同表内偶发碰撞由 exists 兜底重生成。
+// 所有「需要人类可读唯一标识」的地方共用它：后台任务（Registry.Start）、
+// 定时任务、workflow 运行。熵取自 crypto/rand 的 4 字节（展示 28 位），
+// 与进程、会话长度都无关——旧的「进程内自增序号」每重启一次就从 1 重来，
+// 超长会话里会攒出十几个同名标识，通知与查询都无法指认是哪一个。
+//
+// 需要同表查重时（如后台任务表）用 newJobID；单次生成用它。
+func ShortID(kind string) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 不可用（极罕见）：退回纳秒时间熵，仍带低位噪声
+		n := time.Now().UnixNano()
+		b = [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+	}
+	return kind + "-" + hex.EncodeToString(b[:])[:7]
+}
+
+// newJobID 生成后台任务标识（同表内查重，撞了就重生成）。
 func newJobID(kind string, exists func(string) bool) string {
 	for i := 0; i < 16; i++ {
-		var b [4]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			// crypto/rand 不可用（极罕见）：退回纳秒时间熵，仍带低位噪声
-			n := time.Now().UnixNano()
-			b = [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
-		}
-		id := kind + "-" + hex.EncodeToString(b[:])[:7]
-		if !exists(id) {
+		if id := ShortID(kind); !exists(id) {
 			return id
 		}
 	}
