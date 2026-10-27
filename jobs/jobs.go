@@ -14,6 +14,8 @@
 package jobs
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -100,10 +102,33 @@ type Registry struct {
 	mu            sync.Mutex
 	jobs          map[string]*Job
 	order         []string // 启动顺序（List 按此返回）
-	seq           int
 	doneListeners map[int]func(JobSnapshot) // 完成监听器（contained，落定时通知）
 	nextListener  int
 	logger        hclog.Logger // 监听器 panic 等内部错误的日志出口；nil 则静默
+}
+
+// newJobID 生成 Git 风格的短哈希任务标识：<kind>-<7 位十六进制>。
+//
+// 旧实现用注册表内自增序号（shell-1、shell-2、…）：序号在每个进程里都从 1 重新
+// 开始，于是一个超长会话跨几次重启就会攒出十几个 shell-1，完成通知里
+// 「background job shell-1 finished」根本指认不出是哪一个任务，job_output 也会
+// 指到别的世代上。短哈希每次生成都独立（28 位熵，取自 crypto/rand），与进程、
+// 会话长度都无关；同表内偶发碰撞由 exists 兜底重生成。
+func newJobID(kind string, exists func(string) bool) string {
+	for i := 0; i < 16; i++ {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			// crypto/rand 不可用（极罕见）：退回纳秒时间熵，仍带低位噪声
+			n := time.Now().UnixNano()
+			b = [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+		}
+		id := kind + "-" + hex.EncodeToString(b[:])[:7]
+		if !exists(id) {
+			return id
+		}
+	}
+	// 极端兜底：连撞 16 次也给一个唯一标识，绝不返回空 id
+	return fmt.Sprintf("%s-%d", kind, time.Now().UnixNano())
 }
 
 // SetLogger 注入注册表内部日志出口（监听器 panic 等），便于问题可追溯。
@@ -174,8 +199,10 @@ func (r *Registry) Start(spec StartSpec) (string, error) {
 		return "", err
 	}
 	r.mu.Lock()
-	r.seq++
-	id := fmt.Sprintf("%s-%d", spec.Kind, r.seq)
+	id := newJobID(spec.Kind, func(cand string) bool {
+		_, exists := r.jobs[cand]
+		return exists
+	})
 	j := &Job{
 		snapshot: JobSnapshot{
 			ID: id, Kind: spec.Kind, Label: spec.Label,
@@ -376,6 +403,85 @@ func (r *Registry) KillHost(id, reason string) (KillResult, error) {
 		return "", fmt.Errorf("jobs: unknown job %q", id)
 	}
 	return r.killLocked(j, reason), nil
+}
+
+// Claim 声明「有调用方正同步等待这个任务的结果」：落定时不发完成通知
+// （等待方自己就会把输出交出去，再通知一次纯属重复）。
+//
+// 与 Wait 内部的 Awaited 同一语义，区别是**可以撤销**：前台宽限期场景里，
+// 宽限内跑完就 Claim 着收结果，超时转后台时必须 Release 回来，否则这条任务
+// 落定时会一声不响——恰好是「长任务完成没人知道」的老毛病。
+func (r *Registry) Claim(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	if !ok {
+		return fmt.Errorf("jobs: unknown job %q", id)
+	}
+	j.snapshot.Awaited = true
+	return nil
+}
+
+// Release 撤销 Claim（任务落定时恢复完成通知）。未知 id 静默忽略（幂等）。
+func (r *Registry) Release(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if j, ok := r.jobs[id]; ok {
+		j.snapshot.Awaited = false
+	}
+}
+
+// AwaitBudget 有界等待落定：期限内完成则返回终态快照与最终输出，
+// 到期未完成则返回当前（running）快照并报告未完成——**不取消任务**。
+//
+// 与 Wait 的差别：不认领结果（Awaited 由调用方经 Claim 决定），超时后任务
+// 继续在后台跑、落定时仍走正常完成通知。用于「前台执行宽限期」：
+//   - 宽限内跑完 → 当作一次普通同步工具调用，结果直接返回给模型；
+//   - 超时 → 把 job id 交给模型，任务转入后台，完成时照常通知。
+func (r *Registry) AwaitBudget(id string, d time.Duration) (JobSnapshot, string, bool) {
+	r.mu.Lock()
+	j, ok := r.jobs[id]
+	if !ok {
+		r.mu.Unlock()
+		return JobSnapshot{}, "", false
+	}
+	if isTerminalStatus(j.snapshot.Status) {
+		snap, out := j.snapshot, j.output
+		r.mu.Unlock()
+		return snap, out, true
+	}
+	settled := j.settled
+	r.mu.Unlock()
+
+	select {
+	case <-settled:
+		r.mu.Lock()
+		snap, out := j.snapshot, j.output
+		r.mu.Unlock()
+		return snap, out, true
+	case <-time.After(d):
+		r.mu.Lock()
+		snap := j.snapshot
+		r.mu.Unlock()
+		return snap, "", false
+	}
+}
+
+// Discard 删除一个任务记录（宿主内部瞬时任务用：宽限期内跑完的前台命令
+// 就是一次普通工具调用，没有理由在 job_list 里留一条 finished 记录）。
+func (r *Registry) Discard(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.jobs[id]; !ok {
+		return
+	}
+	delete(r.jobs, id)
+	for i, x := range r.order {
+		if x == id {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // Wait 有界等待落定（不取消任务）：超时返回存活快照；落定后返回终态快照并

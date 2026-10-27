@@ -51,6 +51,14 @@ type Tool struct {
 // 与宿主 core 侧同名常量同值（对齐同一 wire token，见 proto.Tool.capabilities 注释）。
 const CapabilityRequiresNeverApproval = "requires-never-approval"
 
+// CapabilityAutoBackground 声明式能力标签：本工具的前台调用由宿主按「后台登记 +
+// 前台宽限期」执行——宽限期内（默认 30s）跑完就当作普通工具结果返回，超时则返回
+// job_id、任务转入后台继续跑（完成时照常通知）。
+//
+// 声明它的应当是「可能长时间阻塞」的工具（典型是 shell 命令）。不声明则一切照旧。
+// 与宿主 core 侧同名常量同值（同一 wire token）。
+const CapabilityAutoBackground = "auto-background"
+
 // toolGRPCPlugin 是 go-core 适配器：注册 ToolService + PluginMetadata +
 // PluginHookService（钩子为可选注册，未设置时为空实现，宿主调用无副作用）。
 type toolGRPCPlugin struct {

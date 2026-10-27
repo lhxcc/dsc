@@ -2,9 +2,13 @@ package jobs
 
 import (
 	"errors"
+	"regexp"
 	"testing"
 	"time"
 )
+
+// shortJobIDRe 任务标识形态：<kind>-<7 位小写十六进制>（Git 风格短哈希）。
+var shortJobIDRe = regexp.MustCompile(`^[a-z][a-z0-9_]*\-[0-9a-f]{7}$`)
 
 // waitStatus 轮询等待任务落定为指定状态。
 func waitStatus(t *testing.T, r *Registry, id string, want JobStatus) {
@@ -42,7 +46,7 @@ func TestRegistryLifecycle(t *testing.T) {
 			return JobHooks{Done: done}, nil
 		},
 	})
-	if err != nil || id != "workflow-1" {
+	if err != nil || !shortJobIDRe.MatchString(id) {
 		t.Fatalf("start = %q, %v", id, err)
 	}
 	if snap, _ := r.Get(id, ""); snap.Status != StatusRunning {
@@ -103,9 +107,13 @@ func TestRegistryLifecycle(t *testing.T) {
 		t.Fatal("unknown job should fail")
 	}
 
-	// List 按启动顺序
+	// List 按启动顺序（标识是随机短哈希，不可预测，故按启动时拿到的 id 比对）
 	all := r.List("")
-	if len(all) != 3 || all[0].ID != "workflow-1" || all[2].ID != "workflow-3" {
+	seen := map[string]bool{}
+	for _, j := range all {
+		seen[j.ID] = true
+	}
+	if len(all) != 3 || all[0].ID != id || all[2].ID != id3 || len(seen) != 3 {
 		t.Fatalf("list = %+v", all)
 	}
 }

@@ -231,7 +231,18 @@ func main() {
 			"filesystem": "true",
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "shell", Description: description, Schema: schema, Handler: handler, ViewFn: shellView})
+	// shell 可能长时间阻塞（起服务、等端口、跑测试）：声明自动后台能力，由宿主
+	// 按「后台登记 + 前台宽限期」执行——宽限内跑完是普通工具结果，超时转后台并
+	// 返回 job id，完成时照常通知。不这样的话一条长命令会占死整个 step，
+	// 期间任何插话/完成通知都只能等它跑完。
+	sdk.Tool(dsc.Tool{
+		Name:         "shell",
+		Description:  description,
+		Schema:       schema,
+		Handler:      handler,
+		ViewFn:       shellView,
+		Capabilities: []string{dsc.CapabilityAutoBackground},
+	})
 	sdk.Serve()
 }
 
