@@ -25,15 +25,23 @@ func TestProcessTurnSyncsBlocks(t *testing.T) {
 		StartRef: "m00000", EndRef: "m00001", EffectiveMessageIDs: []string{"u1", "a1"},
 	})
 
-	// 视图里已完全没有该块的消息（等价于历史被裁剪/替换）
+	// 视图里已完全没有该块的消息（等价于历史被裁剪 / history_injection 只带最近 N 条）
 	gone := []CoreMessage{{ID: "x1", Role: RoleUser, Text: "fresh start"}}
-	_ = ProcessTurn(gone, state, config, 100)
+	res := ProcessTurn(gone, state, config, 100)
 
 	if len(state.Blocks) != 1 {
-		t.Fatalf("块不应被删除（只停用），got %d", len(state.Blocks))
+		t.Fatalf("块不应被删除，got %d", len(state.Blocks))
 	}
-	if state.Blocks[0].Active {
-		t.Fatal("视图中不存在的块应被 sync-blocks 停用")
+	// 缺席 ≠ 消失：停用会写回状态，用户把配置改回来（或换回大窗口）也复原不了
+	// 这些压缩收益。视图是临时的，状态必须留着。
+	if !state.Blocks[0].Active {
+		t.Fatal("块覆盖的消息只是本轮缺席，不得永久停用")
+	}
+	// 但摘要也不能注入：模型看不到原文，一段「幽灵摘要」白占前缀。
+	for _, m := range res.Messages {
+		if strings.Contains(m.Text, "early talk") {
+			t.Fatalf("本轮视图不含该块的消息，不应注入其摘要：%q", m.Text)
+		}
 	}
 }
 

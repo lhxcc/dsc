@@ -75,6 +75,7 @@ func FromCoreMessages(coreMsgs []bcacp.CoreMessage) []*proto.Message {
 	out := make([]*proto.Message, 0, len(coreMsgs))
 	for _, cm := range coreMsgs {
 		pm := &proto.Message{
+			Id:      cm.ID,
 			Role:    string(cm.Role),
 			Content: cm.Text,
 		}
@@ -97,21 +98,22 @@ func FromCoreMessages(coreMsgs []bcacp.CoreMessage) []*proto.Message {
 	return out
 }
 
-// defaultIDProvider 默认 ID 提供者：**以消息在原始历史中的位置作为身份**。
+// defaultIDProvider 取消息身份：宿主下发的稳定 id（proto.Message.id，派生时按
+// surface 事件的 seq 填）。
 //
-// 为什么不是内容 hash：两条内容相同的消息（重复的"继续"、两次相同 compile 输出、
-// 相同工具结果）会得到同一个 ID，于是 MessageRefs.ByRaw 互相覆盖、CoveredMessageIDs
-// 判定错位——压缩会命中错误的消息。acp-kernel 里 ID 由宿主会话日志提供（天然唯一），
-// DSC 的 proto.Message 没有 id/seq 字段，位置就是最接近的等价物。
+// 没有 id 就返回空串——**不得**退回列表下标。下标是列表位置，请求级裁剪、
+// history_injection 只带最近 N 条、fork 都会让它整体平移，于是同一个引用指到
+// 另一条消息，压缩块遮错内容（实测渲染从 765K 塌到 1.9K，整段对话只剩两条）。
+// 那种「退回旧方案」的分支只会让这个错误在没人注意的地方复发：宁可不压（空 id
+// 的消息不参与压缩），也不要压错。
 //
-// 位置为什么稳定：pre-step 每轮收到的是 agent 的 append-only 原始历史（插件的改写
-// 只影响发给 LLM 的视图，不回写 agent 历史），因此同一消息在跨轮的位置不变；
-// 压缩/prune 造成的"视图平移"发生在渲染之后，不参与下一轮的 ID 分配。
-//
-// 注意：状态里若残留旧版（内容 hash）ID 的块，升级后首轮因 ID 失配会被 sync-blocks
-// 停用，等于一次性重新建立压缩记录；这是从错误 ID 迁移出来的一次性代价。
-func defaultIDProvider(idx int, _ *proto.Message) string {
-	return fmt.Sprintf("msg-%d", idx)
+// 内容 hash 也不行：重复内容（两次「继续」、两次相同编译输出）会撞成同一个 id。
+// 事件的 seq 天然唯一，且与派生范围无关。
+func defaultIDProvider(_ int, msg *proto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.Id
 }
 
 // PluginName 是本插件名（与 sdk.Config.Name 同源）。
@@ -165,8 +167,14 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		// 损坏的 state 文件：重建（避免阻塞会话）
 		st = *bcacp.CreateInitialState()
+	} else if st.Schema != bcacp.StateSchema {
+		// 格式版本不符：不解读、不迁移，整个丢弃。压缩记录由会话事件日志重建
+		// （compress 调用自带范围与摘要，重放即可复原），旧格式不保留兼容分支。
+		fmt.Fprintf(os.Stderr, "[billion-context] state schema %d != %d: discarded, will rebuild from the session log\n",
+			st.Schema, bcacp.StateSchema)
+		st = *bcacp.CreateInitialState()
 	} else {
-		// 确保map初始化（旧版本可能缺少字段）
+		// map 写成 null（手工编辑、半截写入）时补初始化：写回 nil map 会 panic。
 		if st.MessageRefs.ByRaw == nil {
 			st.MessageRefs.ByRaw = map[string]string{}
 		}

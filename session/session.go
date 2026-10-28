@@ -368,9 +368,10 @@ func (s *Session) DeriveMessagesLimited(injectCount int) []*proto.Message {
 	// 从 surface node 0 派生 system prompt（v3 设计：surface 全权负责）
 	skipNode0System := false
 	if len(s.surfaceNodes) > 0 {
-		if d, ok := s.events[s.surfaceNodes[0]].Data.(*SystemMessageData); ok {
+		node0 := s.events[s.surfaceNodes[0]]
+		if d, ok := node0.Data.(*SystemMessageData); ok {
 			if d.Content != "" {
-				msgs = append(msgs, &proto.Message{Role: "system", Content: d.Content})
+				msgs = append(msgs, &proto.Message{Id: messageID(node0), Role: "system", Content: d.Content})
 				skipNode0System = true
 			}
 			// 空 content 节点：不派生 system 消息，但保留位置（遍历时 deriveEventMessage
@@ -523,30 +524,42 @@ func deriveMessageRole(ev *Event) string {
 // deriveEventMessage 单事件投影：surface 事件 → 消息；log-only 事件 → nil。
 // system/message 空 content 投影为 nil（保留 surface 位置但不发模型消息，
 // 对齐 DSH "空内容 system 节点投影为 null" 设计）。
+// messageID 返回一条派生消息的稳定标识：直接用其 surface 事件的 seq。
+//
+// 为什么必须是 seq：消息内容会变（工具结果被 TOON 规范化、compress 块被替换），
+// 列表下标更会变（请求级裁剪、历史注入只带最近 N 条）。seq 是事件日志里的位置，
+// append-only 且与派生范围无关——同一个事件永远派生出同一个 id。
+//
+// 消费方（如压缩后端的消息引用）据此跨请求指认同一条消息；拿下标当 id 会在裁剪
+// 发生的下一步整体错位，指认落到别的消息身上。
+func messageID(ev *Event) string {
+	return fmt.Sprintf("e%d", ev.Seq)
+}
+
 func deriveEventMessage(ev *Event) *proto.Message {
 	switch d := ev.Data.(type) {
 	case *UserMessageData:
-		return &proto.Message{Role: "user", Content: d.Content, Images: d.Images}
+		return &proto.Message{Id: messageID(ev), Role: "user", Content: d.Content, Images: d.Images}
 	case *AssistantMessageData:
 		// 内容为空且无工具调用时跳过（同 DSH：空 assistant 不得进入模型历史）。
 		if d.Content == "" && len(d.ToolCalls) == 0 {
 			return nil
 		}
-		m := &proto.Message{Role: "assistant", Content: d.Content}
+		m := &proto.Message{Id: messageID(ev), Role: "assistant", Content: d.Content}
 		if len(d.ToolCalls) > 0 {
 			m.ToolCalls = d.ToolCalls
 		}
 		return m
 	case *ToolResultData:
-		return &proto.Message{Role: "tool", Content: toonizeToolContent(d.Content), ToolCallId: d.CallID, Images: d.Images}
+		return &proto.Message{Id: messageID(ev), Role: "tool", Content: toonizeToolContent(d.Content), ToolCallId: d.CallID, Images: d.Images}
 	case *CompactionSummaryData:
-		return &proto.Message{Role: "user", Content: d.Content}
+		return &proto.Message{Id: messageID(ev), Role: "user", Content: d.Content}
 	case *SystemMessageData:
 		// 空 content 投影为 nil（保留 surface 位置但不派生模型消息）
 		if d.Content == "" {
 			return nil
 		}
-		return &proto.Message{Role: "system", Content: d.Content}
+		return &proto.Message{Id: messageID(ev), Role: "system", Content: d.Content}
 	}
 	return nil
 }

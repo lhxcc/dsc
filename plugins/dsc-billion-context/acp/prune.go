@@ -551,7 +551,10 @@ func collectSummaryAnchors(messages []CoreMessage, state *CompressionState, inde
 			}
 		}
 		if earliest < 0 {
-			earliest = 0
+			// 块覆盖的消息本轮一条都不在（history_injection 只带最近 N 条、宿主裁剪）：
+			// 摘要没有可落的位置，跳过。把摘要塞到 0 位置等于给模型一段它看不到原文的
+			// 「幽灵摘要」，白占前缀还不稳定。
+			continue
 		}
 		earliest = pairSafeAnchorIndex(messages, earliest)
 		anchors = append(anchors, summaryAnchor{

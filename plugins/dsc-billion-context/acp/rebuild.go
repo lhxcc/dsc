@@ -2,6 +2,7 @@ package acp
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -43,22 +44,62 @@ type compressCallRecord struct {
 	succeed bool
 }
 
+// CompressCallArgs 返回一条 compress 调用消息的参数文本。
+//
+// 优先正文，正文为空时取工具调用参数：消息经 adapter 规范化之后，调用的规范化表示
+// 在 ToolCalls[].Arguments 里，正文（Content）通常是空的。只看正文会让**整条重放链
+// 静默失效**——状态文件不可用时就再也复原不出任何压缩块（实测重放 0 个块，视图
+// 弹回 1.66M，直接撞窗口）。
+func CompressCallArgs(m *CoreMessage) string {
+	if s := strings.TrimSpace(m.Text); s != "" {
+		return s
+	}
+	for _, tc := range m.ToolCalls {
+		if tc.Name == "compress" && strings.TrimSpace(tc.Arguments) != "" {
+			return tc.Arguments
+		}
+	}
+	return ""
+}
+
 // ParseCompressArgs 见 compressparse.go（宽松解析：围栏/尾逗号/截断救援/字段变体）。
 
-// compressResultOK 解析 tool-result JSON，报告 blocksCreated>0。
+// compressResultOK 报告一条 compress 结果是否真的建过块（blocksCreated > 0）。
+//
+// 必须同时认两种形态：**JSON**（直接调用/测试）与 **TOON**（真实会话的派生历史——
+// 结构化工具结果在派生层被转成表式表示，形如 "blocksCreated: 1" 一行，没有花括号）。
+// 只认 JSON 会让真实会话的重放恒判失败：状态文件不可用时一个块也复原不出来，
+// 视图弹回全量（实测 1.66M）再撞窗口——这正是「丢弃旧状态、靠日志重建」那条路的地基。
 func compressResultOK(text string) bool {
-	start := strings.Index(text, "{")
-	if start < 0 {
-		return false
+	// JSON 形态：取第一个 '{' 起解析
+	if start := strings.Index(text, "{"); start >= 0 {
+		var res struct {
+			OK            bool `json:"ok"`
+			BlocksCreated int  `json:"blocksCreated"`
+		}
+		if err := json.Unmarshal([]byte(text[start:]), &res); err == nil {
+			return res.OK && res.BlocksCreated > 0
+		}
 	}
-	var res struct {
-		OK            bool `json:"ok"`
-		BlocksCreated int  `json:"blocksCreated"`
+	// TOON 形态：逐行找 "blocksCreated: N"，并排除显式的失败标记
+	ok := true
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "blocksCreated"):
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "blocksCreated"))
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, ":"))
+			n, err := strconv.Atoi(rest)
+			return err == nil && n > 0 && ok
+		case strings.HasPrefix(line, "ok"):
+			rest := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "ok")))
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, ":"))
+			if rest == "false" {
+				ok = false
+			}
+		}
 	}
-	if err := json.Unmarshal([]byte(text[start:]), &res); err != nil {
-		return false
-	}
-	return res.OK && res.BlocksCreated > 0
+	return false
 }
 
 // RebuildStateFromMessages 从消息列表重放压缩事件流重建 state。
@@ -82,7 +123,7 @@ func RebuildStateFromMessages(messages []CoreMessage, config Config) (*Compressi
 		if m.ContentType != ContentTypeToolCall || m.ToolName != "compress" || m.ToolCallID == "" {
 			continue
 		}
-		ranges := ParseCompressArgs(m.Text)
+		ranges := ParseCompressArgs(CompressCallArgs(m))
 		if len(ranges) == 0 {
 			continue
 		}

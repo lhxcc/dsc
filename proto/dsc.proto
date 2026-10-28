@@ -164,6 +164,10 @@ message Message {
   string tool_call_id = 3;   // 用于 tool 角色关联
   repeated ToolCall tool_calls = 4;  // 用于 assistant 角色回传工具调用（OpenAI 格式必需）
   repeated string images = 5;  // 图像内容寻址引用（dsc-img:// 持久附件 / dsc-shot:// 操作截图；user 消息与工具结果消息承载）
+  // 稳定消息标识：宿主派生历史时按「surface 事件的 seq」填写，与会话日志一一对应、
+  // 永不随派生范围变化。任何需要跨请求指认某条消息的组件（压缩后端等）都必须用它，
+  // 不能拿列表下标——请求级裁剪/历史注入会让下标整体平移，指认随即错位。
+  string id = 6;
 }
 
 message Tool {
