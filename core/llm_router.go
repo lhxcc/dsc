@@ -307,17 +307,20 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 
 	surface := EstimateProtoMessagesTokens(msgs) + toolsTokens
 	trimmed, dropped := msgs, 0
-	if s.m.contextWindow > 0 {
-		inflation := s.m.estimateInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, s.m.contextWindow)
+	// 窗口取「配置值」与「provider 亲口报过的上限」的较小者：被 4xx 教过一次之后，
+	// 就不必每次都去撞那面墙。
+	window := s.m.effectiveWindow(session)
+	if window > 0 {
+		inflation := s.m.ceilingInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, window)
 		var before, after int
-		trimmed, dropped, before, after = enforceRequestCeiling(msgs, toolsTokens, s.m.contextWindow, inflation)
+		trimmed, dropped, before, after = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
 		surface = after
 		if dropped > 0 {
 			s.m.logger.Warn("llm request: trimmed to fit the context window",
 				"session", session, "dropped", dropped,
 				"messages", len(msgs), "kept", len(trimmed),
 				"estimated_before", before, "estimated_after", after,
-				"window", s.m.contextWindow, "inflation", inflation,
+				"window", window, "inflation", inflation,
 				"hint", "改写后的视图仍超窗口：已按滑动窗口丢弃最旧的一段（会话日志不动）；压缩后端应在自己阈值内正常压缩，而不是靠紧急压缩擦超窗")
 		}
 	}
@@ -395,6 +398,9 @@ func (m *Manager) recordSessionAnchor(sessionID string, a sessionUsageAnchor) {
 	if sessionID == "" || a.promptTokens <= 0 {
 		return
 	}
+	// 成功的请求证明「当前预算可用」：清掉超窗时学到的临时收紧（一次异常不该让这个
+	// 会话永远按放大系数裁）。系统性的偏差由这个锚点继续持有（estimateInflation）。
+	m.clearOverflow(sessionID)
 	m.sessionAnchorMu.Lock()
 	defer m.sessionAnchorMu.Unlock()
 	m.sessionAnchors[sessionID] = a
@@ -449,6 +455,15 @@ func (s *llmAggregateServer) emitRequestError(ctx context.Context, req *proto.Ch
 	code := "unknown"
 	if isContextWindowExceeded(err) {
 		code = "context_window_exceeded"
+	}
+	// 超窗的处置权在宿主，不派给插件：那条路只能产出无内容的占位摘要（固定模板 /
+	// 强制截断），一次就把几百条真实消息永久埋掉。这里改为「记住 provider 的实测值与
+	// 上限 → 收紧本会话预算 → 要求重试」，重试时 pre-step 收口会滑窗（会话日志不动）。
+	if code == "context_window_exceeded" {
+		sent := EstimateProtoMessagesTokens(req.GetMessages()) + EstimateProtoToolTokens(req.GetTools())
+		actual, max := overflowParse(err.Error())
+		s.m.noteOverflow(req.GetSessionId(), actual, max, sent)
+		return true
 	}
 	result, _ := s.m.dispatchEventToPlugins(EventAgentRequestError, AgentRequestErrorEvent{
 		Agent: s.m.GetMainAgentName(),

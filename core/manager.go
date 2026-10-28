@@ -195,6 +195,11 @@ type Manager struct {
 	// lspToolRegistered 标记 LSPTool 是否已注册到 ToolRegistry（避免重复注册）。
 	lspToolRegistered bool
 
+	// overflowAdj 每会话的「真实超窗」收紧记录（provider 4xx 教会我们的偏差/上限）。
+	// 见 core/overflow_adjust.go：超窗的处置权在宿主（滑窗），不在压缩插件的紧急压缩。
+	overflowMu  sync.Mutex
+	overflowAdj map[string]overflowAdjustment
+
 	// mcpClients MCP 客户端实例表（对齐 DSH packages/mcp/mcp-client）。
 	// 经 admin API /mcp/* 管理生命周期，discoverTools 自动注册 mcp__<server>__<rawName>
 	// 工具到 ToolRegistry。盘活 core/mcp_client.go 死模块。key = serverName。

@@ -226,39 +226,27 @@ func TestCompactionBasicLLMFailureDegrades(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicEmergencyRetainLast 溢出紧急压缩：保留最后 1 条、截断式摘要、
-// 返回 {"retry": true}；非溢出错误码不触发。
-func TestCompactionBasicEmergencyRetainLast(t *testing.T) {
-	s := newTestCompactionBasicServer(t, 1000) // 阈值 800：估算 7224 ≥ 阈值
-	s.retainMin = 10000                        // 保留预算盖过全部消息 → pre-step 不动作（全部落保留区）
-	msgs := bigMsgs(6, 1200)                   // 每条 1204 token（CJK 感知估算），共 7224
-	// 第一次 pre-step：估算超阈值但保留区覆盖全部 → 不改写
+// TestCompactionBasicIgnoresOverflowEvent 超窗的处置权归宿主（收紧预算 + 滑窗 + 重试），
+// 压缩驻留对 agent/request-error 一律不响应。
+//
+// 曾经这里会做「紧急压缩 → 返回 retry」：跳过 LLM、用截断摘要把一整段真实消息换成一句话，
+// 且落盘成块永久生效——比滑窗（只影响本次请求）严格更差。何况一次只压一个区间，不保证
+// 收敛（实测三次重试仍超窗）。
+func TestCompactionBasicIgnoresOverflowEvent(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 1000)
+	s.retainMin = 10000
+	msgs := bigMsgs(6, 1200)
 	if res := mustPreStep(t, s, msgs); res != "" {
 		t.Fatalf("all-in-retain pre-step must not rewrite, got %q", res)
 	}
-	// 紧急：压缩 [0,5)（保留最后 1 条）
 	res, err := s.handleHostEvent(context.Background(), "agent/request-error",
 		`{"agent":"a","code":"context_window_exceeded"}`)
-	if err != nil || res != `{"retry": true}` {
-		t.Fatalf("emergency must request retry, res %q err %v", res, err)
+	if err != nil || res != "" {
+		t.Fatalf("插件不应处理超窗事件，res %q err %v", res, err)
 	}
-	// 重试的 pre-step：指纹命中 → 应用改写
-	res2 := mustPreStep(t, s, msgs)
-	got := parseRewrite(t, res2)
-	if len(got) != 2 {
-		t.Fatalf("after emergency rewrite = %d messages, want 2", len(got))
-	}
-	if !strings.Contains(got[0].GetContent(), "emergency") {
-		t.Fatalf("emergency record must be marked, got %q", got[0].GetContent())
-	}
-	if got[1].GetContent() != msgs[5].GetContent() {
-		t.Fatalf("last message must be preserved")
-	}
-	// 非溢出错误码：不触发
-	res3, err := s.handleHostEvent(context.Background(), "agent/request-error",
-		`{"agent":"a","code":"rate_limited"}`)
-	if err != nil || res3 != "" {
-		t.Fatalf("non-overflow error must be ignored, got %q", res3)
+	// 状态没被改动：再来一次 pre-step 仍然不改写
+	if res := mustPreStep(t, s, msgs); res != "" {
+		t.Fatalf("不应因 request-error 产生压缩记录，got %q", res)
 	}
 }
 

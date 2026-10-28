@@ -73,11 +73,9 @@ type compactionState struct {
 // compactionBasicServer 基础压缩驻留（对齐宿主原 BasicCompactionEngine 语义：
 // 压力驱动 + 溢出紧急，保留尾部，LLM 摘要，截断式退化，防重入）。
 type compactionBasicServer struct {
-	mu          sync.Mutex
-	llm         llmChat // interconnect 聚合 LLM（未互联为 nil → 截断式退化）
-	compacting  bool    // 防重入：同一时间只允许一次压缩
-	lastMsgs    []*proto.Message
-	lastSession string
+	mu         sync.Mutex
+	llm        llmChat // interconnect 聚合 LLM（未互联为 nil → 截断式退化）
+	compacting bool    // 防重入：同一时间只允许一次压缩
 
 	window      int     // 上下文窗口 token 数（0 = 驻留禁用）
 	threshold   float64 // 压力触发阈值比例
@@ -146,8 +144,6 @@ func (s *compactionBasicServer) handleHostEvent(ctx context.Context, eventType, 
 	switch eventType {
 	case string(dsc.EventAgentPreStep):
 		return s.handlePreStep(ctx, dataJSON)
-	case string(dsc.EventAgentRequestError):
-		return s.handleRequestError(ctx, dataJSON)
 	default:
 		return "", nil
 	}
@@ -176,15 +172,13 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		}
 	}
 	// 轻载荷：宿主只把消息列表发给**持有压缩岗位**的插件，其余插件收到不带消息的
-	// 信封（副作用用 session / user_input 就够）。因此这里必须在写 lastMsgs 之前
-	// 返回——否则一旦本插件没当值，缓存会被清空，将来接手时紧急压缩没有材料可用。
+	// 信封（副作用用 session / user_input 就够）。没有消息就什么都不该做——尤其不能
+	// 建/写压缩记录（那等于让一个不在值班的插件改写自己的状态）。
 	if len(msgs) == 0 {
 		return "", nil
 	}
 	sess := s.sessionKey(ev.Session)
 	s.mu.Lock()
-	s.lastMsgs = msgs // 缓存供溢出紧急压缩使用（request-error 事件不带消息列表）
-	s.lastSession = sess
 	st := s.stateFor(sess)
 	// 指纹校验：历史被改写/回滚时丢弃记录从头评估
 	records := validRecords(msgs, st.Records)
@@ -252,7 +246,7 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		return "", nil
 	}
 
-	summary, id := s.summarize(ctx, msgs[base:retainIdx], false)
+	summary, id := s.summarize(ctx, msgs[base:retainIdx])
 	rec := compactionRecord{
 		UpTo:     retainIdx,
 		HeadHash: fingerprint(msgs[:retainIdx]),
@@ -266,84 +260,30 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	return rewriteJSON(applyRecords(msgs, st.Records))
 }
 
-// handleRequestError 溢出紧急压缩（agent/request-error 拦截）：
-// code=context_window_exceeded 时以截断式摘要压缩未压缩前段（保留最后 1 条，
-// 当前用户意图/在途上下文不动），返回 {"retry": true} 让宿主重走 pre-step + 重发。
-// 不调 LLM：溢出时再调大概率同样溢出（对齐 dsc-billion-context 紧急路径的取舍）。
-func (s *compactionBasicServer) handleRequestError(ctx context.Context, dataJSON string) (string, error) {
-	if s.window <= 0 {
-		return "", nil
-	}
-	var ev dsc.AgentRequestErrorEvent
-	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {
-		return "", fmt.Errorf("compaction-basic: parse request-error event: %w", err)
-	}
-	if ev.Code != "context_window_exceeded" {
-		return "", nil // 仅对上下文溢出触发；rate_limited 等不归压缩管
-	}
-	s.mu.Lock()
-	msgs := s.lastMsgs
-	sess := s.lastSession
-	s.mu.Unlock()
-	if len(msgs) < 2 {
-		return "", nil // 无缓存消息（未走过 pre-step）无法压缩
-	}
-	s.mu.Lock()
-	st := s.stateFor(sess)
-	records := validRecords(msgs, st.Records)
-	s.mu.Unlock()
-	base := 0
-	// v3 head 不变量：node 0（system/message）永不被压缩
-	if len(msgs) > 0 && msgs[0].GetRole() == "system" {
-		base = 1
-	}
-	if len(records) > 0 {
-		if r := records[len(records)-1].UpTo; r > base {
-			base = r
-		}
-	}
-	end := len(msgs) - 1 // 保留最后 1 条
-	if end <= base {
-		return "", nil // 无新可压缩段，重试同样的改写无意义
-	}
-	summary, id := s.summarize(ctx, msgs[base:end], true)
-	rec := compactionRecord{
-		UpTo:      end,
-		HeadHash:  fingerprint(msgs[:end]),
-		Summary:   summary,
-		Shadowed:  dsc.EstimateProtoMessagesTokens(msgs[base:end]),
-		ID:        id,
-		Emergency: true,
-	}
-	s.mu.Lock()
-	st.Records = append(records, rec)
-	s.mu.Unlock()
-	return `{"retry": true}`, nil
-}
-
 // summarize 生成 [region] 的摘要。LLM 路径：聚合 LLM 生成（对齐宿主引擎提示词与
 // maxTokens=窗口/8、下限 512）；LLM 未互联或失败：退化为截断式摘要（对齐宿主引擎
-// nil-LLM 路径）。emergency=true 强制截断式（溢出时不赌 LLM 可用）。
-func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.Message, emergency bool) (string, string) {
+// nil-LLM 路径）。
+//
+// 没有「紧急模式」这个参数了：超窗的处置权归宿主（滑窗），不再由本插件在
+// request-error 里做有损的紧急压缩——那会跳过 LLM、用截断摘要把整段真实消息永久埋掉。
+func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.Message) (string, string) {
 	id := fmt.Sprintf("compact-%d", time.Now().UnixMilli())
-	if !emergency {
+	s.mu.Lock()
+	llm := s.llm
+	busy := s.compacting
+	if llm != nil && !busy {
+		s.compacting = true
+	}
+	s.mu.Unlock()
+	if llm != nil && !busy {
+		summary, err := s.llmSummary(ctx, llm, region)
 		s.mu.Lock()
-		llm := s.llm
-		busy := s.compacting
-		if llm != nil && !busy {
-			s.compacting = true
-		}
+		s.compacting = false
 		s.mu.Unlock()
-		if llm != nil && !busy {
-			summary, err := s.llmSummary(ctx, llm, region)
-			s.mu.Lock()
-			s.compacting = false
-			s.mu.Unlock()
-			if err == nil && summary != "" {
-				return summary, id
-			}
-			// LLM 失败：退化截断式（不把失败上抛——压缩尽力而为）
+		if err == nil && summary != "" {
+			return summary, id
 		}
+		// LLM 失败：退化截断式（不把失败上抛——压缩尽力而为）
 	}
 	return truncateSummary(region), id
 }
@@ -430,15 +370,33 @@ func (s *compactionBasicServer) snapToPairBoundary(msgs []*proto.Message, idx in
 
 // truncateSummary 截断式退化摘要：取首条+末条拼接（对齐宿主引擎 truncateCompact，
 // 溢出安全：单侧内容截断到 2000 字符，防截断摘要本身仍超预算）。
+// truncateSummary 在 LLM 不可用时的退化摘要。
+//
+// 关键决定：**不保留被压缩区间的头部**。
+//
+// 区间是「最旧的一段历史」——一份积累了几十 MB 的会话，它的第一句往往是几十轮之前
+// 的话。把它原样搬进摘要，等于把一段早已结束的话题摆到模型眼前：模型会把它当成当前
+// 任务的起点（表现为回答一个早就答过的问题、或把旧结论当现状）。区间末尾才与当前
+// 工作衔接，所以只留末尾。
+//
+// 区间很短（1~2 条）时首尾都给：那种情况下原文本身信息量就小，一句计数不如两行原文。
+// 区间长时只给「压了多少」+ 末尾开头一句——摘要的作用是标示「这里被截断了」，不是
+// 假装自己复述了原文。
 func truncateSummary(region []*proto.Message) string {
 	if len(region) == 0 {
 		return ""
 	}
-	summary := "[压缩摘要] " + capText(region[0].GetContent())
-	if len(region) > 1 {
-		summary += "\n...\n" + capText(region[len(region)-1].GetContent())
+	last := capText(region[len(region)-1].GetContent())
+	head := fmt.Sprintf("[压缩摘要] 已省略 %d 条更早的消息（约 %d tokens）",
+		len(region), dsc.EstimateProtoMessagesTokens(region))
+	switch len(region) {
+	case 1:
+		return head + "：" + last
+	case 2:
+		return head + "\n最早：" + capText(region[0].GetContent()) + "\n最近：" + last
+	default:
+		return head + "\n最近一段：" + last
 	}
-	return summary
 }
 
 // truncateCap 截断式摘要单侧内容上限（字符）。

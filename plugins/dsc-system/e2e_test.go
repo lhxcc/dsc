@@ -652,32 +652,14 @@ func TestCompactionBasicE2E(t *testing.T) {
 		t.Fatalf("replay must be deterministic")
 	}
 
-	// 6. 紧急路径：窗口 1000 场景下 [0,3) 已压缩，request-error 压缩 [3,5)
-	//    （保留最后 1 条）→ {"retry": true}
-	if res := requestError("context_window_exceeded"); res != `{"retry": true}` {
-		t.Fatalf("emergency must request retry, got %q", res)
+	// 6. 超窗不再由本插件处理：处置权归宿主（收紧预算 + 滑窗 + 重试）。
+	//    曾经这里会做「紧急压缩 → 返回 retry」，但那只能写一段没有内容的占位摘要，
+	//    把整段真实消息永久埋掉；现在插件对 request-error 一律不响应。
+	if res := requestError("context_window_exceeded"); res != "" {
+		t.Fatalf("本插件不应再处理超窗（宿主负责滑窗），got %q", res)
 	}
-	// 重试的 pre-step：累计两条摘要 + 尾段
-	second := preStep()
-	var afterRetry struct {
-		Messages []*proto.Message `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(second), &afterRetry); err != nil {
-		t.Fatalf("parse rewrite after retry: %v", err)
-	}
-	if len(afterRetry.Messages) != 3 {
-		t.Fatalf("after emergency rewrite = %d messages, want 3 (2 summaries + last)", len(afterRetry.Messages))
-	}
-	if !strings.Contains(afterRetry.Messages[1].GetContent(), "emergency") {
-		t.Fatalf("second summary must be emergency-marked, got %q", afterRetry.Messages[1].GetContent())
-	}
-	if afterRetry.Messages[2].GetContent() != msgs[5].GetContent() {
-		t.Fatalf("last message must be preserved")
-	}
-
-	// 7. 非溢出错误码：忽略
 	if res := requestError("rate_limited"); res != "" {
-		t.Fatalf("non-overflow code must be ignored, got %q", res)
+		t.Fatalf("非溢出错误码也不该由压缩驻留处理，got %q", res)
 	}
 }
 

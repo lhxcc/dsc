@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+
 	"dsc/proto"
 )
 
@@ -32,6 +34,11 @@ const (
 	// estimateInflationMax 估算偏差系数的上限。只放大、不缩小：估算偏大时多丢历史
 	// 是净损失，而偏差系数本身就是从「provider 比我们算得多」这一现象里得来的。
 	estimateInflationMax = 1.5
+
+	// overflowInflationMax 是「provider 亲口说过超窗」之后的偏差上限。比锚点推断宽松：
+	// 那是实测值除以我们的估算，不是推断；夹这个上限只为防止一次异常文本把预算压到
+	// 无法工作（例如错误里出现的数字根本不是 token 数）。
+	overflowInflationMax = 8.0
 )
 
 // envelopeMatches 报告用量锚点与当前请求是否同一个「信封」（工具目录 + 窗口 + 模型）。
@@ -76,6 +83,21 @@ func (m *Manager) estimateInflation(sessionID, curToolsHash, curModel string, wi
 	return inflation
 }
 
+// ceilingInflation 是收口用的偏差系数：锚点推断与「provider 亲口报过的超窗」取较严者。
+//
+// 两条来源的性质不同，都保留：锚点来自成功请求（promptTokens / sentEstimate），是长期
+// 系统偏差；超窗记录来自被拒的那一次，是一次**实证**——它一定比锚点更接近真相。
+func (m *Manager) ceilingInflation(sessionID, curToolsHash, curModel string, window int) float64 {
+	inflation := m.estimateInflation(sessionID, curToolsHash, curModel, window)
+	if adj, ok := m.overflowFor(sessionID); ok && adj.inflation > inflation {
+		inflation = adj.inflation
+	}
+	if inflation > overflowInflationMax {
+		inflation = overflowInflationMax
+	}
+	return inflation
+}
+
 // CapMessagesToWindow 从消息列表头部丢弃，直到「保留部分 + 工具目录」落进 limit。
 // 返回保留的消息与丢弃条数；装得下时原样返回（dropped=0）。
 //
@@ -113,8 +135,10 @@ func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []
 		acc += per[i]
 		cut = i
 	}
-	// 起点若落在 tool 结果上（它的调用已被丢掉），顺延到下一个可独立阅读的消息。
-	for cut < len(msgs)-1 && msgs[cut].GetRole() == "tool" {
+	// 起点必须是「可独立阅读」的消息：跳过 tool 结果（它的调用已被丢掉），并尽量落到
+	// user 上——Anthropic 一侧要求首条非 system 消息是 user，落在 assistant 上会被直接
+	// 拒掉（OpenAI 兼容端点不挑，但没理由只为一侧让步）。
+	for cut < len(msgs)-1 && msgs[cut].GetRole() != "user" {
 		cut++
 	}
 	if cut <= head {
@@ -127,6 +151,67 @@ func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []
 	}
 	kept = append(kept, msgs[cut:]...)
 	return kept, cut - head
+}
+
+// FoldOversizeMessages 折叠仍然过大的单条消息（保留首尾、中间省略）。
+//
+// 为什么需要有这一步：丢历史只能把「条数」减下来，减不掉「一条消息本身就超窗」——
+// 一次粘贴 200K 的工具输出、一次读到的大文件，单条就顶满窗口。此时从头丢到只剩
+// system + 最后一条仍然装不下，滑窗就失去意义（会一路重试再失败）。折叠是最后手段：
+// 首尾保留、中间标出省略了多少，模型至少知道「这里有内容，被我截断了」，而不是收到
+// 一个必然的 400。
+//
+// 只折叠 user / tool：assistant 的正文通常很短（长内容在 tool_calls 里），system 是
+// 部署指令不得改写。太短的消息不折（那不是超窗的来源，白折腾）。
+func FoldOversizeMessages(msgs []*proto.Message, toolsTokens, limit int) (out []*proto.Message, folded int) {
+	if len(msgs) == 0 || limit <= 0 {
+		return msgs, 0
+	}
+	const maxPasses = 16
+	const minFoldTokens = 512
+	out = append([]*proto.Message(nil), msgs...)
+	for pass := 0; pass < maxPasses; pass++ {
+		if EstimateProtoMessagesTokens(out)+toolsTokens <= limit {
+			return out, folded
+		}
+		idx, best := -1, minFoldTokens
+		for i, m := range out {
+			role := m.GetRole()
+			if role != "user" && role != "tool" {
+				continue
+			}
+			if t := EstimateProtoMessageTokens(m); t > best {
+				idx, best = i, t
+			}
+		}
+		if idx < 0 {
+			return out, folded
+		}
+		out[idx] = foldMessageToBudget(out[idx], best, limit)
+		folded++
+	}
+	return out, folded
+}
+
+// foldMessageToBudget 把一条消息裁成「首 + 省略说明 + 尾」，使其大致落进 limit 的量级。
+func foldMessageToBudget(m *proto.Message, tokens, limit int) *proto.Message {
+	runes := []rune(m.GetContent())
+	head := limit / 10
+	tail := limit / 20
+	if head < 512 {
+		head = 512
+	}
+	if tail < 256 {
+		tail = 256
+	}
+	if len(runes) <= head+tail+64 {
+		return m
+	}
+	cp := *m
+	cp.Content = string(runes[:head]) +
+		fmt.Sprintf("\n\n…（本条内容过长，已折叠：原约 %d tokens，保留首尾，中间过程省略）…\n\n", tokens) +
+		string(runes[len(runes)-tail:])
+	return &cp
 }
 
 // enforceRequestCeiling 保证「即将发出的请求」不超过窗口上限；返回（可能被裁剪的）
@@ -154,8 +239,22 @@ func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, infla
 	}
 	out, dropped = CapMessagesToWindow(msgs, toolsTokens, limit)
 	after = EstimateProtoMessagesTokens(out) + toolsTokens
+	if dropped == 0 && after > limit {
+		// 丢不动（可能只剩 system + 最后一条）或本来就没历史可丢：折叠单条超大消息。
+		if foldedOut, n := FoldOversizeMessages(msgs, toolsTokens, limit); n > 0 {
+			return foldedOut, 0, before, EstimateProtoMessagesTokens(foldedOut) + toolsTokens
+		}
+		return msgs, 0, before, before
+	}
 	if dropped == 0 {
 		return msgs, 0, before, before
+	}
+	// 丢完仍超：折叠保留段里仍然过大的单条消息
+	if after > limit {
+		if foldedOut, n := FoldOversizeMessages(out, toolsTokens, limit); n > 0 {
+			out = foldedOut
+			after = EstimateProtoMessagesTokens(out) + toolsTokens
+		}
 	}
 	return out, dropped, before, after
 }
