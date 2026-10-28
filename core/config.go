@@ -87,6 +87,21 @@ type Config struct {
 	//                     agent/pre-step 事件机制（后端主动压缩，agent 内联兜底）
 	// 对齐 DSH：preset YAML 显式挂 compaction-basic 或其他后端。
 	Compaction string `json:"compaction" yaml:"compaction"`
+	// MCP MCP 工具的注入开关（`/mcp on|off` 写回这里）。
+	//
+	// **缺省（无 mcp 段）= 未启用**：MCP 相关工具一个都不进模型目录，日常会话不承担
+	// 任何目录成本。启用后 mcp_connect 与运行期管理工具（list/load/unload/disconnect）
+	// 才会注入，服务器上发现的 mcp__* 工具再按 mcp_load 逐个曝光。
+	//
+	// 为什么放在配置里而不是只留内存：这是人与模型之外的一个决定——「这个部署要不要
+	// 用 MCP」。重启后还得保持，否则每次启动都要重新打开。
+	MCP *MCPConfig `json:"mcp,omitempty" yaml:"mcp,omitempty"`
+}
+
+// MCPConfig config.yaml 的 mcp 段。
+type MCPConfig struct {
+	// Enabled 是否启用 MCP 注入。缺省（无 mcp 段）按 false 处理。
+	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
 type PluginEntry struct {

@@ -646,6 +646,15 @@ func main() {
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
 
+	// MCP 注入开关（config.yaml 的 mcp.enabled）：**缺省即未启用**。
+	// 关闭时 MCP 相关工具（含入口 mcp_connect）一个都不进模型目录，日常会话因此不付
+	// 任何目录成本；启用后按 mcp_load 逐个曝光。开关只由人经 /mcp on|off 改写（写回
+	// 本文件），模型侧没有关掉/打开它的工具——目录预算是部署决定，不是模型决定。
+	if mainCfg != nil && mainCfg.MCP != nil && mainCfg.MCP.Enabled {
+		mgr.SetMCPToolsEnabled(true)
+		logger.Info("MCP tools enabled from config", "config", core.ConfigPath)
+	}
+
 	// 外部脚本钩子（-hooks hooks.json）：严格 LUA 脚本（go-lua 进程内解释）或
 	// 原生可执行文件（直接 exec 不经 shell），在工具流水线 BeforeTool/AfterTool
 	// 参与裁定。加载失败不致命（配置错误即无钩子），日志留痕便于排查。

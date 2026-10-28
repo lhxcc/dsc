@@ -18,11 +18,12 @@ import (
 //  1. 前端不复制业务实现：连接/列举/加载/卸载/断开一律走宿主工具（manager.ExecuteTool），
 //     与模型调用同一份代码——校验、注册表增删、曝光集变更只有一处。
 //  2. 用户手打命令本身即授权，注入 approval=never；工具内部的校验照旧。
-//  3. 开关（on/off）不是工具，是前端直接改 Manager 状态：它是「要不要把这些工具发给
-//     模型」的部署决定，不该让模型自己按（否则模型可以自行把一个会话的目录预算调上去）。
+//  3. 开关（on/off）**只由人**改：它是「要不要把这些工具发给模型」的部署决定，模型侧
+//     没有任何工具能开关它（否则模型可以自行把一个会话的目录预算调上去）。切换会立即
+//     写回 config.yaml 的 mcp.enabled，重启后保持；缺省（无 mcp 段）即未启用。
 //
-// 默认关闭是刻意的：日常会话用不到 MCP 时不该常態为它付目录成本（管理工具定义 + 已加载
-// 工具都要随每个请求发送）。/mcp on 或模型的 mcp_connect 都可以打开它。
+// 默认关闭是刻意的：日常会话用不到 MCP 时不该常態为它付目录成本。/mcp on 之后才注入
+// MCP 全部管理工具（含入口 mcp_connect），关掉连入口一起不注入——目录成本恰为 0。
 const mcpAdminTimeout = 90 * time.Second
 
 // mcpAdminMsg MCP 管理命令的执行结果（tea.Cmd → 事件循环）。
@@ -176,8 +177,23 @@ func (m *Model) runMCPAdmin(sub string, argv []string) tea.Cmd {
 		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · MCP") + "\n" + mcpStatusText(m.manager.MCPStatus()))
 		return nil
 	case "on", "off":
-		m.manager.SetMCPToolsEnabled(sub == "on")
-		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · MCP") + "\n" + mcpStatusText(m.manager.MCPStatus()))
+		enable := sub == "on"
+		// 先内存后落盘：写盘失败也照样生效于本次运行，但必须让人知道「重启后不保持」。
+		perr := m.manager.SetMCPToolsEnabledPersist(enable)
+		text := mcpStatusText(m.manager.MCPStatus())
+		if perr != nil {
+			text += "\n" + "写回配置失败（本次运行已生效，重启后不保持）：" + perr.Error()
+		} else {
+			text += "\n已写入配置：" + m.manager.MCPConfigPath()
+		}
+		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · MCP") + "\n" + text)
+		return nil
+	}
+
+	// 连接/加载在开关关闭时没有意义（注入不了，模型也看不见）。不静默帮用户打开开关：
+	// 开关是要持久化到配置文件里的部署决定，必须是人明确按下的那一次 /mcp on。
+	if !m.manager.MCPToolsEnabled() && (sub == "connect" || sub == "load") {
+		m.appendMessage(errorSty.Render("MCP 未啟用：先執行 /mcp on（開關會寫入 config.yaml，關閉時連 mcp_connect 都不注入）"))
 		return nil
 	}
 
@@ -214,7 +230,7 @@ func mcpStatusText(st core.MCPStatus) string {
 	if st.Enabled {
 		b.WriteString("注入：已开启（MCP 工具会随请求发给模型）\n")
 	} else {
-		b.WriteString("注入：已关闭（模型看不到任何 MCP 工具，也不占目录成本）/mcp on 开启\n")
+		b.WriteString("注入：已关闭（模型看不到任何 MCP 工具，MCP 目录成本为 0）/mcp on 开启\n")
 	}
 	if len(st.Servers) == 0 {
 		b.WriteString("服务器：未连接（/mcp connect <name> <endpoint>）")

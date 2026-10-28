@@ -148,24 +148,16 @@ func (m *Manager) forgetMCPTools(serverName string) {
 
 // filterMCPCatalog 按开关与曝光集裁剪模型可见目录（AllToolsProto 的唯一出口）。
 //
-// 三层规则，从外到内：
-//  1. 开关关闭（默认）：除 mcp_connect 外，所有 MCP 相关工具都不出现——包括已加载
-//     的 mcp__* 与全部管理工具。日常会话因此付 0 tokens。加载记录留着，重新打开即恢复。
-//  2. 开关打开但一台服务器都没连：三个运行期管理工具也不出现（它们一个也用不上，
-//     却要占几百 tokens、每个请求都发）。
-//  3. 都有：mcp__* 仅当被 mcp_load 加载过才出现（见 mcp_load/mcp_unload）。
+// 开关（config.yaml 的 mcp.enabled，由 /mcp on|off 写回）是**总闸**：
+//   - 关闭（缺省）：所有 MCP 相关工具都不出现——连 mcp_connect 与运行期管理工具一起，
+//     目录成本恰为 0。日常会话根本不用 MCP，没有理由为「可能用到」常態付费。
+//   - 打开但没有服务器：只剩 mcp_connect（把「没有」变成「有」的入口）。
+//   - 打开且有服务器：再加 list/load/unload/disconnect，以及被 mcp_load 加载过的
+//     mcp__* 工具（未加载的仍然不出现）。
 //
-// mcp_connect 始终可见（关闭时也留）：它是把「没有 MCP」变成「有」的唯一入口，而且
-// 它的描述里写着「不要起另一个 dsc 进程去连 MCP」——那句话本身就是防错说明。
-// 执行它会把开关打开，否则模型刚连上却拿不到 mcp_list，只能干瞪眼。
+// 粒度是「每个请求的 tools 数组」：隐藏不等于不可调用——未加载的工具仍注册在宿主、
+// 仍可被后台任务/子代理执行，只是不随请求发给模型。
 func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
-	hasMCP := false
-	for _, t := range tools {
-		if isMCPToolName(t.GetName()) {
-			hasMCP = true
-			break
-		}
-	}
 	e := m.ensureMCPExposure()
 	e.mu.RLock()
 	enabled := e.enabled
@@ -175,18 +167,36 @@ func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
 	}
 	e.mu.RUnlock()
 
+	if !enabled {
+		out := make([]*proto.Tool, 0, len(tools))
+		for _, t := range tools {
+			if isMCPToolName(t.GetName()) || isMCPManagementTool(t.GetName()) {
+				continue
+			}
+			out = append(out, t)
+		}
+		return out
+	}
+
+	hasMCP := false
+	for _, t := range tools {
+		if isMCPToolName(t.GetName()) {
+			hasMCP = true
+			break
+		}
+	}
 	out := make([]*proto.Tool, 0, len(tools))
 	for _, t := range tools {
 		name := t.GetName()
 		switch {
 		case name == mcpConnectToolName:
-			// 常驻：见函数注释
+			// 开关已开：入口保留
 		case isMCPToolName(name):
-			if !enabled || !loaded[name] {
+			if !loaded[name] {
 				continue
 			}
 		case isMCPManagementTool(name):
-			if !enabled || !hasMCP {
+			if !hasMCP {
 				continue
 			}
 		}
@@ -195,11 +205,10 @@ func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
 	return out
 }
 
-// isMCPManagementTool 判断是否为运行期管理工具（开关关闭或没有服务器时都不值得占目录）。
-// mcp_connect 不在其中：它是入口，始终保留。
+// isMCPManagementTool 判断是否为运行期管理工具。
 func isMCPManagementTool(name string) bool {
 	switch name {
-	case mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName:
+	case mcpConnectToolName, mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName:
 		return true
 	}
 	return false
@@ -227,6 +236,21 @@ func (m *Manager) SetMCPToolsEnabled(enabled bool) bool {
 	}
 	e.enabled = enabled
 	return true
+}
+
+// SetMCPToolsEnabledPersist 改开关并写回 config.yaml（供 /mcp on|off 使用）。
+//
+// 顺序是先内存后落盘：写盘失败时本次运行仍按新值生效，只是重启后不保持——把错误
+// 回给前端让人知道「这次没存住」就够了。反过来（先落盘后改内存）会出现「文件改了
+// 但当前会话没生效」这种更难理解的状态。
+func (m *Manager) SetMCPToolsEnabledPersist(enabled bool) error {
+	m.SetMCPToolsEnabled(enabled)
+	return m.persistMCPEnabled(enabled)
+}
+
+// MCPConfigPath 返回开关会写回的配置文件路径（供界面展示，让人知道改了哪个文件）。
+func (m *Manager) MCPConfigPath() string {
+	return m.persistConfigPath()
 }
 
 // MCPStatus 是 MCP 当前状态的只读快照（供斜杆命令展示）。
@@ -332,7 +356,6 @@ func (t *mcpConnectTool) Description() string {
 	return "Connect to an external MCP server over streamable HTTP and register its tools (endpoint like http://127.0.0.1:8765/mcp). " +
 		"Use when the user asks to use an MCP server that is not connected yet. This is a host capability: do NOT start another `dsc` process to connect to MCP — that process has its own tool table and this session can never see it. " +
 		"stdio transport is not supported; start the server with an HTTP endpoint first (e.g. `rea mcp --http --port 8765`). " +
-		"Connecting turns MCP management on for this session (mcp_list/mcp_load become usable) — connecting means you intend to use it. " +
 		"Registered tools stay hidden from your tool list to keep it small — use mcp_list to see them, then mcp_load for the ones you need, and mcp_unload/mcp_disconnect when done. Requires approval."
 }
 
@@ -382,7 +405,6 @@ func (t *mcpConnectTool) Execute(ctx context.Context, args json.RawMessage) (str
 	// 幂等：重复连接是模型常见动作（上一轮连过、或它不确定），报「已连接」并指向
 	// mcp_list 比抛冲突好用。
 	if existing := t.m.GetMCPClient(name); existing != nil {
-		t.m.SetMCPToolsEnabled(true)
 		return fmt.Sprintf("MCP server %q is already connected (%d tools). Its tools are hidden from your tool list by default: "+
 			"call mcp_list to see the names, then mcp_load for the ones you need.", name, existing.ToolCount()), nil
 	}
@@ -393,9 +415,6 @@ func (t *mcpConnectTool) Execute(ctx context.Context, args json.RawMessage) (str
 	if err != nil {
 		return "", err
 	}
-	// 连上即视为「要用」：不打开开关的话，模型刚连上却拿不到 mcp_list（管理工具还没
-	// 注入），只能干瞪眼，或者去重复 connect。
-	t.m.SetMCPToolsEnabled(true)
 	return fmt.Sprintf("Connected MCP server %q: %d tools registered (prefix mcp__%s__); MCP tools are now enabled for this session. "+
 		"Registered is not visible: call mcp_list to see the names and mcp_load for the ones you need.", name, count, name), nil
 }

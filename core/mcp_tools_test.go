@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -268,8 +269,9 @@ func toolNamesOf(tools []*proto.Tool) map[string]bool {
 	return out
 }
 
-// TestMCPToolsDisabledByDefault 注入开关默认关闭：日常会话不该为「可能用到的 MCP」
-// 常態付目录成本。关闭时除 mcp_connect 外一个 MCP 工具都不出现——包括已经加载的。
+// TestMCPToolsDisabledByDefault 开关是**总闸**：默认关闭时除 MCP 之外一个相关工具都
+// 不出现——连入口 mcp_connect 也不注入，目录成本恰为 0。日常会话根本不用 MCP，没有
+// 理由为「可能用到」常態付费。
 func TestMCPToolsDisabledByDefault(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	if m.MCPToolsEnabled() {
@@ -278,32 +280,23 @@ func TestMCPToolsDisabledByDefault(t *testing.T) {
 	mustConnectFake(t, m, "demo", "alpha", "beta")
 	m.setMCPToolsLoaded([]string{"mcp__demo__alpha"}, true)
 
-	names := toolNamesOf(m.AllToolsProto())
 	for _, tool := range m.AllToolsProto() {
-		if isMCPToolName(tool.GetName()) {
-			t.Fatalf("关闭状态下不应出现 MCP 工具：%s", tool.GetName())
+		name := tool.GetName()
+		if isMCPToolName(name) || isMCPManagementTool(name) {
+			t.Fatalf("关闭状态下不应出现 MCP 工具：%s", name)
 		}
-	}
-	for _, hidden := range []string{mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName} {
-		if names[hidden] {
-			t.Fatalf("关闭状态下 %s 不应出现", hidden)
-		}
-	}
-	if !names[mcpConnectToolName] {
-		t.Fatal("mcp_connect 必须常驻（唯一入口）")
 	}
 
-	// 打开后按曝光集恢复：已加载的 alpha 回来，未加载的 beta 仍然不出现
+	// 打开后：入口 + 管理工具 + 已加载的那一个；未加载的仍然不出现
 	m.SetMCPToolsEnabled(true)
-	names = toolNamesOf(m.AllToolsProto())
-	if !names["mcp__demo__alpha"] {
-		t.Fatal("打开后已加载的工具应恢复可见")
+	names := toolNamesOf(m.AllToolsProto())
+	for _, want := range []string{mcpConnectToolName, mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName, "mcp__demo__alpha"} {
+		if !names[want] {
+			t.Fatalf("打开后应出现 %s（目录=%v）", want, names)
+		}
 	}
 	if names["mcp__demo__beta"] {
 		t.Fatal("未加载的工具不应因打开开关而出现")
-	}
-	if !names[mcpListToolName] {
-		t.Fatal("打开后管理工具应出现")
 	}
 
 	// 关闭不清加载记录：再打开仍是同一批
@@ -314,21 +307,95 @@ func TestMCPToolsDisabledByDefault(t *testing.T) {
 	}
 }
 
-// TestMCPConnectEnablesSwitch 模型主动连接即视为「要用」：连上后必须能拿到
-// mcp_list，否则它刚连上却无从发现工具，只能重复 connect。
-func TestMCPConnectEnablesSwitch(t *testing.T) {
+// TestMCPConnectDoesNotToggleSwitch 开关只由人改：连接动作不得改变它（关着时它根本
+// 不可见；能看见就说明已经开着）。模型侧没有任何工具能开关 MCP 注入。
+func TestMCPConnectDoesNotToggleSwitch(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetMCPToolsEnabled(true)
 	srv := fakeMCPServer(t, "alpha")
 	if _, err := (&mcpConnectTool{m: m}).Execute(context.Background(),
 		json.RawMessage(fmt.Sprintf(`{"server_name":"demo","endpoint":%q}`, srv.URL))); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	if !m.MCPToolsEnabled() {
-		t.Fatal("连接成功后开关应打开")
+		t.Fatal("连接不应关掉开关")
 	}
-	names := toolNamesOf(m.AllToolsProto())
-	if !names[mcpListToolName] || !names[mcpLoadToolName] {
-		t.Fatalf("连上后管理工具应可见：%v", names)
+	// 关掉后再直接调一次工具（模拟被别的路径调用）：开关不应被打开
+	m.SetMCPToolsEnabled(false)
+	if _, err := (&mcpConnectTool{m: m}).Execute(context.Background(),
+		json.RawMessage(fmt.Sprintf(`{"server_name":"demo2","endpoint":%q}`, srv.URL))); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if m.MCPToolsEnabled() {
+		t.Fatal("连接工具不得打开开关（开关只由人经 /mcp on 改）")
+	}
+}
+
+// TestPersistMCPEnabledWritesConfig /mcp on|off 要把开关写回 config.yaml，且只动 mcp
+// 段——注释、其它字段原样保留（这是「配置是用户手写的」这一前提的要求）。
+func TestPersistMCPEnabledWritesConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := PJoin(dir, "config.yaml")
+	original := "# 用户手写的注释\nworkspace_root: /tmp/ws\npersona: 保持简洁\n"
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetConfigPath(path)
+
+	if err := m.SetMCPToolsEnabledPersist(true); err != nil {
+		t.Fatalf("persist on: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if cfg.MCP == nil || !cfg.MCP.Enabled {
+		t.Fatalf("配置应写入 mcp.enabled=true，实际 %+v", cfg.MCP)
+	}
+	if cfg.WorkspaceRoot != "/tmp/ws" || cfg.Persona != "保持简洁" {
+		t.Fatalf("不应破坏其它字段：%+v", cfg)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), "# 用户手写的注释") {
+		t.Fatalf("注释应保留：%s", data)
+	}
+
+	// 关闭写回 false（显式表达「关」，而不是删掉键让人猜）
+	if err := m.SetMCPToolsEnabledPersist(false); err != nil {
+		t.Fatalf("persist off: %v", err)
+	}
+	cfg, _ = LoadConfig(path)
+	if cfg.MCP == nil || cfg.MCP.Enabled {
+		t.Fatalf("配置应写入 mcp.enabled=false，实际 %+v", cfg.MCP)
+	}
+	// 幂等：重复写不产生第二个 mcp 段
+	if err := m.SetMCPToolsEnabledPersist(false); err != nil {
+		t.Fatalf("persist off again: %v", err)
+	}
+	data, _ = os.ReadFile(path)
+	if strings.Count(string(data), "mcp:") != 1 {
+		t.Fatalf("bogus 重复段：%s", data)
+	}
+}
+
+// TestMissingMCPConfigMeansDisabled 配置里没有 mcp 段即视为未启用（默认关闭的语义
+// 必须由配置本身表达，而不是靠某个内存默认值）。
+func TestMissingMCPConfigMeansDisabled(t *testing.T) {
+	path := PJoin(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("workspace_root: /tmp/ws\n"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MCP != nil {
+		t.Fatalf("无 mcp 段应解析为 nil（未启用），实际 %+v", cfg.MCP)
+	}
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	if m.MCPToolsEnabled() {
+		t.Fatal("未配置时开关应为关闭")
 	}
 }
 

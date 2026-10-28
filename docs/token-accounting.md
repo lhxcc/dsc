@@ -100,10 +100,10 @@ EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
 
 目录是**固定成本**，所以「哪些工具进目录」跟公式一样重要。三条已落地的判断：
 
-- **MCP 默认关闭**：注入开关（`/mcp on|off`，默认关）关着时，除入口 `mcp_connect` 外一个
-  MCP 工具都不进目录——日常会话付 0 tokens。实测五个管理工具合计 1,087 tokens
-  （connect 309 / list 243 / load 215 / disconnect 161 / unload 159），关闭即省 778，只留
-  入口那 309。开关打开后：
+- **MCP 默认关闭**：注入开关（`config.yaml` 的 `mcp.enabled`，由 `/mcp on|off` 写回，
+  无此段即未启用）是总闸。关着时 MCP 相关工具**一个都不进目录——含入口 `mcp_connect`**，
+  日常会话为它付 0 tokens。实测五个管理工具合计 1,087 tokens（connect 309 / list 243 /
+  load 215 / disconnect 161 / unload 159），即开关关闭省下的就是这 1,087。开关打开后：
 - **MCP 工具默认不进目录**，由模型 `mcp_load` 按需加载、`mcp_unload` 撤出（`core/mcp_tools.go`）。
   实测一台 229 个工具的服务器：全量进目录 **74,543 tokens**（1M 窗口 7%，128K 模型 **57%**），
   连上但已加载 0 个时只有 4,756（含 4 个管理工具）。按 server 配白名单也能降，但那是把

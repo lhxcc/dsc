@@ -3092,7 +3092,7 @@ func (m *Model) buildHelpText() string {
 		"  /plugin upgrade <name> <version> <source>  升级插件",
 		"  /plugin load|unload <name> [--persist]  当前进程加载/卸载",
 		"  /mcp         MCP 状态（开关 / 已连服务器 / 已加载工具与目录成本），默认关闭",
-		"  /mcp on|off  注入开关：关闭时模型看不到任何 MCP 工具，也不占目录成本",
+		"  /mcp on|off  注入开关（写入 config.yaml 的 mcp.enabled，重启保持）：关闭时连入口都不注入，MCP 目录成本为 0",
 		"  /mcp list [server]  列出某服务器的工具（标出哪些已加载）",
 		"  /mcp connect <name> <endpoint>  连接 MCP 服务器（streamable HTTP）",
 		"  /mcp disconnect [server]  断开并注销其工具（不带参数=全部）",

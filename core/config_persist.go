@@ -299,3 +299,42 @@ func (m *Manager) SetHistoryInjectionConfig(count int) error {
 	}
 	return nil
 }
+
+// persistMCPEnabled 把 mcp.enabled 写回 config.yaml（/mcp on|off 用）。
+//
+// 用 yaml.Node 文档级操作（与插件注入同一套做法）：只增改 mcp 段，保留文件里的注释、
+// 字段顺序与未声明字段的缺省语义，不做整体结构体序列化——那会把零值字段一并补进
+// 配置文件，用户下次打开会看到一堆自己没写过的键。
+//
+// 缺文件时新建一份只含 mcp 段的配置（MkdirAll 由 saveConfigNode 负责）。
+func (m *Manager) persistMCPEnabled(enabled bool) error {
+	path := m.persistConfigPath()
+	doc, err := readConfigDocumentNode(path)
+	if err != nil {
+		return fmt.Errorf("read config %s: %w", path, err)
+	}
+	root := configMappingNode(doc)
+	if doc == nil {
+		doc = &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	}
+	value := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "enabled"},
+		{Kind: yaml.ScalarNode, Tag: "!!bool", Value: strconv.FormatBool(enabled)},
+	}}
+	replaced := false
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "mcp" {
+			root.Content[i+1] = value
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "mcp"}, value)
+	}
+	if err := saveConfigNode(path, doc); err != nil {
+		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	return nil
+}
