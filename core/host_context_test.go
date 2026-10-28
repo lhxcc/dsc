@@ -84,9 +84,10 @@ func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
 	}
 	m.toolHookClients["p1"] = f
 	m.toolHookOrder = []string{"p1"}
-	// 只有配置选定的压缩后端才有「改写请求」的采纳权（避免多个声明 compaction 的
-	// 插件层层改写），故这里把它指定为后端。
+	// 只有**岗位持有者**才有「改写请求」的采纳权（避免多个声明 compaction 的插件
+	// 层层改写）：岗位 = 配置点名 + 已加载 + 声明 compaction 能力，三者缺一不算当值。
 	m.compactionBackend = "p1"
+	m.coreMetadata["p1"] = &metadata.PluginInfo{Capabilities: map[string]string{"compaction": "true"}}
 
 	srv := &llmAggregateServer{m: m}
 	req := &proto.ChatRequest{SessionId: "sess-x", Messages: big, Tools: tools}

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -20,6 +21,8 @@ func TestDispatchPreStepOnlyBackendRewriteAdopted(t *testing.T) {
 	m.toolHookClients["backend-b"] = other
 	m.toolHookOrder = []string{"backend-b", "dsc-system"}
 	m.compactionBackend = "dsc-system"
+	m.coreMetadata["dsc-system"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
 	m.mu.Unlock()
 
 	got, err := m.dispatchEventToPlugins(EventAgentPreStep, map[string]string{"messages": "[orig]"})
@@ -89,9 +92,8 @@ func TestCompactionBackendActiveRequiresConfiguredPlugin(t *testing.T) {
 	}
 
 	m.mu.Lock()
-	m.coreMetadata["dsc-system"] = &metadata.PluginInfo{
-		Capabilities: map[string]string{"compaction": "true"},
-	}
+	m.coreMetadata["dsc-system"] = declaresCompaction()
+	m.toolHookClients["dsc-system"] = &fakeHook{}
 	m.mu.Unlock()
 	if !m.compactionBackendActive() {
 		t.Fatal("选定后端声明能力后应视为 active")
@@ -129,6 +131,7 @@ func TestPreStepCollectsAppendsFromAnyPlugin(t *testing.T) {
 	m.toolHookClients["tool-memory-service"] = notifier
 	m.toolHookOrder = []string{"tool-memory-service", "dsc-system"}
 	m.compactionBackend = "dsc-system"
+	m.coreMetadata["dsc-system"] = declaresCompaction()
 	m.mu.Unlock()
 
 	out, err := m.dispatchEventToPlugins(EventAgentPreStep, map[string]string{"messages": "[]"})
@@ -186,6 +189,8 @@ func TestDispatchRequestErrorBackendRetryAdopted(t *testing.T) {
 	m.toolHookClients["backend-b"] = other
 	m.toolHookOrder = []string{"backend-b", "dsc-system"}
 	m.compactionBackend = "dsc-system"
+	m.coreMetadata["dsc-system"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
 	m.mu.Unlock()
 
 	got, err := m.dispatchEventToPlugins(EventAgentRequestError, map[string]string{"code": "context_window_exceeded"})
@@ -220,4 +225,201 @@ func TestDispatchRequestErrorRetryIgnoredWithoutBackend(t *testing.T) {
 	if payload["retry"] == true {
 		t.Fatalf("未选后端时不应采纳 retry, got %v", payload)
 	}
+}
+
+// declaresCompaction 构造一个声明了 compaction 能力的插件元数据。
+func declaresCompaction() *metadata.PluginInfo {
+	return &metadata.PluginInfo{Capabilities: map[string]string{"compaction": "true"}}
+}
+
+// TestCompactionRoleResolvesConfiguredHolder 岗位 = 配置点名 + 已加载 + 声明能力。
+// 有能力的插件可以有多个，但当值的只有一个；其余同为候选人（可解释、可切换）。
+func TestCompactionRoleResolvesConfiguredHolder(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.toolHookClients["backend-b"] = &fakeHook{}
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
+	m.compactionBackend = "backend-b"
+	m.mu.Unlock()
+
+	role := m.ResolveCompactionRole()
+	if role.Holder != "backend-b" {
+		t.Fatalf("岗位应归配置点名的 backend-b，got %q", role.Holder)
+	}
+	if len(role.Candidates) != 2 || role.Candidates[0] != "backend-a" || role.Candidates[1] != "backend-b" {
+		t.Fatalf("候选人应排序为 [backend-a backend-b]，got %v", role.Candidates)
+	}
+	if role.Vacancy != "" {
+		t.Fatalf("有人当值时不应有 vacancy 说明，got %q", role.Vacancy)
+	}
+	// 诊断口径与岗位一致
+	if configured, active := m.CompactionBackendState(); configured != "backend-b" || !active {
+		t.Fatalf("state = %q/%v", configured, active)
+	}
+}
+
+// TestCompactionRoleVacancyReasons 三个条件缺任何一个都算空缺，且必须说明缺的是哪个。
+// 空缺本身是正常形态（本部署不用后端），但「有候选人却没人当值」得能解释。
+func TestCompactionRoleVacancyReasons(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured string
+		loaded     bool
+		declare    bool
+		wantHolder bool
+		contains   string
+	}{
+		{"未配置后端", "", true, true, false, "no compaction backend configured"},
+		{"配置了但没加载", "backend-a", false, true, false, "is not loaded"},
+		{"加载了但没声明能力", "backend-a", true, false, false, "does not declare"},
+		{"三条件齐备", "backend-a", true, true, true, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m, _ := hookManager()
+			m.mu.Lock()
+			if c.loaded {
+				m.toolHookClients["backend-a"] = &fakeHook{}
+			}
+			if c.declare {
+				m.coreMetadata["backend-a"] = declaresCompaction()
+			}
+			m.compactionBackend = c.configured
+			m.mu.Unlock()
+
+			role := m.ResolveCompactionRole()
+			if (role.Holder != "") != c.wantHolder {
+				t.Fatalf("holder = %q, want holder=%v", role.Holder, c.wantHolder)
+			}
+			if !strings.Contains(role.Vacancy, c.contains) {
+				t.Fatalf("vacancy = %q, want contains %q", role.Vacancy, c.contains)
+			}
+		})
+	}
+}
+
+// TestPreStepPayloadOnlyToRoleHolder pre-step 的完整消息列表只发给岗位持有者。
+//
+// 岗位之外没人能改写请求面，把几 MB 的消息复制过去是纯白工——而实测非岗位的压缩
+// 后端还会真的调模型做摘要，结果被宿主丢弃。副作用（重复链重置、记忆落盘）只需要
+// session / user_input，轻载荷里都有。
+func TestPreStepPayloadOnlyToRoleHolder(t *testing.T) {
+	m, _ := hookManager()
+	holder := &fakeHook{events: make(chan *proto.OnEventRequest, 1)}
+	other := &fakeHook{events: make(chan *proto.OnEventRequest, 1), eventResult: `{"messages":"[other]"}`}
+	m.mu.Lock()
+	m.toolHookClients["backend-a"] = holder
+	m.toolHookClients["backend-b"] = other
+	m.toolHookOrder = []string{"backend-b", "backend-a"}
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
+	m.compactionBackend = "backend-a"
+	m.mu.Unlock()
+
+	ev := AgentPreStepEvent{
+		Agent: "agent", Session: "s1", Turn: 3, Step: 1,
+		MessagesJSON: `[{"role":"user","content":"hi"}]`,
+		TokenCount:   1234, ToolTokens: 100, ProjectedTokens: 1300,
+		UserInput: true,
+	}
+	if _, err := m.dispatchEventToPlugins(EventAgentPreStep, ev); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	rolePayload := decodePreStep(t, <-holder.events)
+	if rolePayload.MessagesJSON == "" {
+		t.Fatal("岗位持有者必须收到完整消息列表")
+	}
+	otherPayload := decodePreStep(t, <-other.events)
+	if otherPayload.MessagesJSON != "" {
+		t.Fatalf("非岗位插件不应收到消息列表（白传几 MB），got %.80s", otherPayload.MessagesJSON)
+	}
+	// 轻载荷必须保留副作用需要的一切
+	if otherPayload.Session != "s1" || !otherPayload.UserInput || otherPayload.TokenCount != 1234 {
+		t.Fatalf("轻载荷丢了副作用需要的字段: %+v", otherPayload)
+	}
+}
+
+// TestPreStepObserverCapabilityKeepsFullPayload 声明了 pre-step-messages 的观察型插件
+// 仍收完整列表：默认省流量，但确实要看内容的插件得有办法声明，而不是被猜。
+func TestPreStepObserverCapabilityKeepsFullPayload(t *testing.T) {
+	m, _ := hookManager()
+	holder := &fakeHook{events: make(chan *proto.OnEventRequest, 1)}
+	observer := &fakeHook{events: make(chan *proto.OnEventRequest, 1)}
+	m.mu.Lock()
+	m.toolHookClients["backend-a"] = holder
+	m.toolHookClients["memory"] = observer
+	m.toolHookOrder = []string{"memory", "backend-a"}
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.coreMetadata["memory"] = &metadata.PluginInfo{
+		Capabilities: map[string]string{capPreStepMessages: "true"},
+	}
+	m.compactionBackend = "backend-a"
+	m.mu.Unlock()
+
+	ev := AgentPreStepEvent{Session: "s1", MessagesJSON: `[{"role":"user","content":"hi"}]`}
+	if _, err := m.dispatchEventToPlugins(EventAgentPreStep, ev); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if got := decodePreStep(t, <-observer.events); got.MessagesJSON == "" {
+		t.Fatal("声明了 pre-step-messages 的插件应收到完整消息列表")
+	}
+}
+
+// TestRequestErrorOnlyToRoleHolder request-error 只发给岗位持有者：只有它会做紧急压缩。
+// 广播给其他声明了 compaction 的插件，它们会真的再压一遍（调模型、写状态），结果被丢弃。
+func TestRequestErrorOnlyToRoleHolder(t *testing.T) {
+	m, _ := hookManager()
+	holder := &fakeHook{events: make(chan *proto.OnEventRequest, 2), eventResult: `{"retry": true}`}
+	other := &fakeHook{events: make(chan *proto.OnEventRequest, 2), eventResult: `{"retry": true}`}
+	m.mu.Lock()
+	m.toolHookClients["backend-a"] = holder
+	m.toolHookClients["backend-b"] = other
+	m.toolHookOrder = []string{"backend-b", "backend-a"}
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
+	m.compactionBackend = "backend-a"
+	m.mu.Unlock()
+
+	got, err := m.dispatchEventToPlugins(EventAgentRequestError, map[string]string{"code": "context_window_exceeded"})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if payload, ok := got.(map[string]any); !ok || payload["retry"] != true {
+		t.Fatalf("应采纳岗位持有者的 retry=true, got %v", got)
+	}
+	select {
+	case <-holder.events:
+	default:
+		t.Fatal("岗位持有者应收到 request-error")
+	}
+	select {
+	case <-other.events:
+		t.Fatal("非岗位插件不应收到 request-error（它会白压一遍）")
+	default:
+	}
+
+	// 岗位空缺：没人该动，也不该有人重试
+	m.mu.Lock()
+	m.compactionBackend = ""
+	m.mu.Unlock()
+	got, err = m.dispatchEventToPlugins(EventAgentRequestError, map[string]string{"code": "context_window_exceeded"})
+	if err != nil {
+		t.Fatalf("vacant dispatch: %v", err)
+	}
+	if payload, ok := got.(map[string]any); !ok || payload["retry"] == true {
+		t.Fatalf("岗位空缺时不应采纳 retry, got %v", got)
+	}
+}
+
+// decodePreStep 解析 fakeHook 收到的 pre-step 载荷。
+func decodePreStep(t *testing.T, req *proto.OnEventRequest) AgentPreStepEvent {
+	t.Helper()
+	var ev AgentPreStepEvent
+	if err := json.Unmarshal([]byte(req.GetDataJson()), &ev); err != nil {
+		t.Fatalf("解析 pre-step 载荷失败: %v（原文 %.120s）", err, req.GetDataJson())
+	}
+	return ev
 }

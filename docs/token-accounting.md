@@ -392,7 +392,7 @@ default:
 | 1 | 派生 | `session.DeriveMessagesLimited(n)` | 每次请求 | 事件 → 消息；`n` 只限制**从存档恢复**的历史（`config.history_injection`），当前进程内的轮次不受影响 | 不改 |
 | 2 | agent 请求级裁剪 | `plugins/agent-react-loop`：`trimToWindow` / `fitMessagesToWindow` / `foldOversizeMessages` | **仅当没有压缩后端**，且历史超窗 | 丢弃最旧的完整轮次（多档收紧 90%/60%/35%/15%），单条超大消息折叠为首尾 | 不改（只影响本次请求） |
 | 3 | agent 内联压缩 | 同上：`compactHistory` | **仅当没有后端**，且投影 ≥ 80% | 调模型把旧前缀摘要成一条，**写回会话**（永久） | **改写** |
-| 4 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 有后端时**每次请求** | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。多个插件都收到事件，但**只有 `compaction` 字段选中的那个的改写被采纳** | 通常不改（billion-context 会持久化自己的 state） |
+| 4 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 有后端时**每次请求** | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。事件仍广播给所有插件，但**只有岗位持有者的改写被采纳**，也只有它收到完整消息列表（§8.2） | 通常不改（billion-context 会持久化自己的 state） |
 | 5 | 宿主收口 | `core/llm_router.go finishPreStep` + `core/context_ceiling.go` | 每次请求（改写之后） | 量最终表面；超窗先请后端紧急压缩一次（`agent/request-error`），仍超才从头部丢到 90% 窗口 | 不改 |
 | 6 | 展示口径 | `HostContextMeters`（`NoteActualSurface` / `ContextTokens`） | 每次请求 | 把「实际发出去的大小」发布给 TUI；不是另算一份 | 不改 |
 
@@ -407,6 +407,37 @@ default:
   异常。要看诊断就开 `-log`，那里有 `context trimmed to fit the window` /
   `oversized messages folded` / `compacting history (inline)` /
   `llm request: trimmed to fit the context window`。
+
+### 8.2 压缩岗位：有能力者可以多个，当值者只有一个
+
+「谁在改写请求面」不是每步去猜，而是启动期就定下来的**一个岗位**（`core/notify.go`
+`ResolveCompactionRole`）。三个条件同时成立才算当值：
+
+1. `config.yaml` 的 `compaction` 点了名；
+2. 该插件已加载（注册表里有它的 hook 客户端）；
+3. 它确实声明了 `Provides: {compaction: "true"}`。
+
+缺任意一条就是**岗位空缺**，且空缺原因写在 `Vacancy` 里（没配置 / 没加载 / 没声明能力），
+`main.go` 启动时把「谁当值 + 还有谁有这能力」写进日志。空缺本身是正常形态（本部署不用
+后端，agent 内联压缩是唯一路径），但「有候选人却没人当值」必须能解释——那正是「新压缩
+没生效」的常见原因。
+
+**载荷跟着岗位走。** `agent/pre-step` 仍派发给所有插件（副作用不能丢：重复调用链重置、
+记忆落盘），但完整消息列表只发给岗位持有者：
+
+- 岗位之外**没有任何插件能改写请求面**，把几 MB 的历史复制过去是纯白工——实测非岗位的
+  压缩后端还会真的调模型做摘要，结果被宿主丢弃；
+- 其余插件收到同一信封但不带 `messages_json`（轻载荷），`session` / `user_input` / 各计数
+  都在，副作用需要的正是这些；
+- 观察型插件若确实要看消息，声明 `Provides: {"pre-step-messages": "true"}` 即恢复完整载荷
+  ——默认省流量，但需要的人有办法声明，而不是靠猜。
+
+**`agent/request-error` 只发给岗位持有者**：只有它会做紧急压缩。广播给其他声明了
+`compaction` 的插件，它们会真的再压一遍（调模型、写状态），结果同样被丢弃。
+
+两个插件侧配套（缺了会留下隐患）：收到空载荷必须**什么都不做**——尤其不能清掉
+「最近一次消息列表」缓存（那是 `compress` 与紧急压缩的材料），也不能建/写 state。
+
 
 ---
 

@@ -175,6 +175,12 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 			return "", fmt.Errorf("compaction-basic: parse messages: %w", err)
 		}
 	}
+	// 轻载荷：宿主只把消息列表发给**持有压缩岗位**的插件，其余插件收到不带消息的
+	// 信封（副作用用 session / user_input 就够）。因此这里必须在写 lastMsgs 之前
+	// 返回——否则一旦本插件没当值，缓存会被清空，将来接手时紧急压缩没有材料可用。
+	if len(msgs) == 0 {
+		return "", nil
+	}
 	sess := s.sessionKey(ev.Session)
 	s.mu.Lock()
 	s.lastMsgs = msgs // 缓存供溢出紧急压缩使用（request-error 事件不带消息列表）
@@ -183,9 +189,6 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	// 指纹校验：历史被改写/回滚时丢弃记录从头评估
 	records := validRecords(msgs, st.Records)
 	s.mu.Unlock()
-	if len(msgs) == 0 {
-		return "", nil
-	}
 
 	// 复用既有压缩后的用量评估：低于阈值则直接返回改写（或无记录时不改写）
 	rewritten := applyRecords(msgs, records)

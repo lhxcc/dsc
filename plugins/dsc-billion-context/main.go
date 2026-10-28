@@ -364,7 +364,14 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// 记录宿主真实会话 ID：pre-step 载荷已带 req.GetSessionId()，但宿主从不注入
 	// DSC_SESSION_ID env，故必须以事件为准，否则同工作区多会话共用一份 state。
+	// 放在「空载荷早退」之前：轻载荷也带 session，记下来不影响任何状态。
 	bc.setSessionID(ev.Session)
+
+	// 轻载荷：宿主只把消息列表发给**持有压缩岗位**的插件。没有消息就什么都不该做——
+	// 尤其不能建/写 state，也不能覆盖 lastMessages（compress 工具要拿它当材料）。
+	if ev.MessagesJSON == "" {
+		return "", nil
+	}
 
 	// 解析消息列表
 	var protoMsgs []*proto.Message

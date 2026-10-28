@@ -848,6 +848,15 @@ func main() {
 		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
 			logger.Warn(warn)
 		}
+		// 岗位在启动期定死：谁当值、还有谁也有这个能力。声明了 compaction 能力不等于
+		// 当值，用户看到「插件在跑但压缩没换」时，这行就是答案。
+		if role := mgr.ResolveCompactionRole(); role.Holder != "" {
+			logger.Info("compaction role resolved", "holder", role.Holder, "candidates", role.Candidates)
+		} else if len(role.Candidates) > 1 || (len(role.Candidates) == 1 && role.Configured == "") {
+			logger.Warn("compaction role is vacant although plugins declare the capability",
+				"candidates", role.Candidates, "reason", role.Vacancy,
+				"hint", "set `compaction: <plugin>` in config.yaml to put one on duty")
+		}
 		// 声明了需要宿主凭据的能力、却没有在 config.yaml 里显式授予时，插件运行时
 		// 会静默失败（401/连不上）。宿主不按插件名自动放行凭据，所以这里必须把
 		// 「该给哪个插件加哪一行」说出来。
