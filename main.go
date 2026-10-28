@@ -843,19 +843,12 @@ func main() {
 	pluginsSnap := pluginsDir + "-backup"
 	loadErr := mgr.LoadFromConfig(merged)
 	if loadErr == nil {
-		// 配置了压缩后端却没生效时，宿主此前是**静默**回落到内联压缩的：用户只看到
-		// "新压缩没生效"，日志里也没有一句解释。这里至少留一条明确告警。
-		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
-			logger.Warn(warn)
-		}
-		// 岗位在启动期定死：谁当值、还有谁也有这个能力。声明了 compaction 能力不等于
-		// 当值，用户看到「插件在跑但压缩没换」时，这行就是答案。
+		// 岗位在启动期定死：谁当值、还有谁也有这个能力。只有唯一候选时宿主直接把它
+		// 放上岗位（用户启用一个后端即生效，不必再写一行配置）；多候选必须点名。
 		if role := mgr.ResolveCompactionRole(); role.Holder != "" {
-			logger.Info("compaction role resolved", "holder", role.Holder, "candidates", role.Candidates)
-		} else if len(role.Candidates) > 1 || (len(role.Candidates) == 1 && role.Configured == "") {
-			logger.Warn("compaction role is vacant although plugins declare the capability",
-				"candidates", role.Candidates, "reason", role.Vacancy,
-				"hint", "set `compaction: <plugin>` in config.yaml to put one on duty")
+			logger.Info("compaction role resolved",
+				"holder", role.Holder, "auto_selected", role.AutoSelected,
+				"configured", role.Configured, "candidates", role.Candidates)
 		}
 		// 声明了需要宿主凭据的能力、却没有在 config.yaml 里显式授予时，插件运行时
 		// 会静默失败（401/连不上）。宿主不按插件名自动放行凭据，所以这里必须把
@@ -915,6 +908,15 @@ func main() {
 		if loadErr != nil {
 			fail("failed to load plugins declaratively: %v", loadErr)
 		}
+	}
+
+	// 压缩是 agent 的强依赖（agent 元数据声明 requires/dsc/compaction）：它只跑循环与
+	// 调度，不实现压缩，请求面的改写由当值后端完成。没有当值的后端时 agent 不会被
+	// 激活，继续启动只会得到「有界面、没有循环」的假象——不如在这里就把缺什么说清楚。
+	//
+	// 这也是唯一的口径：不按插件名判断，只问「谁声明了 compression 能力并当值」。
+	if problem := mgr.CompactionRoleProblem(); problem != "" {
+		fail("compaction backend is required but not available: %s. Enable a plugin that declares Provides compaction in config.yaml (set `compaction: <name>` when several are enabled).", problem)
 	}
 
 	// 成功启动：把已生效的 config.yaml 与当前 preset 各自独立备份一次（配置自愈基础——

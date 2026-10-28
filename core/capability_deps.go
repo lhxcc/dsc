@@ -182,6 +182,27 @@ func (m *Manager) findProviderByCapabilityLocked(providerType, capability, selfN
 	if capability == "" {
 		return "", nil
 	}
+	if capability == "compaction" {
+		// 压缩与 LLM 同构：多候选合法（换后端只需改一行配置），但当值者唯一，
+		// 显式选择器是 config.yaml 的 compaction 字段（角色同 default_llm）。
+		//
+		// 选择规则必须与岗位解析共用 pickCompactionProviderLocked——两处各写一份就会
+		// 分叉成「岗位有人、依赖却说没有 provider」，agent 永远停在 PENDING。
+		// 因此这里不看下面那份 names（它按 coreMetadata 列出所有声明者），而是直接
+		// 问岗位。
+		holder, candidates, reason := m.pickCompactionProviderLocked(providerType)
+		switch {
+		case holder != "":
+			return holder, nil
+		case len(candidates) <= 1:
+			// 没有候选 → 交给依赖机制（PENDING）+ 启动闸门报告；唯一候选却选不出来
+			// 只可能是它没加载，同样留给闸门解释。
+			return "", nil
+		default:
+			// 多候选未点名：配置歧义必须 fail-loud，否则会静默选错/不选。
+			return "", fmt.Errorf("no compaction provider on duty (type=%s): %s; candidates=%v", providerType, reason, candidates)
+		}
+	}
 	var names []string
 	for name, info := range m.coreMetadata {
 		if name == selfName {

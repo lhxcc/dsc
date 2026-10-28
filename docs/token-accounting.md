@@ -289,10 +289,11 @@ default:
 `last_usage_tokens`（上一次真正发出去的量），**不用** `projected_tokens`，代码注释里写明
 理由，防止后来者"顺手统一"。
 
-### 7.1 有压缩后端时，agent 不做请求级裁剪
+### 7.1 agent 不做请求级裁剪（与有没有后端无关）
 
-承接上一条「谁能改写表面，谁就必须自己量」：**既然后端把表面改小了，agent 手里的
-投影就不再描述将要发出的东西**，任何基于它的裁剪都是瞎猜。
+承接上一条「谁能改写表面，谁就必须自己量」：**agent 手里的投影不描述将要发出的东西**，
+任何基于它的裁剪都是瞎猜——有压缩后端时是这样（后端会把表面积改小），没有后端时也一样
+（真正决定能不能发出去的是宿主收口层，§7.2）。
 
 `TokenMeter.Project` 的锚点一头是**改写后**的 usage（比如 169K），一头是**改写前**的
 估算（比如 932K）——两者描述的是两个不同的列表。`usage + (x − sentEstimate)` 于是把
@@ -300,15 +301,17 @@ default:
 在 932K / 610K 交替（对应 provider 的 169K / 26.5K），裁剪深度也跟着每步翻转，前缀缓存
 每次全废。
 
-因此裁定（`plugins/agent-react-loop` 的 step 循环）：
+因此裁定（`plugins/agent-react-loop` 的 step 循环）：agent **只做循环与调度**，
 
-- 有后端（`hasCompactionBackend`）时：**不裁剪、不折叠、不做「单轮内容超出上下文窗口」
-  硬报错**。这三件事量的都是改写前的列表，而真正上线的是后端的渲染结果（实测 765K vs
-  原始 1.66M），拿前者判后者会把完全装得下的请求判死。
-- 窗口适配是后端的职责：它看得到完整的 append-only 历史，也只有它能决定保留什么。
-- 兜底不是盲发：provider 4xx → 宿主 `agent/request-error` → 后端紧急压缩 → 重试
-  （`notify` 只采纳选定后端的 `retry`）。
-- 无后端时裁剪照旧（§11「动裁剪逻辑」），两条路径不要互相「统一」。
+- **不裁剪**（没有任何 `trimToWindow` / 调用）；
+- **不折叠**（不改写任何消息正文；`foldOversizeMessages` 已删除）；
+- **不做摘要化压缩**（`compactHistory` 已删除；压缩是声明 `Provides compaction` 的插件的
+  职责，agent metadata 用 `requires/dsc/compaction` 声明这个强依赖）；
+- **不做「单轮内容超出上下文窗口」硬报错**：它量的是改写前的列表，而真正上线的是后端渲染
+  结果（实测 765K vs 原始 1.66M）或宿主滑窗后的视图，拿前者判后者会把完全装得下的请求判死。
+
+窗口适配的两条路径都在宿主：改写后的收口（§7.2）与 provider 4xx 后的滑窗重试
+（`core/overflow_adjust.go`）。没有当值压缩后端时进程根本不会启动（agent 依赖未满足）。
 
 ### 7.2 发出去的那一份必须有硬上限（宿主侧收口）
 
@@ -405,7 +408,7 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
 
 | 消费者 | 读什么 | 为什么 |
 |---|---|---|
-| agent（裁剪/单轮超窗/显示） | 自己的 `TokenMeter`（`SampleUsage` + `Project`） | 决策在 agent 进程，窗口裁剪必须本地判断 |
+| agent（上报「已用」） | 自己的 `TokenMeter`（`SampleUsage` + `Project`） | 它只上报投影给前端；**不做**裁剪/压缩决策（那是宿主与压缩后端的事） |
 | 宿主 pre-step | `projectPressure` | 给插件一个统一的、含工具目录与信封判据的投影 |
 | `dsc-system` | 无记录时用 `projected_tokens`，有记录时自测 `rewritten` | §7 表面所有权 |
 | `dsc-billion-context` | `last_usage_tokens` | 它的真实载荷是自己渲染出的视图 |
@@ -419,37 +422,49 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
 |---|---|---|---|---|---|
 | 0 | 会话日志 | `session/`（`*.jsonl`） | 每次事件 | 只追加。**任何裁剪都不改它** | — |
 | 1 | 派生 | `session.DeriveMessagesLimited(n)` | 每次请求 | 事件 → 消息；`n` 只限制**从存档恢复**的历史（`config.history_injection`），当前进程内的轮次不受影响 | 不改 |
-| 2 | agent 请求级裁剪 | `plugins/agent-react-loop`：`trimToWindow` / `fitMessagesToWindow` / `foldOversizeMessages` | **仅当没有压缩后端**，且历史超窗 | 丢弃最旧的完整轮次（多档收紧 90%/60%/35%/15%），单条超大消息折叠为首尾 | 不改（只影响本次请求） |
-| 3 | agent 内联压缩 | 同上：`compactHistory` | **仅当没有后端**，且投影 ≥ 80% | 调模型把旧前缀摘要成一条，**写回会话**（永久） | **改写** |
-| 4 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 有后端时**每次请求** | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。事件仍广播给所有插件，但**只有岗位持有者的改写被采纳**，也只有它收到完整消息列表（§8.2） | 通常不改（billion-context 会持久化自己的 state） |
-| 5 | 宿主收口 | `core/llm_router.go finishPreStep` + `core/context_ceiling.go` + `core/overflow_adjust.go` | 每次请求（改写之后）；以及 provider 4xx 的重试 | 量最终表面；超窗从头部丢到 90% 窗口（保留段全是原始消息 + 一行切除说明）；单条本身超窗则本地报错（不截断、不靠 400）。4xx 时用 provider 报的实际值收紧预算后重试（仍是滑窗） | 不改 |
-| 6 | 展示口径 | `HostContextMeters`（`NoteActualSurface` / `ContextTokens`） | 每次请求 | 把「实际发出去的大小」发布给 TUI；不是另算一份 | 不改 |
+| 2 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 每次请求 | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。事件仍广播给所有插件，但**只有岗位持有者的改写被采纳**，也只有它收到完整消息列表（§8.2） | 通常不改（billion-context 会持久化自己的 state） |
+| 3 | 宿主收口 | `core/llm_router.go finishPreStep` + `core/context_ceiling.go` + `core/overflow_adjust.go` | 每次请求（改写之后）；以及 provider 4xx 的重试 | 量最终表面；超窗从头部丢到 90% 窗口（保留段全是原始消息 + 一行切除说明）；单条本身超窗则本地报错（不截断、不靠 400）。4xx 时用 provider 报的实际值收紧预算后重试（仍是滑窗） | 不改 |
+| 4 | 展示口径 | `HostContextMeters`（`NoteActualSurface` / `ContextTokens`） | 每次请求 | 把「实际发出去的大小」发布给 TUI；不是另算一份 | 不改 |
+
+**agent 不在这张表里。** 它派生历史后原样下发：不裁剪、不折叠、不做摘要。理由不是
+消息身份（身份已是宿主下发的稳定 id，裁掉头部不会让压缩块指错消息），而是三条：
+
+1. 职责：改写请求面归压缩后端，窗口适配归宿主收口层，agent 只调度；
+2. 观测点错位：它手里是**改写前**的列表（可能几倍于窗口），真正上线的是后端渲染后 /
+   宿主滑窗后的视图——拿前者决定丢什么，等于替后端扔材料；
+3. 压缩是增量的（`dsc-system` 按已压前缀的 sha256 指纹复用摘要、billion-context 的块覆盖
+   按它见过的历史建立）：喂它每步都被裁过的列表，前缀指纹每步失配 → 每步重算压缩，
+   请求面在相邻两步之间摆动、前缀缓存反复失效（早期实测 169K/26.5K 交替，那时还叠加着
+   按位置寻址的错位；那一层已随稳定 id 消失，增量这一层仍在）。
+
+而「滑窗窗口内每条都是原始消息」的不变量只能由宿主收口那一层保证。
 
 几条由此推出的结论：
 
-- **同时只有一条裁剪路径在干活**：有后端时是 4（+5 兜底），没有后端时是 2/3。所以
+- **同时只有一条改写路径在干活**：先是 2（压缩后端，可能改写），再是 3（宿主滑窗兜底）。
   「为什么我看到的裁剪数变了」先确认 `compaction` 配的是哪个后端、它是否真的加载了
   （`CompactionBackendState`）。
-- **前四层里只有第 3 层会写回会话**，其余都只影响「这一次请求」。所以「切回大窗口还能
-  看到原文」成立的前提是没走内联压缩（压缩过的那段真的没了）。
+- **只有压缩后端可能写回会话**（摘要化不可逆），其余都只影响「这一次请求」。所以
+  「切回大窗口还能看到原文」成立的前提是那段没被压缩过——滑窗丢掉的只是本次请求的
+  视图，会话日志一字未改。
 - **前端不输出任何裁剪/压缩提示**：滑动窗口是本产品的常态工作方式，不是要用户处理的
-  异常。要看诊断就开 `-log`，那里有 `context trimmed to fit the window` /
-  `oversized messages folded` / `compacting history (inline)` /
-  `llm request: trimmed to fit the context window`。
+  异常。要看诊断就开 `-log`，那里有 `llm request: trimmed to fit the context window`
+  这类记录。
 
 ### 8.2 压缩岗位：有能力者可以多个，当值者只有一个
 
 「谁在改写请求面」不是每步去猜，而是启动期就定下来的**一个岗位**（`core/notify.go`
-`ResolveCompactionRole`）。三个条件同时成立才算当值：
+`ResolveCompactionRole` → `pickCompactionProviderLocked`）：
 
-1. `config.yaml` 的 `compaction` 点了名；
-2. 该插件已加载（注册表里有它的 hook 客户端）；
-3. 它确实声明了 `Provides: {compaction: "true"}`。
+1. `config.yaml` 的 `compaction` 点了名 → 该插件当值（前提：已加载 + 声明了
+   `Provides: {"compaction": "true"}`）；
+2. 没点名、但**恰好一个**候选 → 它自动当值（启用即生效，用户不必再写一行配置）；
+3. 没点名、多个候选 → **空缺**并要求点名（两个后端同时改写会层层叠加，结果既不是 A
+   也不是 B），原因写在 `Vacancy` 里。
 
-缺任意一条就是**岗位空缺**，且空缺原因写在 `Vacancy` 里（没配置 / 没加载 / 没声明能力），
-`main.go` 启动时把「谁当值 + 还有谁有这能力」写进日志。空缺本身是正常形态（本部署不用
-后端，agent 内联压缩是唯一路径），但「有候选人却没人当值」必须能解释——那正是「新压缩
-没生效」的常见原因。
+**空缺不再是正常形态**：压缩是 agent 的强依赖（agent metadata 声明
+`requires/dsc/compaction`），它自己不实现压缩。没有当值后端时 agent 不会被激活，
+`main.go` 在加载完成后据 `CompactionRoleProblem()` 直接 `fail`，把缺的是哪一环说清楚。
 
 **载荷跟着岗位走。** `agent/pre-step` 仍派发给所有插件（副作用不能丢：重复调用链重置、
 记忆落盘），但完整消息列表只发给岗位持有者：
@@ -515,23 +530,23 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
 - **消息身份 = 宿主下发的稳定 id**（`proto.Message.id`，派生时取 surface 事件 seq）。
   任何跨请求指认同一条消息的东西（压缩块的覆盖集合、`mNNNNN` 映射）都用它；列表下标
   不是身份，只是位置（§7.1）。
-- **压缩改写权归岗位**：`ResolveCompactionRole()` 是唯一解析点（配置点名 + 已加载 + 声明
-  `compaction`）。`agent/pre-step` 的完整消息列表只发给岗位持有者，`agent/request-error`
+- **压缩改写权归岗位**：`ResolveCompactionRole()` 是唯一解析点（配置点名且合格者当值；
+  未点名时唯一候选自动当值；多候选未点名即空缺并要求点名）。压缩是 agent 的**强依赖**
+  （metadata 声明 `requires/dsc/compaction`）：岗位空缺时 agent 不会被激活，宿主启动即失败。`agent/pre-step` 的完整消息列表只发给岗位持有者，`agent/request-error`
   只发给它——岗位之外没人能改写请求面，发过去就是白干。需要看消息的观察型插件用
   `pre-step-messages` 声明，不要在核心里按名字特判。
 - **压缩（唯一）与投影（可叠加）分阶段**：`stage=compaction` 只采纳岗位持有者的结果；
   `stage=projection` 由声明 `pre-step-transform` 的插件依次作用在压缩后的视图上，必须无损、
   失败不 veto。**不要把投影塞回压缩插件内部**——那会让压缩换人时投影一起消失（§8.3）。
 - 压力必须量在"将要发出的表面"上（§7）；改写者自测。
-- **裁剪与超窗判定必须同一口径**（仅无压缩后端时，见 §7.1）：裁剪按消息估算选起点，
-  判定读投影值，两者可能差数倍，故裁剪要闭环（裁完用 `projectedFit` 复核，不满足就收紧
-  预算再裁，见 §11「动裁剪逻辑」）。
+- **超窗判定只在宿主一处**：agent 不判定、不裁剪（见 §7.1）。宿主收口用同一份
+  「消息 + 工具目录」的投影量与裁，且裁完要按同一口径复核——估算与投影分叉时一次裁不足。
 - **压缩提示词必须命令模型在摘要里保留用户「当前最紧要任务/事项」**：`dsc-system`
   的 `llmSummary` 与 `dsc-billion-context` 的 `compress` 描述都写明——压缩后模型仍须知道
   现在要做什么、卡在哪、下一步是什么。当前任务靠模型自己的压缩选择保留，不靠程序钉死某条。
-- **展示口径必须跟随「裁剪/折叠之后真正发出的表面」**：agent 的 `Usage.ContextTokens`
-  在裁剪完成后按 `msgs + tools` 计算（`sentSurface`），不是按裁剪前的全量历史。小窗口读
-  超长会话时两者差着一整段被裁掉的历史。
+- **展示口径必须跟随「真正发出的表面」**：agent 的 `Usage.ContextTokens` 按
+  `msgs + tools` 计算（`sentSurface`），而 `msgs` 是派生后原样下发的那一份；宿主侧若做了
+  滑窗，用 `HostContextMeters.NoteActualSurface` 覆盖为实际发出量。
 - **没有增量基线的实测值不得当投影**（见 §4）：它会冻结在界面上。锚定必须无条件做，
   且投影输入与锚定基线同源（都是发出去的那份表面）。
 - **展示值一律夹在当前窗口内**：超过容量的部分发不出去（agent 会先裁掉），显示「714K/128K」
@@ -556,14 +571,15 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
   只需保 `system` + 最近 N 条（保留尾），早期历史随滑动窗口自然淘汰即可。
 - 用列表下标（`msg-<n>`）当消息身份：`history_injection`、请求级裁剪、fork 都会让
   同一个引用指到另一条消息——那是「遮错内容」，不是「压得不准」。
-- 在有压缩后端时于 agent 里做请求级裁剪、折叠，或拿改写前的估算做「单轮超窗」硬报错
-  （§7.1）。这三件事量的都不是将要发出的那份表面。
+- 在 agent 里做请求级裁剪、折叠、摘要化，或拿改写前的估算做「单轮超窗」硬报错
+  （§7.1）。那既超出 agent 的职责（它只调度），也量的不是将要发出的那份表面。
 - 宿主按插件名分发用量相关能力（应走声明式/事件）。
 
 **守卫测试**（改坏了会红）：`plugin_names_guard_test.go`、`TestToolsFingerprint`、
 `TestProjectPressure`、`TestLastUsageAnchor`、`TestRequestHeaderLogOnly`、
 `TestEstimateProtoToolTokens`、`TestCompactionBasicMeasuresItsOwnSurface`、
-`TestLsPipedIsOnePerLine`、`TestBackendActiveSkipsHistoryTrim`（有后端时不裁）、
+`TestLsPipedIsOnePerLine`、`TestAgentSendsFullHistoryVerbatim`（agent 原样下发、
+不裁不折）、`TestAgentDeclaresCompactionDependency`（压缩是强依赖）、
 `TestStableIDsSurviveHeadTrimming`（id 不随列表起点变）、
 `TestRetainBoundaryKeepsToolPairing`（压缩切点不切断 tool 配对）、
 `TestFinishPreStepTrimsOversizedRequest`（超窗请求被收口压进窗口）、
@@ -619,16 +635,16 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
 触发比例 `DSC_COMPACTION_BASIC_THRESHOLD`（默认 0.80）；保留尾部 `DSC_COMPACTION_BASIC_RETAIN_RATIO`（默认 0.16）。
 注意阈值比较的是"投影压力"，不是原始历史大小。
 
-**动裁剪逻辑**（`trimToWindow` / `fitMessagesToWindow*`）：**先确认没有压缩后端**——
-有后端时这条路径整段不执行（§7.1），把它改成无条件执行就会重现「发送面 932K/610K
-交替、前缀缓存每步失效」。以下仅适用于无后端的兜底路径。
+**动滑窗逻辑**（`core/context_ceiling.go` 的 `enforceRequestCeiling` / `CapMessagesToWindow`）：
+这是**唯一**会丢历史的路径（agent 侧已无裁剪，§7.1）。三条不变量不能碰：
 
-裁剪按消息估算选起点，超窗判定
-却读投影值，两者口径不同（差两三倍并不罕见）。所以裁剪是**闭环**的：裁一次 → 用
-`projectedFit`（投影口径，含工具目录）复核 → 不满足就按
-`oversizeTrimFallbackRatios`（0.90 → 0.60 → 0.35 → 0.15）逐档收紧再裁，直到装得进或
-无历史可裁。改动时不得退回"裁一次就判超窗"——那正是「省略六千多条之后还报 441195 /
-131072」的成因；也不得让提示帧回显裁剪前的占用（那会让人以为裁剪没执行）。
+1. 保留段里的每条都是**原始消息**（同一对象、内容不变），只在开头插一行切除说明；
+2. 切点必须是合法边界（首条 system 保留、不以 tool 结果开头、至少保留最后一条）；
+3. 量的是**改写后**的表面（消息 + 工具目录），不是改写前。
+
+改动时不得退回"裁一次就判超窗"——估算与投影分叉时会来回摆（「省略六千多条之后还报
+441195 / 131072」就是这么来的）；也不得让提示帧回显裁剪前的占用（那会让人以为裁剪没
+执行）。
 
 ---
 

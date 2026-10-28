@@ -253,6 +253,35 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
 
 4. **先例与反例**：`history_injection`（`README.md` §语义分歧）按此三值编码——`-1`=不注入 / `0`=未定义(默认不限制) / `N>0`=最近 N 条；`max_tokens=0` 在 openai 由 `resolveMaxTokens`、anthropic 由 `omitZeroMaxTokens` 中间件摘除，在 ollama 经 `num_predict` 转发且**绝不以 `0` 上送**（避免被服务端当无限）；反面教材：`DSC_HISTORY_INJECTION` 曾按 DSH 的 `-1=不限制` 反向实现、`num_predict=0` 被 ollama 当无上限、布尔 env 三套写法并存——均属未守此约定所致。
 
+### 13. 压缩是插件能力；agent 只调度，且对压缩是**强依赖**
+
+职责边界（改 agent 插件前先读这条）：
+
+- **agent 不实现压缩**。裁剪、折叠、摘要化、把"已省略 N 条"塞进 system——这些都属于
+  "改写请求面"，归当值的压缩后端（声明 `Provides: {compaction: "true"}`）与宿主收口层
+  所有。agent 只负责循环与调度。历史上 agent 曾自带 `trimToWindow` / `foldOversizeMessages`
+  / `compactHistory` 三套兜底，已全部删除。**「不能裁」的理由不是消息身份**（身份早已是
+  宿主下发的稳定 id，裁掉头部不再让压缩块指错消息），而是：①职责不属于它；②它手里是
+  **改写前**的列表，真正上线的是后端渲染后 / 宿主滑窗后的视图，拿前者决定丢什么等于替
+  后端扔材料；③压缩是增量的（`dsc-system` 按已压前缀的 sha256 指纹复用摘要、
+  billion-context 的块覆盖按它见过的历史建立），喂它一份每步都被裁过的列表会让前缀指纹
+  每步失配 → 每步重算压缩、请求面在相邻两步之间摆动、前缀缓存反复失效。
+- **窗口适配归宿主**：`core/context_ceiling.go`（改写完成后量表面 → 超窗即滑窗到 90%，
+  保留段全是原始消息 + 开头一行切除说明）与 `core/overflow_adjust.go`（provider 4xx 收紧
+  预算后仍走滑窗）。agent 侧**不得**再判定"单轮超窗"报错——它量的是改写前的列表。
+- **依赖必须显式声明**：agent 的 metadata（`plugins/agent-react-loop` 的 `agentSDKConfig()`）
+  声明 `requires/dsc/compaction`。宿主据此在依赖未满足时把 agent 留在 PENDING，不按插件名
+  或 env 猜。删掉这条声明 = 允许 agent 在没有压缩能力的环境里裸奔，属于回归。
+- **启动期闸门**：`main.go` 在插件加载完成后调 `Manager.CompactionRoleProblem()`，岗位空缺
+  即 `fail`（说明缺的是"没启用插件 / 点名的没加载 / 点名的没声明能力 / 多候选未点名"）。
+  空缺不是可选形态，不要把它改回 warn。
+- **岗位解析唯一入口** `core/notify.go ResolveCompactionRole` → `pickCompactionProviderLocked`：
+  配置点名且合格者当值；未点名时**唯一候选自动当值**（启用即生效）；多候选未点名则空缺并
+  要求点名（两个后端同时改写会层层叠加）。能力依赖解析复用同一函数——两处各写一份就会
+  分叉成"岗位有人、agent 却因依赖未满足而 PENDING"。
+- **能力可多、岗位唯一**：`Candidates` 列出所有候选仅供诊断与切换；`agent/pre-step` 的完整
+  消息列表只发给岗位持有者，`agent/request-error` 也只发给它。
+
 ## 文档同步
 
 - **README 必须时刻反映代码实现的实际变化**。任何会改变 README 所述内容（架构、目录/模块与依赖增减、关键行为、安全设定）的源码修改，须在本次提交内一并同步更新 README，不允许 README 与实现漂移。

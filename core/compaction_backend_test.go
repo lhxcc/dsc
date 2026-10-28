@@ -7,6 +7,7 @@ import (
 
 	"dsc/proto"
 	"dsc/proto/metadata"
+	plugin "github.com/hashicorp/go-plugin"
 )
 
 // TestDispatchPreStepOnlyBackendRewriteAdopted 压缩改写权只归 compaction 字段选定的
@@ -47,8 +48,11 @@ func TestDispatchPreStepOnlyBackendRewriteAdopted(t *testing.T) {
 	}
 }
 
-// TestDispatchPreStepIgnoresRewritesWithoutBackend 未配置后端时改写一律不采纳
-// （由 agent 内联压缩接管），但事件仍派发以保留其它插件的副作用。
+// TestDispatchPreStepIgnoresRewritesWithoutBackend 岗位空缺（没有任何合格候选）时
+// 改写一律不采纳，但事件仍派发以保留其它插件的副作用。
+//
+// 注意：正常运行不会出现这个状态——agent 对压缩是强依赖，空缺时宿主启动即失败
+// （见 main 的启动闸门）。这里守的是「派发层不因为缺岗位而丢副作用」。
 func TestDispatchPreStepIgnoresRewritesWithoutBackend(t *testing.T) {
 	m, _ := hookManager()
 	h := &fakeHook{events: make(chan *proto.OnEventRequest, 1), eventResult: `{"messages":"[rewritten]"}`}
@@ -108,12 +112,21 @@ func TestCompactionBackendActiveRequiresConfiguredPlugin(t *testing.T) {
 		t.Fatal("能力显式声明 false 时不应 active")
 	}
 
-	// 未配置后端 → 恒 false，即使有插件提供能力。
+	// 未点名但存在唯一已加载候选 → 自动当值（启用即生效）；没有任何合格候选时才是空缺。
 	m.mu.Lock()
 	m.compactionBackend = ""
+	m.coreMetadata["dsc-system"] = declaresCompaction()
+	m.mu.Unlock()
+	if !m.compactionBackendActive() {
+		t.Fatal("未点名但唯一候选应自动当值")
+	}
+
+	m.mu.Lock()
+	delete(m.coreMetadata, "dsc-system")
+	delete(m.toolHookClients, "dsc-system")
 	m.mu.Unlock()
 	if m.compactionBackendActive() {
-		t.Fatal("未配置后端时应为 false")
+		t.Fatal("没有任何候选时应为空缺")
 	}
 }
 
@@ -260,8 +273,10 @@ func TestCompactionRoleResolvesConfiguredHolder(t *testing.T) {
 	}
 }
 
-// TestCompactionRoleVacancyReasons 三个条件缺任何一个都算空缺，且必须说明缺的是哪个。
-// 空缺本身是正常形态（本部署不用后端），但「有候选人却没人当值」得能解释。
+// TestCompactionRoleVacancyReasons 岗位解析的四种形态，且空缺时必须说明缺的是哪个。
+//
+// 空缺不再是「可选形态」：压缩是 agent 的强依赖，空缺 = 启动失败。所以这里的每条
+// vacancy 文案都是给用户看的「怎么补」的依据，不能含糊。
 func TestCompactionRoleVacancyReasons(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -271,7 +286,7 @@ func TestCompactionRoleVacancyReasons(t *testing.T) {
 		wantHolder bool
 		contains   string
 	}{
-		{"未配置后端", "", true, true, false, "no compaction backend configured"},
+		{"未点名但唯一候选（自动当值）", "", true, true, true, ""},
 		{"配置了但没加载", "backend-a", false, true, false, "is not loaded"},
 		{"加载了但没声明能力", "backend-a", true, false, false, "does not declare"},
 		{"三条件齐备", "backend-a", true, true, true, ""},
@@ -296,7 +311,42 @@ func TestCompactionRoleVacancyReasons(t *testing.T) {
 			if !strings.Contains(role.Vacancy, c.contains) {
 				t.Fatalf("vacancy = %q, want contains %q", role.Vacancy, c.contains)
 			}
+			// 自动当值只发生在「没点名 + 唯一候选」这一种形态
+			if wantAuto := c.configured == "" && c.wantHolder; role.AutoSelected != wantAuto {
+				t.Fatalf("auto_selected = %v, want %v", role.AutoSelected, wantAuto)
+			}
 		})
+	}
+}
+
+// TestCompactionRoleMultipleCandidatesNeedName 多候选未点名 → 空缺并要求点名：
+// 两个后端同时改写请求面会层层叠加，结果既不是 A 也不是 B。
+func TestCompactionRoleMultipleCandidatesNeedName(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.toolHookClients["backend-b"] = &fakeHook{}
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.coreMetadata["backend-b"] = declaresCompaction()
+	m.mu.Unlock()
+
+	role := m.ResolveCompactionRole()
+	if role.Holder != "" {
+		t.Fatalf("多候选未点名时不应自动选一个，got %q", role.Holder)
+	}
+	if !strings.Contains(role.Vacancy, "multiple compaction candidates") {
+		t.Fatalf("vacancy 应说明多候选未点名，got %q", role.Vacancy)
+	}
+	if len(role.Candidates) != 2 {
+		t.Fatalf("候选应全部列出，got %v", role.Candidates)
+	}
+
+	// 点名后立即当值（候选仍然完整，便于用户切换）
+	m.mu.Lock()
+	m.compactionBackend = "backend-b"
+	m.mu.Unlock()
+	if role := m.ResolveCompactionRole(); role.Holder != "backend-b" {
+		t.Fatalf("点名后应归 backend-b，got %q", role.Holder)
 	}
 }
 
@@ -539,5 +589,40 @@ func TestPreStepProjectionFailureKeepsPreviousView(t *testing.T) {
 	raw, _ := json.Marshal(payload["messages"])
 	if !strings.Contains(string(raw), "compacted") {
 		t.Fatalf("应保留上一步（压缩）结果，got %s", raw)
+	}
+}
+
+// TestCompactionRoleProblemIsStartupGate 启动闸门的输入：岗位空缺时必须给出一句能直接
+// 贴到错误信息里的说明（缺的是哪一环），有人当值时为空。
+func TestCompactionRoleProblemIsStartupGate(t *testing.T) {
+	m, _ := hookManager()
+	if got := m.CompactionRoleProblem(); got == "" || !strings.Contains(got, "no compaction backend on duty") {
+		t.Fatalf("岗位空缺时应给出原因，got %q", got)
+	}
+	m.mu.Lock()
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.mu.Unlock()
+	if got := m.CompactionRoleProblem(); got != "" {
+		t.Fatalf("有人当值时不应报问题，got %q", got)
+	}
+}
+
+// TestUnloadRefusesCompactionRoleHolder 当值压缩后端不可卸载：agent 依赖它，卸掉之后
+// 没有任何东西能改写请求面。换后端必须先启用并点名另一个。
+func TestUnloadRefusesCompactionRoleHolder(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.coreMetadata["backend-a"] = declaresCompaction()
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.clients["backend-a"] = &plugin.Client{} // 占位：只要"存在"就会走到守卫
+	m.mu.Unlock()
+
+	err := m.UnloadPlugin("backend-a")
+	if err == nil {
+		t.Fatal("卸载当值压缩后端应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "compaction role holder") {
+		t.Fatalf("错误信息应说明它是压缩岗位持有者，got %v", err)
 	}
 }

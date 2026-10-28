@@ -1,8 +1,8 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"strings"
 	"testing"
 
@@ -41,11 +41,11 @@ func TestRunLoopLimitedHistoryInjection(t *testing.T) {
 		t.Fatalf("SetHistoryInjection: %v", err)
 	}
 
-	llm := &compactMockLLM{done: make(chan struct{})}
+	llm := &recordingLLM{done: make(chan struct{})}
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	// emit 非空走 ChatStream 路径（与 TUI 一致），compactMockLLM 在该路径记录入参消息
+	// emit 非空走 ChatStream 路径（与 TUI 一致），recordingLLM 在该路径记录入参消息
 	res, err := a.runLoop(context.Background(), "继续", nil, func(*dsc.RunStreamResponse) {})
 	if err != nil {
 		t.Fatalf("runLoop: %v", err)
