@@ -300,6 +300,11 @@ func TestSeedSessionPromptFromLog(t *testing.T) {
 	if a.toolsHash != "abc123" || a.sentEstimate != 37790 || a.contextWindow != 1048576 || a.model != "deepseek-test" {
 		t.Fatalf("锚点信封字段未恢复: %+v", a)
 	}
+	// 同时预置展示读数：恢复有历史的会话时，「已用」不该在用户发出第一个请求之前
+	// 一直显示 0——上下文里已经躺着这段历史了。
+	if got := m.ContextTokens(key); got != 40347 {
+		t.Fatalf("启动预置的已用 = %d，want 40347（历史已注入，不该显示 0）", got)
+	}
 }
 
 // TestDisplayableMessagesExpandsToolProcess 回放必须带上工具过程：

@@ -34,6 +34,22 @@ type hostMeterState struct {
 	actual int
 }
 
+// Seed 用会话日志里的历史读数预置展示值（启动时、还没有任何 usage 帧）。
+//
+// 存在的理由：恢复一个有历史的项目会话时，第一帧 usage 要等到用户发出请求之后才有，
+// 此前标题栏的「已用」一直是 0——明明上下文里已经躺着几十万 token 的历史。品牌新会话
+// 显示 0 是对的（确实空），有历史时显示 0 就是在说假话。
+//
+// 只填「兜底」那一层：不写 reported，也不写 actual，第一帧真实用量到达后被自然替换。
+func (h *HostContextMeters) Seed(sessionID string, tokens int) {
+	if sessionID == "" || tokens <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stateLocked(sessionID).meter.SampleUsage(tokens, 0)
+}
+
 // NoteActualSurface 记录本步改写后实际发出的表面大小（消息 + 工具目录，同一个
 // core 估算口径）；传 0 表示本步没有改写，展示退回 agent 上报的投影值。
 func (h *HostContextMeters) NoteActualSurface(sessionID string, n int) {

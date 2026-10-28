@@ -253,6 +253,15 @@ func (m *Manager) ContextTokens(sessionID string) int {
 	return m.ctxMeters.ContextTokens(sessionID)
 }
 
+// SeedContextUsage 用会话日志里的历史读数预置「已用」（启动时、还没有 usage 帧）。
+// 恢复有历史的会话时，标题栏不该在用户发出第一个请求之前一直显示 0。
+func (m *Manager) SeedContextUsage(sessionID string, tokens int) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.Seed(sessionID, tokens)
+}
+
 // ResetContextMeters 清空某会话的计量（切会话 / 压缩改写历史后）。
 func (m *Manager) ResetContextMeters(sessionID string) {
 	if m == nil || m.ctxMeters == nil {

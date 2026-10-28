@@ -155,6 +155,34 @@ func TestPreStepWithoutRewriteClearsStaleActualSurface(t *testing.T) {
 	}
 }
 
+// TestHostContextMetersSeed 启动预置：恢复有历史的会话时，用户发出第一个请求之前
+// 就该有读数（上下文里已经躺着这段历史），第一帧真实用量到达后被替换。
+//
+// 预置只填「兜底」那一层：不写上报值、不写实际表面，避免把历史读数当成当前请求的
+// 权威值。
+func TestHostContextMetersSeed(t *testing.T) {
+	h := NewHostContextMeters(1_048_576)
+	h.Seed("s1", 40347)
+	if got := h.ContextTokens("s1"); got != 40347 {
+		t.Fatalf("预置后应显示 40347，got %d", got)
+	}
+	// 新会话不预置：仍是 0（前端显示「未知」而不是 0%）
+	if got := h.ContextTokens("brand-new"); got != 0 {
+		t.Fatalf("未预置的会话应为 0，got %d", got)
+	}
+	// 第一帧真实用量到达：预置值被替换，不再残留
+	h.NoteUsage("s1", &Usage{PromptTokens: 512_000, ContextTokens: 512_000}, 512_000)
+	if got := h.ContextTokens("s1"); got != 512_000 {
+		t.Fatalf("首帧用量应替换预置值，got %d", got)
+	}
+	// 非法入参不写脏数据
+	h.Seed("s2", 0)
+	h.Seed("", 1234)
+	if got := h.ContextTokens("s2"); got != 0 {
+		t.Fatalf("非正预置值应被忽略，got %d", got)
+	}
+}
+
 // TestHostContextMetersReset 切会话/压缩改写历史后清空，避免旧数字残留。
 func TestHostContextMetersReset(t *testing.T) {
 	h := NewHostContextMeters(1000)
