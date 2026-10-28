@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -118,5 +119,42 @@ func TestCandidateFromFile(t *testing.T) {
 	c, ok = candidateFromFile(filepath.Join(dir, "single.md"))
 	if !ok || c.Name != "s1" {
 		t.Fatalf("flat candidate wrong: %+v ok=%v", c, ok)
+	}
+}
+
+// TestBuiltinSkillsParse 仓库自带的 builtin 技能必须都能被解析出 name + description。
+//
+// frontmatter 写坏（漏 `---`、YAML 里出现裸冒号、描述为空）时，技能仍会出现在
+// 目录里但索引里没有条目——模型永远不知道该调用它，而且没有任何报错。
+func TestBuiltinSkillsParse(t *testing.T) {
+	root := filepath.Join("..", "..", "skills", "builtin")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("读取 builtin 技能目录: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, e.Name(), "SKILL.md")
+		sk, ok := parseSkillFile(path, e.Name())
+		if !ok {
+			t.Errorf("%s 解析失败", path)
+			continue
+		}
+		if strings.TrimSpace(sk.Name) == "" {
+			t.Errorf("%s 缺少 name", path)
+		}
+		if strings.TrimSpace(sk.Description) == "" {
+			t.Errorf("%s 缺少 description（索引里会看不到它）", path)
+		}
+		if strings.TrimSpace(sk.Body) == "" {
+			t.Errorf("%s 正文为空", path)
+		}
+		n++
+	}
+	if n == 0 {
+		t.Fatal("builtin 目录下没有技能")
 	}
 }
