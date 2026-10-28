@@ -90,6 +90,14 @@ func (m *Manager) hookClientsSnapshot() []proto.PluginHookServiceClient {
 // 若确实要看消息，在 SDK Config 的 Provides 里声明这一项即可。
 const capPreStepMessages = "pre-step-messages"
 
+// capPreStepTransform 插件声明「我提供一个可组合的请求面变换（projection）」。
+//
+// 与 compaction 的分工：压缩是「谁当值谁说了算」，只能有一个；投影是可以叠加的
+// 若干道工序（按预算退役旧图像、按类型截断大段工具结果……），谁声明谁参与，按装载
+// 顺序依次作用在上一步的输出上。早先投影只能寄生在压缩插件内部——于是压缩换人时
+// 投影跟着消失，那不是配置问题，是把两件事绑在了一起。
+const capPreStepTransform = "pre-step-transform"
+
 // CompactionRole 是「压缩岗位」的解析结果。
 //
 // 有压缩能力的插件可以有多个，岗位只有一个：谁当值，谁的 pre-step 改写被采纳，
@@ -354,6 +362,164 @@ func (m *Manager) hookClientsNamedSnapshot() []namedHookClient {
 }
 
 // collectPreStepAppends 从插件返回的 result_json 中取出一次性插播消息。
+// withPreStepStage 复制一份 pre-step 载荷并写入阶段标记（不改原事件）。
+func withPreStepStage(data any, stage string) any {
+	switch ev := data.(type) {
+	case AgentPreStepEvent:
+		ev.Stage = stage
+		return ev
+	case *AgentPreStepEvent:
+		if ev == nil {
+			return data
+		}
+		cp := *ev
+		cp.Stage = stage
+		return cp
+	case map[string]any:
+		out := make(map[string]any, len(ev)+1)
+		for k, v := range ev {
+			out[k] = v
+		}
+		out["stage"] = stage
+		return out
+	}
+	return data
+}
+
+// applyPreStepProjections 跑第二阶段：让每个声明 pre-step-transform 的插件在
+// **当前视图**上依次投影，返回合并后的结果。
+//
+// 约定（写进文档与 sdk 常量注释）：投影是无损变换——不删消息、不改角色顺序、不动
+// 工具配对，只改单条消息的内容/附件。这样它才能安全地叠加在压缩结果之上。
+//
+// 失败处理与第一阶段不同：压缩改写的失败会让请求超窗（必须 veto），而投影只是
+// 优化（省下的是图像/长输出的字节）。所以某个投影报错或传输失败时记 WARN 并继续
+// 用上一步的结果，绝不因此让整轮请求失败。
+func (m *Manager) applyPreStepProjections(ctx context.Context, clients []namedHookClient, data any, result any) any {
+	var transforms []namedHookClient
+	for _, nc := range clients {
+		if m.wantsPreStepTransform(nc.name) {
+			transforms = append(transforms, nc)
+		}
+	}
+	if len(transforms) == 0 {
+		return result
+	}
+
+	msgs := ""
+	if raw, ok := extractPreStepMessages(result); ok {
+		msgs = raw
+	} else if ev, ok := data.(AgentPreStepEvent); ok {
+		msgs = ev.MessagesJSON
+	}
+	if msgs == "" {
+		return result // 没有视图可投影（空会话/旧载荷）：不白跑
+	}
+
+	changed := false
+	for _, nc := range transforms {
+		payload, ok := preStepProjectionPayload(data, msgs)
+		if !ok {
+			m.logger.Warn("pre-step projection skipped: cannot build payload", "plugin", nc.name)
+			continue
+		}
+		resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(EventAgentPreStep), DataJson: payload})
+		if err != nil {
+			m.logger.Warn("pre-step projection transport error, keeping previous view",
+				"plugin", nc.name, "error", err.Error())
+			continue
+		}
+		if e := resp.GetError(); e != "" {
+			m.logger.Warn("pre-step projection failed, keeping previous view", "plugin", nc.name, "error", e)
+			continue
+		}
+		next, ok := extractPreStepMessagesJSON(resp.GetResultJson())
+		if !ok || next == msgs {
+			continue
+		}
+		msgs = next
+		changed = true
+	}
+	if !changed {
+		return result
+	}
+
+	out, _ := result.(map[string]any)
+	if out == nil {
+		out = map[string]any{}
+	}
+	var arr any
+	if err := json.Unmarshal([]byte(msgs), &arr); err != nil {
+		m.logger.Warn("pre-step projection produced invalid messages JSON, ignoring", "error", err.Error())
+		return result
+	}
+	out["messages"] = arr
+	return out
+}
+
+// preStepProjectionPayload 生成第二阶段的载荷：同一信封，消息换成当前视图，阶段标记
+// 为 projection。
+func preStepProjectionPayload(data any, messagesJSON string) (string, bool) {
+	staged := withPreStepStage(data, PreStepStageProjection)
+	switch ev := staged.(type) {
+	case AgentPreStepEvent:
+		ev.MessagesJSON = messagesJSON
+		b, err := json.Marshal(ev)
+		return string(b), err == nil
+	case map[string]any:
+		ev["messages_json"] = messagesJSON
+		b, err := json.Marshal(ev)
+		return string(b), err == nil
+	}
+	return "", false
+}
+
+// extractPreStepMessages 取结果载荷里的消息数组（原样 JSON 文本）。
+func extractPreStepMessages(result any) (string, bool) {
+	m, ok := result.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	raw, ok := m["messages"]
+	if !ok {
+		return "", false
+	}
+	b, err := json.Marshal(raw)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return "", false
+	}
+	return string(b), true
+}
+
+// extractPreStepMessagesJSON 从插件返回的 result_json 里取 messages。
+func extractPreStepMessagesJSON(resultJSON string) (string, bool) {
+	if resultJSON == "" {
+		return "", false
+	}
+	var payload struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &payload); err != nil {
+		return "", false
+	}
+	if len(payload.Messages) == 0 || string(payload.Messages) == "null" {
+		return "", false
+	}
+	return string(payload.Messages), true
+}
+
+// wantsPreStepTransform 报告该插件是否声明了「可组合的请求面变换」能力。
+func (m *Manager) wantsPreStepTransform(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	info := m.coreMetadata[name]
+	if info == nil {
+		return false
+	}
+	v, ok := info.Capabilities[capPreStepTransform]
+	return ok && v != "false"
+}
+
 // decodeEventPayload 把事件载荷还原成调用方期望的形态。
 //
 // 正常路径返回的是 json.Unmarshal 出来的 any（map[string]any）；提前返回若直接给回
@@ -414,9 +580,15 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 	if len(clients) == 0 {
 		return data, nil
 	}
+	// pre-step 分两阶段（结构改写 → 请求面投影），载荷里带阶段标记，插件据此决定
+	// 这一步该做哪件事。旧插件忽略该字段，行为与从前一致（它们只会在第一阶段生效）。
+	payloadData := data
+	if name == EventAgentPreStep {
+		payloadData = withPreStepStage(data, PreStepStageCompaction)
+	}
 	dataJSON := ""
-	if data != nil {
-		if b, err := json.Marshal(data); err == nil {
+	if payloadData != nil {
+		if b, err := json.Marshal(payloadData); err == nil {
 			dataJSON = string(b)
 		}
 	}
@@ -458,7 +630,7 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 	lightJSON := ""
 	fullPayload := map[string]bool{}
 	if name == EventAgentPreStep {
-		lightJSON = reducedPreStepPayload(data)
+		lightJSON = reducedPreStepPayload(payloadData)
 		for _, nc := range clients {
 			if m.wantsPreStepMessages(nc.name) {
 				fullPayload[nc.name] = true
@@ -520,6 +692,11 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		var result any
 		if finalResult != "" {
 			_ = json.Unmarshal([]byte(finalResult), &result)
+		}
+		// 第二阶段：请求面投影。在结构改写之后、对改写后的视图依次作用，与谁当值无关
+		// ——投影不是「压缩的一部分」，压缩换人也该照跑。
+		if name == EventAgentPreStep {
+			result = m.applyPreStepProjections(ctx, clients, data, result)
 		}
 		if len(appends) > 0 {
 			// 合并进返回载荷的 append 字段，交由调用方追加到消息末尾

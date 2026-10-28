@@ -423,3 +423,121 @@ func decodePreStep(t *testing.T, req *proto.OnEventRequest) AgentPreStepEvent {
 	}
 	return ev
 }
+
+// declaresTransform 构造一个声明了「可组合请求面变换」能力的插件元数据。
+func declaresTransform() *metadata.PluginInfo {
+	return &metadata.PluginInfo{Capabilities: map[string]string{capPreStepTransform: "true"}}
+}
+
+// TestPreStepProjectionComposesAfterCompaction 第二阶段必须作用在**压缩改写后的视图**上，
+// 且结果被采纳——投影是独立工序，不是压缩的一部分。
+//
+// 现场动因：图像预算卸载原先寄生在压缩插件内部（插件内串链），于是压缩换成另一个后端
+// 时，投影跟着一起消失。分开之后：谁当值压缩归岗位，投影按能力由宿主依次调用。
+func TestPreStepProjectionComposesAfterCompaction(t *testing.T) {
+	m, _ := hookManager()
+	holder := &fakeHook{events: make(chan *proto.OnEventRequest, 4),
+		eventResult: `{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"compacted"}]}`}
+	projector := &fakeHook{events: make(chan *proto.OnEventRequest, 4),
+		eventResult: `{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"projected"}]}`}
+	m.mu.Lock()
+	m.toolHookClients["compactor"] = holder
+	m.toolHookClients["projector"] = projector
+	m.toolHookOrder = []string{"projector", "compactor"}
+	m.coreMetadata["compactor"] = declaresCompaction()
+	m.coreMetadata["projector"] = declaresTransform()
+	m.compactionBackend = "compactor"
+	m.mu.Unlock()
+
+	ev := AgentPreStepEvent{Session: "s1", MessagesJSON: `[{"role":"user","content":"original"}]`, TokenCount: 100}
+	out, err := m.dispatchEventToPlugins(EventAgentPreStep, ev)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	// 阶段一：投影者只拿到轻载荷（它不当值压缩）
+	first := decodePreStep(t, <-projector.events)
+	if first.Stage != PreStepStageCompaction || first.MessagesJSON != "" {
+		t.Fatalf("阶段一应发轻载荷(compaction/无消息)，got stage=%q msgs=%.40s", first.Stage, first.MessagesJSON)
+	}
+	// 阶段二：拿到压缩后的视图，阶段标记为 projection
+	second := decodePreStep(t, <-projector.events)
+	if second.Stage != PreStepStageProjection {
+		t.Fatalf("阶段二 stage = %q", second.Stage)
+	}
+	if !strings.Contains(second.MessagesJSON, "compacted") {
+		t.Fatalf("投影必须作用在压缩改写后的视图上，got %.80s", second.MessagesJSON)
+	}
+
+	// 结果取投影的输出
+	payload, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("返回载荷类型 %T", out)
+	}
+	raw, _ := json.Marshal(payload["messages"])
+	if !strings.Contains(string(raw), "projected") {
+		t.Fatalf("最终视图应为投影结果，got %s", raw)
+	}
+}
+
+// TestPreStepProjectionIndependentOfRole 岗位空缺（没配压缩后端）时投影照跑：
+// 它的触发条件是预算，不是岗位。压缩与投影是两件事的另一个证明。
+func TestPreStepProjectionIndependentOfRole(t *testing.T) {
+	m, _ := hookManager()
+	projector := &fakeHook{events: make(chan *proto.OnEventRequest, 4),
+		eventResult: `{"messages":[{"role":"user","content":"projected"}]}`}
+	m.mu.Lock()
+	m.toolHookClients["projector"] = projector
+	m.toolHookOrder = []string{"projector"}
+	m.coreMetadata["projector"] = declaresTransform()
+	m.compactionBackend = ""
+	m.mu.Unlock()
+
+	ev := AgentPreStepEvent{Session: "s1", MessagesJSON: `[{"role":"user","content":"original"}]`}
+	out, err := m.dispatchEventToPlugins(EventAgentPreStep, ev)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	payload, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("返回载荷类型 %T", out)
+	}
+	raw, _ := json.Marshal(payload["messages"])
+	if !strings.Contains(string(raw), "projected") {
+		t.Fatalf("岗位空缺时投影仍应生效，got %s", raw)
+	}
+}
+
+// TestPreStepProjectionFailureKeepsPreviousView 投影失败不能让整轮请求失败：
+// 它省的是字节（图像/长输出），不是把请求压进窗口的那一步。压缩的失败才必须 veto。
+func TestPreStepProjectionFailureKeepsPreviousView(t *testing.T) {
+	m, _ := hookManager()
+	holder := &fakeHook{events: make(chan *proto.OnEventRequest, 2),
+		eventResult: `{"messages":[{"role":"user","content":"compacted"}]}`}
+	bad := &fakeHook{events: make(chan *proto.OnEventRequest, 2)}
+	bad.eventResult = ""
+	bad.eventErr = "projection exploded"
+	bad.eventErrStage = PreStepStageProjection
+	m.mu.Lock()
+	m.toolHookClients["compactor"] = holder
+	m.toolHookClients["projector"] = bad
+	m.toolHookOrder = []string{"compactor", "projector"}
+	m.coreMetadata["compactor"] = declaresCompaction()
+	m.coreMetadata["projector"] = declaresTransform()
+	m.compactionBackend = "compactor"
+	m.mu.Unlock()
+
+	ev := AgentPreStepEvent{Session: "s1", MessagesJSON: `[{"role":"user","content":"original"}]`}
+	out, err := m.dispatchEventToPlugins(EventAgentPreStep, ev)
+	if err != nil {
+		t.Fatalf("投影失败不应让派发失败: %v", err)
+	}
+	payload, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("返回载荷类型 %T", out)
+	}
+	raw, _ := json.Marshal(payload["messages"])
+	if !strings.Contains(string(raw), "compacted") {
+		t.Fatalf("应保留上一步（压缩）结果，got %s", raw)
+	}
+}

@@ -93,7 +93,25 @@ type AgentPreStepEvent struct {
 	// 对齐 DSH agent/pre-step 的 inbox claim 语义：循环检测类插件据此重置
 	// per-session 循环链（用户插话改变了上下文，跨插话的重复不是循环）。
 	UserInput bool `json:"user_input"`
+	// Stage 本步阶段（见 PreStepStage*）：
+	//   - compaction（缺省，兼容旧宿主）：结构改写，只有压缩岗位持有者的结果被采纳；
+	//   - projection：请求面投影，**在结构改写之后**、对改写后的视图做无损变换
+	//     （如按预算退役旧图像）。声明 pre-step-transform 的插件按装载顺序依次参与，
+	//     每个看到的是上一阶段/上一个变换的输出。
+	//
+	// 两阶段分开的原因：压缩是「谁当值谁说了算」，投影是「可以叠加的若干道工序」。
+	// 早先两者都挤在同一个结果里（谁当值谁连投影一起做），于是压缩换人时投影就跟着
+	// 消失——那不是配置问题，是把两件事绑在了一起。
+	Stage string `json:"stage"`
 }
+
+// PreStepStage 的取值。
+const (
+	// PreStepStageCompaction 结构改写阶段：体积最大、必须唯一（否则层层压缩）。
+	PreStepStageCompaction = "compaction"
+	// PreStepStageProjection 请求面投影阶段：可叠加的变换，按装载顺序组合。
+	PreStepStageProjection = "projection"
+)
 
 // AgentRequestErrorEvent agent/request-error 事件的载荷（对齐 DSH agent/request-error）。
 // listener 在 waterfall 模式下可返回非空 result_json 含 {"retry": true} 触发重试。

@@ -166,35 +166,83 @@ func TestImageOffloadHandlePreStep(t *testing.T) {
 	}
 }
 
-// TestChainPreStep 链式拼接：上游改写结果（{"messages": [...]}）替换载荷中的
-// 消息列表，其余字段（agent/session/token_count/user_input）原样保留。
-func TestChainPreStep(t *testing.T) {
-	orig := []*proto.Message{{Role: "user", Content: "old"}}
-	payload := preStepPayload(t, orig)
-	rewritten := []*proto.Message{
-		{Role: "user", Content: "[压缩摘要] old"},
-		{Role: "assistant", Content: "tail", Images: []string{imgRef(9)}},
-	}
-	rewJSON, err := json.Marshal(map[string]any{"messages": rewritten})
+// TestStageRoutingKeepsProjectionIndependentOfCompaction 阶段分流：
+//
+//   - stage=projection：只做图像投影，压缩不参与（此时列表已是压缩改写后的视图）；
+//   - stage=compaction（或缺省）：走压缩，图像投影不参与——图像卸载不能被绑在
+//     「本插件是否当值压缩」上，它的触发条件是预算，不是岗位。
+//
+// 这条取代了原先的「插件内部串链」测试：串链已搬到宿主（pre-step 第二阶段），
+// 插件只需按阶段各做各的。
+func TestStageRoutingKeepsProjectionIndependentOfCompaction(t *testing.T) {
+	ctx := context.Background()
+	compaction := newCompactionBasicServer()
+	offload := newImageOffloadServer()
+	reminder, err := newReminderServer()
 	if err != nil {
-		t.Fatalf("marshal rewrite: %v", err)
+		t.Fatalf("reminder: %v", err)
 	}
-	chained, err := chainPreStep(payload, string(rewJSON))
+	t.Setenv(envMaxRequestImages, "1")
+
+	// 4 张图、预算 1：projection 阶段必须动手
+	msgs := []*proto.Message{
+		{Role: "user", Content: "a", Images: []string{imgRef(1), imgRef(2)}},
+		{Role: "assistant", Content: "b"},
+		{Role: "user", Content: "c", Images: []string{imgRef(3), imgRef(4)}},
+	}
+	proj := preStepPayloadWithStage(t, msgs, dsc.PreStepStageProjection)
+	out, err := handleDscSystemEvent(ctx, string(dsc.EventAgentPreStep), proj, compaction, offload, reminder)
 	if err != nil {
-		t.Fatalf("chainPreStep: %v", err)
+		t.Fatalf("projection stage: %v", err)
 	}
-	var ev dsc.AgentPreStepEvent
-	if err := json.Unmarshal([]byte(chained), &ev); err != nil {
-		t.Fatalf("parse chained payload: %v", err)
+	if out == "" {
+		t.Fatal("projection 阶段应产出图像卸载改写")
 	}
-	var msgs []*proto.Message
-	if err := json.Unmarshal([]byte(ev.MessagesJSON), &msgs); err != nil {
-		t.Fatalf("parse chained messages: %v", err)
+	var res struct {
+		Messages []*proto.Message `json:"messages"`
 	}
-	if len(msgs) != 2 || msgs[0].Content != "[压缩摘要] old" || len(msgs[1].Images) != 1 {
-		t.Fatalf("chained messages mismatch: %+v", msgs)
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	if ev.Agent != "agent-react-loop" || ev.Session != "t" || ev.TokenCount != 10 {
-		t.Fatalf("payload fields must be preserved: %+v", ev)
+	total := 0
+	for _, m := range res.Messages {
+		total += len(m.Images)
 	}
+	if total != 1 {
+		t.Fatalf("投影后图像数 = %d，期望 1（预算 1）", total)
+	}
+
+	// compaction 阶段：图像不该被这段逻辑动（即便超预算），压缩驻留说了算
+	comp := preStepPayloadWithStage(t, msgs, dsc.PreStepStageCompaction)
+	out, err = handleDscSystemEvent(ctx, string(dsc.EventAgentPreStep), comp, compaction, offload, reminder)
+	if err == nil && out != "" {
+		var res2 struct {
+			Messages []*proto.Message `json:"messages"`
+		}
+		if json.Unmarshal([]byte(out), &res2) == nil {
+			for _, m := range res2.Messages {
+				if len(m.Images) == 0 && strings.Contains(m.Content, "image omitted") {
+					t.Fatalf("compaction 阶段不应做图像投影：%+v", m)
+				}
+			}
+		}
+	}
+}
+
+// preStepPayloadWithStage 构造带阶段的 pre-step 载荷。
+func preStepPayloadWithStage(t *testing.T, msgs []*proto.Message, stage string) string {
+	t.Helper()
+	raw, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("marshal messages: %v", err)
+	}
+	ev := dsc.AgentPreStepEvent{
+		Agent: "agent-react-loop", Session: "t", MessagesJSON: string(raw),
+		TokenCount: 10, ProjectedTokens: 10, UserInput: true, Stage: stage,
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	return string(b)
 }

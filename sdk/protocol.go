@@ -16,6 +16,7 @@ package dsc
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"dsc/core"
@@ -43,6 +44,7 @@ type (
 	// AgentPreStepEvent agent/pre-step 载荷：本步消息列表（MessagesJSON）与工具目录，
 	// 压缩/注入类插件在此改写 msgs。
 	AgentPreStepEvent = core.AgentPreStepEvent
+
 	// UserQuestionAskedEvent userquestion/asked 载荷：问题数量与首个标题。
 	UserQuestionAskedEvent = core.UserQuestionAskedEvent
 
@@ -50,6 +52,29 @@ type (
 	// context_window_exceeded），插件可返回 retry 让宿主重走 pre-step。
 	AgentRequestErrorEvent = core.AgentRequestErrorEvent
 )
+
+// PreStepStage 的取值（插件判断自己在哪个阶段干活）。
+const (
+	// PreStepStageCompaction 结构改写阶段：只有压缩岗位持有者的结果被采纳。
+	PreStepStageCompaction = core.PreStepStageCompaction
+	// PreStepStageProjection 请求面投影阶段：声明 pre-step-transform 的插件依次参与，
+	// 每个看到的是上一步的输出。投影不得改变消息条数与角色顺序（无损变换）。
+	PreStepStageProjection = core.PreStepStageProjection
+)
+
+// PreStepStageOf 读 pre-step 载荷的阶段；没有该字段（旧宿主）= 结构改写阶段。
+//
+// 插件应当用它决定「这一步该我做哪件事」：同一个插件可以既提供压缩又提供投影，
+// 两者的触发条件与输出都不同。
+func PreStepStageOf(dataJSON string) string {
+	var ev struct {
+		Stage string `json:"stage"`
+	}
+	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil || ev.Stage == "" {
+		return PreStepStageCompaction
+	}
+	return ev.Stage
+}
 
 // Handshake 宿主与插件的握手配置（MagicCookie 校验）。插件侧以 dsc.Handshake 构造
 // go-plugin 服务端，不要自行拼一份——cookie 对不上会导致插件被宿主强杀。

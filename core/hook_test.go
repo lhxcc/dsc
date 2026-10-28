@@ -32,6 +32,10 @@ type fakeHook struct {
 	events   chan *proto.OnEventRequest
 	// eventResult 作为 OnEvent 的 result_json 返回（pre-step 改写测试用）。
 	eventResult string
+	// eventErr 非空时作为应用层错误返回（模拟插件拒绝处理该事件）。
+	eventErr string
+	// eventErrStage 非空时只在载荷 stage 等于它时返回 eventErr（用于只让某个阶段失败）。
+	eventErrStage string
 }
 
 func (f *fakeHook) BeforeTool(_ context.Context, req *proto.BeforeToolRequest, _ ...grpc.CallOption) (*proto.BeforeToolResponse, error) {
@@ -52,7 +56,15 @@ func (f *fakeHook) OnEvent(_ context.Context, req *proto.OnEventRequest, _ ...gr
 	if f.events != nil {
 		f.events <- req
 	}
-	return &proto.OnEventResponse{ResultJson: f.eventResult}, nil
+	if f.eventErr != "" && f.eventErrStage != "" {
+		var ev struct {
+			Stage string `json:"stage"`
+		}
+		if err := json.Unmarshal([]byte(req.GetDataJson()), &ev); err != nil || ev.Stage != f.eventErrStage {
+			return &proto.OnEventResponse{ResultJson: f.eventResult}, nil
+		}
+	}
+	return &proto.OnEventResponse{ResultJson: f.eventResult, Error: f.eventErr}, nil
 }
 
 func hookManager() (*Manager, *plainHookTool) {

@@ -161,6 +161,8 @@ func runOne(exe, msgsJSON string, toolTokens, total, window int, stateDir string
 		fmt.Sprintf("DSC_COMPACTION_BASIC_CONTEXT_WINDOW=%d", window),
 		"DSC_SESSION_DIR="+stateDir,
 		"DSC_MEMORY_DIR="+stateDir,
+		// 投影探针用：把图像预算压到 1，逼出「按预算退役旧图」这条路径。
+		"DSC_MAX_REQUEST_IMAGES=1",
 	)
 	// 隐藏子进程控制台：否则每个插件启动都会在 Windows 上闪一个黑窗
 	// （运行期派生点统一要求，见 core.ConfigureChildProcessAttrs）。
@@ -234,7 +236,85 @@ func runOne(exe, msgsJSON string, toolTokens, total, window int, stateDir string
 	res.kind = kindChecked
 	res.summary = fmt.Sprintf("%d 条 → %d 条 / %d tokens", len(in), len(out.Messages), core.EstimateProtoMessagesTokens(out.Messages))
 	res.problems = check(in, out.Messages)
+
+	// 声明了「可组合请求面变换」的插件，再走一次第二阶段（stage=projection）。
+	// 这条通道与压缩无关：压缩换人时投影也得照跑，所以它必须能单独通过检查。
+	if info.GetCapabilities()["pre-step-transform"] == "true" {
+		projProblems, projSummary := checkProjection(ctx, hook, window, toolTokens, total)
+		res.problems = append(res.problems, projProblems...)
+		if projSummary != "" {
+			res.summary += "；投影 " + projSummary
+		}
+	}
 	return res
+}
+
+// checkProjection 用一份「图像超预算」的历史走 pre-step 第二阶段，验证投影仍然
+// 满足结构约束（不删消息、不切配对、不回流位置式 id），并且确实按预算退役了图像。
+func checkProjection(ctx context.Context, hook proto.PluginHookServiceClient, window, toolTokens, total int) ([]string, string) {
+	in := projectionFixture()
+	if len(in) == 0 {
+		return nil, ""
+	}
+	msgsJSON, _ := json.Marshal(in)
+	payload, _ := json.Marshal(map[string]any{
+		"agent": "backendcheck", "session": "backendcheck-projection", "user_input": true,
+		"messages_json": string(msgsJSON), "token_count": total, "projected_tokens": total,
+		"last_usage_tokens": 0, "tool_tokens": toolTokens, "stage": "projection",
+		"context_window": window,
+	})
+	resp, err := hook.OnEvent(ctx, &proto.OnEventRequest{Name: "agent/pre-step", DataJson: string(payload)})
+	if err != nil {
+		return []string{fmt.Sprintf("投影阶段调用失败: %v", err)}, ""
+	}
+	if resp.GetError() != "" {
+		return []string{"投影阶段报错: " + resp.GetError()}, ""
+	}
+	var out struct {
+		Messages []*proto.Message `json:"messages"`
+	}
+	if raw := resp.GetResultJson(); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			return []string{fmt.Sprintf("投影结果不是合法 JSON: %v", err)}, ""
+		}
+	}
+	if len(out.Messages) == 0 {
+		return []string{"声明了 pre-step-transform 但投影阶段没有产出改写（预算内不动，属正常；此夹具故意超预算）"}, ""
+	}
+	problems := check(in, out.Messages)
+	if len(out.Messages) != len(in) {
+		problems = append(problems, fmt.Sprintf("投影不得增删消息: %d → %d（它是无损变换）", len(in), len(out.Messages)))
+	}
+	images := 0
+	for _, m := range out.Messages {
+		images += len(m.Images)
+	}
+	if images > 1 {
+		problems = append(problems, fmt.Sprintf("图像预算为 1，投影后仍有 %d 张", images))
+	}
+	return problems, fmt.Sprintf("%d 张图 → %d 张", countImages(in), images)
+}
+
+// projectionFixture 构造图像超预算的历史（每轮一张图，共 4 张）。
+func projectionFixture() []*proto.Message {
+	s := session.New()
+	s.Append(session.SystemMessage, &session.SystemMessageData{Content: "sys prompt"}, &session.SurfaceOp{Op: session.SurfaceAppend})
+	for i := 0; i < 4; i++ {
+		s.Append(session.UserMessage, &session.UserMessageData{
+			Content: fmt.Sprintf("round %d 看图", i),
+			Images:  []string{fmt.Sprintf("dsc-shot://backendcheck-%d", i)},
+		}, &session.SurfaceOp{Op: session.SurfaceAppend})
+	}
+	return s.DeriveMessages()
+}
+
+// countImages 统计消息里的图像引用数。
+func countImages(msgs []*proto.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Images)
+	}
+	return n
 }
 
 func check(in, out []*proto.Message) []string {
