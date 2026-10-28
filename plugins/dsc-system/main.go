@@ -70,12 +70,16 @@ func main() {
 		os.Exit(2)
 	}
 	compactionBasicServer := newCompactionBasicServer()
+	// 摘要缓存的落盘通道：与会话存档同目录（<id>.dsc-system.json），重启后指纹吻合
+	// 即复用、不必为同一段前缀重新调用 LLM。装配只在这里——测试构造的服务器不带
+	// store（纯内存），因此不会写进用户的 sessions/。
+	compactionBasicServer.store = newCompactionStore(dsc.SessionDir())
 	imageOffloadServer := newImageOffloadServer()
 
 	skillStore, skillInstalledDir := newSkillResident()
 	sdk := dsc.New(dsc.Config{
 		Name:    "dsc-system",
-		Version: "1.6.1",
+		Version: "1.7.0",
 		Type:    dsc.TypeDsc,
 		// 声明压缩后端能力：config.yaml 的 compaction: dsc-system 选中时，
 		// 宿主 registerDscCoreLocked 验证此声明并标记后端生效

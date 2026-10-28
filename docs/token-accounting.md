@@ -422,7 +422,7 @@ provider 的 4xx 只作为「估算失真」的兜底，不是发现超窗的手
 |---|---|---|---|---|---|
 | 0 | 会话日志 | `session/`（`*.jsonl`） | 每次事件 | 只追加。**任何裁剪都不改它** | — |
 | 1 | 派生 | `session.DeriveMessagesLimited(n)` | 每次请求 | 事件 → 消息；`n` 只限制**从存档恢复**的历史（`config.history_injection`），当前进程内的轮次不受影响 | 不改 |
-| 2 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 每次请求 | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。事件仍广播给所有插件，但**只有岗位持有者的改写被采纳**，也只有它收到完整消息列表（§8.2） | 通常不改（billion-context 会持久化自己的 state） |
+| 2 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 每次请求 | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。事件仍广播给所有插件，但**只有岗位持有者的改写被采纳**，也只有它收到完整消息列表（§8.2） | 不改会话日志；各自写自己的旁挂状态（`<id>.dsc-system.json` 摘要缓存 / `<id>.acp.json` 块与引用） |
 | 3 | 宿主收口 | `core/llm_router.go finishPreStep` + `core/context_ceiling.go` + `core/overflow_adjust.go` | 每次请求（改写之后）；以及 provider 4xx 的重试 | 量最终表面；超窗从头部丢到 90% 窗口（保留段全是原始消息 + 一行切除说明）；单条本身超窗则本地报错（不截断、不靠 400）。4xx 时用 provider 报的实际值收紧预算后重试（仍是滑窗） | 不改 |
 | 4 | 展示口径 | `HostContextMeters`（`NoteActualSurface` / `ContextTokens`） | 每次请求 | 把「实际发出去的大小」发布给 TUI；不是另算一份 | 不改 |
 
