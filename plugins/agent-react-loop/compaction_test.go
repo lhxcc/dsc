@@ -1,8 +1,8 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"io"
 	"strings"
 	"sync"
@@ -155,18 +155,14 @@ func TestPreDispatchCompactionOnRestore(t *testing.T) {
 		t.Fatalf("主请求最后一条 = role=%s content=%q, 期望逐字保留当前用户消息", last.Role, last.Content)
 	}
 
-	// 5) 界面提示压缩发生
+	// 5) 前端不得出现压缩提示：压缩是宿主自己的调度动作，用户不需要为它处理任何事。
+	//    观察到它请用 -log（agent 侧 logger.Info("compacting history (inline)")）。
 	mu.Lock()
 	defer mu.Unlock()
-	notified := false
 	for _, f := range frames {
 		if strings.Contains(f.Output, "上下文压缩") {
-			notified = true
-			break
+			t.Fatalf("前端不应输出压缩提示帧，实际：%q", f.Output)
 		}
-	}
-	if !notified {
-		t.Fatalf("未输出上下文压缩提示帧")
 	}
 }
 
@@ -228,7 +224,7 @@ func TestCompactionNotTriggeredOnAccurateUsage(t *testing.T) {
 	defer mu.Unlock()
 	for _, f := range frames {
 		if strings.Contains(f.Output, "上下文压缩") {
-			t.Fatalf("不应输出上下文压缩提示帧（估算虚高不应覆盖服务端精确值）")
+			t.Fatalf("前端不应输出压缩提示帧，实际：%q", f.Output)
 		}
 	}
 }

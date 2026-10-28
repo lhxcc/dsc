@@ -300,13 +300,10 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	llm := &windowEnforcingLLM{window: a.contextWindow}
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
-	var mu sync.Mutex
-	var trimmed bool
+	var frames int
 	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
-		if strings.Contains(f.Output, "上下文裁剪") {
-			mu.Lock()
-			trimmed = true
-			mu.Unlock()
+		if strings.Contains(f.Output, "上下文裁剪") || strings.Contains(f.Output, "上下文折叠") {
+			frames++
 		}
 	})
 	if err != nil {
@@ -315,22 +312,20 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	if res.Status != "success" {
 		t.Fatalf("状态 = %s", res.Status)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if trimmed {
-		t.Fatal("历史只占窗口 40%，不应触发裁剪（估算被高估才会这样）")
-	}
-	// 全量历史都应发出去（11 条历史/当前消息 + system）
+	// 全量历史都应发出去（11 条历史/当前消息 + system）——不裁剪就是「没丢东西」的证据
 	if got := len(llm.streamMsgs); got < 11 {
 		t.Fatalf("主请求消息数 = %d, 期望全量（不应丢历史）", got)
 	}
+	if frames != 0 {
+		t.Fatalf("前端不应输出裁剪/折叠提示帧，实际 %d 帧", frames)
+	}
 }
 
-// TestTrimNoticePrintedOncePerDropCount 真超窗时，同一省略条数只提示一次。
+// TestTrimIsLoggedNotShown 真超窗时：确实裁剪，但**前端一帧都不输出**。
 //
-// 现场表现：每轮都打印「已省略最早 93 条消息」，把消息区刷满。真超窗时每轮裁掉的是
-// 同一段，重复提示没有新信息；条数变化时才应再提示。
-func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
+// 滑动窗口是这个产品的常态工作方式，不是需要用户处理的异常——提示帧只会把消息区
+// 刷成同一句话。诊断信息走运行日志（-log）：每会话第一次裁剪记一条，避免每步刷日志。
+func TestTrimIsLoggedNotShown(t *testing.T) {
 	a := newTestAgent(t)
 	a.contextWindow = 50000
 	a.llmServiceID, a.toolServiceID = 1, 1
@@ -340,33 +335,38 @@ func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	countTrimFrames := func() int {
+	runOnce := func() (int, int) {
 		var mu sync.Mutex
-		n := 0
+		frames := 0
 		_, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
-			if strings.Contains(f.Output, "上下文裁剪") {
+			if strings.Contains(f.Output, "上下文裁剪") || strings.Contains(f.Output, "上下文折叠") {
 				mu.Lock()
-				n++
+				frames++
 				mu.Unlock()
 			}
 		})
 		if err != nil {
 			t.Fatalf("runLoop: %v", err)
 		}
-		return n
+		mu.Lock()
+		defer mu.Unlock()
+		llm.mu.Lock()
+		sent := len(llm.streamMsgs)
+		llm.mu.Unlock()
+		return frames, sent
 	}
 
-	// 默认静默：小窗口读越窗口的会话是常态（滑动窗口式工作），提示帧不该打扰
-	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("默认不应输出裁剪提示帧（滑动窗口是常态），实际 %d 次", got)
+	frames, sent := runOnce()
+	if frames != 0 {
+		t.Fatalf("前端不应输出裁剪提示帧，实际 %d 帧", frames)
 	}
-	// 显式开启后：每会话只提示一次，第二轮不再重复
-	t.Setenv("DSC_TRIM_NOTICE", "1")
-	if got := countTrimFrames(); got != 1 {
-		t.Fatalf("开启提示后首次裁剪应提示 1 次，实际 %d 次", got)
+	if full := len(a.sess.DeriveMessages()); sent >= full {
+		t.Fatalf("未发生裁剪：发出 %d 条，全量 %d 条", sent, full)
 	}
-	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("同一会话不应重复提示，第二轮实际提示 %d 次", got)
+
+	// 第二轮同样不输出：提示既不是一次性的「通知」，也不是每轮重复
+	if frames, _ := runOnce(); frames != 0 {
+		t.Fatalf("第二轮仍不应输出提示帧，实际 %d 帧", frames)
 	}
 }
 

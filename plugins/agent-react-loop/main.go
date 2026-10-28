@@ -544,18 +544,16 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		if droppedMsgs > 0 {
 			// 不往 system 里追加「已省略 N 条」的说明：system 是缓存前缀，每次改写都会
 			// 让整段前缀缓存失效；而且小窗口读越窗口的会话是常态（一个项目积累数月的
-			// 会话），这句话会一直挂在每一轮里。信息改由下面的提示帧一次性给出。
+			// 会话），这句话会一直挂在每一轮里。
 			//
-			// 提示只在本会话**第一次**裁剪时出现：常态事件不该反复出声，用户需要知道的
-			// 是「这个会话被裁了」这一件事，不是每轮的省略条数。
-			if emit != nil && trimNoticeEnabled() && a.trimNoticeSession != a.sess.ID() {
+			// 也**不往前端输出提示帧**：滑动窗口是这个产品的常态工作方式，不是需要用户
+			// 处理的异常。它是运行日志（-log 可见），只在一个会话第一次被裁时记一条，
+			// 免得每步刷满日志。
+			if a.trimNoticeSession != a.sess.ID() {
 				a.trimNoticeSession = a.sess.ID()
-				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文裁剪: 本会话历史超出 %d tokens 窗口，较早的记录将只随本次请求省略（会话记录未删除）；"+
-						"本提示只出现一次。当前预计占用 %d / %d。]\n",
-						a.contextWindow, a.projectedFit(msgs, availableTools), a.contextWindow),
-					Status: "tool",
-				})
+				a.logger.Warn("context trimmed to fit the window",
+					"session", a.sess.ID(), "dropped", droppedMsgs,
+					"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
 			}
 		}
 		// 历史已裁到无可再裁，仍然超窗 → 折叠过长的单条消息（保留首尾）。
@@ -570,13 +568,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				msgs = folded
 				historySlimmed = true
 				// 同样只提示一次，理由同上（常态事件不出声）。
-				if emit != nil && trimNoticeEnabled() && a.foldNoticeSession != a.sess.ID() {
+				if a.foldNoticeSession != a.sess.ID() {
 					a.foldNoticeSession = a.sess.ID()
-					emit(&dsc.RunStreamResponse{
-						Output: fmt.Sprintf("\n[上下文折叠: %d 条过长消息已保留首尾（预计占用 %d / %d tokens）；本提示只出现一次。]\n",
-							n, a.projectedFit(msgs, availableTools), a.contextWindow),
-						Status: "tool",
-					})
+					a.logger.Warn("oversized messages folded (head and tail kept)",
+						"session", a.sess.ID(), "folded", n,
+						"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
 				}
 			}
 		}
@@ -638,13 +634,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		compacted := false
 		if !historySlimmed && a.contextWindow > 0 && a.historyInjection == 0 &&
 			float64(projectedTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
-			if emit != nil {
-				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文压缩: 预计占用 %d%% 容量，即将压缩对话历史]\n",
-						projectedTokens*100/a.contextWindow),
-					Status: "tool",
-				})
-			}
+			// 同样只记日志、不输出到前端：压缩是宿主自己的调度动作，用户不需要为它
+			// 处理任何事（真要观察可以用 -log）。
+			a.logger.Info("compacting history (inline)",
+				"session", a.sess.ID(), "projected_pct", projectedTokens*100/a.contextWindow,
+				"window", a.contextWindow)
 			// 计算保留尾部（compactionRetainRatio 比例，至少 compactionRetainMinTokens），
 			// 从末尾向前累积直至预算用尽；绝不压缩刚追加的当前用户消息（不可分尾部）。
 			nodes := sess.SurfaceNodes()
@@ -1520,15 +1514,6 @@ var oversizeTrimRatio = 0.90
 // 内联压缩处理（留尾部逐字、旧前缀摘要化，比直接丢弃更保信息）；只有超过这条线
 // ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
 var oversizeTrimTriggerRatio = 0.95
-
-// trimNoticeEnabled 是否输出裁剪/折叠的提示帧。
-//
-// 默认关闭：小窗口读超窗口的会话是**常态**——一个项目积累数月的会话，配 128K 窗口
-// 就是一台滑动窗口机器，每轮都在把最早的一段滑出去。常态事件不该出声，否则消息区
-// 会被同一句话刷满，而它从不携带新信息。需要核对时设 DSC_TRIM_NOTICE=1。
-func trimNoticeEnabled() bool {
-	return os.Getenv("DSC_TRIM_NOTICE") == "1"
-}
 
 // oversizeTrimFallbackRatios 闭环裁剪时逐档收紧的目标比例。
 //
