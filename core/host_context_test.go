@@ -149,7 +149,7 @@ func TestPreStepWithoutRewriteClearsStaleActualSurface(t *testing.T) {
 	// 本步没有任何 hook 客户端（提前返回路径）→ 必须清掉残留
 	srv := &llmAggregateServer{m: m}
 	req := &proto.ChatRequest{SessionId: "sess-x", Messages: []*proto.Message{{Role: "user", Content: "hi"}}}
-	_ = srv.applyPreStepHook(context.Background(), req)
+	_, _ = srv.applyPreStepHook(context.Background(), req)
 	if got := m.ContextTokens("sess-x"); got != 731_391 {
 		t.Fatalf("未改写的一步应回到上报投影 731391，got %d（残留的实际表面没被清掉）", got)
 	}
