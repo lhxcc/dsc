@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"time"
@@ -67,7 +66,7 @@ func main() {
 
 	var checked, warn, bad int
 	for _, name := range dirs {
-		exe := filepath.Join(*pluginsDir, name, name+".exe")
+		exe := core.PJoin(*pluginsDir, name, name+".exe")
 		res := runOne(exe, string(msgsJSON), toolTokens, total, *window, stateDir)
 		fmt.Println(res.String())
 		switch res.kind {
@@ -98,7 +97,7 @@ func pluginDirs(root string) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if _, err := os.Stat(filepath.Join(root, name, name+".exe")); err == nil {
+		if _, err := os.Stat(core.PJoin(root, name, name+".exe")); err == nil {
 			out = append(out, name)
 		}
 	}
@@ -154,7 +153,7 @@ func (r result) String() string {
 var legacyID = regexp.MustCompile(`^msg-\d+$`)
 
 func runOne(exe, msgsJSON string, toolTokens, total, window int, stateDir string) result {
-	name := filepath.Base(filepath.Dir(exe))
+	_, name := core.PSplit(core.PDir(exe))
 	res := result{name: name}
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(),
@@ -163,6 +162,9 @@ func runOne(exe, msgsJSON string, toolTokens, total, window int, stateDir string
 		"DSC_SESSION_DIR="+stateDir,
 		"DSC_MEMORY_DIR="+stateDir,
 	)
+	// 隐藏子进程控制台：否则每个插件启动都会在 Windows 上闪一个黑窗
+	// （运行期派生点统一要求，见 core.ConfigureChildProcessAttrs）。
+	core.ConfigureChildProcessAttrs(cmd)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
