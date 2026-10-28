@@ -169,7 +169,49 @@ func main() {
 		printError(fmt.Sprintf("\n=== 打包失败: dist/dsc-for-%s（发布目录可能不完整，请先关闭正在运行的 dsc 后重试）===\n", host.Name))
 		os.Exit(1)
 	}
+	// 契约检查：用真实派生历史驱动每个声明 compaction 能力的插件**实际二进制**，
+	// 校验改写结果的结构约束（配对完整 / 不膨胀 / system 不被压掉 / 不回流位置式 id）。
+	// 放在打包之后：查的就是"即将被拿去运行的那份字节"。共享模块（proto/session/core/
+	// sdk）一改，另一侧的压缩后端可能静默变形，而它自己的测试未必覆盖到那条路径。
+	if !verifyBackendContracts(repoRoot, *host) {
+		printError(fmt.Sprintf("\n=== 压缩后端契约检查未通过: dist/dsc-for-%s（产物不可直接使用）===\n", host.Name))
+		os.Exit(1)
+	}
 	printSuccess(fmt.Sprintf("\n=== 打包完成: dist/dsc-for-%s ===\n", host.Name))
+}
+
+// verifyBackendContracts 调 tools/backendcheck 检查所有压缩后端的实际二进制。
+//
+// 为什么在构建器里做、而不是各插件的测试里做：这类回归（改 A 撞 B）只有拿**真实的
+// 二进制 + 真实的派生历史**跑一遍才看得见；各插件的单测各自构造消息，天然绕过了共享
+// 模块的传导路径。检查项只看 provider 硬要求与结构性不变量，不涉及具体压缩策略，
+// 因此对任何后端都成立。
+//
+// DSC_SKIP_BACKENDCHECK=false 可显式关闭（opt-out）：仅在确认检查本身不可用
+//（如目标平台无法启动插件）时用于紧急出包，正常构建不应关闭。
+func verifyBackendContracts(repoRoot string, p platform) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DSC_SKIP_BACKENDCHECK"))) {
+	case "false", "0":
+		printInfo("\n=== 跳过压缩后端契约检查（DSC_SKIP_BACKENDCHECK）===\n")
+		return true
+	}
+	toolDir := filepath.Join(repoRoot, "tools", "backendcheck")
+	if _, err := os.Stat(filepath.Join(toolDir, "go.mod")); err != nil {
+		printInfo("\n=== 未找到 tools/backendcheck，跳过契约检查 ===\n")
+		return true
+	}
+	distDir := filepath.Join(repoRoot, "dist", "dsc-for-"+p.Name, "plugins")
+	printInfo(fmt.Sprintf("\n=== 压缩后端契约检查: %s ===\n", distDir))
+
+	cmd := exec.Command("go", "run", ".", "-plugins", distDir)
+	cmd.Dir = toolDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		printError(fmt.Sprintf("契约检查失败: %v\n", err))
+		return false
+	}
+	return true
 }
 
 // hostPlatform 由当前 GOOS/GOARCH 匹配目标平台定义。

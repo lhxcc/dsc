@@ -3,6 +3,7 @@ package jobs
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -475,5 +476,37 @@ func TestWaitTimeoutReleasesClaim(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("等待超时后任务落定仍未发通知（Awaited 没有撤回）")
+	}
+}
+
+// TestUnknownJobErrorExplainsProcessScope 查不到的 job id 必须说明原因。
+//
+// 现场：会话记录里留着上一次运行（或父进程）打印的 job id，模型照着它调
+// job_output，得到的只是一句 "unknown job"——它无从判断是自己记错、任务被清掉、
+// 还是换了进程，于是原地重试或改成相近的 id 再试，整轮耗在这上面。错误里要写出
+// 「id 只活在本进程」并指向 job_list，同时带上当前在跑的数量。
+func TestUnknownJobErrorExplainsProcessScope(t *testing.T) {
+	r := NewRegistry()
+	_, err := r.Read("shell-deadbeef", "")
+	if err == nil {
+		t.Fatal("未知 id 必须报错")
+	}
+	msg := err.Error()
+	for _, want := range []string{"unknown job", "only in this process", "never persisted", "job_list", "0 running now"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("错误缺少 %q：%s", want, msg)
+		}
+	}
+
+	// 有任务在跑时数量要跟着变（模型据此判断「该重新跑还是看列表」）
+	if _, err := r.Start(StartSpec{
+		Kind:  "shell",
+		Start: func() (JobHooks, error) { return JobHooks{Done: make(chan JobOutcome)}, nil },
+	}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	_, err = r.Read("shell-deadbeef", "")
+	if err == nil || !strings.Contains(err.Error(), "1 running now") {
+		t.Fatalf("应报告当前在跑 1 个任务，实际: %v", err)
 	}
 }

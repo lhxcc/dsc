@@ -151,11 +151,23 @@ type AbsorbRecord struct {
 
 // CompressionState acp 核心状态（显式传入传出，对齐 zip(data)→data 模型）。
 // adapter 层负责持久化（JSON 文件 / session 事件）。
+// StateSchema 是 state 文件的当前格式版本。
+//
+// 消息身份变过两次（列表下标 → 稳定 id `e<n>` → 稳定 id `event-<n>`）。每次换 id
+// 空间，旧文件里记的原始 id 就一条也对不上。这种不兼容不做迁移：载入时判定版本
+// 不符即丢弃，由会话事件日志重建（compress 调用本来就带完整参数，重放即可复原）。
+//
+// 语义变了就加一，不写「保留旧字段解读」的分支——那只会让旧实现永远留在仓库里。
+const StateSchema = 3
+
 type CompressionState struct {
 	Blocks      []CompressionBlock `json:"blocks"`
 	MessageRefs MessageRefMap      `json:"messageRefs"`
 	Nudge       NudgeState         `json:"nudge"`
 	Stats       CompressionStats   `json:"stats"`
+	// Schema 状态文件格式版本。与当前版本不符（含缺失该字段的旧文件）一律视为
+	// 不可用：丢弃后由事件日志重建，不做逐字段迁移——旧格式不为兼容而活。
+	Schema int `json:"schema"`
 	// Absorbed 已吸收的工具结果记录（hide-absorbed 每轮隐藏对应消息对）
 	Absorbed []AbsorbRecord `json:"absorbed,omitempty"`
 	// TerminalStreak 近满无解连续计数（terminal-escape 信号，对齐 #300）
@@ -283,6 +295,7 @@ func CreateInitialState() *CompressionState {
 		MessageRefs: MessageRefMap{ByRaw: map[string]string{}, ByRef: map[string]string{}},
 		Nudge:       NudgeState{Anchors: map[string]any{}},
 		Stats:       CompressionStats{},
+		Schema:      StateSchema,
 		NextBlockID: 0,
 		NextRunID:   0,
 	}

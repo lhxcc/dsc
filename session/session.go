@@ -374,9 +374,10 @@ func (s *Session) DeriveMessagesLimited(injectCount int) []*proto.Message {
 	// 从 surface node 0 派生 system prompt（v3 设计：surface 全权负责）
 	skipNode0System := false
 	if len(s.surfaceNodes) > 0 {
-		if d, ok := s.events[s.surfaceNodes[0]].Data.(*SystemMessageData); ok {
+		node0 := s.events[s.surfaceNodes[0]]
+		if d, ok := node0.Data.(*SystemMessageData); ok {
 			if d.Content != "" {
-				msgs = append(msgs, &proto.Message{Role: "system", Content: d.Content})
+				msgs = append(msgs, &proto.Message{Id: messageID(node0), Role: "system", Content: d.Content})
 				skipNode0System = true
 			}
 			// 空 content 节点：不派生 system 消息，但保留位置（遍历时 deriveEventMessage
@@ -529,32 +530,53 @@ func deriveMessageRole(ev *Event) string {
 // deriveEventMessage 单事件投影：surface 事件 → 消息；log-only 事件 → nil。
 // system/message 空 content 投影为 nil（保留 surface 位置但不发模型消息，
 // 对齐 DSH "空内容 system 节点投影为 null" 设计）。
+
 func deriveEventMessage(ev *Event) *proto.Message {
 	switch d := ev.Data.(type) {
 	case *UserMessageData:
-		return &proto.Message{Role: "user", Content: d.Content, Images: d.Images}
+		return &proto.Message{Id: messageID(ev), Role: "user", Content: d.Content, Images: d.Images}
 	case *AssistantMessageData:
 		// 内容为空且无工具调用时跳过（同 DSH：空 assistant 不得进入模型历史）。
 		if d.Content == "" && len(d.ToolCalls) == 0 {
 			return nil
 		}
-		m := &proto.Message{Role: "assistant", Content: d.Content}
+		m := &proto.Message{Id: messageID(ev), Role: "assistant", Content: d.Content}
 		if len(d.ToolCalls) > 0 {
 			m.ToolCalls = d.ToolCalls
 		}
 		return m
 	case *ToolResultData:
-		return &proto.Message{Role: "tool", Content: toonizeToolContent(d.Content), ToolCallId: d.CallID, Images: d.Images}
+		return &proto.Message{Id: messageID(ev), Role: "tool", Content: toonizeToolContent(d.Content), ToolCallId: d.CallID, Images: d.Images}
 	case *CompactionSummaryData:
-		return &proto.Message{Role: "user", Content: d.Content}
+		return &proto.Message{Id: messageID(ev), Role: "user", Content: d.Content}
 	case *SystemMessageData:
 		// 空 content 投影为 nil（保留 surface 位置但不派生模型消息）
 		if d.Content == "" {
 			return nil
 		}
-		return &proto.Message{Role: "system", Content: d.Content}
+		return &proto.Message{Id: messageID(ev), Role: "system", Content: d.Content}
 	}
 	return nil
+}
+
+// messageID 返回一条派生消息的稳定标识：`event-<seq>`。
+//
+// 前缀写全拼「event-」而不是缩写：它要读得懂才起作用。单个字母既可能被读成
+// anything（error/entry/…），也会让人去猜是否承重；写全拼之后「这是事件序号」
+// 自解释，且字面上就不是数字下标，不会诱发 `id ± 1` 之类的用法——那正是旧方案
+// `msg-<idx>` 的错（列表起点一变就指到别的消息）。
+//
+// 前缀本身不承重：没有代码解析它，纯数字在行为上等价。保留它只为两点——落盘状态
+// 里一眼可辨（`byRaw: {"event-3921": "m00542"}` 与块 id `b3`、后端合成的
+// `acp_summary_b0` 不会混成一类），以及上面那条「不要当索引算」。
+//
+// 为什么必须是 seq：消息内容会变（工具结果被 TOON 规范化、compress 块被替换），
+// 列表下标更会变（请求级裁剪、历史注入只带最近 N 条）。seq 是事件日志里的位置，
+// append-only 且与派生范围无关——同一个事件永远派生出同一个 id。
+//
+// 消费方（如压缩后端的消息引用）据此跨请求指认同一条消息。
+func messageID(ev *Event) string {
+	return fmt.Sprintf("event-%d", ev.Seq)
 }
 
 // toonizeToolContent 在「事件 → 模型消息」投影层把工具结果的 Content 做确定性

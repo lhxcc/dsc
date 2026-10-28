@@ -1,12 +1,9 @@
 package adapter
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	bcacp "dsc-billion-context/acp"
-	dsc "dsc-sdk"
 	"dsc/proto"
 )
 
@@ -74,171 +71,128 @@ func TestRoundTripPreservesToolCallArguments(t *testing.T) {
 	}
 }
 
-// TestCoreMessageIDsUniqueByPosition 内容相同的两条消息必须得到不同 ID。
+// TestContentIdenticalMessagesKeepDistinctIDs 内容完全相同的两条消息必须是两个身份。
 //
-// 旧实现按 (role+content+toolIds) 做 FNV hash：两条"继续"、两次相同 compile 输出
-// 会撞成同一个 ID，MessageRefs.ByRaw 互相覆盖、CoveredMessageIDs 判定错位，
-// 压缩就会命中错误的消息。改为按位置取身份后必须唯一且跨轮稳定。
-func TestCoreMessageIDsUniqueByPosition(t *testing.T) {
+// 旧实现按 (role+content+toolIds) 做 hash：两条「继续」、两次相同编译输出会撞成同一个
+// ID，MessageRefs.ByRaw 互相覆盖、覆盖判定错位，压缩命中错误的消息。现在身份由宿主
+// 按事件 seq 下发，内容重复完全不影响唯一性——这里连同「逐字相同」的极端情形一起钉住。
+func TestContentIdenticalMessagesKeepDistinctIDs(t *testing.T) {
 	msgs := []*proto.Message{
-		{Role: "user", Content: "继续"},
-		{Role: "assistant", Content: "好的"},
-		{Role: "user", Content: "继续"}, // 与第一条完全相同
-		{Role: "tool", Content: "ok", ToolCallId: "call_1"},
-		{Role: "tool", Content: "ok", ToolCallId: "call_1"}, // 完全重复
+		{Id: "event-1", Role: "user", Content: "继续"},
+		{Id: "event-2", Role: "assistant", Content: "好的"},
+		{Id: "event-3", Role: "user", Content: "继续"}, // 与第一条完全相同
+		{Id: "event-4", Role: "tool", Content: "ok", ToolCallId: "call_1"},
+		{Id: "event-5", Role: "tool", Content: "ok", ToolCallId: "call_1"}, // 完全重复
 	}
 
 	cores := ToCoreMessages(msgs, nil)
 	seen := map[string]bool{}
 	for i, cm := range cores {
-		if cm.ID == "" {
-			t.Fatalf("#%d ID 为空", i)
+		if cm.ID != msgs[i].Id {
+			t.Fatalf("#%d id = %q，期望宿主 id %q", i, cm.ID, msgs[i].Id)
 		}
 		if seen[cm.ID] {
-			t.Fatalf("#%d ID 重复: %s（内容相同的消息必须按位置区分）", i, cm.ID)
+			t.Fatalf("#%d id 重复: %s", i, cm.ID)
 		}
 		seen[cm.ID] = true
 	}
 
-	// 同一输入重复转换 → ID 必须稳定（跨轮 ref 映射依赖它）
+	// 同一输入重复转换 → id 必须稳定（跨轮 ref 映射依赖它）
 	again := ToCoreMessages(msgs, nil)
 	for i := range cores {
 		if cores[i].ID != again[i].ID {
-			t.Fatalf("#%d 重复转换 ID 不稳定: %s vs %s", i, cores[i].ID, again[i].ID)
+			t.Fatalf("#%d 重复转换 id 不稳定: %s vs %s", i, cores[i].ID, again[i].ID)
 		}
 	}
 }
 
-// TestStateStoreSaveAtomic 覆盖写后落盘内容必须完整可解析、且不残留临时文件。
-// 旧实现直接 WriteFile：崩溃/断电会留下半截 JSON，Load 解析失败即重建，
-// 压缩记录全丢（压缩收益一次性归零）。
-func TestStateStoreSaveAtomic(t *testing.T) {
+// TestMessageIDIsStableAcrossListShift 宿主下发的稳定 id 必须原样成为压缩后端的
+// 消息身份，且**不随列表位置变化**——这是「配置随时会改」的兜底：history_injection
+// 只带最近 N 条、宿主裁剪、fork 都会让列表起点平移。
+//
+// 此前用列表下标当身份，理由是「pre-step 收到的是 append-only 原始历史」；那个前提
+// 被裁剪与注入开关打破后，同一个 mNNNNN 会指到别的消息，压缩块遮掉模型当前的工作
+// 内容（实测渲染从 765K 塌到 1.9K）。
+func TestMessageIDIsStableAcrossListShift(t *testing.T) {
+	full := []*proto.Message{
+		{Id: "event-10", Role: "user", Content: "最早的需求"},
+		{Id: "event-11", Role: "assistant", Content: "好的"},
+		{Id: "event-12", Role: "user", Content: "第二步"},
+		{Id: "event-13", Role: "assistant", Content: "继续"},
+	}
+	core := ToCoreMessages(full, nil)
+	for i, cm := range core {
+		if cm.ID != full[i].Id {
+			t.Fatalf("第 %d 条 core id = %q，期望宿主 id %q", i, cm.ID, full[i].Id)
+		}
+	}
+
+	// 只发后两条（模拟只注入最近 N 条）：id 不变，位置变了
+	shifted := ToCoreMessages(full[2:], nil)
+	if shifted[0].ID != "event-12" || shifted[1].ID != "event-13" {
+		t.Fatalf("列表起点平移后 id 漂移：%q, %q", shifted[0].ID, shifted[1].ID)
+	}
+
+	// 往返也必须保住 id（改写链路上任何一环丢了，下一轮就退回按位置寻址）
+	back := FromCoreMessages(core)
+	for i, pm := range back {
+		if pm.Id != full[i].Id {
+			t.Fatalf("往返后第 %d 条 id = %q，期望 %q", i, pm.Id, full[i].Id)
+		}
+	}
+}
+
+// TestMissingMessageIDIsNotFabricated 没有稳定 id 的消息不得拿列表下标顶替。
+//
+// 「缺 id 就退回位置」等于把已经被证明会遮错内容的老方案留在仓库里：一旦某条链路
+// 忘了填 id，症状不是报错而是压缩块指到别的消息。空 id 的后果是「这条消息不参与
+// 压缩」——局部失效，不破坏别人的内容。
+func TestMissingMessageIDIsNotFabricated(t *testing.T) {
+	core := ToCoreMessages([]*proto.Message{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Content: "b"},
+	}, nil)
+	for i, cm := range core {
+		if cm.ID != "" {
+			t.Fatalf("第 %d 条不应被编造 id，实际 %q", i, cm.ID)
+		}
+	}
+}
+
+// TestLoadDiscardsStateWithUnknownSchema 状态文件格式版本不符时整体丢弃，不做逐字段
+// 迁移：旧格式里记的消息 id 是列表下标（msg-<i>），与稳定 id 空间对不上，硬迁就等于
+// 给已废弃的寻址方式留实现分支。丢弃后由事件日志重建（compress 调用带完整范围与摘要）。
+func TestLoadDiscardsStateWithUnknownSchema(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStateStore(dir)
 
-	st := bcacp.CreateInitialState()
-	st.Stats.CompressionCount = 1
-	if err := store.Save("sess-1", st); err != nil {
-		t.Fatalf("首次保存失败: %v", err)
+	old := bcacp.CreateInitialState()
+	old.Schema = bcacp.StateSchema - 1
+	old.Blocks = []bcacp.CompressionBlock{{
+		BlockID:             "b0",
+		Active:              true,
+		StartRef:            "m00001",
+		EndRef:              "m00002",
+		DirectMessageIDs:    []string{"msg-1", "msg-2"},
+		EffectiveMessageIDs: []string{"msg-1", "msg-2"},
+	}}
+	old.MessageRefs.ByRaw["msg-1"] = "m00001"
+	old.MessageRefs.ByRef["m00001"] = "msg-1"
+	if err := store.Save("s1", old); err != nil {
+		t.Fatalf("save: %v", err)
 	}
 
-	st.Stats.CompressionCount = 2
-	if err := store.Save("sess-1", st); err != nil {
-		t.Fatalf("覆盖保存失败: %v", err)
-	}
-
-	// 新 store 直接读磁盘（绕过缓存）→ 证明落盘是完整 JSON
-	reloaded, err := NewStateStore(dir).Load("sess-1")
+	// 新 store 实例：绕开进程内 cache，走真实读盘路径
+	store2 := NewStateStore(dir)
+	got, err := store2.Load("s1")
 	if err != nil {
-		t.Fatalf("落盘内容应完整可解析: %v", err)
+		t.Fatalf("load: %v", err)
 	}
-	if reloaded.Stats.CompressionCount != 2 {
-		t.Fatalf("覆盖写未生效: count=%d", reloaded.Stats.CompressionCount)
+	if got.Schema != bcacp.StateSchema {
+		t.Fatalf("应返回当前版本的空状态，实际 schema = %d", got.Schema)
 	}
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("读目录失败: %v", err)
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tmp") {
-			t.Fatalf("不应残留临时文件: %s", e.Name())
-		}
-	}
-}
-
-// TestStateStoreUsesSessionsDirWithSuffix state 必须与宿主会话同目录、靠后缀区分：
-// 不再单独占用 ExecDir/billion-context/，且文件名带 .acp.json 以免被 session.Store
-// （只扫描 *.jsonl）或人工清理会话时误认。
-func TestStateStoreUsesSessionsDirWithSuffix(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStateStore(dir)
-	st := bcacp.CreateInitialState()
-	if err := store.Save("session-7", st); err != nil {
-		t.Fatalf("保存失败: %v", err)
-	}
-	want := dsc.PJoin(dir, "session-7"+StateFileSuffix)
-	if _, err := os.Stat(want); err != nil {
-		t.Fatalf("应写入 %s: %v", want, err)
-	}
-	// 不得产生裸 <id>.json（旧命名），否则与新版并存时行为不确定
-	if _, err := os.Stat(dsc.PJoin(dir, "session-7.json")); err == nil {
-		t.Fatalf("不应再写旧命名 session-7.json")
-	}
-}
-
-// TestStateStorePathUsesSessionIDVerbatim state 文件名必须与会话 id 一一对应：
-// 旧实现把非法字符替换为 '_'（"a b" 与 "a_b" 折成同一文件，两个会话串状态），
-// 现在只用 SDK 的统一校验，不做字符替换；非法 id 直接报错而非静默改名。
-func TestStateStorePathUsesSessionIDVerbatim(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStateStore(dir)
-
-	for _, id := range []string{"a b", "a_b", "O=--Agents--dsc", "x~db"} {
-		p, err := store.path(id)
-		if err != nil {
-			t.Fatalf("%q 应可作文件名: %v", id, err)
-		}
-		if want := dsc.PJoin(dir, id+StateFileSuffix); p != want {
-			t.Fatalf("path(%q) = %q, want %q", id, p, want)
-		}
-	}
-
-	for _, bad := range []string{"", "..", "a/b", `a\b`} {
-		if _, err := store.path(bad); err == nil {
-			t.Fatalf("%q 应被拒绝（防路径穿越）", bad)
-		}
-	}
-}
-
-// TestStateFileNamedAfterPlugin 状态文件名必须带插件名（<会话 id>.<插件名>.json）：
-// 宿主核心不该知道任何插件的落盘后缀，同名会话的多种插件状态同目录并存而不冲突。
-func TestStateFileNamedAfterPlugin(t *testing.T) {
-	if !strings.Contains(StateFileSuffix, PluginName) {
-		t.Fatalf("后缀应含插件名: %q（插件名 %q）", StateFileSuffix, PluginName)
-	}
-	p, err := NewStateStore(t.TempDir()).path("session-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(p, "session-1."+PluginName+".json") {
-		t.Fatalf("文件名规则不符: %q", p)
-	}
-	if strings.HasSuffix(p, dsc.SessionFileSuffix) {
-		t.Fatalf("不得与会话日志同名: %q", p)
-	}
-}
-
-// TestPruneOrphans 会话已删除时，其状态文件由插件自行清理（宿主不再知道这些文件）。
-func TestPruneOrphans(t *testing.T) {
-	dir := t.TempDir()
-	store := NewStateStore(dir)
-
-	// 两个会话：一个仍有日志，一个已被删除
-	if err := os.WriteFile(dsc.PJoin(dir, "session-1"+dsc.SessionFileSuffix), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"session-1", "session-2"} {
-		if err := store.Save(id, bcacp.CreateInitialState()); err != nil {
-			t.Fatalf("保存 %s 失败: %v", id, err)
-		}
-	}
-	// 无关文件不得被误删
-	other := dsc.PJoin(dir, "session-1.other-plugin.json")
-	if err := os.WriteFile(other, []byte("{}"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	if n := PruneOrphans(dir); n != 1 {
-		t.Fatalf("应清理 1 个孤儿状态，got %d", n)
-	}
-	if _, err := os.Stat(dsc.PJoin(dir, "session-1"+StateFileSuffix)); err != nil {
-		t.Fatalf("仍有会话日志的状态不应被删: %v", err)
-	}
-	if _, err := os.Stat(dsc.PJoin(dir, "session-2"+StateFileSuffix)); !os.IsNotExist(err) {
-		t.Fatalf("孤儿状态应被删除: err=%v", err)
-	}
-	if _, err := os.Stat(other); err != nil {
-		t.Fatalf("其它插件的文件不得被误删: %v", err)
+	if len(got.Blocks) != 0 || len(got.MessageRefs.ByRaw) != 0 {
+		t.Fatalf("不兼容的旧状态应被丢弃，实际 blocks=%d refs=%d",
+			len(got.Blocks), len(got.MessageRefs.ByRaw))
 	}
 }

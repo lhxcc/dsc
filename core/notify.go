@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -108,27 +109,111 @@ func (m *Manager) markHookClientDead(name string, err error) {
 		"plugin", name, "error", err.Error())
 }
 
-// compactionBackendName 返回配置选定的压缩后端插件名（空 = 未选，走 agent 内联压缩）。
-func (m *Manager) compactionBackendName() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.compactionBackend
+// capPreStepMessages 插件声明「即使不持有压缩岗位，也需要 pre-step 的完整消息列表」。
+//
+// 默认不发：岗位之外没有任何插件能改写请求面，把几 MB 的消息复制过去没有用处——
+// 实测非岗位的压缩后端还会真的调模型做摘要，结果被宿主丢弃。观察型插件（记忆、审计）
+// 若确实要看消息，在 SDK Config 的 Provides 里声明这一项即可。
+const capPreStepMessages = "pre-step-messages"
+
+// capPreStepTransform 插件声明「我提供一个可组合的请求面变换（projection）」。
+//
+// 与 compaction 的分工：压缩是「谁当值谁说了算」，只能有一个；投影是可以叠加的
+// 若干道工序（按预算退役旧图像、按类型截断大段工具结果……），谁声明谁参与，按装载
+// 顺序依次作用在上一步的输出上。早先投影只能寄生在压缩插件内部——于是压缩换人时
+// 投影跟着消失，那不是配置问题，是把两件事绑在了一起。
+const capPreStepTransform = "pre-step-transform"
+
+// CompactionRole 是「压缩岗位」的解析结果。
+//
+// 有压缩能力的插件可以有多个，岗位只有一个：谁当值，谁的 pre-step 改写被采纳，
+// 也只有它需要拿到完整消息列表。岗位在启动期就能定死（配置点名 + 已加载 + 声明了
+// compaction 能力），不必等广播之后再从多个结果里挑。
+//
+// 不做缓存的理由：插件热加载/卸载会改变答案，缓存得额外维护失效；解析本身只是查两张
+// 表，代价可以忽略。
+type CompactionRole struct {
+	// Holder 岗位持有者（空 = 岗位空缺：没人能改写请求面，agent 走内联压缩）。
+	Holder string
+	// Configured config.yaml 的 compaction 字段（可能指向一个没加载的插件）。
+	Configured string
+	// Candidates 当前已加载、且声明了 compaction 能力的插件（按名字排序）。
+	Candidates []string
+	// Vacancy 岗位空缺的原因（空 = 有人当值）。空缺本身是正常形态（不用后端），
+	// 但「有候选人却没人当值」必须解释清楚缺的是哪个条件。
+	Vacancy string
 }
 
-// CompactionBackendState 返回配置选定的压缩后端名与它是否真的生效。
+// ResolveCompactionRole 解析压缩岗位（唯一入口：改名/换后端只需改这里）。
+//
+// 三个条件同时成立才算当值：配置点了名、插件已加载（且进程仍可用）、它确实声明了
+// Provides compaction。只认配置点名的那一个——同时启用两个后端时若都采纳，pre-step
+// 改写会层层叠加，与配置意图不符。
+//
+// 已标记不可用（进程退出/连接断开）的插件一律视为未加载：否则岗位会一直指向一个再也
+// 不会改写载荷的死插件，agent 也不会退回内联压缩。
+func (m *Manager) ResolveCompactionRole() CompactionRole {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	role := CompactionRole{Configured: m.compactionBackend}
+	for name := range m.coreMetadata {
+		if m.toolHookClients[name] == nil || m.deadHookClients[name] || !m.declaresCompactionLocked(name) {
+			continue
+		}
+		role.Candidates = append(role.Candidates, name)
+	}
+	sort.Strings(role.Candidates)
+
+	switch {
+	case role.Configured == "":
+		role.Vacancy = "no compaction backend configured (agent inline compaction is the only path)"
+	case m.toolHookClients[role.Configured] == nil:
+		role.Vacancy = fmt.Sprintf("configured backend %q is not loaded", role.Configured)
+	case m.deadHookClients[role.Configured]:
+		role.Vacancy = fmt.Sprintf("configured backend %q is unavailable (plugin process exited)", role.Configured)
+	case !m.declaresCompactionLocked(role.Configured):
+		role.Vacancy = fmt.Sprintf("configured backend %q does not declare Provides compaction", role.Configured)
+	default:
+		role.Holder = role.Configured
+	}
+	return role
+}
+
+// declaresCompactionLocked 报告某个已加载插件是否声明了 compaction 能力（需持有读锁）。
+func (m *Manager) declaresCompactionLocked(name string) bool {
+	info := m.coreMetadata[name]
+	if info == nil {
+		return false
+	}
+	v, ok := info.Capabilities["compaction"]
+	return ok && v != "false"
+}
+
+// wantsPreStepMessages 报告该插件是否显式声明需要 pre-step 的完整消息列表。
+func (m *Manager) wantsPreStepMessages(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	info := m.coreMetadata[name]
+	if info == nil {
+		return false
+	}
+	v, ok := info.Capabilities[capPreStepMessages]
+	return ok && v != "false"
+}
+
+// compactionBackendName 返回岗位持有者（空 = 岗位空缺，走 agent 内联压缩）。
+func (m *Manager) compactionBackendName() string {
+	return m.ResolveCompactionRole().Holder
+}
+
+// CompactionBackendState 返回配置指定的后端名与岗位是否真的有人当值。
 //
 // 给前端/诊断用：config.yaml 里写了 `compaction: X` 但插件没加载（plugins 列表里
 // 注释掉、enabled: false、二进制缺失）时，宿主会静默回落到 agent 内联压缩——
-// 用户看到的是"新压缩没生效"，却没有任何地方说明原因。这个入口让状态类
-// 命令/面板能把话说明白。
+// 用户看到的是"新压缩没生效"，却没有任何地方说明原因。
 func (m *Manager) CompactionBackendState() (configured string, active bool) {
-	if m == nil {
-		return "", false
-	}
-	m.mu.RLock()
-	name := m.compactionBackend
-	m.mu.RUnlock()
-	return name, m.compactionBackendActive()
+	role := m.ResolveCompactionRole()
+	return role.Configured, role.Holder != ""
 }
 
 // WarnIfCompactionBackendMissing 检查「配置了压缩后端但它没生效」，返回一句可展示的
@@ -138,41 +223,21 @@ func (m *Manager) WarnIfCompactionBackendMissing() string {
 	if m == nil {
 		return ""
 	}
-	name, active := m.CompactionBackendState()
-	if name == "" || active {
+	role := m.ResolveCompactionRole()
+	if role.Configured == "" || role.Holder != "" {
 		return ""
 	}
-	msg := fmt.Sprintf(
-		"compaction backend %q is configured but not active: plugin not loaded or does not declare Provides compaction; "+
-			"falling back to agent inline compaction", name)
 	m.logger.Error("compaction backend configured but not active",
-		"backend", name,
+		"backend", role.Configured, "reason", role.Vacancy,
+		"candidates", role.Candidates,
 		"hint", "check config.yaml: the plugin must appear in the plugins list with enabled: true (and binary_path ending in .exe on Windows)")
-	return msg
+	return fmt.Sprintf("compaction backend %q is configured but not active: %s; falling back to agent inline compaction",
+		role.Configured, role.Vacancy)
 }
 
-// compactionBackendActive 报告选定的压缩后端是否已加载且声明了 compaction 能力。
-//
-// 只认 compaction 字段指定的那一个：其它插件即使同样声明 Provides compaction 也不
-// 参与接管（否则同时启用的两个压缩后端 pre-step 改写会
-// 会叠加成双重压缩，且与配置意图不符）。
+// compactionBackendActive 报告岗位是否有人当值。
 func (m *Manager) compactionBackendActive() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.compactionBackend == "" {
-		return false
-	}
-	if m.deadHookClients[m.compactionBackend] {
-		// 后端进程已退出：声明「无后端」，让 agent 退回内联压缩，
-		// 而不是一直等一个再也不会改写载荷的死插件。
-		return false
-	}
-	info := m.coreMetadata[m.compactionBackend]
-	if info == nil {
-		return false
-	}
-	v, ok := info.Capabilities["compaction"]
-	return ok && v != "false"
+	return m.ResolveCompactionRole().Holder != ""
 }
 
 // LoadLuaHooks 加载外部脚本钩子配置（-hooks 指定的 hooks.json；路径不存在为
@@ -332,6 +397,208 @@ func (m *Manager) hookClientsNamedSnapshot() []namedHookClient {
 }
 
 // collectPreStepAppends 从插件返回的 result_json 中取出一次性插播消息。
+// withPreStepStage 复制一份 pre-step 载荷并写入阶段标记（不改原事件）。
+func withPreStepStage(data any, stage string) any {
+	switch ev := data.(type) {
+	case AgentPreStepEvent:
+		ev.Stage = stage
+		return ev
+	case *AgentPreStepEvent:
+		if ev == nil {
+			return data
+		}
+		cp := *ev
+		cp.Stage = stage
+		return cp
+	case map[string]any:
+		out := make(map[string]any, len(ev)+1)
+		for k, v := range ev {
+			out[k] = v
+		}
+		out["stage"] = stage
+		return out
+	}
+	return data
+}
+
+// applyPreStepProjections 跑第二阶段：让每个声明 pre-step-transform 的插件在
+// **当前视图**上依次投影，返回合并后的结果。
+//
+// 约定（写进文档与 sdk 常量注释）：投影是无损变换——不删消息、不改角色顺序、不动
+// 工具配对，只改单条消息的内容/附件。这样它才能安全地叠加在压缩结果之上。
+//
+// 失败处理与第一阶段不同：压缩改写的失败会让请求超窗（必须 veto），而投影只是
+// 优化（省下的是图像/长输出的字节）。所以某个投影报错或传输失败时记 WARN 并继续
+// 用上一步的结果，绝不因此让整轮请求失败。
+func (m *Manager) applyPreStepProjections(ctx context.Context, clients []namedHookClient, data any, result any) any {
+	var transforms []namedHookClient
+	for _, nc := range clients {
+		if m.wantsPreStepTransform(nc.name) {
+			transforms = append(transforms, nc)
+		}
+	}
+	if len(transforms) == 0 {
+		return result
+	}
+
+	msgs := ""
+	if raw, ok := extractPreStepMessages(result); ok {
+		msgs = raw
+	} else if ev, ok := data.(AgentPreStepEvent); ok {
+		msgs = ev.MessagesJSON
+	}
+	if msgs == "" {
+		return result // 没有视图可投影（空会话/旧载荷）：不白跑
+	}
+
+	changed := false
+	for _, nc := range transforms {
+		payload, ok := preStepProjectionPayload(data, msgs)
+		if !ok {
+			m.logger.Warn("pre-step projection skipped: cannot build payload", "plugin", nc.name)
+			continue
+		}
+		resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(EventAgentPreStep), DataJson: payload})
+		if err != nil {
+			m.logger.Warn("pre-step projection transport error, keeping previous view",
+				"plugin", nc.name, "error", err.Error())
+			continue
+		}
+		if e := resp.GetError(); e != "" {
+			m.logger.Warn("pre-step projection failed, keeping previous view", "plugin", nc.name, "error", e)
+			continue
+		}
+		next, ok := extractPreStepMessagesJSON(resp.GetResultJson())
+		if !ok || next == msgs {
+			continue
+		}
+		msgs = next
+		changed = true
+	}
+	if !changed {
+		return result
+	}
+
+	out, _ := result.(map[string]any)
+	if out == nil {
+		out = map[string]any{}
+	}
+	var arr any
+	if err := json.Unmarshal([]byte(msgs), &arr); err != nil {
+		m.logger.Warn("pre-step projection produced invalid messages JSON, ignoring", "error", err.Error())
+		return result
+	}
+	out["messages"] = arr
+	return out
+}
+
+// preStepProjectionPayload 生成第二阶段的载荷：同一信封，消息换成当前视图，阶段标记
+// 为 projection。
+func preStepProjectionPayload(data any, messagesJSON string) (string, bool) {
+	staged := withPreStepStage(data, PreStepStageProjection)
+	switch ev := staged.(type) {
+	case AgentPreStepEvent:
+		ev.MessagesJSON = messagesJSON
+		b, err := json.Marshal(ev)
+		return string(b), err == nil
+	case map[string]any:
+		ev["messages_json"] = messagesJSON
+		b, err := json.Marshal(ev)
+		return string(b), err == nil
+	}
+	return "", false
+}
+
+// extractPreStepMessages 取结果载荷里的消息数组（原样 JSON 文本）。
+func extractPreStepMessages(result any) (string, bool) {
+	m, ok := result.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	raw, ok := m["messages"]
+	if !ok {
+		return "", false
+	}
+	b, err := json.Marshal(raw)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return "", false
+	}
+	return string(b), true
+}
+
+// extractPreStepMessagesJSON 从插件返回的 result_json 里取 messages。
+func extractPreStepMessagesJSON(resultJSON string) (string, bool) {
+	if resultJSON == "" {
+		return "", false
+	}
+	var payload struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &payload); err != nil {
+		return "", false
+	}
+	if len(payload.Messages) == 0 || string(payload.Messages) == "null" {
+		return "", false
+	}
+	return string(payload.Messages), true
+}
+
+// wantsPreStepTransform 报告该插件是否声明了「可组合的请求面变换」能力。
+func (m *Manager) wantsPreStepTransform(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	info := m.coreMetadata[name]
+	if info == nil {
+		return false
+	}
+	v, ok := info.Capabilities[capPreStepTransform]
+	return ok && v != "false"
+}
+
+// decodeEventPayload 把事件载荷还原成调用方期望的形态。
+//
+// 正常路径返回的是 json.Unmarshal 出来的 any（map[string]any）；提前返回若直接给回
+// 原始 data（可能是 map[string]string 之类），调用方的类型断言会失配而静默当作「没有
+// 改写」——所以这里统一成同一形态。
+func decodeEventPayload(dataJSON string, fallback any) any {
+	if dataJSON == "" {
+		return fallback
+	}
+	var out any
+	if err := json.Unmarshal([]byte(dataJSON), &out); err != nil {
+		return fallback
+	}
+	return out
+}
+
+// reducedPreStepPayload 生成 pre-step 的「轻载荷」：同一个信封，但不带消息列表。
+//
+// 岗位之外的插件拿不到改写权，把几 MB 的消息复制过去没有任何用处。轻载荷保留
+// session / user_input / 各计数——副作用需要的正是这些（重置重复调用链、记忆落盘
+// 都只读这几个字段）。空串表示形状不认识，调用方退回完整载荷（宁可多传，不可把
+// 不认识的信封改坏）。
+func reducedPreStepPayload(data any) string {
+	switch ev := data.(type) {
+	case AgentPreStepEvent:
+		ev.MessagesJSON = ""
+		if b, err := json.Marshal(ev); err == nil {
+			return string(b)
+		}
+	case map[string]any:
+		trimmed := make(map[string]any, len(ev))
+		for k, v := range ev {
+			if k == "messages_json" {
+				continue
+			}
+			trimmed[k] = v
+		}
+		if b, err := json.Marshal(trimmed); err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
 // 约定形状：{"append":[{"role":"system","content":"…"}]}；无该字段返回 nil。
 func collectPreStepAppends(resultJSON string) []any {
 	var payload struct {
@@ -348,9 +615,15 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 	if len(clients) == 0 {
 		return data, nil
 	}
+	// pre-step 分两阶段（结构改写 → 请求面投影），载荷里带阶段标记，插件据此决定
+	// 这一步该做哪件事。旧插件忽略该字段，行为与从前一致（它们只会在第一阶段生效）。
+	payloadData := data
+	if name == EventAgentPreStep {
+		payloadData = withPreStepStage(data, PreStepStageCompaction)
+	}
 	dataJSON := ""
-	if data != nil {
-		if b, err := json.Marshal(data); err == nil {
+	if payloadData != nil {
+		if b, err := json.Marshal(payloadData); err == nil {
 			dataJSON = string(b)
 		}
 	}
@@ -359,17 +632,45 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		mode = "emit"
 	}
 
-	// agent/pre-step 的「消息改写权」与 agent/request-error 的「重试决定权」都只归
-	// compaction 字段选定的后端：多个插件可能都声明 Provides compaction（基础压缩与
-	// 上下文管理插件都会声明），若全部采纳就会层层改写、叠加压缩，与配置选择的后端
-	// 不符。request-error 必须走同一采纳规则——否则后端返回的 {"retry": true}（溢出
-	// 紧急压缩后要求重试）会被丢弃，首次请求超窗时没有任何安全阀。
-	// 注意仍向所有插件派发——pre-step 还承载副作用（重置重复调用链、通知型 listener
-	// 等），只是它们的 result_json 不参与载荷改写/重试决定；未选后端时一律不采纳，
-	// 由 agent 内联压缩兜底。
-	backend := ""
+	// 压缩岗位：只有一个插件当值，它的改写被采纳、也只有它需要完整消息列表。
+	// 岗位在启动期就确定（配置点名 + 已加载 + 声明 compaction），不是广播之后再挑。
+	// 两个事件都走同一岗位：request-error 的重试决定权也一样——否则后端返回的
+	// {"retry": true}（溢出紧急压缩后要求重试）会被丢弃，首次超窗就没有安全阀。
+	role := CompactionRole{}
 	if name == EventAgentPreStep || name == EventAgentRequestError {
-		backend = m.compactionBackendName()
+		role = m.ResolveCompactionRole()
+	}
+
+	// request-error 只发给岗位持有者：只有它会做紧急压缩。广播给其他声明了 compaction
+	// 的插件，它们会真的再压一遍（调模型、写状态），结果却被丢弃。岗位空缺时没人该动。
+	if name == EventAgentRequestError {
+		if role.Holder == "" {
+			return decodeEventPayload(dataJSON, data), nil
+		}
+		kept := clients[:0:0]
+		for _, nc := range clients {
+			if nc.name == role.Holder {
+				kept = append(kept, nc)
+			}
+		}
+		if len(kept) == 0 {
+			return decodeEventPayload(dataJSON, data), nil
+		}
+		clients = kept
+	}
+
+	// pre-step 的完整消息列表只发给岗位持有者，以及显式声明需要的观察者。其他人拿到
+	// 同一信封但不带消息（副作用只需 session / user_input / 计数）。省掉的是每步
+	// 几 MB 的复制 + 非岗位后端的无效摘要调用。
+	lightJSON := ""
+	fullPayload := map[string]bool{}
+	if name == EventAgentPreStep {
+		lightJSON = reducedPreStepPayload(payloadData)
+		for _, nc := range clients {
+			if m.wantsPreStepMessages(nc.name) {
+				fullPayload[nc.name] = true
+			}
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -383,10 +684,14 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		next := func() (string, error) { return dataJSON, nil }
 		for i := len(clients) - 1; i >= 0; i-- {
 			nc := clients[i]
-			adopt := backend != "" && nc.name == backend
+			adopt := role.Holder != "" && nc.name == role.Holder
 			innerNext := next
 			next = func() (string, error) {
-				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: dataJSON})
+				payload := dataJSON
+				if lightJSON != "" && nc.name != role.Holder && !fullPayload[nc.name] {
+					payload = lightJSON
+				}
+				resp, err := nc.client.OnEvent(ctx, &proto.OnEventRequest{Name: string(name), DataJson: payload})
 				if err != nil {
 					// 传输层失败（插件崩溃/连接断开/超时）不是语义否决：跳过该插件继续，
 					// 否则一个退出的观察者/压缩后端会让整轮请求永久失败。
@@ -420,6 +725,11 @@ func (m *Manager) dispatchEventToPlugins(name EventName, data any) (any, error) 
 		var result any
 		if finalResult != "" {
 			_ = json.Unmarshal([]byte(finalResult), &result)
+		}
+		// 第二阶段：请求面投影。在结构改写之后、对改写后的视图依次作用，与谁当值无关
+		// ——投影不是「压缩的一部分」，压缩换人也该照跑。
+		if name == EventAgentPreStep {
+			result = m.applyPreStepProjections(ctx, clients, data, result)
 		}
 		if len(appends) > 0 {
 			// 合并进返回载荷的 append 字段，交由调用方追加到消息末尾

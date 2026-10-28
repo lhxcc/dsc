@@ -300,13 +300,10 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	llm := &windowEnforcingLLM{window: a.contextWindow}
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
-	var mu sync.Mutex
-	var trimmed bool
+	var frames int
 	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
-		if strings.Contains(f.Output, "上下文裁剪") {
-			mu.Lock()
-			trimmed = true
-			mu.Unlock()
+		if strings.Contains(f.Output, "上下文裁剪") || strings.Contains(f.Output, "上下文折叠") {
+			frames++
 		}
 	})
 	if err != nil {
@@ -315,22 +312,20 @@ func TestNoTrimForAsciiHistoryWithinWindow(t *testing.T) {
 	if res.Status != "success" {
 		t.Fatalf("状态 = %s", res.Status)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if trimmed {
-		t.Fatal("历史只占窗口 40%，不应触发裁剪（估算被高估才会这样）")
-	}
-	// 全量历史都应发出去（11 条历史/当前消息 + system）
+	// 全量历史都应发出去（11 条历史/当前消息 + system）——不裁剪就是「没丢东西」的证据
 	if got := len(llm.streamMsgs); got < 11 {
 		t.Fatalf("主请求消息数 = %d, 期望全量（不应丢历史）", got)
 	}
+	if frames != 0 {
+		t.Fatalf("前端不应输出裁剪/折叠提示帧，实际 %d 帧", frames)
+	}
 }
 
-// TestTrimNoticePrintedOncePerDropCount 真超窗时，同一省略条数只提示一次。
+// TestTrimIsLoggedNotShown 真超窗时：确实裁剪，但**前端一帧都不输出**。
 //
-// 现场表现：每轮都打印「已省略最早 93 条消息」，把消息区刷满。真超窗时每轮裁掉的是
-// 同一段，重复提示没有新信息；条数变化时才应再提示。
-func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
+// 滑动窗口是这个产品的常态工作方式，不是需要用户处理的异常——提示帧只会把消息区
+// 刷成同一句话。诊断信息走运行日志（-log）：每会话第一次裁剪记一条，避免每步刷日志。
+func TestTrimIsLoggedNotShown(t *testing.T) {
 	a := newTestAgent(t)
 	a.contextWindow = 50000
 	a.llmServiceID, a.toolServiceID = 1, 1
@@ -340,33 +335,38 @@ func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	countTrimFrames := func() int {
+	runOnce := func() (int, int) {
 		var mu sync.Mutex
-		n := 0
+		frames := 0
 		_, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {
-			if strings.Contains(f.Output, "上下文裁剪") {
+			if strings.Contains(f.Output, "上下文裁剪") || strings.Contains(f.Output, "上下文折叠") {
 				mu.Lock()
-				n++
+				frames++
 				mu.Unlock()
 			}
 		})
 		if err != nil {
 			t.Fatalf("runLoop: %v", err)
 		}
-		return n
+		mu.Lock()
+		defer mu.Unlock()
+		llm.mu.Lock()
+		sent := len(llm.streamMsgs)
+		llm.mu.Unlock()
+		return frames, sent
 	}
 
-	// 默认静默：小窗口读越窗口的会话是常态（滑动窗口式工作），提示帧不该打扰
-	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("默认不应输出裁剪提示帧（滑动窗口是常态），实际 %d 次", got)
+	frames, sent := runOnce()
+	if frames != 0 {
+		t.Fatalf("前端不应输出裁剪提示帧，实际 %d 帧", frames)
 	}
-	// 显式开启后：每会话只提示一次，第二轮不再重复
-	t.Setenv("DSC_TRIM_NOTICE", "1")
-	if got := countTrimFrames(); got != 1 {
-		t.Fatalf("开启提示后首次裁剪应提示 1 次，实际 %d 次", got)
+	if full := len(a.sess.DeriveMessages()); sent >= full {
+		t.Fatalf("未发生裁剪：发出 %d 条，全量 %d 条", sent, full)
 	}
-	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("同一会话不应重复提示，第二轮实际提示 %d 次", got)
+
+	// 第二轮同样不输出：提示既不是一次性的「通知」，也不是每轮重复
+	if frames, _ := runOnce(); frames != 0 {
+		t.Fatalf("第二轮仍不应输出提示帧，实际 %d 帧", frames)
 	}
 }
 
@@ -566,5 +566,65 @@ func TestReportedUsageFollowsSentSurface(t *testing.T) {
 	// 用裁剪前的估算算投影会把「被裁掉的那部分」当成占用（这正是界面上虚高的来源）
 	if got := a.meter.Project(fullEstimate); got <= a.meter.Project(sentEstimate) {
 		t.Fatalf("裁剪前的投影应明显高于裁剪后（got %d vs %d）", got, a.meter.Project(sentEstimate))
+	}
+}
+
+// TestBackendActiveSkipsHistoryTrim 有压缩后端时，**不得**做请求级裁剪。
+//
+// 现场（1M 窗口、~1.6M 历史会话）：
+//   - 每一步请求都在 932K / 610K 两个规模之间交替，provider 侧对应 169K / 26.5K；
+//   - 界面上「上下文容量」也跟着百几K ↔ 廿几K 来回跳，前缀缓存每步失效。
+//
+// 根因不是压缩算法，而是裁剪与后端的**寻址方式**冲突：后端给消息分配引用按位置
+// （msg-<idx> → mNNNNN），一旦裁掉头部，同一个 mNNNNN 就落到另一条消息上——已有的
+// 压缩块遮掉了模型的当前工作内容（渲染结果因此塌到 26K），下一步裁剪深度一变又恢复。
+//
+// 不变量：有后端时派生历史原样下发（后端看完整 append-only 历史才谈得上稳定寻址），
+// 窗口适配交给后端 + request-error 重试兜底；无后端时裁剪行为不变（见本文件其余用例）。
+func TestBackendActiveSkipsHistoryTrim(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 50000
+	a.llmServiceID, a.toolServiceID = 1, 1
+	a.hasCompactionBackend = true
+	buildOversizeSession(t, a, 10, 10000) // 20 条 × 10k ≈ 200K ≈ 4 倍窗口
+
+	full := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	if full <= a.contextWindow*2 {
+		t.Fatalf("夹具不够大：估算 %d，应至少为窗口两倍", full)
+	}
+
+	llm := &compactMockLLM{done: make(chan struct{})} // 不判超窗：真实 provider 看到的是后端改写后的视图
+	a.llmClient = llm
+	a.toolClient = &mockToolClient{}
+
+	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {})
+	if err != nil {
+		t.Fatalf("有后端时不应因「改写前超窗」整轮报错: %v", err)
+	}
+	if res.Status != "success" {
+		t.Fatalf("结果状态 = %s, 期望 success", res.Status)
+	}
+
+	llm.mu.Lock()
+	sent := llm.streamMsgs
+	calls := llm.streamCalls
+	llm.mu.Unlock()
+	if calls == 0 || len(sent) == 0 {
+		t.Fatal("主请求未发出")
+	}
+	// 1) 未裁剪：发出去的就是全量派生历史（裁剪会把它压到 0.9×窗口以下）
+	if got := dsc.EstimateProtoMessagesTokens(sent); got <= a.contextWindow {
+		t.Fatalf("有后端时历史被裁到 %d（窗口 %d）——位置的引用语义会被打断", got, a.contextWindow)
+	}
+	// 2) 最早一轮仍在（裁剪会从最旧处丢）
+	found := false
+	for _, m := range sent {
+		if strings.Contains(m.GetContent(), "#round-0") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("最早一轮历史不见了：有后端时不得做请求级裁剪")
 	}
 }

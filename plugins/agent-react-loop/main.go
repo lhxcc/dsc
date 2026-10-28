@@ -522,7 +522,22 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
-		msgs, droppedMsgs := a.trimToWindow(msgs, availableTools, projectedTokens)
+		// 有压缩后端时**不做请求级裁剪**：这里拿到的是改写**前**的列表，裁它等于在
+		// 后端接手之前就替它丢了材料——而后端的状态（块覆盖、保留区）是按完整
+		// append-only 历史建立的，喂它一份被裁过的列表会让覆盖关系错位，渲染结果在
+		// 相邻两步之间摆动（实测 1M 窗口下 169K/26.5K 交替），前缀缓存每步失效。
+		//
+		// 「谁保证发出去的 ≤ 窗口」由宿主统一收口：pre-step 改写完成后、请求发出之前，
+		// 宿主量最终表面并按需裁剪（core/context_ceiling.go，超窗时先请后端紧急压缩，
+		// 压不下去才丢最旧的一段）。那里看到的是**真正要发的那一份**，且消息身份已是
+		// 宿主下发的稳定 id，裁剪不会让压缩块指错消息。
+		//
+		// 因此这里也不再做「单轮超窗」硬报错，那是拿**改写前**的规模去判**改写后**的
+		// 请求，有后端时必然误判。
+		var droppedMsgs int
+		if !a.hasCompactionBackend {
+			msgs, droppedMsgs = a.trimToWindow(msgs, availableTools, projectedTokens)
+		}
 		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
 		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
 		// 掉的内容重新装回去——等于白折。
@@ -530,18 +545,16 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		if droppedMsgs > 0 {
 			// 不往 system 里追加「已省略 N 条」的说明：system 是缓存前缀，每次改写都会
 			// 让整段前缀缓存失效；而且小窗口读越窗口的会话是常态（一个项目积累数月的
-			// 会话），这句话会一直挂在每一轮里。信息改由下面的提示帧一次性给出。
+			// 会话），这句话会一直挂在每一轮里。
 			//
-			// 提示只在本会话**第一次**裁剪时出现：常态事件不该反复出声，用户需要知道的
-			// 是「这个会话被裁了」这一件事，不是每轮的省略条数。
-			if emit != nil && trimNoticeEnabled() && a.trimNoticeSession != a.sess.ID() {
+			// 也**不往前端输出提示帧**：滑动窗口是这个产品的常态工作方式，不是需要用户
+			// 处理的异常。它是运行日志（-log 可见），只在一个会话第一次被裁时记一条，
+			// 免得每步刷满日志。
+			if a.trimNoticeSession != a.sess.ID() {
 				a.trimNoticeSession = a.sess.ID()
-				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文裁剪: 本会话历史超出 %d tokens 窗口，较早的记录将只随本次请求省略（会话记录未删除）；"+
-						"本提示只出现一次。当前预计占用 %d / %d。]\n",
-						a.contextWindow, a.projectedFit(msgs, availableTools), a.contextWindow),
-					Status: "tool",
-				})
+				a.logger.Warn("context trimmed to fit the window",
+					"session", a.sess.ID(), "dropped", droppedMsgs,
+					"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
 			}
 		}
 		// 历史已裁到无可再裁，仍然超窗 → 折叠过长的单条消息（保留首尾）。
@@ -549,18 +562,18 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 裁剪只能从「最旧的完整轮次」开始丢，遇到「这一轮本身就超窗」（一次巨大的工具
 		// 输出、一次长粘贴）时它无历史可裁——以前只能整轮失败。折叠一条消息（丢掉中间的
 		// 过程、保留头尾与结论）比让整轮一事无成要强；会话还能继续走下去。
-		if a.contextWindow > 0 && !a.fitsWindow(msgs, availableTools) {
+		// 有压缩后端时不做：后端改写后的载荷由它自己负责，这里折叠只会重复劳动，
+		// 而且折叠会改写正文（位置不变，但内容变了），白白牺牲前缀缓存。
+		if a.contextWindow > 0 && !a.hasCompactionBackend && !a.fitsWindow(msgs, availableTools) {
 			if folded, n := a.foldOversizeMessages(msgs, availableTools); n > 0 {
 				msgs = folded
 				historySlimmed = true
 				// 同样只提示一次，理由同上（常态事件不出声）。
-				if emit != nil && trimNoticeEnabled() && a.foldNoticeSession != a.sess.ID() {
+				if a.foldNoticeSession != a.sess.ID() {
 					a.foldNoticeSession = a.sess.ID()
-					emit(&dsc.RunStreamResponse{
-						Output: fmt.Sprintf("\n[上下文折叠: %d 条过长消息已保留首尾（预计占用 %d / %d tokens）；本提示只出现一次。]\n",
-							n, a.projectedFit(msgs, availableTools), a.contextWindow),
-						Status: "tool",
-					})
+					a.logger.Warn("oversized messages folded (head and tail kept)",
+						"session", a.sess.ID(), "folded", n,
+						"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
 				}
 			}
 		}
@@ -578,7 +591,10 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 
 		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
 		// 被 provider 拒绝的请求。
-		if a.contextWindow > 0 {
+		// 有压缩后端时不做这个判定：这里量的是**改写前**的列表，而真正发出去的是后端
+		// 渲染后的视图（可能小一个数量级）。拿前者判后者会把一个完全装得下的请求判死，
+		// 正是「1M 窗口、历史 1.6M、后端已压到 170K 却整轮报单轮超窗」的成因。
+		if a.contextWindow > 0 && !a.hasCompactionBackend {
 			// 工具目录同样占窗口：只算消息会把「单轮超窗」判晚。
 			// 报错取两个口径的较严者——投影（实测为底数）与估算都可能偏，取大者才不会
 			// 出现「判定说装得下、provider 说超窗」。
@@ -619,13 +635,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		compacted := false
 		if !historySlimmed && a.contextWindow > 0 && a.historyInjection == 0 &&
 			float64(projectedTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
-			if emit != nil {
-				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文压缩: 预计占用 %d%% 容量，即将压缩对话历史]\n",
-						projectedTokens*100/a.contextWindow),
-					Status: "tool",
-				})
-			}
+			// 同样只记日志、不输出到前端：压缩是宿主自己的调度动作，用户不需要为它
+			// 处理任何事（真要观察可以用 -log）。
+			a.logger.Info("compacting history (inline)",
+				"session", a.sess.ID(), "projected_pct", projectedTokens*100/a.contextWindow,
+				"window", a.contextWindow)
 			// 计算保留尾部（compactionRetainRatio 比例，至少 compactionRetainMinTokens），
 			// 从末尾向前累积直至预算用尽；绝不压缩刚追加的当前用户消息（不可分尾部）。
 			nodes := sess.SurfaceNodes()
@@ -1179,8 +1193,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 宿主工具注册表已更新，但 availableTools 仍是 RunStream 开始时的快照——
 		// 下一次 LLM 请求会带着过时的工具列表，模型看不到新加载的工具。
 		// 刷新 availableTools 确保模型在下一轮看到最新工具集。
+		//
+		// MCP 的 load/unload/connect 同理：那三个工具改的是宿主侧「哪些 MCP 工具对模型
+		// 可见」，宿主下一次 ListTools 给的目录已经不同（见 core/mcp_tools.go）。不刷新
+		// 的话，模型刚 mcp_load 完就调不了那两个工具——它会以为加载失败，然后重复加载。
 		for _, tc := range toolCalls {
-			if tc.Name == "load_dsc_plugin" || tc.Name == "unload_dsc_plugin" || tc.Name == "install_dsc_plugin" || tc.Name == "uninstall_dsc_plugin" {
+			if isToolCatalogChangingCall(tc.Name) {
 				if refreshed, err := toolClient.ListTools(ctx, &proto.ListToolsRequest{}); err == nil {
 					availableTools = append(refreshed.Tools, a.hostTools()...)
 					// 刷新是全量替换：会话检索工具的可见性要重新按同一规则裁定
@@ -1524,15 +1542,6 @@ var oversizeTrimRatio = 0.90
 // 内联压缩处理（留尾部逐字、旧前缀摘要化，比直接丢弃更保信息）；只有超过这条线
 // ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
 var oversizeTrimTriggerRatio = 0.95
-
-// trimNoticeEnabled 是否输出裁剪/折叠的提示帧。
-//
-// 默认关闭：小窗口读超窗口的会话是**常态**——一个项目积累数月的会话，配 128K 窗口
-// 就是一台滑动窗口机器，每轮都在把最早的一段滑出去。常态事件不该出声，否则消息区
-// 会被同一句话刷满，而它从不携带新信息。需要核对时设 DSC_TRIM_NOTICE=1。
-func trimNoticeEnabled() bool {
-	return os.Getenv("DSC_TRIM_NOTICE") == "1"
-}
 
 // oversizeTrimFallbackRatios 闭环裁剪时逐档收紧的目标比例。
 //
@@ -2114,6 +2123,21 @@ func (a *ReactLoopAgent) filterContextSearch(tools []*proto.Tool, msgsEstimate i
 	}
 	a.contextSearchSeen = true
 	return tools
+}
+
+// isToolCatalogChangingCall 报告一个工具调用是否会改变「模型可见的工具目录」，
+// 从而需要在本步结束后重新向宿主取一次目录。
+//
+// 两类：插件热加载（注册表真的增删了工具）与 MCP 的 connect/load/unload（注册表没变，
+// 但宿主侧的曝光集变了，下一次 ListTools 给的目录就不同）。mcp_list 不改目录，不在
+// 其中——把它算进来会让每次列举都白跑一次 ListContext + system prompt 重建。
+func isToolCatalogChangingCall(name string) bool {
+	switch name {
+	case "load_dsc_plugin", "unload_dsc_plugin", "install_dsc_plugin", "uninstall_dsc_plugin",
+		"mcp_connect", "mcp_load", "mcp_unload":
+		return true
+	}
+	return false
 }
 
 // dropToolByName 返回去掉指定名字后的工具目录副本（不改原切片：调用方可能与

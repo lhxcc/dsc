@@ -207,7 +207,8 @@ func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatReque
 
 // applyPreStepHook 在 LLM 请求前分发 agent/pre-step 事件（waterfall 模式），
 // 让订阅了 pre-step 的插件有机会改写消息列表。无插件监听或返回空 result
-// 时原样返回 req（零开销）。
+// 时原样返回 req（零开销）；插件显式拒绝（应用层 error）时返回错误，
+// 本次请求不再发出。
 //
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
@@ -216,9 +217,24 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	// （无插件、分发出错）都必须把它作废，否则一份过时的数字会一直压着界面，
 	// 让「已用」冻在一个不存在的请求上。
 	s.m.NoteActualSurface(req.GetSessionId(), 0)
-	if len(s.m.hookClientsSnapshot()) == 0 {
-		return req, nil // 无插件监听：直接返回，零开销
+
+	msgs, changed := req.Messages, false
+	if len(s.m.hookClientsSnapshot()) > 0 {
+		var err error
+		msgs, changed, err = s.rewriteViaPlugins(ctx, req)
+		if err != nil {
+			return nil, err // 插件显式拒绝（veto）：本次请求不再发出
+		}
 	}
+	out, _ := s.finishPreStep(req, msgs, changed)
+	return out, nil
+}
+
+// rewriteViaPlugins 分发 agent/pre-step，让订阅的插件改写消息列表；返回最终消息、
+// 「是否真的变了」与错误。分发出错即插件显式拒绝（veto）：调用方终止本次请求，
+// 绝不带着未改写的全量历史发出。传输层失败（插件进程已退出）在 dispatchEventToPlugins
+// 内已被跳过并继续下游，走不到这里的 error。
+func (s *llmAggregateServer) rewriteViaPlugins(ctx context.Context, req *proto.ChatRequest) ([]*proto.Message, bool, error) {
 	msgsJSON, _ := json.Marshal(req.Messages)
 	// 估算当前 token 数（复用 core 公用启发式 EstimateProtoMessagesTokens，
 	// CJK 感知 + 角色开销 + 图像 + 工具参数，供插件 nudge 决策）——
@@ -242,18 +258,17 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		UserInput:       req.GetNewUserInput(),
 	})
 	if err != nil {
-		// waterfall 返回 error 即插件 veto：终止本次请求（不再静默放行）。
-		// 传输层失败已在 dispatchEventToPlugins 内跳过该插件并继续下游，
-		// 能走到这里的都是插件显式拒绝，请求本身不该带着未改写的全量历史发出。
-		return nil, fmt.Errorf("agent/pre-step vetoed request: %w", err)
+		// 插件显式拒绝（应用层 error）：终止本次请求。传输层失败已在
+		// dispatchEventToPlugins 内跳过该插件并继续下游，能走到这里的都是插件
+		// 主动拒绝，请求本身不该带着未改写的全量历史发出。
+		return nil, false, fmt.Errorf("agent/pre-step vetoed request: %w", err)
 	}
-	// 解析改写后的消息列表（「实际表面」已在函数入口清空，见上）
 	if result == nil {
-		return req, nil
+		return req.Messages, false, nil
 	}
 	resultMap, ok := result.(map[string]any)
 	if !ok {
-		return req, nil
+		return req.Messages, false, nil
 	}
 	msgs := req.Messages
 	changed := false
@@ -272,24 +287,74 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		msgs = append(append([]*proto.Message{}, msgs...), ups...)
 		changed = true
 	}
-	if !changed {
-		return req, nil
+	return msgs, changed, nil
+}
+
+// finishPreStep 收口：量最终表面、记录展示口径、执行窗口硬上限，返回要发出的请求。
+//
+// 硬上限（enforceRequestCeiling）是最后一道确定性防线：压缩后端把 1.66M 渲染成 1.07M
+// 就发出去过一次，provider 用 400 告诉我们 1,048,576 才是天花板。改写后的视图有多大都
+// 由后端自己决定，它并没有「必须塞进窗口」的义务，所以这里必须兜住——宁可从头丢掉
+// 最旧的一段，也不发一个必然被拒的请求。裁剪安全的前提是消息身份为宿主下发的稳定 id
+// （event-<seq>），裁掉头部不会让压缩块的引用错位。
+//
+// 为什么超窗时直接滑窗，而**不**先请压缩后端紧急压缩一次：
+//
+//   - 紧急路径产出的是**没有内容的占位摘要**——一类后端写「N 条消息已压缩」的固定模板，
+//     另一类强制走截断摘要（`emergency=true` 直接跳过 LLM）。一次紧急压缩就把几百条
+//     真实消息永久埋进一句空话，而滑窗只影响这一次请求（会话日志一字不动，下次仍可
+//     正常压缩）；
+//   - 一次滑窗必然装得下，而「压一个范围再重试」不保证收敛：1.07M 那次连续三次重试都
+//     没压进窗口，最后仍是整轮失败；
+//   - 真正需要紧急压缩的信号是 provider 的 4xx——那说明我们量错了（估算偏差），而不是
+//     预测性地提前挤压历史。那条路仍然保留（provider 4xx → agent/request-error → 后端
+//     紧急压缩 → 重试）。
+//
+// 所以顺序是：改写 → 量 → 装不下就滑窗；后端该做的是它自己阈值内的正常压缩，不是替
+// 宿主擦超窗的屁股。
+func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto.Message, changed bool) (*proto.ChatRequest, int) {
+	toolsTokens := EstimateProtoToolTokens(req.Tools)
+	session := req.GetSessionId()
+
+	surface := EstimateProtoMessagesTokens(msgs) + toolsTokens
+	trimmed, dropped := msgs, 0
+	// 窗口取「配置值」与「provider 亲口报过的上限」的较小者：被 4xx 教过一次之后，
+	// 就不必每次都去撞那面墙。
+	window := s.m.effectiveWindow(session)
+	if window > 0 {
+		inflation := s.m.ceilingInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, window)
+		var before, after int
+		trimmed, dropped, before, after = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
+		surface = after
+		if dropped > 0 {
+			s.m.logger.Warn("llm request: trimmed to fit the context window",
+				"session", session, "dropped", dropped,
+				"messages", len(msgs), "kept", len(trimmed),
+				"estimated_before", before, "estimated_after", after,
+				"window", window, "inflation", inflation,
+				"hint", "改写后的视图仍超窗口：已按滑动窗口丢弃最旧的一段（会话日志不动）；压缩后端应在自己阈值内正常压缩，而不是靠紧急压缩擦超窗")
+		}
 	}
+
 	// 记录本步**实际发出**的表面（消息 + 工具目录）。压缩后端改写请求之后
 	// （900k → 摘要 + 尾部），宿主与 agent 看到的仍是未改写的全量历史：展示若照用
 	// 那个数，界面会一直显示 90% 而压缩插件按 40% 判断「还没到阈值」，看起来就是
 	// 「到了阈值却不动」。展示口径必须跟真正发出去的东西走。
-	s.m.NoteActualSurface(req.GetSessionId(),
-		EstimateProtoMessagesTokens(msgs)+EstimateProtoToolTokens(req.Tools))
+	if changed || dropped > 0 {
+		s.m.NoteActualSurface(session, surface)
+	}
+	if !changed && dropped == 0 {
+		return req, 0
+	}
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
 	return &proto.ChatRequest{
-		Messages:     msgs,
+		Messages:     trimmed,
 		Tools:        req.Tools,
 		MaxTokens:    req.MaxTokens,
 		SessionId:    req.SessionId,
 		NewUserInput: req.NewUserInput,
-	}, nil
+	}, dropped
 }
 
 // parsePreStepAppends 解析插件经 pre-step 返回的一次性插播消息：
@@ -344,6 +409,9 @@ func (m *Manager) recordSessionAnchor(sessionID string, a sessionUsageAnchor) {
 	if sessionID == "" || a.promptTokens <= 0 {
 		return
 	}
+	// 成功的请求证明「当前预算可用」：清掉超窗时学到的临时收紧（一次异常不该让这个
+	// 会话永远按放大系数裁）。系统性的偏差由这个锚点继续持有（estimateInflation）。
+	m.clearOverflow(sessionID)
 	m.sessionAnchorMu.Lock()
 	defer m.sessionAnchorMu.Unlock()
 	m.sessionAnchors[sessionID] = a
@@ -374,13 +442,7 @@ func projectPressure(anchor sessionUsageAnchor, curEstimate int, curToolsHash, c
 	if curEstimate < 0 {
 		curEstimate = 0
 	}
-	matched = anchor.toolsHash != "" && curToolsHash != "" && anchor.toolsHash == curToolsHash
-	if matched && anchor.contextWindow > 0 && window > 0 && anchor.contextWindow != window {
-		matched = false // 换了窗口：用量不可比
-	}
-	if matched && anchor.model != "" && curModel != "" && anchor.model != curModel {
-		matched = false // 换了模型：tokenizer/计价都可能变，锚点作废
-	}
+	matched = envelopeMatches(anchor, curToolsHash, curModel, window)
 	if !matched || anchor.promptTokens < anchor.sentEstimate {
 		return curEstimate, matched
 	}
@@ -404,6 +466,15 @@ func (s *llmAggregateServer) emitRequestError(ctx context.Context, req *proto.Ch
 	code := "unknown"
 	if isContextWindowExceeded(err) {
 		code = "context_window_exceeded"
+	}
+	// 超窗的处置权在宿主，不派给插件：那条路只能产出无内容的占位摘要（固定模板 /
+	// 强制截断），一次就把几百条真实消息永久埋掉。这里改为「记住 provider 的实测值与
+	// 上限 → 收紧本会话预算 → 要求重试」，重试时 pre-step 收口会滑窗（会话日志不动）。
+	if code == "context_window_exceeded" {
+		sent := EstimateProtoMessagesTokens(req.GetMessages()) + EstimateProtoToolTokens(req.GetTools())
+		actual, max := overflowParse(err.Error())
+		s.m.noteOverflow(req.GetSessionId(), actual, max, sent)
+		return true
 	}
 	result, _ := s.m.dispatchEventToPlugins(EventAgentRequestError, AgentRequestErrorEvent{
 		Agent: s.m.GetMainAgentName(),

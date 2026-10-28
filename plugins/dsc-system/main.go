@@ -17,8 +17,8 @@
 //   - spill.go          外置决策（自 policy-spill 迁入，对齐 DSH spill-policy：
 //     tool/post-execute 槽超长结果外置为文件 + replace 预览替换）
 //   - compaction-basic.go 基础上下文压缩（自宿主 core/compaction.go 迁入，对齐 DSH
-//     compaction-basic：agent/pre-step 压力驱动改写消息列表 + agent/request-error
-//     溢出紧急压缩重试；LLM 摘要经 interconnect，未互联退化截断式；
+//     compaction-basic：agent/pre-step 压力驱动改写消息列表；LLM 摘要经 interconnect，
+//     未互联退化截断式；超窗由宿主滑窗兜底；
 //     config.yaml compaction: dsc-system 选其为本插件后端）
 //   - image-offload.go 请求面图像预算卸载（自 agent-react-loop/image_offload.go
 //     抽取迁入，对齐 DSH RequestImageOffloadPolicy count 预算：agent/pre-step 槽
@@ -40,6 +40,23 @@ import (
 
 	"dsc/proto"
 )
+
+// handleDscSystemEvent 事件入口：按 pre-step 阶段分流到不同驻留。
+//
+//   - stage=projection：只做请求面投影（图像预算卸载），压缩不参与——此时列表已经
+//     是压缩改写后的视图，再压一次既无意义也会打乱引用；
+//   - stage=compaction（或缺省，旧宿主）：reminder 重置重复链 + 压缩结构改写；
+func handleDscSystemEvent(ctx context.Context, eventType, dataJSON string,
+	compaction *compactionBasicServer, offload *imageOffloadServer, reminder *reminderServer) (string, error) {
+	if eventType == string(dsc.EventAgentPreStep) && dsc.PreStepStageOf(dataJSON) == dsc.PreStepStageProjection {
+		return offload.handleHostEvent(ctx, eventType, dataJSON)
+	}
+	// reminder 只消费 pre-step 副作用（重置重复链），恒返回空
+	if _, err := reminder.handleHostEvent(ctx, eventType, dataJSON); err != nil {
+		return "", err
+	}
+	return compaction.handleHostEvent(ctx, eventType, dataJSON)
+}
 
 func main() {
 	fsObservationServer := newFsObservationServer()
@@ -64,6 +81,10 @@ func main() {
 		//（对齐 DSH preset compaction group 的能力验证）。
 		Provides: map[string]string{
 			"compaction": "true",
+			// 请求面投影能力：图像预算卸载与压缩彼此正交——压缩换人（改配置选另一个
+			// 后端）时它照样该跑。宿主在 pre-step 第二阶段（stage=projection）按能力
+			// 找到本插件，作用在压缩改写后的视图上。
+			"pre-step-transform": "true",
 		},
 	})
 	// 通用类型叠加 policy 服务：宿主按 PluginInfo.services 的 "policy" 声明，
@@ -74,41 +95,17 @@ func main() {
 	//   - reminder：agent/pre-step 的「新用户输入」重置重复链（对齐 DSH
 	//     repeat-tool-reminder 的 agent/pre-step reset hook——用户插话改变了
 	//     上下文，跨插话的重复不是循环）；恒返回空，不影响其他驻留的改写结果
-	//   - compaction-basic：agent/pre-step 压缩改写消息列表 + agent/request-error
-	//     溢出紧急压缩重试（改写结果非空时优先透传给宿主）
-	//   - image-offload：agent/pre-step 请求面图像预算卸载（链式改写：作用于
-	//     压缩改写后的列表——结构改写在前、请求面投影在后，对齐原 agent 内联次序）
+	//   - compaction-basic：agent/pre-step 结构改写（stage=compaction）
+	//   - image-offload：pre-step 第二阶段的请求面投影（stage=projection），由宿主按
+	//     pre-step-transform 能力调用，作用在压缩改写后的视图上
+	//
+	// 两件事的触发条件不同，所以按阶段分流而不是在插件内部串成一条链：压缩只在
+	// 「本插件当值」时有意义（不当值时宿主根本不发消息列表），投影则与谁当值无关。
+	// 早先在插件内部串链的写法，等于把投影绑死在「本插件当值」上——换后端就丢功能。
 	sdk.Hook(dsc.Hook{
 		OnEvent: func(ctx context.Context, eventType, dataJSON string) (string, error) {
-			// reminder 只消费 pre-step 副作用（重置重复链），恒返回空
-			if _, err := reminderServer.handleHostEvent(ctx, eventType, dataJSON); err != nil {
-				return "", err
-			}
-			res, err := compactionBasicServer.handleHostEvent(ctx, eventType, dataJSON)
-			if err != nil {
-				return "", err
-			}
-			if eventType != string(dsc.EventAgentPreStep) {
-				return res, nil // request-error 结果（retry 等）原样透传，卸载不参与
-			}
-			// pre-step：压缩改写结果回拼载荷，交 image-offload 在改写后的列表上投影；
-			// 压缩零改写时卸载直接作用于原载荷（两驻留独立生效，结果取链末端）
-			payload := dataJSON
-			if res != "" {
-				p, err := chainPreStep(dataJSON, res)
-				if err != nil {
-					return "", err
-				}
-				payload = p
-			}
-			out, err := imageOffloadServer.handleHostEvent(ctx, eventType, payload)
-			if err != nil {
-				return "", err
-			}
-			if out == "" {
-				return res, nil // 卸载零改写：透传压缩结果（零改写零丢失）
-			}
-			return out, nil
+			return handleDscSystemEvent(ctx, eventType, dataJSON,
+				compactionBasicServer, imageOffloadServer, reminderServer)
 		},
 	})
 	// 互通：缓存宿主聚合 LLM 客户端供压缩摘要生成（未互联时截断式退化）

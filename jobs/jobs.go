@@ -299,12 +299,34 @@ func (r *Registry) OnJobDone(fn func(snapshot JobSnapshot)) func() {
 func (r *Registry) authorize(id, caller string) (*Job, error) {
 	j, ok := r.jobs[id]
 	if !ok {
-		return nil, fmt.Errorf("jobs: unknown job %q", id)
+		return nil, r.unknownJobLocked(id)
 	}
 	if j.snapshot.Owner != "" && j.snapshot.Owner != caller {
 		return nil, fmt.Errorf("jobs: job %q belongs to another session", id)
 	}
 	return j, nil
+}
+
+// unknownJobLocked 生成「任务不存在」的错误（需已持有锁）。
+//
+// 为什么要把原因写进错误里：job id 只是**本进程**注册表里的键，从不落盘。会话记录
+// 里留着的 id（上一次运行打印的、或父进程打印而被子进程读到的）在新进程里必然查
+// 不到。光秃秃一句 "unknown job" 会让模型以为是自己记错，于是原地重试、或改成相近
+// 的 id 再试，整轮就耗在这上面；明确说「换进程就失效，用 job_list 看现有的」它才有
+// 可行动的下一步。
+//
+// 这条路径是**模型可见**的（job_output/job_kill 经 authorize）；宿主管理视图
+// （ReadHost/KillHost）保持短句，TUI 自己就有任务列表，不需要这串解释。
+func (r *Registry) unknownJobLocked(id string) error {
+	running := 0
+	for _, j := range r.jobs {
+		if j.snapshot.Status == StatusRunning || j.snapshot.Status == StatusStopping {
+			running++
+		}
+	}
+	return fmt.Errorf("jobs: unknown job %q (job ids live only in this process and are never persisted; "+
+		"an id printed by an earlier run or by another process no longer exists. "+
+		"Use job_list to see current jobs — %d running now)", id, running)
 }
 
 // Get 返回非消费快照（不改变游标与 reported）。

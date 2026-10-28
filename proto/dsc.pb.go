@@ -975,12 +975,16 @@ func (x *ChatRequest) GetNewUserInput() bool {
 }
 
 type Message struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Role          string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"` // "system", "user", "assistant", "tool"
-	Content       string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
-	ToolCallId    string                 `protobuf:"bytes,3,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"` // 用于 tool 角色关联
-	ToolCalls     []*ToolCall            `protobuf:"bytes,4,rep,name=tool_calls,json=toolCalls,proto3" json:"tool_calls,omitempty"`      // 用于 assistant 角色回传工具调用（OpenAI 格式必需）
-	Images        []string               `protobuf:"bytes,5,rep,name=images,proto3" json:"images,omitempty"`                             // 图像内容寻址引用（dsc-img:// 持久附件 / dsc-shot:// 操作截图；user 消息与工具结果消息承载）
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Role       string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"` // "system", "user", "assistant", "tool"
+	Content    string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
+	ToolCallId string                 `protobuf:"bytes,3,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"` // 用于 tool 角色关联
+	ToolCalls  []*ToolCall            `protobuf:"bytes,4,rep,name=tool_calls,json=toolCalls,proto3" json:"tool_calls,omitempty"`      // 用于 assistant 角色回传工具调用（OpenAI 格式必需）
+	Images     []string               `protobuf:"bytes,5,rep,name=images,proto3" json:"images,omitempty"`                             // 图像内容寻址引用（dsc-img:// 持久附件 / dsc-shot:// 操作截图；user 消息与工具结果消息承载）
+	// 稳定消息标识：宿主派生历史时按「surface 事件的 seq」填写，与会话日志一一对应、
+	// 永不随派生范围变化。任何需要跨请求指认某条消息的组件（压缩后端等）都必须用它，
+	// 不能拿列表下标——请求级裁剪/历史注入会让下标整体平移，指认随即错位。
+	Id            string `protobuf:"bytes,6,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1048,6 +1052,13 @@ func (x *Message) GetImages() []string {
 		return x.Images
 	}
 	return nil
+}
+
+func (x *Message) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
 }
 
 type Tool struct {
@@ -3781,7 +3792,7 @@ const file_proto_dsc_proto_rawDesc = "" +
 	"max_tokens\x18\x03 \x01(\x05R\tmaxTokens\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x04 \x01(\tR\tsessionId\x12$\n" +
-	"\x0enew_user_input\x18\x05 \x01(\bR\fnewUserInput\"\x9f\x01\n" +
+	"\x0enew_user_input\x18\x05 \x01(\bR\fnewUserInput\"\xaf\x01\n" +
 	"\aMessage\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\tR\acontent\x12 \n" +
@@ -3789,7 +3800,8 @@ const file_proto_dsc_proto_rawDesc = "" +
 	"toolCallId\x12,\n" +
 	"\n" +
 	"tool_calls\x18\x04 \x03(\v2\r.dsc.ToolCallR\ttoolCalls\x12\x16\n" +
-	"\x06images\x18\x05 \x03(\tR\x06images\"\x89\x01\n" +
+	"\x06images\x18\x05 \x03(\tR\x06images\x12\x0e\n" +
+	"\x02id\x18\x06 \x01(\tR\x02id\"\x89\x01\n" +
 	"\x04Tool\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12'\n" +

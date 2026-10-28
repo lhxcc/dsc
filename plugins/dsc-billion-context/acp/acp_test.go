@@ -759,7 +759,7 @@ func TestComputeCompressibleRangesSkipsRenderedSummary(t *testing.T) {
 // ---------------- sync-blocks ----------------
 
 // TestSyncBlocks 验证块活性对齐：蒸馏消费停用 / Expanded 保持停用 /
-// 覆盖消息与 summary 双缺席停用 / 其余保持 active。
+// 覆盖消息本轮缺席**不停用**（视图是临时的，配置改回来要能复原）/ 其余保持 active。
 func TestSyncBlocks(t *testing.T) {
 	msgs := []CoreMessage{
 		{ID: "a", Role: RoleUser, Text: "u1"},
@@ -782,8 +782,13 @@ func TestSyncBlocks(t *testing.T) {
 	for _, id := range deactivated {
 		seen[id] = true
 	}
-	if !seen["b0"] {
-		t.Errorf("b0 (messages absent) must be deactivated, got %v", deactivated)
+	// b0 的覆盖消息本轮缺席（视图被截断），但那是**临时视图**：不得停用，
+	// 否则用户把 history_injection 改回来也复原不了压缩收益。本轮不注入摘要即可。
+	if seen["b0"] {
+		t.Errorf("b0 的覆盖消息只是本轮缺席，不应被永久停用，got %v", deactivated)
+	}
+	if !state.BlockByID("b0").Active {
+		t.Error("b0 应保持 active（缺席 ≠ 消失）")
 	}
 	if state.BlockByID("b1").Active {
 		t.Errorf("expanded block must stay inactive")

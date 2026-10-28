@@ -18,6 +18,7 @@ import (
 //
 //   - name: mcp-memory
 //     type: dsc
+//     enabled: true          # 必须显式写：Enabled 是普通 bool，省略即为 false → 整条被跳过
 //     config:
 //     mcp:
 //     server_name: memory
@@ -36,11 +37,19 @@ func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.
 		return
 	}
 	for _, entry := range cfg.Plugins {
-		if !entry.Enabled || len(entry.Config) == 0 {
+		if len(entry.Config) == 0 {
 			continue
 		}
 		mcpCfg, ok := entry.Config["mcp"].(map[string]any)
 		if !ok {
+			continue
+		}
+		// enabled 是普通 bool：YAML 里省略等于 false。MCP 条目唯一的用途就是连接，
+		// 漏写这一行会让整份 overlay 静默失效（现场表现是「配了 MCP 却一个工具都没有」）。
+		// 不改变语义（disabled 仍然不连），只是把静默跳过变成一条可搜到的告警。
+		if !entry.Enabled {
+			logger.Warn("patch MCP config present but entry is disabled; add `enabled: true` to use it",
+				"plugin", entry.Name)
 			continue
 		}
 		serverName, _ := mcpCfg["server_name"].(string)

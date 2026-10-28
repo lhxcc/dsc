@@ -11,6 +11,11 @@ package acp
 //   - 返回本轮被停用的块 ID 列表（供宿主日志/诊断）。
 
 // SyncBlocks 把块 active 状态与消息列表对齐（原地修改 state）。
+// 只按**语义**停用：被蒸馏消费、或被用户显式展开。曾经还按「覆盖消息不在本轮视图里」
+// 停用，那是把**临时视图**当成事实——history_injection 只带最近 N 条、宿主裁剪、
+// fork 都会让块本轮不可见，停用一旦写回状态，用户把配置改回来也复原不了，压缩收益
+// 永久丢失（配置是用户输入，随时会改）。缺席的块本轮不注入摘要即可（见
+// collectSummaryAnchors），状态保持可用。
 func SyncBlocks(messages []CoreMessage, state *CompressionState) []string {
 	presentIDs := map[string]bool{}
 	for _, m := range messages {
@@ -40,21 +45,6 @@ func SyncBlocks(messages []CoreMessage, state *CompressionState) []string {
 			continue
 		}
 		b.Active = true
-		// 块的可见表示 = 渲染 summary（acp_summary_bN）或任一覆盖的原始消息；
-		// 两者皆缺席说明视图已不含该块，停用并记录
-		stillPresent := presentIDs[summaryMessageID(b.BlockID)]
-		if !stillPresent {
-			for _, id := range b.EffectiveMessageIDs {
-				if presentIDs[id] {
-					stillPresent = true
-					break
-				}
-			}
-		}
-		if !stillPresent {
-			b.Active = false
-			deactivated = append(deactivated, b.BlockID)
-		}
 	}
 	return deactivated
 }

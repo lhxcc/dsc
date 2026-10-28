@@ -142,3 +142,37 @@ func TestLoadPatchFilesEmpty(t *testing.T) {
 		t.Fatalf("expected nil, got %v", overlays)
 	}
 }
+
+// TestApplyPatchOverlaysPreservesUnlistedFields overlay 合并必须原样保留「没被 patch
+// 碰到的字段」。
+//
+// 这里曾经是逐字段列举拷贝：新加配置项只要忘了加一行，用 -patch 启动时就被静默抹掉。
+// mcp 开关与 history_shows 正是这样漏的——而 mcp 被抹掉意味着「用户明明开了 MCP，
+// 加了 -patch 启动又变成关闭」，症状是工具莫名消失，极难归因。
+func TestApplyPatchOverlaysPreservesUnlistedFields(t *testing.T) {
+	base := &Config{
+		WorkspaceRoot: "/tmp/ws",
+		HistoryShows:  5,
+		MCP:           &MCPConfig{Enabled: true},
+		Plugins:       []PluginEntry{{Name: "a", Type: "tool", Enabled: true}},
+	}
+	overlays := []*PatchOverlay{{Entries: []PluginEntry{{Name: "b", Type: "tool"}}}}
+
+	merged := ApplyPatchOverlays(base, overlays)
+	if merged.MCP == nil || !merged.MCP.Enabled {
+		t.Fatalf("mcp 开关被 patch 合并抹掉了：%+v", merged.MCP)
+	}
+	if merged.HistoryShows != 5 {
+		t.Fatalf("history_shows 被抹掉了：%d", merged.HistoryShows)
+	}
+	if merged.WorkspaceRoot != "/tmp/ws" {
+		t.Fatalf("workspace_root 变了：%q", merged.WorkspaceRoot)
+	}
+	if len(merged.Plugins) != 2 {
+		t.Fatalf("插件应合并为 2 条，实际 %d", len(merged.Plugins))
+	}
+	// 不修改 base（切片深拷贝）
+	if len(base.Plugins) != 1 {
+		t.Fatalf("不应写回 base：%d", len(base.Plugins))
+	}
+}

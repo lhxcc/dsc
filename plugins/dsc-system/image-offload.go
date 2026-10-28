@@ -145,9 +145,6 @@ func (s *imageOffloadServer) handlePreStep(dataJSON string) (string, error) {
 	return string(out), nil
 }
 
-// chainPreStep 把上游驻留的 pre-step 改写结果（{"messages": [...]}）拼接回事件
-// 载荷，供本驻留在「压缩改写后的列表」上继续投影——多驻留共享单 Hook 的链式
-// 改写（宿主对每插件只收一个结果，链内拼接是共享 Hook 的接缝）。
 func chainPreStep(dataJSON, upstreamResult string) (string, error) {
 	var ev dsc.AgentPreStepEvent
 	if err := json.Unmarshal([]byte(dataJSON), &ev); err != nil {

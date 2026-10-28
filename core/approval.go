@@ -251,6 +251,27 @@ const EventApprovalDecided EventName = "approval/decided"
 // agent 经 OnEvent 桥把 approval/policy 落进会话日志（持久化/折叠恢复）。
 const EventApprovalPolicy EventName = "approval/policy"
 
+// userGrantCtxKey 「用户已直接授权」的 context 标记。
+type userGrantCtxKey struct{}
+
+// WithUserGrant 标记本次工具调用已获用户直接授权——前端把用户手打的命令转成工具调用
+// 时用它（如 TUI 的斜杆命令）。
+//
+// 为什么不能用 approval=never 代替：never 的语义是**自动拒绝**（无人值守/CI 用），
+// 拿它当「已批准」会 fail-closed 直接失败。此前斜杆命令那条路正是这么写的，结果
+// 用户手打的 /plugin install 一定会被审批门拒掉——这不是设计，是把两个相反的策略混了。
+//
+// 只给前端用：人是明确按下回车的，那就是授权本身；模型自己不能构造这个标记。
+func WithUserGrant(ctx context.Context) context.Context {
+	return context.WithValue(ctx, userGrantCtxKey{}, true)
+}
+
+// HasUserGrant 报告本次调用是否带用户直接授权。
+func HasUserGrant(ctx context.Context) bool {
+	granted, _ := ctx.Value(userGrantCtxKey{}).(bool)
+	return granted
+}
+
 // ApprovalRequester 可选接口（入口②工具声明需审批，对齐 DSH tools kind:'ask' 决策 /
 // serviceAsk）：工具实现它并对本次调用返回非空 reason 时，执行前经审批门问人。
 // reason 会展示给用户并写入审计；空串表示正常执行。工具按每次调用的参数自行判定。
@@ -278,6 +299,10 @@ func (m *Manager) toolApprovalGate() WaterfallListener {
 		}
 		reason := ar.ApprovalReason(inv.ArgumentsJSON)
 		if strings.TrimSpace(reason) == "" {
+			return next(ev)
+		}
+		// 用户在前端手打命令即授权：不再问一次（审计事件照旧记）。
+		if HasUserGrant(ev.Context) {
 			return next(ev)
 		}
 		if m.executionApprovalPolicy(inv) == ApprovalNever {

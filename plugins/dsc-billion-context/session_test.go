@@ -45,7 +45,7 @@ func TestHandlePreStepAdoptsEventSession(t *testing.T) {
 		config: bcacp.DefaultConfig(200000),
 	}
 
-	payload := `{"session":"sess-A","messages":"[]","tokenCount":10}`
+	payload := `{"session":"sess-A","messages_json":"[{\"role\":\"user\",\"content\":\"hi\"}]","token_count":10}`
 	if _, err := bc.handlePreStep(context.Background(), payload); err != nil {
 		t.Fatalf("pre-step 失败: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestHandlePreStepAdoptsEventSession(t *testing.T) {
 	}
 
 	// 切到另一会话：写入新文件，旧文件保留
-	payload = `{"session":"sess-B","messages":"[]","tokenCount":10}`
+	payload = `{"session":"sess-B","messages_json":"[{\"role\":\"user\",\"content\":\"hi\"}]","token_count":10}`
 	if _, err := bc.handlePreStep(context.Background(), payload); err != nil {
 		t.Fatalf("pre-step(B) 失败: %v", err)
 	}

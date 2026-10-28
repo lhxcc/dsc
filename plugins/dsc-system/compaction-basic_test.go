@@ -227,39 +227,27 @@ func TestCompactionBasicLLMFailureDegrades(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicEmergencyRetainLast 溢出紧急压缩：保留最后 1 条、截断式摘要、
-// 返回 {"retry": true}；非溢出错误码不触发。
-func TestCompactionBasicEmergencyRetainLast(t *testing.T) {
-	s := newTestCompactionBasicServer(t, 1000) // 阈值 800：估算 7224 ≥ 阈值
-	s.retainMin = 10000                        // 保留预算盖过全部消息 → pre-step 不动作（全部落保留区）
-	msgs := bigMsgs(6, 1200)                   // 每条 1204 token（CJK 感知估算），共 7224
-	// 第一次 pre-step：估算超阈值但保留区覆盖全部 → 不改写
+// TestCompactionBasicIgnoresOverflowEvent 超窗的处置权归宿主（收紧预算 + 滑窗 + 重试），
+// 压缩驻留对 agent/request-error 一律不响应。
+//
+// 曾经这里会做「紧急压缩 → 返回 retry」：跳过 LLM、用截断摘要把一整段真实消息换成一句话，
+// 且落盘成块永久生效——比滑窗（只影响本次请求）严格更差。何况一次只压一个区间，不保证
+// 收敛（实测三次重试仍超窗）。
+func TestCompactionBasicIgnoresOverflowEvent(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 1000)
+	s.retainMin = 10000
+	msgs := bigMsgs(6, 1200)
 	if res := mustPreStep(t, s, msgs); res != "" {
 		t.Fatalf("all-in-retain pre-step must not rewrite, got %q", res)
 	}
-	// 紧急：压缩 [0,5)（保留最后 1 条）
 	res, err := s.handleHostEvent(context.Background(), "agent/request-error",
 		`{"agent":"a","code":"context_window_exceeded"}`)
-	if err != nil || res != `{"retry": true}` {
-		t.Fatalf("emergency must request retry, res %q err %v", res, err)
+	if err != nil || res != "" {
+		t.Fatalf("插件不应处理超窗事件，res %q err %v", res, err)
 	}
-	// 重试的 pre-step：指纹命中 → 应用改写
-	res2 := mustPreStep(t, s, msgs)
-	got := parseRewrite(t, res2)
-	if len(got) != 2 {
-		t.Fatalf("after emergency rewrite = %d messages, want 2", len(got))
-	}
-	if !strings.Contains(got[0].GetContent(), "emergency") {
-		t.Fatalf("emergency record must be marked, got %q", got[0].GetContent())
-	}
-	if got[1].GetContent() != msgs[5].GetContent() {
-		t.Fatalf("last message must be preserved")
-	}
-	// 非溢出错误码：不触发
-	res3, err := s.handleHostEvent(context.Background(), "agent/request-error",
-		`{"agent":"a","code":"rate_limited"}`)
-	if err != nil || res3 != "" {
-		t.Fatalf("non-overflow error must be ignored, got %q", res3)
+	// 状态没被改动：再来一次 pre-step 仍然不改写
+	if res := mustPreStep(t, s, msgs); res != "" {
+		t.Fatalf("不应因 request-error 产生压缩记录，got %q", res)
 	}
 }
 
@@ -411,46 +399,34 @@ func TestCompactionBasicSnapsToToolPairBoundary(t *testing.T) {
 	}
 }
 
-// TestCompactionBasicEmergencySnapsToToolPairBoundary 回归：溢出紧急压缩的保留区
-// 以最后一条为界，若最后一条是工具结果，必须吸附到其所属 assistant——否则尾部
-// 就是一条孤立 tool 消息。
-func TestCompactionBasicEmergencySnapsToToolPairBoundary(t *testing.T) {
-	s := newTestCompactionBasicServer(t, 1_000_000) // 远高于压力阈值：pre-step 只缓存 lastMsgs
-	msgs := []*proto.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: strings.Repeat("x", 40000)},
-		{Role: "assistant", ToolCalls: []*proto.ToolCall{
-			{Id: "a", Name: "t", ArgumentsJson: "{}"},
-			{Id: "b", Name: "t", ArgumentsJson: "{}"},
-		}},
-		{Role: "tool", Content: strings.Repeat("x", 2400), ToolCallId: "a"},
-		{Role: "tool", Content: strings.Repeat("x", 2400), ToolCallId: "b"},
-	}
-	if res := mustPreStep(t, s, msgs); res != "" {
-		t.Fatalf("low pressure must not rewrite, got %q", res)
-	}
-	res, err := s.handleHostEvent(context.Background(), "agent/request-error",
-		`{"agent":"agent-react-loop","session":"sess-c1","code":"context_window_exceeded"}`)
-	if err != nil {
-		t.Fatalf("request-error: %v", err)
-	}
-	if !strings.Contains(res, `"retry":true`) && !strings.Contains(res, `"retry": true`) {
-		t.Fatalf("emergency compaction should request retry, got %q", res)
+// TestRetainBoundaryKeepsToolPairing 保留区起点不得落在 assistant(tool_calls) 与其
+// tool_result 之间。
+//
+// 预算边界是纯按 token 累积出来的，落在中间就会把调用压进摘要、结果留在保留区——
+// provider 收到孤立的 tool 消息直接 400，整轮失败。契约检查工具
+// （tools/backendcheck，按 compaction 能力扫全部插件）在真实派生历史上抓到过这个
+// 切点，这里用同一形状的历史把边界钉住：任何预算下保留区首条都不能是 tool。
+func TestRetainBoundaryKeepsToolPairing(t *testing.T) {
+	msgs := []*proto.Message{{Role: "user", Content: strings.Repeat("x", 400)}}
+	for i := 0; i < 5; i++ {
+		callID := "c" + string(rune('0'+i))
+		msgs = append(msgs,
+			&proto.Message{Role: "assistant", ToolCalls: []*proto.ToolCall{{Id: callID, Name: "shell", ArgumentsJson: "{}"}}},
+			&proto.Message{Role: "tool", ToolCallId: callID, Content: strings.Repeat("y", 400)},
+		)
 	}
 
-	// 下一次 pre-step 应用已记录：改写结果必须保持工具对完整。
-	rewritten := parseRewrite(t, mustPreStep(t, s, msgs))
-	if err := dsc.ValidateToolPairing(rewritten); err != nil {
-		t.Fatalf("emergency rewrite violates tool pairing: %v", err)
-	}
-	start := -1
-	for i, m := range rewritten {
-		if m.GetRole() == "assistant" && len(m.GetToolCalls()) == 2 {
-			start = i
-			break
+	s := newCompactionBasicServer()
+	s.window = 0 // 预算只由 retainMin 决定，便于逐档扫
+	for budget := 1; budget <= 3000; budget++ {
+		s.retainMin = budget
+		idx := s.retainBoundary(msgs)
+		if idx < len(msgs) && msgs[idx].GetRole() == "tool" {
+			t.Fatalf("预算 %d 时保留区首条是孤立 tool 结果（下标 %d，callID=%s）；provider 会 400",
+				budget, idx, msgs[idx].GetToolCallId())
 		}
-	}
-	if start < 0 || start+1 >= len(rewritten) || rewritten[start+1].GetRole() != "tool" {
-		t.Fatalf("emergency retain region does not start at owning assistant: %+v", rewritten)
+		if idx < 1 || idx > len(msgs) {
+			t.Fatalf("预算 %d 时边界越界: %d", budget, idx)
+		}
 	}
 }

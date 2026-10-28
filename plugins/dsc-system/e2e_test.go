@@ -652,32 +652,14 @@ func TestCompactionBasicE2E(t *testing.T) {
 		t.Fatalf("replay must be deterministic")
 	}
 
-	// 6. 紧急路径：窗口 1000 场景下 [0,3) 已压缩，request-error 压缩 [3,5)
-	//    （保留最后 1 条）→ {"retry": true}
-	if res := requestError("context_window_exceeded"); res != `{"retry": true}` {
-		t.Fatalf("emergency must request retry, got %q", res)
+	// 6. 超窗不再由本插件处理：处置权归宿主（收紧预算 + 滑窗 + 重试）。
+	//    曾经这里会做「紧急压缩 → 返回 retry」，但那只能写一段没有内容的占位摘要，
+	//    把整段真实消息永久埋掉；现在插件对 request-error 一律不响应。
+	if res := requestError("context_window_exceeded"); res != "" {
+		t.Fatalf("本插件不应再处理超窗（宿主负责滑窗），got %q", res)
 	}
-	// 重试的 pre-step：累计两条摘要 + 尾段
-	second := preStep()
-	var afterRetry struct {
-		Messages []*proto.Message `json:"messages"`
-	}
-	if err := json.Unmarshal([]byte(second), &afterRetry); err != nil {
-		t.Fatalf("parse rewrite after retry: %v", err)
-	}
-	if len(afterRetry.Messages) != 3 {
-		t.Fatalf("after emergency rewrite = %d messages, want 3 (2 summaries + last)", len(afterRetry.Messages))
-	}
-	if !strings.Contains(afterRetry.Messages[1].GetContent(), "emergency") {
-		t.Fatalf("second summary must be emergency-marked, got %q", afterRetry.Messages[1].GetContent())
-	}
-	if afterRetry.Messages[2].GetContent() != msgs[5].GetContent() {
-		t.Fatalf("last message must be preserved")
-	}
-
-	// 7. 非溢出错误码：忽略
 	if res := requestError("rate_limited"); res != "" {
-		t.Fatalf("non-overflow code must be ignored, got %q", res)
+		t.Fatalf("非溢出错误码也不该由压缩驻留处理，got %q", res)
 	}
 }
 
@@ -713,7 +695,7 @@ func TestImageOffloadE2E(t *testing.T) {
 		}
 		return proto.NewPluginHookServiceClient(grpcClient.Conn)
 	}
-	preStep := func(t2 *testing.T, hook proto.PluginHookServiceClient, session string, msgs []*proto.Message, tokenCount int) string {
+	preStepStage := func(t2 *testing.T, hook proto.PluginHookServiceClient, session string, msgs []*proto.Message, tokenCount int, stage string) string {
 		t2.Helper()
 		ctx := context.Background()
 		msgsJSON, err := json.Marshal(msgs)
@@ -725,6 +707,8 @@ func TestImageOffloadE2E(t *testing.T) {
 			"messages_json": string(msgsJSON), "token_count": tokenCount,
 			// 压力由宿主投影给出（插件只读，见 core.projectPressure）。
 			"projected_tokens": tokenCount,
+			// 阶段：图像卸载属于请求面投影（pre-step 第二阶段），压缩属于结构改写。
+			"stage": stage,
 		})
 		if err != nil {
 			t2.Fatalf("marshal event: %v", err)
@@ -734,6 +718,10 @@ func TestImageOffloadE2E(t *testing.T) {
 			t2.Fatalf("pre-step OnEvent: %v", err)
 		}
 		return resp.GetResultJson()
+	}
+	// preStep 默认走结构改写阶段（压缩），图像投影场景显式用 preStepStage。
+	preStep := func(t2 *testing.T, hook proto.PluginHookServiceClient, session string, msgs []*proto.Message, tokenCount int) string {
+		return preStepStage(t2, hook, session, msgs, tokenCount, dsc.PreStepStageCompaction)
 	}
 	parse := func(t2 *testing.T, res string) []*proto.Message {
 		t2.Helper()
@@ -754,7 +742,8 @@ func TestImageOffloadE2E(t *testing.T) {
 		{Role: "tool", Content: "t2", Images: []string{imgD}},
 	}
 	hookA := spawn("DSC_MAX_REQUEST_IMAGES=2")
-	res := preStep(t, hookA, "e2e-image-offload", msgsA, 100)
+	// 图像卸载属于请求面投影阶段（stage=projection），与谁当值压缩无关
+	res := preStepStage(t, hookA, "e2e-image-offload", msgsA, 100, dsc.PreStepStageProjection)
 	got := parse(t, res)
 	if len(got) != 3 {
 		t.Fatalf("A: messages = %d, want 3", len(got))
@@ -794,8 +783,11 @@ func TestImageOffloadE2E(t *testing.T) {
 		"DSC_COMPACTION_BASIC_CONTEXT_WINDOW=1000",
 		"DSC_MAX_REQUEST_IMAGES=1",
 	)
-	// 宿主投影 ≈ 消息估算（16×1200 字符 ≈ 4900 > 阈值 800，无锚点）→ 触发压缩
+	// 宿主投影 ≈ 消息估算（16×1200 字符 ≈ 4900 > 阈值 800，无锚点）→ 触发压缩。
+	// 两阶段是两次调用（宿主串联）：先结构改写，再把改写后的视图交给投影阶段。
 	res = preStep(t, hookB, "e2e-image-offload-chain", msgsB, 4900)
+	compacted := parse(t, res)
+	res = preStepStage(t, hookB, "e2e-image-offload-chain", compacted, 4900, dsc.PreStepStageProjection)
 	got = parse(t, res)
 	if len(got) != 4 {
 		t.Fatalf("B: messages = %d, want 4 (summary + 3 tail)", len(got))

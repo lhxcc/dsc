@@ -187,7 +187,7 @@ func TestApplyPreStepHookTransportFailureDoesNotVeto(t *testing.T) {
 	m.llms["p"] = p
 	m.llmOrder = []string{"p"}
 	m.agentLLMName = "p"
-	m.toolHookClients["dead"] = &fakeHook{eventErr: status.Error(codes.Unavailable, "connection refused")}
+	m.toolHookClients["dead"] = &fakeHook{eventTransportErr: status.Error(codes.Unavailable, "connection refused")}
 	m.toolHookOrder = []string{"dead"}
 
 	srv := &llmAggregateServer{m: m}

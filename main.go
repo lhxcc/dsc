@@ -662,6 +662,15 @@ func main() {
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
 
+	// MCP 注入开关（config.yaml 的 mcp.enabled）：**缺省即未启用**。
+	// 关闭时 MCP 相关工具（含入口 mcp_connect）一个都不进模型目录，日常会话因此不付
+	// 任何目录成本；启用后按 mcp_load 逐个曝光。开关只由人经 /mcp on|off 改写（写回
+	// 本文件），模型侧没有关掉/打开它的工具——目录预算是部署决定，不是模型决定。
+	if mainCfg != nil && mainCfg.MCP != nil && mainCfg.MCP.Enabled {
+		mgr.SetMCPToolsEnabled(true)
+		logger.Info("MCP tools enabled from config", "config", core.ConfigPath)
+	}
+
 	// 外部脚本钩子（-hooks hooks.json）：严格 LUA 脚本（go-lua 进程内解释）或
 	// 原生可执行文件（直接 exec 不经 shell），在工具流水线 BeforeTool/AfterTool
 	// 参与裁定。加载失败不致命（配置错误即无钩子），日志留痕便于排查。
@@ -854,6 +863,15 @@ func main() {
 		// "新压缩没生效"，日志里也没有一句解释。这里至少留一条明确告警。
 		if warn := mgr.WarnIfCompactionBackendMissing(); warn != "" {
 			logger.Warn(warn)
+		}
+		// 岗位在启动期定死：谁当值、还有谁也有这个能力。声明了 compaction 能力不等于
+		// 当值，用户看到「插件在跑但压缩没换」时，这行就是答案。
+		if role := mgr.ResolveCompactionRole(); role.Holder != "" {
+			logger.Info("compaction role resolved", "holder", role.Holder, "candidates", role.Candidates)
+		} else if len(role.Candidates) > 1 || (len(role.Candidates) == 1 && role.Configured == "") {
+			logger.Warn("compaction role is vacant although plugins declare the capability",
+				"candidates", role.Candidates, "reason", role.Vacancy,
+				"hint", "set `compaction: <plugin>` in config.yaml to put one on duty")
 		}
 		// 声明了需要宿主凭据的能力、却没有在 config.yaml 里显式授予时，插件运行时
 		// 会静默失败（401/连不上）。宿主不按插件名自动放行凭据，所以这里必须把

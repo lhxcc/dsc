@@ -35,8 +35,10 @@ type fakeHook struct {
 	eventResult string
 	// eventError 作为 OnEvent 响应体的 error 返回（语义 veto，插件主动拒绝）。
 	eventError string
-	// eventErr 非 nil 时 OnEvent 返回传输层错误（模拟插件进程退出/连接断开）。
-	eventErr error
+	// eventErrStage 非空时只在载荷 stage 等于它时返回 eventError（用于只让某个阶段失败）。
+	eventErrStage string
+	// eventTransportErr 非 nil 时 OnEvent 返回传输层错误（模拟插件进程退出/连接断开）。
+	eventTransportErr error
 }
 
 func (f *fakeHook) BeforeTool(_ context.Context, req *proto.BeforeToolRequest, _ ...grpc.CallOption) (*proto.BeforeToolResponse, error) {
@@ -54,16 +56,22 @@ func (f *fakeHook) AfterTool(_ context.Context, req *proto.AfterToolRequest, _ .
 }
 
 func (f *fakeHook) OnEvent(_ context.Context, req *proto.OnEventRequest, _ ...grpc.CallOption) (*proto.OnEventResponse, error) {
-	if f.eventErr != nil {
-		return nil, f.eventErr
-	}
-	if f.eventError != "" {
-		return &proto.OnEventResponse{Error: f.eventError}, nil
+	if f.eventTransportErr != nil {
+		return nil, f.eventTransportErr
 	}
 	if f.events != nil {
 		f.events <- req
 	}
-	return &proto.OnEventResponse{ResultJson: f.eventResult}, nil
+	// 只让指定阶段失败：其余阶段照常返回 result（不带 error）。
+	if f.eventErrStage != "" {
+		var ev struct {
+			Stage string `json:"stage"`
+		}
+		if err := json.Unmarshal([]byte(req.GetDataJson()), &ev); err != nil || ev.Stage != f.eventErrStage {
+			return &proto.OnEventResponse{ResultJson: f.eventResult}, nil
+		}
+	}
+	return &proto.OnEventResponse{ResultJson: f.eventResult, Error: f.eventError}, nil
 }
 
 func hookManager() (*Manager, *plainHookTool) {
