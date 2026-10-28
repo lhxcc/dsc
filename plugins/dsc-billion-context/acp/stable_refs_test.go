@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-// stableMsgs 造 10 条带**稳定 id** 的消息（对应宿主下发的 e<seq>）。
+// stableMsgs 造 10 条带**稳定 id** 的消息（对应宿主下发的 event-<seq>）。
 func stableMsgs() []CoreMessage {
 	out := make([]CoreMessage, 0, 10)
 	for i := 0; i < 10; i++ {
 		out = append(out, CoreMessage{
-			ID:   "e" + string(rune('0'+i)),
+			ID:   "event-" + string(rune('0'+i)),
 			Role: RoleUser,
 			Text: "text" + string(rune('0'+i)),
 		})
@@ -35,7 +35,7 @@ func TestRefsAddressSameMessagesUnderHeadTrim(t *testing.T) {
 
 	// 压缩 e1..e4（refs m00001..m00004）
 	covered := fullState.CoveredMessageIDs()
-	for _, id := range []string{"e1", "e2", "e3", "e4"} {
+	for _, id := range []string{"event-1", "event-2", "event-3", "event-4"} {
 		if !covered[id] {
 			t.Fatalf("夹具无效：%s 应被覆盖，实际 %v", id, covered)
 		}
@@ -118,13 +118,13 @@ func TestPositionalIDsWouldShiftUnderHeadTrim(t *testing.T) {
 // 这是「不留兼容分支」的可行性前提：不做旧格式迁移，就必须保证重建足够还原。
 func TestRebuildFromHistoryUsesStableIDs(t *testing.T) {
 	msgs := []CoreMessage{
-		{ID: "e0", Role: RoleUser, Text: "最早的需求"},
-		{ID: "e1", Role: RoleAssistant, Text: "a1"},
-		{ID: "e2", Role: RoleUser, Text: "u2"},
-		{ID: "e3", Role: RoleAssistant, Text: "a3"},
-		{ID: "e4", Role: RoleAssistant, ContentType: ContentTypeToolCall, ToolName: "compress", ToolCallID: "c1",
+		{ID: "event-0", Role: RoleUser, Text: "最早的需求"},
+		{ID: "event-1", Role: RoleAssistant, Text: "a1"},
+		{ID: "event-2", Role: RoleUser, Text: "u2"},
+		{ID: "event-3", Role: RoleAssistant, Text: "a3"},
+		{ID: "event-4", Role: RoleAssistant, ContentType: ContentTypeToolCall, ToolName: "compress", ToolCallID: "c1",
 			Text: `{"content":[{"startId":"m00001","endId":"m00003","summary":"压缩摘要","topic":"t"}]}`},
-		{ID: "e5", Role: RoleTool, ContentType: ContentTypeToolResult, ToolCallID: "c1",
+		{ID: "event-5", Role: RoleTool, ContentType: ContentTypeToolResult, ToolCallID: "c1",
 			Text: `{"ok":true,"blocksCreated":1}`},
 	}
 	state, n := RebuildStateFromMessages(msgs, DefaultConfig(1000000))
@@ -132,12 +132,12 @@ func TestRebuildFromHistoryUsesStableIDs(t *testing.T) {
 		t.Fatalf("重放出 %d 个块，期望 1", n)
 	}
 	covered := state.CoveredMessageIDs()
-	for _, want := range []string{"e1", "e2", "e3"} {
+	for _, want := range []string{"event-1", "event-2", "event-3"} {
 		if !covered[want] {
 			t.Fatalf("重建后应覆盖 %s，实际 %v", want, covered)
 		}
 	}
-	if covered["e0"] || covered["e4"] || covered["msg-1"] {
+	if covered["event-0"] || covered["event-4"] || covered["msg-1"] {
 		t.Fatalf("重建后覆盖集合不对：%v", covered)
 	}
 	if state.Schema != StateSchema {

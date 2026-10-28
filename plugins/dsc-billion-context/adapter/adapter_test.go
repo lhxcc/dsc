@@ -78,11 +78,11 @@ func TestRoundTripPreservesToolCallArguments(t *testing.T) {
 // 按事件 seq 下发，内容重复完全不影响唯一性——这里连同「逐字相同」的极端情形一起钉住。
 func TestContentIdenticalMessagesKeepDistinctIDs(t *testing.T) {
 	msgs := []*proto.Message{
-		{Id: "e1", Role: "user", Content: "继续"},
-		{Id: "e2", Role: "assistant", Content: "好的"},
-		{Id: "e3", Role: "user", Content: "继续"}, // 与第一条完全相同
-		{Id: "e4", Role: "tool", Content: "ok", ToolCallId: "call_1"},
-		{Id: "e5", Role: "tool", Content: "ok", ToolCallId: "call_1"}, // 完全重复
+		{Id: "event-1", Role: "user", Content: "继续"},
+		{Id: "event-2", Role: "assistant", Content: "好的"},
+		{Id: "event-3", Role: "user", Content: "继续"}, // 与第一条完全相同
+		{Id: "event-4", Role: "tool", Content: "ok", ToolCallId: "call_1"},
+		{Id: "event-5", Role: "tool", Content: "ok", ToolCallId: "call_1"}, // 完全重复
 	}
 
 	cores := ToCoreMessages(msgs, nil)
@@ -115,10 +115,10 @@ func TestContentIdenticalMessagesKeepDistinctIDs(t *testing.T) {
 // 内容（实测渲染从 765K 塌到 1.9K）。
 func TestMessageIDIsStableAcrossListShift(t *testing.T) {
 	full := []*proto.Message{
-		{Id: "e10", Role: "user", Content: "最早的需求"},
-		{Id: "e11", Role: "assistant", Content: "好的"},
-		{Id: "e12", Role: "user", Content: "第二步"},
-		{Id: "e13", Role: "assistant", Content: "继续"},
+		{Id: "event-10", Role: "user", Content: "最早的需求"},
+		{Id: "event-11", Role: "assistant", Content: "好的"},
+		{Id: "event-12", Role: "user", Content: "第二步"},
+		{Id: "event-13", Role: "assistant", Content: "继续"},
 	}
 	core := ToCoreMessages(full, nil)
 	for i, cm := range core {
@@ -129,7 +129,7 @@ func TestMessageIDIsStableAcrossListShift(t *testing.T) {
 
 	// 只发后两条（模拟只注入最近 N 条）：id 不变，位置变了
 	shifted := ToCoreMessages(full[2:], nil)
-	if shifted[0].ID != "e12" || shifted[1].ID != "e13" {
+	if shifted[0].ID != "event-12" || shifted[1].ID != "event-13" {
 		t.Fatalf("列表起点平移后 id 漂移：%q, %q", shifted[0].ID, shifted[1].ID)
 	}
 

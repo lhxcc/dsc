@@ -553,14 +553,16 @@ func deriveEventMessage(ev *Event) *proto.Message {
 	return nil
 }
 
-// messageID 返回一条派生消息的稳定标识：`e<seq>`。
+// messageID 返回一条派生消息的稳定标识：`event-<seq>`。
 //
-// 「e」只是命名空间前缀，含义是「来源为**事件**序号」（event seq）。没有任何代码
-// 解析它——不承重，换成纯数字或别的写法都等价。保留它的两个理由：
-//   - 落盘状态里一眼可辨：`byRaw: {"e3921": "m00542"}` 与块 id `b3`、后端合成的
-//     `acp_summary_b0` 不会混成一类；
-//   - 它**不再是数字下标**这件事在字面上就成立，避免后人顺手拿去当索引运算
-//     （那正是旧方案 `msg-<idx>` 的错：列表起点一变就指到别的消息）。
+// 前缀写全拼「event-」而不是缩写：它要读得懂才起作用。单个字母既可能被读成
+// anything（error/entry/…），也会让人去猜是否承重；写全拼之后「这是事件序号」
+// 自解释，且字面上就不是数字下标，不会诱发 `id ± 1` 之类的用法——那正是旧方案
+// `msg-<idx>` 的错（列表起点一变就指到别的消息）。
+//
+// 前缀本身不承重：没有代码解析它，纯数字在行为上等价。保留它只为两点——落盘状态
+// 里一眼可辨（`byRaw: {"event-3921": "m00542"}` 与块 id `b3`、后端合成的
+// `acp_summary_b0` 不会混成一类），以及上面那条「不要当索引算」。
 //
 // 为什么必须是 seq：消息内容会变（工具结果被 TOON 规范化、compress 块被替换），
 // 列表下标更会变（请求级裁剪、历史注入只带最近 N 条）。seq 是事件日志里的位置，
@@ -568,7 +570,7 @@ func deriveEventMessage(ev *Event) *proto.Message {
 //
 // 消费方（如压缩后端的消息引用）据此跨请求指认同一条消息。
 func messageID(ev *Event) string {
-	return fmt.Sprintf("e%d", ev.Seq)
+	return fmt.Sprintf("event-%d", ev.Seq)
 }
 
 // toonizeToolContent 在「事件 → 模型消息」投影层把工具结果的 Content 做确定性
