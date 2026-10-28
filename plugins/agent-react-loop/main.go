@@ -1169,8 +1169,12 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 宿主工具注册表已更新，但 availableTools 仍是 RunStream 开始时的快照——
 		// 下一次 LLM 请求会带着过时的工具列表，模型看不到新加载的工具。
 		// 刷新 availableTools 确保模型在下一轮看到最新工具集。
+		//
+		// MCP 的 load/unload/connect 同理：那三个工具改的是宿主侧「哪些 MCP 工具对模型
+		// 可见」，宿主下一次 ListTools 给的目录已经不同（见 core/mcp_tools.go）。不刷新
+		// 的话，模型刚 mcp_load 完就调不了那两个工具——它会以为加载失败，然后重复加载。
 		for _, tc := range toolCalls {
-			if tc.Name == "load_dsc_plugin" || tc.Name == "unload_dsc_plugin" || tc.Name == "install_dsc_plugin" || tc.Name == "uninstall_dsc_plugin" {
+			if isToolCatalogChangingCall(tc.Name) {
 				if refreshed, err := toolClient.ListTools(ctx, &proto.ListToolsRequest{}); err == nil {
 					availableTools = append(refreshed.Tools, a.hostTools()...)
 					// 刷新是全量替换：会话检索工具的可见性要重新按同一规则裁定
@@ -2104,6 +2108,21 @@ func (a *ReactLoopAgent) filterContextSearch(tools []*proto.Tool, msgsEstimate i
 	}
 	a.contextSearchSeen = true
 	return tools
+}
+
+// isToolCatalogChangingCall 报告一个工具调用是否会改变「模型可见的工具目录」，
+// 从而需要在本步结束后重新向宿主取一次目录。
+//
+// 两类：插件热加载（注册表真的增删了工具）与 MCP 的 connect/load/unload（注册表没变，
+// 但宿主侧的曝光集变了，下一次 ListTools 给的目录就不同）。mcp_list 不改目录，不在
+// 其中——把它算进来会让每次列举都白跑一次 ListContext + system prompt 重建。
+func isToolCatalogChangingCall(name string) bool {
+	switch name {
+	case "load_dsc_plugin", "unload_dsc_plugin", "install_dsc_plugin", "uninstall_dsc_plugin",
+		"mcp_connect", "mcp_load", "mcp_unload":
+		return true
+	}
+	return false
 }
 
 // dropToolByName 返回去掉指定名字后的工具目录副本（不改原切片：调用方可能与

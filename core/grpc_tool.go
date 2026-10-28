@@ -82,7 +82,10 @@ func (m *Manager) AllToolsProto() []*proto.Tool {
 	// PTC 描述内嵌清单），请求前缀随进程随机漂移、命中前缀缓存失效。此处统一按名升序，
 	// 与 agent 端对工具目录的排序算法一致（顺序不影响功能，但必须确定）。
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	// MCP 工具按「已加载」曝光（见 core/mcp_tools.go）。过滤放在这里，是因为它供
+	// 三类消费者共用：主 agent 的 tools 数组、子代理的 tools 数组、run_code 的 SDK
+	// 清单。放到任何单一消费者旁边都只能照顾到一路。
+	return m.filterMCPCatalog(out)
 }
 
 // isPTC 当前是否为 PTC 呈现模式（短读锁）。

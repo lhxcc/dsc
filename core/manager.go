@@ -199,6 +199,11 @@ type Manager struct {
 	// 经 admin API /mcp/* 管理生命周期，discoverTools 自动注册 mcp__<server>__<rawName>
 	// 工具到 ToolRegistry。盘活 core/mcp_client.go 死模块。key = serverName。
 	mcpClients map[string]*MCPClient
+	// mcpExpose / mcpExposeOnce 模型可见的 MCP 工具集合（见 core/mcp_tools.go）。
+	// 连接与注册都是进程级的，所以「哪些已加载」也按进程级管理；懒初始化，
+	// 让零值 Manager（测试里常见）也能直接用。
+	mcpExpose     *mcpExposure
+	mcpExposeOnce sync.Once
 }
 
 type ManagerConfig struct {
@@ -369,6 +374,13 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	// 宿主内置会话检索工具：滑窗把早期记录裁掉后，模型仍能按关键词精确取回原话。
 	_ = m.toolRegistry.Register(&contextSearchTool{m: m})
+	// 宿主内置 MCP 工具族：连接（mcp_connect）与运行期加载/卸载（mcp_list/mcp_load/
+	// mcp_unload）。全部由宿主执行——「哪些工具该出现在模型目录里」必须由
+	// AllToolsProto 一处裁定，否则子代理与 run_code 会拿到另一份目录。
+	_ = m.toolRegistry.Register(&mcpConnectTool{m: m})
+	_ = m.toolRegistry.Register(&mcpListTool{m: m})
+	_ = m.toolRegistry.Register(&mcpLoadTool{m: m})
+	_ = m.toolRegistry.Register(&mcpUnloadTool{m: m})
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
 		// 已完成却只会造成重复唤醒的两种情形直接丢弃：

@@ -96,6 +96,23 @@ EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
 
 宿主 pre-step 的 `TokenCount`、agent 的投影/单轮超窗/压缩预算、压缩后端自测表面都遵循此式。
 
+#### 3.3.1 目录里放什么，本身就是一个预算决策
+
+目录是**固定成本**，所以「哪些工具进目录」跟公式一样重要。两个已落地的判断：
+
+- **MCP 工具默认不进目录**，由模型 `mcp_load` 按需加载、`mcp_unload` 撤出（`core/mcp_tools.go`）。
+  实测一台 229 个工具的服务器：全量进目录 **74,543 tokens**（1M 窗口 7%，128K 模型 **57%**），
+  连上但已加载 0 个时只有 4,756（含 4 个管理工具）。按 server 配白名单也能降，但那是把
+  「哪些工具该出现」固化成用户输入（改配置要重启、换任务又对不上）；按需加载把判断留在运行期。
+  代价写清楚：每次 load/unload 都会改变目录 → 前缀缓存失效一次，所以**按需成批**，不是每步一抖。
+- **没有 MCP 连接时，三个运行期管理工具自己也不进目录**（`mcp_list`/`mcp_load`/`mcp_unload`，
+  约 600 tokens）：它们一个也用不上，留着就是纯成本。入口 `mcp_connect` 常驻——它是把
+  「没有」变成「有」的唯一手段。
+
+裁定点只有一个：`Manager.AllToolsProto()` 末尾的 `filterMCPCatalog`。它同时供主 agent 的
+tools 数组、子代理的 tools 数组、`run_code` 的 SDK 清单——放在任何**单一消费者**旁边
+（例如 agent 插件里过滤）都只能照顾到一路，另两路照旧收到整份目录。
+
 ---
 
 ## 4. 计量器 `TokenMeter`
@@ -343,6 +360,9 @@ default:
 
 - 估算只用 `core/token_meter.go` 的公式，插件经 `dsc.Estimate*`。
 - 「请求大小」= 消息 + 工具目录，任何压力/裁剪/预算都不得漏工具。
+- **工具目录的裁剪只准在 `AllToolsProto()` 出口做**（`filterMCPCatalog`，见 §3.3.1）：
+  它同时供主 agent、子代理、`run_code` 的 SDK 清单。在单一消费者旁边过滤会漏掉另外两路，
+  而那两路照旧把整份目录发出去——MCP 一台服务器就可能是 7 万 tokens。
 - **消息身份 = 宿主下发的稳定 id**（`proto.Message.id`，派生时取 surface 事件 seq）。
   任何跨请求指认同一条消息的东西（压缩块的覆盖集合、`mNNNNN` 映射）都用它；列表下标
   不是身份，只是位置（§7.1）。

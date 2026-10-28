@@ -213,27 +213,16 @@ func (m *Manager) handleMCPConnect(c *vodka.Context) error {
 
 	m.mu.Lock()
 	m.ensureMCPClients()
-	if _, ok := m.mcpClients[req.ServerName]; ok {
-		m.mu.Unlock()
+	_, exists := m.mcpClients[req.ServerName]
+	m.mu.Unlock()
+	if exists {
 		return vodka.NewHTTPError(http.StatusConflict, fmt.Sprintf("MCP server %q already connected", req.ServerName))
 	}
-	m.mu.Unlock()
 
-	client, err := NewMCPClient(m, req.ServerName, req.Endpoint)
+	toolCount, err := m.ConnectMCPServer(context.Background(), req.ServerName, req.Endpoint)
 	if err != nil {
-		return vodka.NewHTTPError(http.StatusBadRequest, err.Error())
+		return vodka.NewHTTPError(http.StatusBadGateway, err.Error())
 	}
-
-	ctx := context.Background()
-	if err := client.Connect(ctx); err != nil {
-		return vodka.NewHTTPError(http.StatusBadGateway, "MCP connect failed: "+err.Error())
-	}
-
-	m.mu.Lock()
-	m.ensureMCPClients()
-	m.mcpClients[req.ServerName] = client
-	toolCount := len(client.tools)
-	m.mu.Unlock()
 
 	return c.JSON(map[string]any{"ok": true, "server_name": req.ServerName, "tools_discovered": toolCount})
 }
@@ -267,6 +256,9 @@ func (m *Manager) handleMCPDisconnect(c *vodka.Context) error {
 			m.toolRegistry.Unregister(publicName)
 		}
 	}
+	// 曝光记录一并清掉：否则重新连上同名服务器时，同一批工具会「凭空」直接可见，
+	// 而模型上一轮明明是卸载过的。
+	m.forgetMCPTools(req.ServerName)
 	return c.JSON(map[string]any{"ok": true, "server_name": req.ServerName, "tools_removed": len(client.tools)})
 }
 
@@ -299,6 +291,27 @@ func (m *Manager) handleMCPList(c *vodka.Context) error {
 // LSPTool.client 非 nil 时查询单实例；client 为 nil 时经 Manager.lspDiagnosticsAll
 // 聚合所有已启动 LSPClient 的诊断缓存（由 admin API /lsp/start 注册的实例）。
 // SetManager 在 ensureLSPToolRegistered 中注入，无需修改 LSPTool 自身签名。
+
+// ConnectMCPServer 连接一个 MCP 服务器、发现其工具并登记到 Manager。
+// 返回发现的工具数。
+//
+// 这是「连接」的唯一实现：管理 API（/mcp/connect）、启动时的配置自动连接、
+// 以及模型侧的 mcp_connect 工具都走它。三条入口各写一份会分叉——比如某一条
+// 忘了把客户端登记进 mcpClients，断开时就会留下一批无人管的工具注册。
+func (m *Manager) ConnectMCPServer(ctx context.Context, serverName, endpoint string) (int, error) {
+	if !isMCPServerNameValid(serverName) {
+		return 0, fmt.Errorf("invalid MCP server name %q: use [A-Za-z0-9_-] only, max 32 chars", serverName)
+	}
+	client, err := NewMCPClient(m, serverName, endpoint)
+	if err != nil {
+		return 0, err
+	}
+	if err := client.Connect(ctx); err != nil {
+		return 0, fmt.Errorf("MCP connect failed: %w", err)
+	}
+	m.RegisterMCPClient(serverName, client)
+	return client.ToolCount(), nil
+}
 
 // RegisterMCPClient 注册一个已连接的 MCPClient 到 Manager.mcpClients。
 // 供 main.go 的 autoConnectMCPFromConfig（-patch 注入的 MCP 配置自动连接）
