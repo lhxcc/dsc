@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -206,36 +205,12 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	// （无插件、分发出错）都必须把它作废，否则一份过时的数字会一直压着界面，
 	// 让「已用」冻在一个不存在的请求上。
 	s.m.NoteActualSurface(req.GetSessionId(), 0)
-	return s.preStepOnce(ctx, req, true)
-}
 
-// errPreemptiveOverflow 预检发现「改写后的请求仍超窗」时，用来触发压缩后端紧急压缩
-// 的合成错误。它不会真的发给 provider——只是复用 agent/request-error 这条既有协议，
-// 把原本「provider 400 之后才补救」提前到「发请求之前」。
-//
-// 文案里必须有 "context window"，emitRequestError 靠它归类出 context_window_exceeded
-// （插件按 Code 决策，不看具体文案）。
-var errPreemptiveOverflow = errors.New("pre-step: rendered request still exceeds the context window")
-
-// preStepOnce 跑一轮 pre-step 改写 + 收口。allowPreempt 为 true 时，若收口阶段发现
-// 「渲染后仍超窗、只能靠丢历史」才勉强发得出去，就先请压缩后端紧急压缩一次再重来
-// （基于**原始请求**重新渲染——后端的状态是按完整历史建立的，喂它一份已经被裁过的
-// 列表会让覆盖关系错位）。最多重来一次：allowPreempt 每轮只给一次机会。
-func (s *llmAggregateServer) preStepOnce(ctx context.Context, req *proto.ChatRequest, allowPreempt bool) *proto.ChatRequest {
 	msgs, changed := req.Messages, false
-	hasHooks := len(s.m.hookClientsSnapshot()) > 0
-	if hasHooks {
+	if len(s.m.hookClientsSnapshot()) > 0 {
 		msgs, changed = s.rewriteViaPlugins(ctx, req)
 	}
-	out, dropped := s.finishPreStep(req, msgs, changed)
-	if dropped > 0 && allowPreempt && hasHooks {
-		if s.emitRequestError(ctx, req, errPreemptiveOverflow) {
-			s.m.logger.Warn("pre-step: rewritten request exceeds the window; asking the compaction backend to compress before sending",
-				"session", req.GetSessionId(), "dropped_if_sent", dropped,
-				"window", s.m.contextWindow)
-			return s.preStepOnce(ctx, req, false)
-		}
-	}
+	out, _ := s.finishPreStep(req, msgs, changed)
 	return out
 }
 
@@ -311,6 +286,21 @@ func (s *llmAggregateServer) rewriteViaPlugins(ctx context.Context, req *proto.C
 // 由后端自己决定，它并没有「必须塞进窗口」的义务，所以这里必须兜住——宁可从头丢掉
 // 最旧的一段，也不发一个必然被拒的请求。裁剪安全的前提是消息身份为宿主下发的稳定 id
 // （event-<seq>），裁掉头部不会让压缩块的引用错位。
+//
+// 为什么超窗时直接滑窗，而**不**先请压缩后端紧急压缩一次：
+//
+//   - 紧急路径产出的是**没有内容的占位摘要**——一类后端写「N 条消息已压缩」的固定模板，
+//     另一类强制走截断摘要（`emergency=true` 直接跳过 LLM）。一次紧急压缩就把几百条
+//     真实消息永久埋进一句空话，而滑窗只影响这一次请求（会话日志一字不动，下次仍可
+//     正常压缩）；
+//   - 一次滑窗必然装得下，而「压一个范围再重试」不保证收敛：1.07M 那次连续三次重试都
+//     没压进窗口，最后仍是整轮失败；
+//   - 真正需要紧急压缩的信号是 provider 的 4xx——那说明我们量错了（估算偏差），而不是
+//     预测性地提前挤压历史。那条路仍然保留（provider 4xx → agent/request-error → 后端
+//     紧急压缩 → 重试）。
+//
+// 所以顺序是：改写 → 量 → 装不下就滑窗；后端该做的是它自己阈值内的正常压缩，不是替
+// 宿主擦超窗的屁股。
 func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto.Message, changed bool) (*proto.ChatRequest, int) {
 	toolsTokens := EstimateProtoToolTokens(req.Tools)
 	session := req.GetSessionId()
@@ -328,7 +318,7 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 				"messages", len(msgs), "kept", len(trimmed),
 				"estimated_before", before, "estimated_after", after,
 				"window", s.m.contextWindow, "inflation", inflation,
-				"hint", "压缩后端渲染后仍超窗口：已按滑动窗口丢弃最旧的一段，避免必然的 provider 400")
+				"hint", "改写后的视图仍超窗口：已按滑动窗口丢弃最旧的一段（会话日志不动）；压缩后端应在自己阈值内正常压缩，而不是靠紧急压缩擦超窗")
 		}
 	}
 

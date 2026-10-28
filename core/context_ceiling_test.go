@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -187,5 +188,66 @@ func TestFinishPreStepKeepsFittingRequestUntouched(t *testing.T) {
 	req := &proto.ChatRequest{Messages: msgs, SessionId: "s"}
 	if out, dropped := srv.finishPreStep(req, msgs, false); out != req || dropped != 0 {
 		t.Fatal("装得下应原样返回同一个请求且不裁")
+	}
+}
+
+// TestOverWindowSlidesInsteadOfAskingBackendToCompress 超窗时的处置顺序：**直接滑窗**，
+// 不先请压缩后端做一次紧急压缩。
+//
+// 两条理由，各自独立成立：
+//  1. 紧急路径只能产出没有内容的占位摘要（一类后端写「N 条消息已压缩」的固定模板，
+//     另一类 emergency=true 强制截断摘要、跳过 LLM）。一次就把几百条真实消息永久埋进
+//     一句空话；滑窗只影响这一次请求，会话日志一字不动，下一轮仍能正常压缩。
+//  2. 滑窗一次必然装得下；「压一个范围再重试」不保证收敛——1.07M 那次连续三次重试都没
+//     压进窗口，最后整轮失败。
+//
+// 所以这里断言：请求被压进窗口，且后端**没有**收到 request-error。真正该触发紧急压缩的
+// 是 provider 的 4xx（那说明估算失真），而不是宿主的预测。
+func TestOverWindowSlidesInsteadOfAskingBackendToCompress(t *testing.T) {
+	m, _ := hookManager()
+	m.contextWindow = 20_000
+	backend := &fakeHook{events: make(chan *proto.OnEventRequest, 8)}
+	m.mu.Lock()
+	m.toolHookClients["compactor"] = backend
+	m.toolHookOrder = []string{"compactor"}
+	m.coreMetadata["compactor"] = declaresCompaction()
+	m.compactionBackend = "compactor"
+	m.mu.Unlock()
+
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs, mkTurn(i, "abcdefghij")...)
+	}
+	if sizeOf(msgs) <= m.contextWindow {
+		t.Fatalf("夹具不足：%d 未超窗口 %d", sizeOf(msgs), m.contextWindow)
+	}
+
+	srv := &llmAggregateServer{m: m}
+	out := srv.applyPreStepHook(context.Background(), &proto.ChatRequest{SessionId: "s", Messages: msgs})
+	if got := sizeOf(out.Messages) + EstimateProtoToolTokens(out.Tools); got > m.contextWindow {
+		t.Fatalf("发出的请求仍超窗：%d > %d", got, m.contextWindow)
+	}
+
+	// 后端只应收到 pre-step（一次），不得收到 request-error
+	preSteps, errEvents := 0, 0
+	for {
+		select {
+		case req := <-backend.events:
+			switch req.GetName() {
+			case string(EventAgentPreStep):
+				preSteps++
+			case string(EventAgentRequestError):
+				errEvents++
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if errEvents != 0 {
+		t.Fatalf("超窗不应触发 request-error（紧急压缩只该由 provider 4xx 触发），实际 %d 次", errEvents)
+	}
+	if preSteps != 1 {
+		t.Fatalf("pre-step 应只跑一次（不重来），实际 %d 次", preSteps)
 	}
 }
