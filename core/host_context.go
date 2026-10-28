@@ -90,6 +90,10 @@ func (h *HostContextMeters) NoteUsage(sessionID string, u *Usage, reportedContex
 //   - 否则用 agent 上报的投影值（与决策同源）
 //   - 都没有 → 退回实测 prompt 侧用量
 //   - 全无 → 0（前端显示"未知"而不是 0%）
+//
+// 兜底必须读「实测用量」本身，不能用 meter.Project(0)：那算的是
+// `实测 − 该次请求的估算`（启发式误差），在小窗口长会话里会是一个几万的小常数，
+// 而且几乎不随会话增长——界面上的「已用」因此永远钉在一个假数字上。
 func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -103,7 +107,7 @@ func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	if st.reported > 0 {
 		return st.reported
 	}
-	return st.meter.Project(0)
+	return st.meter.MeasuredPromptTokens()
 }
 
 // Reset 清空某会话的计量（切会话 / 压缩改写历史后调用）。

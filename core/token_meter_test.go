@@ -290,11 +290,30 @@ func TestTokenMeterProjectAnchored(t *testing.T) {
 		t.Fatalf("332000 - 320000 = 12000，got %d", got)
 	}
 
-	// 无基线（只知道用量、不知道当次消息估算）：投影退化为实测值，不应把整段估算加上去
+	// 无基线（只知道用量、不知道当次消息估算）：退回估算，**不能**把实测值钉成投影。
+	//
+	// 实测值描述的是那一次请求，估算描述的是即将发出的这一发；两者之间没有可换算的
+	// 关系。此前这里返回实测值当「保守下界」，在小窗口读超长会话时就是界面卡死：
+	// 滑動窗口每步裁剪 → 拿不到基线 → 投影恒等于启动倒查到的旧用量（实测 33K/3.29%
+	// 从头不动，而实际已达 730K）。
 	tm2 := NewTokenMeter(1_000_000)
 	tm2.UpdateUsage(&Usage{PromptTokens: 90000})
-	if got := tm2.Project(500000); got != 90000 {
-		t.Fatalf("无基线时投影应为实测值 90000（而非 90000+500000），got %d", got)
+	if got := tm2.Project(500000); got != 500000 {
+		t.Fatalf("无基线时应退回估算 500000（实测 90000 只描述旧请求），got %d", got)
+	}
+	// 但实测值仍可以被展示层直接读到（兜底用），且不是 Project(0) 那个「误差值」
+	if got := tm2.MeasuredPromptTokens(); got != 90000 {
+		t.Fatalf("MeasuredPromptTokens 应返回实测 90000，got %d", got)
+	}
+	anchor := NewTokenMeter(1_000_000)
+	anchor.SampleUsage(731391, 605619)
+	if got := anchor.MeasuredPromptTokens(); got != 731391 {
+		t.Fatalf("MeasuredPromptTokens 应返回实测 731391，got %d", got)
+	}
+	// 有基线时 Project(0) 算的是「实测 − 当次估算」（启发式误差），因此它绝不能
+	// 被当成「已用」——那正是界面上那个几乎不随会话增长的小常数。
+	if got := anchor.Project(0); got == anchor.MeasuredPromptTokens() {
+		t.Fatalf("Project(0) 不应等于实测值（它是误差，不是规模），got %d", got)
 	}
 
 	// Reset（切会话 / 压缩后）：回到纯估算

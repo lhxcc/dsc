@@ -510,10 +510,6 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
-		// 决策用的这个数同时是展示口径：随帧上报宿主（见 usageSnapshot）
-		a.usageMu.Lock()
-		a.lastContextTokens = projectedTokens
-		a.usageMu.Unlock()
 		msgs, droppedMsgs := a.trimToWindow(msgs, availableTools, projectedTokens)
 		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
 		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
@@ -556,6 +552,17 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				}
 			}
 		}
+
+		// 展示/上报的「已用」必须是**真正要发出去的那份表面**（裁剪、折叠都做完之后）：
+		// 拿裁剪前的估算上报，等于向界面上报一个没有发出去的请求。
+		//
+		// 这在小窗口读超长会话（滑动窗口）时尤其要紧：历史每轮都被裁掉一大段，裁剪前
+		// 的估算可能几倍于窗口、而真正发出的是裁完的那一段。此前这里在裁剪前赋值，
+		// 界面上的占用与实际请求之间差着「被裁掉的那部分」。
+		sentSurface := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
+		a.usageMu.Lock()
+		a.lastContextTokens = meter.Project(sentSurface)
+		a.usageMu.Unlock()
 
 		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
 		// 被 provider 拒绝的请求。
@@ -785,14 +792,18 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 					a.lastPromptTokens = cr.Usage.PromptTokens
 					a.lastUsage = dsc.UsageFromProto(cr.Usage)
 					a.usageMu.Unlock()
-					// 锚定上下文计量：实测 prompt 侧用量 + 本次所发消息的估算。
-					// 之后 Project(currentEstimate) = 实测 + 增量，绝对误差被实测抵消。
+					// 锚定上下文计量：实测 prompt 侧用量 + **本次实际发出**的消息估算。
+					// 之后 Project(sentSurface) = 实测 + 增量，绝对误差被实测抵消。
 					//
-					// 只在「本次请求未被裁剪」时锚定：裁剪是请求级的（历史仍全在会话里），
-					// 发出的列表与后续派生的历史不同源，拿它当增量基线会把差额算成增长。
-					if droppedMsgs == 0 {
-						a.tokenMeter().SampleUsage(dsc.PromptSideTokens(dsc.UsageFromProto(cr.Usage)), sentEstimate)
-					}
+					// 不再因为「本步裁剪过」就跳过锚定。跳过会让 meter 永远拿不到增量
+					// 基线（只有重启倒查来的一个旧实测值），而滑動窗口模式下每步都在裁剪
+					// ——于是 Project 恒等于那个旧值，界面上的「已用」从首帧起就不动
+					// （实测：会话涨到 730K，界面一直是 33K/3.29%）。
+					//
+					// 之所以以前担心「把差额算成增长」：基线取自裁剪后的列表，而投影输入
+					// 是裁剪前的全量历史，两者不同源。现在投影输入统一改成裁剪后的表面
+					// （见上面的 sentSurface），基线与投影同源，增量才有意义。
+					a.tokenMeter().SampleUsage(dsc.PromptSideTokens(dsc.UsageFromProto(cr.Usage)), sentEstimate)
 				}
 				content += cr.Content
 				if cr.Content != "" {
@@ -2046,8 +2057,12 @@ func (a *ReactLoopAgent) projectedFit(msgs []*proto.Message, tools []*proto.Tool
 // seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
 // 服务端 usage 可依）：
 //   - lastPromptTokens/lastUsage 供 usageSnapshot 上报「已用」；
-//   - tokenMeter().UpdateUsage 建立锚点，使 Project 退化为该实测值，而不是把全量
-//     派生历史（含被压缩后端遮蔽、模型看不到的部分）当作已用。
+//   - tokenMeter().UpdateUsage 记住这个实测值，供 MeasuredPromptTokens 与
+//     「锚点是否已超窗」的判断使用。
+//
+// 注意它**不**会让 Project 退化为该实测值：没有增量基线的实测值只描述那一次请求，
+// 拿它当投影会把界面钉在一个旧数字上（见 core.TokenMeter.projectLocked）。投影在
+// 拿到第一发真实响应（SampleUsage 锚定实测 + 当次表面估算）之后才精确。
 //
 // 倒查逻辑在 dsc.LastPromptUsage（唯一实现，宿主 core 用同一份），此处不再自己
 // 遍历事件——同一规则写两遍就会出现「宿主和插件挑到不同锚点」的漂移。

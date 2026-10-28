@@ -201,8 +201,11 @@ func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatReque
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
 func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) *proto.ChatRequest {
+	// 先清掉上一发的「实际表面」：它只描述那一次请求，任何一条提前返回的路径
+	// （无插件、分发出错）都必须把它作废，否则一份过时的数字会一直压着界面，
+	// 让「已用」冻在一个不存在的请求上。
+	s.m.NoteActualSurface(req.GetSessionId(), 0)
 	if len(s.m.hookClientsSnapshot()) == 0 {
-		s.m.NoteActualSurface(req.GetSessionId(), 0) // 无插件改写：展示回到上报值
 		return req // 无插件监听：直接返回，零开销
 	}
 	msgsJSON, _ := json.Marshal(req.Messages)
@@ -239,10 +242,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 			"estimated_tokens", tokenCount)
 		return req
 	}
-	// 解析改写后的消息列表
-	// 本步没有插件改写请求：展示口径回到 agent 上报的投影值（清掉上一步的
-	// 「实际表面」，否则一份过时的数字会一直压着界面）。
-	s.m.NoteActualSurface(req.GetSessionId(), 0)
+	// 解析改写后的消息列表（「实际表面」已在函数入口清空，见上）
 	if result == nil {
 		return req
 	}

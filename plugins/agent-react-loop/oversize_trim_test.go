@@ -529,3 +529,42 @@ func TestOversizeTrimIsSlidingWindow(t *testing.T) {
 		}
 	}
 }
+
+// TestReportedUsageFollowsSentSurface 滑動窗口下「已用」必须跟随**真正发出去的那一段**，
+// 而不是裁剪前的全量历史。
+//
+// 现实触发：82MB 会话 + 1M 窗口，每步都在裁剪。此前「已用」在裁剪前赋值，且
+// SampleUsage 因为「本步裁剪过」被跳过（meter 永远拿不到增量基线），于是 Project
+// 恒等于启动时倒查到的旧用量——界面从首帧起就钉在 33K / 3.29%，而 provider 实测
+// 已达 730K，速率/缓存命中照常刷新（它们读的是另一个数）。
+func TestReportedUsageFollowsSentSurface(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 10000
+	a.meter = dsc.NewTokenMeter(a.contextWindow)
+	// 上一发真实响应：实测 9000，当次发出的表面估算 8000（已锚定，有增量基线）
+	a.meter.SampleUsage(9000, 8000)
+
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 60; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: strings.Repeat("内容", 100)})
+	}
+	fullEstimate := dsc.EstimateProtoMessagesTokens(msgs)
+	trimmed, dropped := a.trimToWindow(msgs, nil, a.projectedFit(msgs, nil))
+	if dropped == 0 {
+		t.Fatal("夹具无效：应发生裁剪")
+	}
+	sentEstimate := dsc.EstimateProtoMessagesTokens(trimmed)
+	if sentEstimate >= fullEstimate {
+		t.Fatalf("裁剪无效：%d >= %d", sentEstimate, fullEstimate)
+	}
+
+	// 展示口径 = 裁剪后表面的投影：实测 + (裁剪后估算 − 基线)
+	want := 9000 + (sentEstimate - 8000)
+	if got := a.meter.Project(sentEstimate); got != want {
+		t.Fatalf("裁剪后的投影 = %d，期望 %d", got, want)
+	}
+	// 用裁剪前的估算算投影会把「被裁掉的那部分」当成占用（这正是界面上虚高的来源）
+	if got := a.meter.Project(fullEstimate); got <= a.meter.Project(sentEstimate) {
+		t.Fatalf("裁剪前的投影应明显高于裁剪后（got %d vs %d）", got, a.meter.Project(sentEstimate))
+	}
+}

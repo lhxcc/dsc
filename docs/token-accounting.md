@@ -114,10 +114,28 @@ type TokenMeter struct {
 | 方法 | 设定 `sampledEstimate` | 之后 `Project(x)` |
 |---|---|---|
 | `SampleUsage(usage, sentEstimate)` | 有（必须与该次请求同源） | `usage + (x − sentEstimate)`，即**实测底数 + 差量** |
-| `UpdateUsage(usage)` | 0（不设基线） | 退化为 `usage` 本身（保守下界，不把整段估算重复加上） |
+| `UpdateUsage(usage)` | 0（不设基线） | **退回 `x`**（实测值只描述那一次请求，不能当投影） |
 
 `Project` 的差量**可以为负**：压缩让表面变小时，"已用"要跟着回落，否则永远在喊"该压缩了"。
 `ShouldCompact(currentEstimate, ratio)` 只在 `window>0` 时给出判断。
+
+**没有增量基线时绝不能拿实测值当投影**（`hasSample && sampledEstimate <= 0 → x`）。
+实测值描述的是"那一次请求"，`x` 描述的是"即将发出的这一发"，两者之间没有可换算的关系。
+曾经这里返回实测值当"保守下界"，在小窗口读超长会话（滑动窗口，每步都在裁剪）时就是
+界面卡死：裁剪后不重新锚定 → 基线永远是 0 → `Project` 恒等于启动倒查到的旧用量。
+实测现场是会话已到 730K（provider 实测），界面「已用」从首帧起一直是 33K / 3.29%，
+而速率、缓存命中照常刷新（它们读的是另一个数）。
+
+所以还有两条配套约束：
+
+- **`UpdateUsage` 的实测值只用于 `MeasuredPromptTokens()`**（展示兜底、锚点超窗判断），
+  不参与投影换算。
+- **锚定必须无条件做**：agent 侧 `SampleUsage(promptTokens, sentEstimate)` 不再因为
+  "本步裁剪过"跳过。跳过就等于永远拿不到基线。前提是投影输入也换成**裁剪后真正发出的
+  表面**（否则基线与投影不同源，差量会把被裁掉的那段算成增长）。
+- **展示兜底读 `MeasuredPromptTokens()`，不读 `Project(0)`**：后者算的是
+  `实测 − 该次请求的估算`，即启发式的**误差**（几万量级、几乎不随会话增长），
+  不是规模。
 
 **锚点自身超窗时退回纯估算**（`window>0 && pressureTokens > window`）：上一次实测已经
 大于窗口，说明窗口配置（或探测值）小于 provider 实际接受的规模。继续以它为底数，会把
@@ -299,6 +317,11 @@ default:
 - **压缩提示词必须命令模型在摘要里保留用户「当前最紧要任务/事项」**：`dsc-system`
   的 `llmSummary` 与 `dsc-billion-context` 的 `compress` 描述都写明——压缩后模型仍须知道
   现在要做什么、卡在哪、下一步是什么。当前任务靠模型自己的压缩选择保留，不靠程序钉死某条。
+- **展示口径必须跟随「裁剪/折叠之后真正发出的表面」**：agent 的 `Usage.ContextTokens`
+  在裁剪完成后按 `msgs + tools` 计算（`sentSurface`），不是按裁剪前的全量历史。小窗口读
+  超长会话时两者差着一整段被裁掉的历史。
+- **没有增量基线的实测值不得当投影**（见 §4）：它会冻结在界面上。锚定必须无条件做，
+  且投影输入与锚定基线同源（都是发出去的那份表面）。
 - 新增会话事件：`EventType` 常量 + `Data` 结构 + `session/persist.go` 解码注册，三处齐。
 - 用量锚点只能通过 `session.LastUsageAnchor` 取（宿主与 agent 共用一份）。
 - log-only 事件必须以 `Append(..., nil)` 写入（不进 surface）。
@@ -308,6 +331,9 @@ default:
 - 在插件里写 `len/4`、`max(bytes/4,runes)` 之类公式。
 - 把 `llm/attempt` 当信封用，或把信封字段塞回 `llm/attempt`。
 - 用 `projected_tokens` 代替"自己渲染后的表面"（会压过头）。
+- 拿 `Project(0)` 当「已用」展示值：它算的是 `实测 − 该次请求的估算`（启发式误差），
+  不是规模，量级几万且几乎不随会话增长——界面会永远停在一个假数字上。
+- 用 `UpdateUsage(usage)` 的实测值当投影（无基线，见 §4）。
 - 裁一次就判定超窗（估算与投影分叉时会误报；见 §10）。
 - 靠程序僵硬地「钉死首条消息 / 首条 user 不被裁不压缩」：超长会话（数十 MB 级）的「首条
   user 消息」大概率是几周前的失效旧需求，强行保留既无效又架空模型自身的压缩判断。裁剪/压缩

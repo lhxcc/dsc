@@ -110,6 +110,51 @@ func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
 	}
 }
 
+// TestHostContextMetersFallsBackToMeasurement 兜底必须读「实测用量」本身，而不是
+// meter.Project(0) 算出的启发式误差。
+//
+// Project(0) = 实测 − 该次请求的估算，是「估算偏差」，量级几万且几乎不随会话增长。
+// 曾经它被当成「已用」的兜底：会话涨到 730K（provider 实测），界面却一直显示
+// 33K / 3.29%，整轮不动——而速率、缓存命中照常变（它们读的是另一个数）。
+func TestHostContextMetersFallsBackToMeasurement(t *testing.T) {
+	h := NewHostContextMeters(1_048_576)
+	// 只有实测、没有上报投影：兜底应给出 731391 本身
+	h.NoteUsage("s1", &Usage{PromptTokens: 731_391}, 0)
+	if got := h.ContextTokens("s1"); got != 731_391 {
+		t.Fatalf("无上报值时应退回实测 731391，got %d（这是误差值而非规模）", got)
+	}
+	// 会话继续增长：兜底跟着涨，不再钉在原处
+	h.NoteUsage("s1", &Usage{PromptTokens: 780_000}, 0)
+	if got := h.ContextTokens("s1"); got != 780_000 {
+		t.Fatalf("实测增长时必须跟着变，got %d", got)
+	}
+}
+
+// TestPreStepWithoutRewriteClearsStaleActualSurface 没有插件改写的那一步必须作废上一发
+// 记录的「实际表面」，否则界面会一直显示一份不存在的请求。
+//
+// 这是「已用」冻结的另一条路径：某一步被改写成很小的表面（例如 33K），之后每一步
+// 都没有改写（或分发提前返回），残留的 33K 就永远压着上报值不动。
+func TestPreStepWithoutRewriteClearsStaleActualSurface(t *testing.T) {
+	m := newRouterManager()
+	m.ctxMeters = NewHostContextMeters(1_048_576)
+	m.ctxMeters.NoteUsage("sess-x", &Usage{PromptTokens: 731_391, ContextTokens: 731_391}, 731_391)
+
+	// 模拟「上一步被压缩后端改写成了很小的表面」
+	m.NoteActualSurface("sess-x", 33_000)
+	if got := m.ContextTokens("sess-x"); got != 33_000 {
+		t.Fatalf("改写时应显示实际表面 33000，got %d", got)
+	}
+
+	// 本步没有任何 hook 客户端（提前返回路径）→ 必须清掉残留
+	srv := &llmAggregateServer{m: m}
+	req := &proto.ChatRequest{SessionId: "sess-x", Messages: []*proto.Message{{Role: "user", Content: "hi"}}}
+	_ = srv.applyPreStepHook(context.Background(), req)
+	if got := m.ContextTokens("sess-x"); got != 731_391 {
+		t.Fatalf("未改写的一步应回到上报投影 731391，got %d（残留的实际表面没被清掉）", got)
+	}
+}
+
 // TestHostContextMetersReset 切会话/压缩改写历史后清空，避免旧数字残留。
 func TestHostContextMetersReset(t *testing.T) {
 	h := NewHostContextMeters(1000)
