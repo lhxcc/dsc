@@ -370,33 +370,20 @@ func (s *compactionBasicServer) snapToPairBoundary(msgs []*proto.Message, idx in
 
 // truncateSummary 截断式退化摘要：取首条+末条拼接（对齐宿主引擎 truncateCompact，
 // 溢出安全：单侧内容截断到 2000 字符，防截断摘要本身仍超预算）。
-// truncateSummary 在 LLM 不可用时的退化摘要。
 //
-// 关键决定：**不保留被压缩区间的头部**。
-//
-// 区间是「最旧的一段历史」——一份积累了几十 MB 的会话，它的第一句往往是几十轮之前
-// 的话。把它原样搬进摘要，等于把一段早已结束的话题摆到模型眼前：模型会把它当成当前
-// 任务的起点（表现为回答一个早就答过的问题、或把旧结论当现状）。区间末尾才与当前
-// 工作衔接，所以只留末尾。
-//
-// 区间很短（1~2 条）时首尾都给：那种情况下原文本身信息量就小，一句计数不如两行原文。
-// 区间长时只给「压了多少」+ 末尾开头一句——摘要的作用是标示「这里被截断了」，不是
-// 假装自己复述了原文。
+// 这是**压缩**路径：用摘要替换整段历史、明确标着 `[压缩摘要]`，与滑窗是两件事——滑窗
+// 保留原始消息、只在开头加一行「已省略 N 条」，并不改写任何正文。这里保留区间首尾各一句：
+// 这段是要被替换掉的历史，模型只能靠摘要知道「这里发生过什么」，给出当初的话题与最近的
+// 状态比一句计数有用。
 func truncateSummary(region []*proto.Message) string {
 	if len(region) == 0 {
 		return ""
 	}
-	last := capText(region[len(region)-1].GetContent())
-	head := fmt.Sprintf("[压缩摘要] 已省略 %d 条更早的消息（约 %d tokens）",
-		len(region), dsc.EstimateProtoMessagesTokens(region))
-	switch len(region) {
-	case 1:
-		return head + "：" + last
-	case 2:
-		return head + "\n最早：" + capText(region[0].GetContent()) + "\n最近：" + last
-	default:
-		return head + "\n最近一段：" + last
+	summary := "[压缩摘要] " + capText(region[0].GetContent())
+	if len(region) > 1 {
+		summary += "\n...\n" + capText(region[len(region)-1].GetContent())
 	}
+	return summary
 }
 
 // truncateCap 截断式摘要单侧内容上限（字符）。

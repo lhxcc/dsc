@@ -101,11 +101,19 @@ func (m *Manager) ceilingInflation(sessionID, curToolsHash, curModel string, win
 // CapMessagesToWindow 从消息列表头部丢弃，直到「保留部分 + 工具目录」落进 limit。
 // 返回保留的消息与丢弃条数；装得下时原样返回（dropped=0）。
 //
+// **窗口里的消息一律是原始消息**：这里只做「按指针切一段」——同一个 *proto.Message，
+// 内容、附件、工具调用一字不改。滑窗的意义是「换一个起点重新读同一份历史」，不是
+// 「把历史改小」。任何正文改写（折叠、截断、摘要）都属于压缩，不属于滑窗。
+//
+// 唯一的例外是窗口开头那一行**切除说明**（`slideNote`）：它明说「更早的 N 条被省略」，
+// 让模型知道对话不是从这里开始的。它是一条独立的 system 消息，不替换、不修饰任何原始
+// 消息；放在首条 system（部署指令）之后、保留段之前。
+//
 // 规则：
 //   - 首条 system 保留：它是部署写的指令，丢了模型就失去了行为约束，而它通常只占
 //     很小一部分；
 //   - 保留段的起点不能是 tool 消息：那会留下一个没有对应调用的孤儿结果（provider
-//     直接 400），遇到就往后顺延到不是 tool 的位置；
+//     直接 400），并且要落到 user 上（Anthropic 要求首条非 system 是 user）；
 //   - 至少保留最后一条：用户这一句或最新的工具结果绝不能丢。
 func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []*proto.Message, dropped int) {
 	if len(msgs) == 0 || limit <= 0 {
@@ -121,6 +129,11 @@ func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []
 		return msgs, 0
 	}
 
+	// 预留切除说明的位置：它也要占预算，否则裁完 + 一行说明又顶出去。
+	limit -= slideNoteCap
+	if limit <= 0 {
+		limit = 1
+	}
 	head := 0
 	if msgs[0].GetRole() == "system" && len(msgs) > 1 {
 		head = 1 // 首条 system 永久保留
@@ -145,73 +158,33 @@ func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []
 		return msgs, 0 // 无处可丢（甚至装不下的就是 system + 最后一条）：原样发
 	}
 
-	kept = make([]*proto.Message, 0, len(msgs)-cut+head)
+	kept = make([]*proto.Message, 0, len(msgs)-cut+head+1)
 	if head == 1 {
 		kept = append(kept, msgs[0])
 	}
+	kept = append(kept, slideNote(cut-head, EstimateProtoMessagesTokens(msgs[head:cut])))
 	kept = append(kept, msgs[cut:]...)
 	return kept, cut - head
 }
 
-// FoldOversizeMessages 折叠仍然过大的单条消息（保留首尾、中间省略）。
-//
-// 为什么需要有这一步：丢历史只能把「条数」减下来，减不掉「一条消息本身就超窗」——
-// 一次粘贴 200K 的工具输出、一次读到的大文件，单条就顶满窗口。此时从头丢到只剩
-// system + 最后一条仍然装不下，滑窗就失去意义（会一路重试再失败）。折叠是最后手段：
-// 首尾保留、中间标出省略了多少，模型至少知道「这里有内容，被我截断了」，而不是收到
-// 一个必然的 400。
-//
-// 只折叠 user / tool：assistant 的正文通常很短（长内容在 tool_calls 里），system 是
-// 部署指令不得改写。太短的消息不折（那不是超窗的来源，白折腾）。
-func FoldOversizeMessages(msgs []*proto.Message, toolsTokens, limit int) (out []*proto.Message, folded int) {
-	if len(msgs) == 0 || limit <= 0 {
-		return msgs, 0
-	}
-	const maxPasses = 16
-	const minFoldTokens = 512
-	out = append([]*proto.Message(nil), msgs...)
-	for pass := 0; pass < maxPasses; pass++ {
-		if EstimateProtoMessagesTokens(out)+toolsTokens <= limit {
-			return out, folded
-		}
-		idx, best := -1, minFoldTokens
-		for i, m := range out {
-			role := m.GetRole()
-			if role != "user" && role != "tool" {
-				continue
-			}
-			if t := EstimateProtoMessageTokens(m); t > best {
-				idx, best = i, t
-			}
-		}
-		if idx < 0 {
-			return out, folded
-		}
-		out[idx] = foldMessageToBudget(out[idx], best, limit)
-		folded++
-	}
-	return out, folded
-}
+// slideNoteCap 切除说明的预算上限（token）。说明本身只有一行，固定留这点余量，
+// 避免它把裁好的预算又顶出去。
+const slideNoteCap = 64
 
-// foldMessageToBudget 把一条消息裁成「首 + 省略说明 + 尾」，使其大致落进 limit 的量级。
-func foldMessageToBudget(m *proto.Message, tokens, limit int) *proto.Message {
-	runes := []rune(m.GetContent())
-	head := limit / 10
-	tail := limit / 20
-	if head < 512 {
-		head = 512
+// slideNote 生成窗口开头那一行「切除说明」。
+//
+// 为什么要有：滑窗之后列表从中间开始，模型不知道前面还有历史，容易把「当前这段的
+// 开头」当成整个对话的开头（典型表现是把中途的结论当成最初需求）。一行说明把这件事
+// 讲清：更早的 N 条被省略、会话记录仍然完整、以下都是原文。
+//
+// 它必须是**独立的一条消息**而不是拼到某条原文前面——拼进去就等于改写原始消息，
+// 窗口里就不再「每条都是原文」。
+func slideNote(dropped, droppedTokens int) *proto.Message {
+	return &proto.Message{
+		Role: "system",
+		Content: fmt.Sprintf("[滑窗] 已省略更早的 %d 条消息（约 %d tokens）；会话记录仍完整，"+
+			"以下为窗口内的原始消息。", dropped, droppedTokens),
 	}
-	if tail < 256 {
-		tail = 256
-	}
-	if len(runes) <= head+tail+64 {
-		return m
-	}
-	cp := *m
-	cp.Content = string(runes[:head]) +
-		fmt.Sprintf("\n\n…（本条内容过长，已折叠：原约 %d tokens，保留首尾，中间过程省略）…\n\n", tokens) +
-		string(runes[len(runes)-tail:])
-	return &cp
 }
 
 // enforceRequestCeiling 保证「即将发出的请求」不超过窗口上限；返回（可能被裁剪的）
@@ -219,9 +192,9 @@ func foldMessageToBudget(m *proto.Message, tokens, limit int) *proto.Message {
 //
 // inflation 由 estimateInflation 给出（≥1），用于把「我们算的」放大成「provider 大概
 // 会算的」再与上限比较。window<=0（窗口未知）时不裁。
-func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, inflation float64) (out []*proto.Message, dropped, before, after int) {
+func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, inflation float64) (out []*proto.Message, dropped, before, after int, fits bool) {
 	if window <= 0 || len(msgs) == 0 {
-		return msgs, 0, 0, 0
+		return msgs, 0, 0, 0, true
 	}
 	if inflation < 1 {
 		inflation = 1
@@ -229,7 +202,7 @@ func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, infla
 	before = EstimateProtoMessagesTokens(msgs) + toolsTokens
 	effective := int(float64(before) * inflation)
 	if effective <= window {
-		return msgs, 0, before, before
+		return msgs, 0, before, before, true
 	}
 	limit := int(float64(window) * contextCeilingRatio)
 	// 裁剪按「真实估算」做，但预算按放大后的口径收紧：把 limit 除以 inflation，
@@ -239,22 +212,11 @@ func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, infla
 	}
 	out, dropped = CapMessagesToWindow(msgs, toolsTokens, limit)
 	after = EstimateProtoMessagesTokens(out) + toolsTokens
-	if dropped == 0 && after > limit {
-		// 丢不动（可能只剩 system + 最后一条）或本来就没历史可丢：折叠单条超大消息。
-		if foldedOut, n := FoldOversizeMessages(msgs, toolsTokens, limit); n > 0 {
-			return foldedOut, 0, before, EstimateProtoMessagesTokens(foldedOut) + toolsTokens
-		}
-		return msgs, 0, before, before
-	}
 	if dropped == 0 {
-		return msgs, 0, before, before
+		// 无历史可丢：只剩「首条 system + 最后一条」。装不下就是这一轮本身太大，
+		// 没有任何「合法切点」能救——**不改编原文**，交回调用方按错误处理。
+		return msgs, 0, before, before, after <= limit
 	}
-	// 丢完仍超：折叠保留段里仍然过大的单条消息
-	if after > limit {
-		if foldedOut, n := FoldOversizeMessages(out, toolsTokens, limit); n > 0 {
-			out = foldedOut
-			after = EstimateProtoMessagesTokens(out) + toolsTokens
-		}
-	}
-	return out, dropped, before, after
+	// 丢完仍超：同样是「剩下的这一段本身太大」（通常是最后一条工具结果），不折叠。
+	return out, dropped, before, after, after <= limit
 }

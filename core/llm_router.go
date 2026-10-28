@@ -38,7 +38,10 @@ type llmAggregateServer struct {
 func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (*proto.ChatResponse, error) {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req = s.applyPreStepHook(ctx, req)
+		var err error
+		if req, err = s.applyPreStepHook(ctx, req); err != nil {
+			return nil, err
+		}
 		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		for _, np := range s.m.llmRouteSnapshot() {
@@ -98,7 +101,10 @@ func (s *llmAggregateServer) Chat(ctx context.Context, req *proto.ChatRequest) (
 func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer) error {
 	const maxRetries = 3
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req = s.applyPreStepHook(stream.Context(), req)
+		var preErr error
+		if req, preErr = s.applyPreStepHook(stream.Context(), req); preErr != nil {
+			return preErr
+		}
 		req = sanitizeRequestPairing(s.m, req)
 		var lastErr error
 		providerTried := false
@@ -200,7 +206,7 @@ func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatReque
 //
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
-func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) *proto.ChatRequest {
+func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) (*proto.ChatRequest, error) {
 	// 先清掉上一发的「实际表面」：它只描述那一次请求，任何一条提前返回的路径
 	// （无插件、分发出错）都必须把它作废，否则一份过时的数字会一直压着界面，
 	// 让「已用」冻在一个不存在的请求上。
@@ -210,8 +216,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 	if len(s.m.hookClientsSnapshot()) > 0 {
 		msgs, changed = s.rewriteViaPlugins(ctx, req)
 	}
-	out, _ := s.finishPreStep(req, msgs, changed)
-	return out
+	return s.finishPreStep(req, msgs, changed)
 }
 
 // rewriteViaPlugins 分发 agent/pre-step，让订阅的插件改写消息列表；返回最终消息与
@@ -301,7 +306,7 @@ func (s *llmAggregateServer) rewriteViaPlugins(ctx context.Context, req *proto.C
 //
 // 所以顺序是：改写 → 量 → 装不下就滑窗；后端该做的是它自己阈值内的正常压缩，不是替
 // 宿主擦超窗的屁股。
-func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto.Message, changed bool) (*proto.ChatRequest, int) {
+func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto.Message, changed bool) (*proto.ChatRequest, error) {
 	toolsTokens := EstimateProtoToolTokens(req.Tools)
 	session := req.GetSessionId()
 
@@ -313,8 +318,16 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 	if window > 0 {
 		inflation := s.m.ceilingInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, window)
 		var before, after int
-		trimmed, dropped, before, after = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
+		var fits bool
+		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
 		surface = after
+		if !fits {
+			// 滑窗之后仍超：剩下的这一段本身就是这一轮的内容（通常是最后一条工具结果），
+			// 没有合法切点可丢。宁可在这里明确报错，也不改写原文，更不发出去换一个 400。
+			return nil, fmt.Errorf("本轮内容超出上下文窗口：滑窗后仍有 %d tokens（窗口 %d，偏差系数 %.2f）。"+
+				"更早的消息已全部省略，剩下的是这一轮本身——请缩短本次输入（如大文件/长输出）或换更大窗口的模型",
+				after, window, inflation)
+		}
 		if dropped > 0 {
 			s.m.logger.Warn("llm request: trimmed to fit the context window",
 				"session", session, "dropped", dropped,
@@ -333,7 +346,7 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 		s.m.NoteActualSurface(session, surface)
 	}
 	if !changed && dropped == 0 {
-		return req, 0
+		return req, nil
 	}
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
@@ -343,7 +356,7 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 		MaxTokens:    req.MaxTokens,
 		SessionId:    req.SessionId,
 		NewUserInput: req.NewUserInput,
-	}, dropped
+	}, nil
 }
 
 // parsePreStepAppends 解析插件经 pre-step 返回的一次性插播消息：
