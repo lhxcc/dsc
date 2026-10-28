@@ -98,16 +98,20 @@ EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
 
 #### 3.3.1 目录里放什么，本身就是一个预算决策
 
-目录是**固定成本**，所以「哪些工具进目录」跟公式一样重要。两个已落地的判断：
+目录是**固定成本**，所以「哪些工具进目录」跟公式一样重要。三条已落地的判断：
 
+- **MCP 默认关闭**：注入开关（`/mcp on|off`，默认关）关着时，除入口 `mcp_connect` 外一个
+  MCP 工具都不进目录——日常会话付 0 tokens。实测五个管理工具合计 1,087 tokens
+  （connect 309 / list 243 / load 215 / disconnect 161 / unload 159），关闭即省 778，只留
+  入口那 309。开关打开后：
 - **MCP 工具默认不进目录**，由模型 `mcp_load` 按需加载、`mcp_unload` 撤出（`core/mcp_tools.go`）。
   实测一台 229 个工具的服务器：全量进目录 **74,543 tokens**（1M 窗口 7%，128K 模型 **57%**），
   连上但已加载 0 个时只有 4,756（含 4 个管理工具）。按 server 配白名单也能降，但那是把
   「哪些工具该出现」固化成用户输入（改配置要重启、换任务又对不上）；按需加载把判断留在运行期。
   代价写清楚：每次 load/unload 都会改变目录 → 前缀缓存失效一次，所以**按需成批**，不是每步一抖。
-- **没有 MCP 连接时，三个运行期管理工具自己也不进目录**（`mcp_list`/`mcp_load`/`mcp_unload`，
-  约 600 tokens）：它们一个也用不上，留着就是纯成本。入口 `mcp_connect` 常驻——它是把
-  「没有」变成「有」的唯一手段。
+- **没有 MCP 连接时，运行期管理工具自己也不进目录**（`mcp_list`/`mcp_load`/`mcp_unload`/
+  `mcp_disconnect`，合计 778 tokens）：它们一个也用不上，留着就是纯成本。入口 `mcp_connect`
+  常驻——它是把「没有」变成「有」的唯一手段。
 
 裁定点只有一个：`Manager.AllToolsProto()` 末尾的 `filterMCPCatalog`。它同时供主 agent 的
 tools 数组、子代理的 tools 数组、`run_code` 的 SDK 清单——放在任何**单一消费者**旁边

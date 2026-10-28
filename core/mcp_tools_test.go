@@ -98,6 +98,7 @@ func mustConnectFake(t *testing.T, m *Manager, serverName string, toolNames ...s
 func TestMCPToolsHiddenUntilLoaded(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	mustConnectFake(t, m, "demo", "alpha", "beta")
+	m.SetMCPToolsEnabled(true) // 注入开关默认关闭，见 TestMCPToolsDisabledByDefault
 
 	names := toolNamesOf(m.AllToolsProto())
 	for _, hidden := range []string{"mcp__demo__alpha", "mcp__demo__beta"} {
@@ -141,6 +142,7 @@ func TestMCPToolsHiddenUntilLoaded(t *testing.T) {
 // 「有」的唯一入口。
 func TestMCPManagementToolsHiddenWithoutServer(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetMCPToolsEnabled(true)
 	names := toolNamesOf(m.AllToolsProto())
 	for _, hidden := range []string{mcpListToolName, mcpLoadToolName, mcpUnloadToolName} {
 		if names[hidden] {
@@ -156,6 +158,7 @@ func TestMCPManagementToolsHiddenWithoutServer(t *testing.T) {
 func TestMCPLoadUnloadReportCost(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	mustConnectFake(t, m, "demo", "alpha", "beta", "gamma")
+	m.SetMCPToolsEnabled(true)
 
 	out, err := (&mcpLoadTool{m: m}).Execute(context.Background(), json.RawMessage(`{"server":"demo"}`))
 	if err != nil {
@@ -186,6 +189,7 @@ func TestMCPLoadAcceptsBareNameAndRejectsAmbiguous(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	mustConnectFake(t, m, "one", "search")
 	mustConnectFake(t, m, "two", "search")
+	m.SetMCPToolsEnabled(true)
 
 	out, err := (&mcpLoadTool{m: m}).Execute(context.Background(), json.RawMessage(`{"tools":["mcp__one__search"]}`))
 	if err != nil {
@@ -262,4 +266,119 @@ func toolNamesOf(tools []*proto.Tool) map[string]bool {
 		out[t.GetName()] = true
 	}
 	return out
+}
+
+// TestMCPToolsDisabledByDefault 注入开关默认关闭：日常会话不该为「可能用到的 MCP」
+// 常態付目录成本。关闭时除 mcp_connect 外一个 MCP 工具都不出现——包括已经加载的。
+func TestMCPToolsDisabledByDefault(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	if m.MCPToolsEnabled() {
+		t.Fatal("MCP 注入开关应默认关闭")
+	}
+	mustConnectFake(t, m, "demo", "alpha", "beta")
+	m.setMCPToolsLoaded([]string{"mcp__demo__alpha"}, true)
+
+	names := toolNamesOf(m.AllToolsProto())
+	for _, tool := range m.AllToolsProto() {
+		if isMCPToolName(tool.GetName()) {
+			t.Fatalf("关闭状态下不应出现 MCP 工具：%s", tool.GetName())
+		}
+	}
+	for _, hidden := range []string{mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName} {
+		if names[hidden] {
+			t.Fatalf("关闭状态下 %s 不应出现", hidden)
+		}
+	}
+	if !names[mcpConnectToolName] {
+		t.Fatal("mcp_connect 必须常驻（唯一入口）")
+	}
+
+	// 打开后按曝光集恢复：已加载的 alpha 回来，未加载的 beta 仍然不出现
+	m.SetMCPToolsEnabled(true)
+	names = toolNamesOf(m.AllToolsProto())
+	if !names["mcp__demo__alpha"] {
+		t.Fatal("打开后已加载的工具应恢复可见")
+	}
+	if names["mcp__demo__beta"] {
+		t.Fatal("未加载的工具不应因打开开关而出现")
+	}
+	if !names[mcpListToolName] {
+		t.Fatal("打开后管理工具应出现")
+	}
+
+	// 关闭不清加载记录：再打开仍是同一批
+	m.SetMCPToolsEnabled(false)
+	m.SetMCPToolsEnabled(true)
+	if !toolNamesOf(m.AllToolsProto())["mcp__demo__alpha"] {
+		t.Fatal("关闭/打开不应丢失加载记录")
+	}
+}
+
+// TestMCPConnectEnablesSwitch 模型主动连接即视为「要用」：连上后必须能拿到
+// mcp_list，否则它刚连上却无从发现工具，只能重复 connect。
+func TestMCPConnectEnablesSwitch(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	srv := fakeMCPServer(t, "alpha")
+	if _, err := (&mcpConnectTool{m: m}).Execute(context.Background(),
+		json.RawMessage(fmt.Sprintf(`{"server_name":"demo","endpoint":%q}`, srv.URL))); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if !m.MCPToolsEnabled() {
+		t.Fatal("连接成功后开关应打开")
+	}
+	names := toolNamesOf(m.AllToolsProto())
+	if !names[mcpListToolName] || !names[mcpLoadToolName] {
+		t.Fatalf("连上后管理工具应可见：%v", names)
+	}
+}
+
+// TestMCPDisconnectUnregistersEverything 断开必须三步一起做：删登记、注销工具、清曝光。
+// 只删登记会留下一批调不通的幽灵工具；只注销工具会留下空壳，重连被判「已连接」。
+func TestMCPDisconnectUnregistersEverything(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	mustConnectFake(t, m, "demo", "alpha", "beta")
+	m.SetMCPToolsEnabled(true)
+	m.setMCPToolsLoaded([]string{"mcp__demo__alpha"}, true)
+
+	out, err := (&mcpDisconnectTool{m: m}).Execute(context.Background(), json.RawMessage(`{"server_name":"demo"}`))
+	if err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if !strings.Contains(out, "2 tool(s) unregistered") {
+		t.Fatalf("out = %s", out)
+	}
+	if m.GetMCPClient("demo") != nil {
+		t.Fatal("登记应被删除")
+	}
+	if _, ok := m.toolRegistry.Get("mcp__demo__alpha"); ok {
+		t.Fatal("工具应从注册表注销")
+	}
+	if m.mcpToolLoaded("mcp__demo__alpha") {
+		t.Fatal("曝光记录应被清掉")
+	}
+	// 断开不关开关：其它服务器/后续连接仍按开关注入
+	if !m.MCPToolsEnabled() {
+		t.Fatal("断开不应关闭注入开关")
+	}
+	// 未连接的服务器报错要说清现状
+	if _, err := (&mcpDisconnectTool{m: m}).Execute(context.Background(), json.RawMessage(`{"server_name":"nope"}`)); err == nil {
+		t.Fatal("断开未连接的服务器应报错")
+	}
+}
+
+// TestMCPDisconnectAll 空 server_name = 全部断开。
+func TestMCPDisconnectAll(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	mustConnectFake(t, m, "one", "a")
+	mustConnectFake(t, m, "two", "b")
+	out, err := (&mcpDisconnectTool{m: m}).Execute(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("disconnect all: %v", err)
+	}
+	if !strings.Contains(out, "2 server(s)") {
+		t.Fatalf("out = %s", out)
+	}
+	if len(m.MCPStatus().Servers) != 0 {
+		t.Fatal("应全部断开")
+	}
 }

@@ -32,13 +32,14 @@ import (
 // 就让这一跳的前缀失效。所以加载/卸载要**按需成批**，不是每步一抖；加载后一直留在
 // 目录里，直到模型自己卸载、断开服务器或重启进程。
 const (
-	mcpConnectToolName = "mcp_connect"
-	mcpListToolName    = "mcp_list"
-	mcpLoadToolName    = "mcp_load"
-	mcpUnloadToolName  = "mcp_unload"
+	mcpConnectToolName    = "mcp_connect"
+	mcpDisconnectToolName = "mcp_disconnect"
+	mcpListToolName       = "mcp_list"
+	mcpLoadToolName       = "mcp_load"
+	mcpUnloadToolName     = "mcp_unload"
 
 	// mcpToolNamePrefix 是 MCP 工具名的固定前缀：mcp__<server>__<raw>。
-	// 宿主内置的四个管理工具用单下划线，不会被当成 MCP 工具。
+	// 宿主内置的管理工具用单下划线，不会被当成 MCP 工具。
 	mcpToolNamePrefix = "mcp__"
 
 	mcpConnectTimeout = 60 * time.Second
@@ -62,15 +63,6 @@ func mcpServerOf(publicName string) string {
 	return rest
 }
 
-// isMCPManagementTool 判断是否为三个运行期管理工具（无 MCP 连接时不值得占用目录）。
-func isMCPManagementTool(name string) bool {
-	switch name {
-	case mcpListToolName, mcpLoadToolName, mcpUnloadToolName:
-		return true
-	}
-	return false
-}
-
 // ---- 曝光集 ----
 
 // mcpExposure 已经加载（对模型可见）的 MCP 工具集合。
@@ -80,6 +72,15 @@ func isMCPManagementTool(name string) bool {
 type mcpExposure struct {
 	mu   sync.RWMutex
 	load map[string]bool
+	// enabled 是 MCP 的**注入开关**，默认关。
+	//
+	// 为什么要有它：日常会话里绝大多数时间用不到 MCP，但管理工具的定义本身要占几百
+	// tokens、每个请求都发。默认关掉即「零成本」，要用时由用户（/mcp on）或模型自己
+	// （调 mcp_connect）打开——两者都是明确的意图表达，不是猜测。
+	//
+	// 关闭时连已加载的 MCP 工具一起不注入：off 的语义是「这个话题现在不占我任何目录
+	// 预算」，而不是「只藏管理入口、留下的照付」。加载记录保留，重新 on 即恢复。
+	enabled bool
 }
 
 func (m *Manager) ensureMCPExposure() *mcpExposure {
@@ -145,14 +146,18 @@ func (m *Manager) forgetMCPTools(serverName string) {
 	}
 }
 
-// filterMCPCatalog 按曝光集裁剪模型可见目录（AllToolsProto 的唯一出口）。
+// filterMCPCatalog 按开关与曝光集裁剪模型可见目录（AllToolsProto 的唯一出口）。
 //
-// 两条规则：
-//  1. 未加载的 mcp__* 一律不出现——它们仍然注册着、仍可 execute（后台任务、子代理
-//     内部调用不受影响），只是不进请求的 tools 数组；
-//  2. 一台服务器都没连时，三个运行期管理工具也不出现：它们一个也用不上，却要占
-//     几百 tokens、每个请求都发。把「无服务器」变成「有服务器」的入口是 mcp_connect，
-//     它始终可见。
+// 三层规则，从外到内：
+//  1. 开关关闭（默认）：除 mcp_connect 外，所有 MCP 相关工具都不出现——包括已加载
+//     的 mcp__* 与全部管理工具。日常会话因此付 0 tokens。加载记录留着，重新打开即恢复。
+//  2. 开关打开但一台服务器都没连：三个运行期管理工具也不出现（它们一个也用不上，
+//     却要占几百 tokens、每个请求都发）。
+//  3. 都有：mcp__* 仅当被 mcp_load 加载过才出现（见 mcp_load/mcp_unload）。
+//
+// mcp_connect 始终可见（关闭时也留）：它是把「没有 MCP」变成「有」的唯一入口，而且
+// 它的描述里写着「不要起另一个 dsc 进程去连 MCP」——那句话本身就是防错说明。
+// 执行它会把开关打开，否则模型刚连上却拿不到 mcp_list，只能干瞪眼。
 func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
 	hasMCP := false
 	for _, t := range tools {
@@ -163,22 +168,103 @@ func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
 	}
 	e := m.ensureMCPExposure()
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	enabled := e.enabled
+	loaded := make(map[string]bool, len(e.load))
+	for name := range e.load {
+		loaded[name] = true
+	}
+	e.mu.RUnlock()
 
 	out := make([]*proto.Tool, 0, len(tools))
 	for _, t := range tools {
 		name := t.GetName()
 		switch {
+		case name == mcpConnectToolName:
+			// 常驻：见函数注释
 		case isMCPToolName(name):
-			if !e.load[name] {
+			if !enabled || !loaded[name] {
 				continue
 			}
-		case !hasMCP && isMCPManagementTool(name):
-			continue
+		case isMCPManagementTool(name):
+			if !enabled || !hasMCP {
+				continue
+			}
 		}
 		out = append(out, t)
 	}
 	return out
+}
+
+// isMCPManagementTool 判断是否为运行期管理工具（开关关闭或没有服务器时都不值得占目录）。
+// mcp_connect 不在其中：它是入口，始终保留。
+func isMCPManagementTool(name string) bool {
+	switch name {
+	case mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName:
+		return true
+	}
+	return false
+}
+
+// MCPToolsEnabled 报告 MCP 注入开关的状态。
+func (m *Manager) MCPToolsEnabled() bool {
+	e := m.ensureMCPExposure()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.enabled
+}
+
+// SetMCPToolsEnabled 打开/关闭 MCP 注入，返回是否发生了变化。
+//
+// 关闭只影响「注入」，不动连接与加载记录：服务器还连着、工具还加载着，只是这一个
+// 进程不再把它们发给模型。重新打开即原样恢复——这让 /mcp off 成为一个可以随手按的
+// 「先别花这个钱」开关，而不是一个会丢状态的破坏性操作。
+func (m *Manager) SetMCPToolsEnabled(enabled bool) bool {
+	e := m.ensureMCPExposure()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.enabled == enabled {
+		return false
+	}
+	e.enabled = enabled
+	return true
+}
+
+// MCPStatus 是 MCP 当前状态的只读快照（供斜杆命令展示）。
+type MCPStatus struct {
+	Enabled    bool
+	Servers    []MCPServerStatus
+	Loaded     []string
+	LoadedCost int
+}
+
+// MCPServerStatus 一台已连接服务器的概要。
+type MCPServerStatus struct {
+	Name     string
+	Endpoint string
+	Tools    int
+	Loaded   int
+}
+
+// MCPStatus 取当前状态快照。
+func (m *Manager) MCPStatus() MCPStatus {
+	status := MCPStatus{Enabled: m.MCPToolsEnabled()}
+	loaded := map[string]bool{}
+	for _, name := range m.loadedMCPTools() {
+		loaded[name] = true
+	}
+	for _, view := range m.mcpServers() {
+		srv := MCPServerStatus{Name: view.name, Endpoint: view.endpoint, Tools: len(view.tools)}
+		for _, tool := range view.tools {
+			if loaded[tool.publicName] {
+				srv.Loaded++
+				status.Loaded = append(status.Loaded, tool.publicName)
+			}
+		}
+		status.Servers = append(status.Servers, srv)
+	}
+	sort.Strings(status.Loaded)
+	status.LoadedCost = m.loadedMCPCost()
+	return status
 }
 
 // ---- 服务器快照 ----
@@ -246,7 +332,8 @@ func (t *mcpConnectTool) Description() string {
 	return "Connect to an external MCP server over streamable HTTP and register its tools (endpoint like http://127.0.0.1:8765/mcp). " +
 		"Use when the user asks to use an MCP server that is not connected yet. This is a host capability: do NOT start another `dsc` process to connect to MCP — that process has its own tool table and this session can never see it. " +
 		"stdio transport is not supported; start the server with an HTTP endpoint first (e.g. `rea mcp --http --port 8765`). " +
-		"Registered tools stay hidden from your tool list to keep it small — use mcp_list to see them, then mcp_load for the ones you need. Requires approval."
+		"Connecting turns MCP management on for this session (mcp_list/mcp_load become usable) — connecting means you intend to use it. " +
+		"Registered tools stay hidden from your tool list to keep it small — use mcp_list to see them, then mcp_load for the ones you need, and mcp_unload/mcp_disconnect when done. Requires approval."
 }
 
 func (t *mcpConnectTool) ParametersSchema() json.RawMessage {
@@ -295,6 +382,7 @@ func (t *mcpConnectTool) Execute(ctx context.Context, args json.RawMessage) (str
 	// 幂等：重复连接是模型常见动作（上一轮连过、或它不确定），报「已连接」并指向
 	// mcp_list 比抛冲突好用。
 	if existing := t.m.GetMCPClient(name); existing != nil {
+		t.m.SetMCPToolsEnabled(true)
 		return fmt.Sprintf("MCP server %q is already connected (%d tools). Its tools are hidden from your tool list by default: "+
 			"call mcp_list to see the names, then mcp_load for the ones you need.", name, existing.ToolCount()), nil
 	}
@@ -305,7 +393,10 @@ func (t *mcpConnectTool) Execute(ctx context.Context, args json.RawMessage) (str
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Connected MCP server %q: %d tools registered (prefix mcp__%s__). "+
+	// 连上即视为「要用」：不打开开关的话，模型刚连上却拿不到 mcp_list（管理工具还没
+	// 注入），只能干瞪眼，或者去重复 connect。
+	t.m.SetMCPToolsEnabled(true)
+	return fmt.Sprintf("Connected MCP server %q: %d tools registered (prefix mcp__%s__); MCP tools are now enabled for this session. "+
 		"Registered is not visible: call mcp_list to see the names and mcp_load for the ones you need.", name, count, name), nil
 }
 
@@ -636,6 +727,80 @@ func (t *mcpUnloadTool) Execute(_ context.Context, args json.RawMessage) (string
 	}
 	fmt.Fprintf(&b, "Still loaded: ~%d tokens per request.\n", t.m.loadedMCPCost())
 	return b.String(), nil
+}
+
+// ============================================================
+// mcp_disconnect
+// ============================================================
+
+type mcpDisconnectTool struct{ m *Manager }
+
+func (t *mcpDisconnectTool) Name() string { return mcpDisconnectToolName }
+
+func (t *mcpDisconnectTool) Description() string {
+	return "Disconnect an MCP server: unregister its tools and forget which ones were loaded. " +
+		"Use it when the server is gone, was connected to the wrong endpoint, or the user is done with it. " +
+		"Use mcp_unload instead when you only want the tools out of your tool list but still want the server connected. " +
+		"An empty server_name disconnects every server. Requires approval."
+}
+
+func (t *mcpDisconnectTool) ParametersSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{
+"server_name":{"type":"string","description":"Server to disconnect (as passed to mcp_connect). Omit or leave empty to disconnect every server."}
+},"additionalProperties":false}`)
+}
+
+// ApprovalReason 实现 ApprovalRequester：断开会让正在进行的调用失败（工具随即从注册表
+// 消失），属高影响变更。
+func (t *mcpDisconnectTool) ApprovalReason(argumentsJSON string) string {
+	var in struct {
+		ServerName string `json:"server_name"`
+	}
+	_ = json.Unmarshal([]byte(argumentsJSON), &in)
+	if strings.TrimSpace(in.ServerName) == "" {
+		return "Disconnects every MCP server and unregisters all their tools."
+	}
+	return fmt.Sprintf("Disconnects MCP server %q and unregisters its tools.", in.ServerName)
+}
+
+func (t *mcpDisconnectTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+	var in struct {
+		ServerName string `json:"server_name"`
+	}
+	if s := strings.TrimSpace(string(args)); s != "" && s != "null" {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return "", fmt.Errorf("mcp_disconnect: %v", err)
+		}
+	}
+	name := strings.TrimSpace(in.ServerName)
+	if name == "" {
+		servers := t.m.mcpServers()
+		if len(servers) == 0 {
+			return "No MCP server is connected; nothing to disconnect.", nil
+		}
+		var removed int
+		var names []string
+		for _, view := range servers {
+			n, err := t.m.DisconnectMCPServer(view.name)
+			if err != nil {
+				return "", err
+			}
+			removed += n
+			names = append(names, view.name)
+		}
+		return fmt.Sprintf("Disconnected %d server(s) (%s); %d tool(s) unregistered. mcp_connect reconnects them.",
+			len(names), strings.Join(names, ", "), removed), nil
+	}
+
+	if t.m.GetMCPClient(name) == nil {
+		return "", fmt.Errorf("MCP server %q is not connected. Connected: %s", name, mcpServerSummary(t.m.mcpServers()))
+	}
+	removed, err := t.m.DisconnectMCPServer(name)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Disconnected MCP server %q; %d tool(s) unregistered and their loaded state forgotten. "+
+		"Other servers are unaffected.", name, removed), nil
 }
 
 // ---- 展示辅助 ----

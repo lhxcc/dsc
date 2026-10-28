@@ -7,12 +7,18 @@ description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP）：運行期
 
 當使用者說「用 DSC 連上某個 MCP 服務」「把 MCP 工具接進來」「為什麼 MCP 連不上」「連上了但看不到工具」時，照本技能做。
 
-## 先記住兩條
+## 先記住三條
 
 1. **不要**用 `shell` 再起一個 `dsc …` 進程去「連 MCP」。那是另一個進程，有它自己的工具表，
    當前會話永遠看不到那些工具，還會多一份會話與任務狀態。
-2. **連上 ≠ 看得見**。MCP 工具被接進宿主後**預設不進你的工具目錄**（一台伺服器可能有幾百個工具，
-   目錄每個請求都要發）。要用 `mcp_load` 明確加載，用完 `mcp_unload` 撤出。
+2. **MCP 默認關閉**。DSC 默認不把 MCP 工具放進你的工具目錄（日常會話用不到它，沒理由每個
+   請求都為它付目錄成本）。你手上有三種情況：
+   - 工具清單裡有 `mcp_connect` 但沒有 `mcp_list`/`mcp_load` → 直接 `mcp_connect` 連一台，
+     連上即自動打開；
+   - 連 `mcp_connect` 都沒有 → MCP 被宿主關掉了，請使用者執行 `/mcp on`（或告訴他 MCP 未啟用）；
+   - 已經開著 → 按下面的流程用。
+3. **連上 ≠ 看得見**。工具被接進宿主後仍**不進你的工具目錄**（一台伺服器可能有幾百個工具）。
+   要用 `mcp_load` 明確加載，用完 `mcp_unload` 撤出。
 
 ## 前提：只支援 streamable HTTP
 
@@ -83,6 +89,21 @@ mcp_unload(tools=["mcp__rea__list_jeb_units"])
 卸載只是把工具移出目錄，**連接還在**——再 `mcp_load` 即可回來，不用重連。
 任務結束（或不再需要那批工具）就卸載，別讓它一直佔著每個請求的目錄成本。
 
+## 使用者側的等價操作（斜杆命令）
+
+使用者在終端裡可以自己做同樣的事，與你的工具共用一份宿主實現——所以他說「我自己連好了」
+時，先用 `mcp_list` 確認，不要重連：
+
+| 命令 | 作用 |
+|---|---|
+| `/mcp` | 狀態：開關、已連伺服器、已加載工具與其目錄成本 |
+| `/mcp on` / `/mcp off` | 注入開關（默認關）。關掉後模型看不到任何 MCP 工具，連接與加載記錄保留 |
+| `/mcp list [server]` | 列出工具（`[loaded]` 表示已在模型目錄裡） |
+| `/mcp connect <name> <endpoint>` | 連接（streamable HTTP） |
+| `/mcp disconnect [server]` | 斷開並註銷工具（不帶參數=全部） |
+| `/mcp load <tool...>` / `--server <name>` | 加載進模型目錄 |
+| `/mcp unload [tool...]` / `--server <name>` | 卸載（不帶參數=全部） |
+
 ## 路線 B：寫進配置（需要每次啟動都連時用）
 
 ```yaml
@@ -115,6 +136,7 @@ dsc -patch <絕對路徑>/mcp-rea.yaml
 | 症狀 | 原因 | 處理 |
 |---|---|---|
 | `connection refused` / 端口沒在聽 | 伺服器沒起，或起成了 **stdio** 模式 | 加 `--http --port N`；確認日誌有 `MCP transport listening` |
+| 工具清單裡沒有 `mcp_list`/`mcp_load` | MCP 注入被關（默認關） | `mcp_connect` 會自動打開；或請使用者 `/mcp on` |
 | `mcp_list` 說沒有伺服器 | 還沒連，或連的是另一個 DSC 進程 | 用 `mcp_connect` 在本會話連（不要 shell 起新 dsc） |
 | 連上了，但工具清單裡看不到那批工具 | 正常：預設不曝光 | `mcp_load` 你要用的那幾個 |
 | `mcp_load` 說名字找不到 | 名字記錯／沒加 `mcp__<server>__` 前綴 | 先 `mcp_list` 拿準確名字（裸名唯一時也可用） |

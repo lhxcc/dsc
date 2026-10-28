@@ -238,28 +238,44 @@ func (m *Manager) handleMCPDisconnect(c *vodka.Context) error {
 		return vodka.NewHTTPError(http.StatusBadRequest, "server_name is required")
 	}
 
-	m.mu.Lock()
-	client, ok := m.mcpClients[req.ServerName]
-	if !ok {
-		m.mu.Unlock()
+	if m.GetMCPClient(req.ServerName) == nil {
 		return vodka.NewHTTPError(http.StatusNotFound, fmt.Sprintf("MCP server %q not found", req.ServerName))
 	}
-	delete(m.mcpClients, req.ServerName)
+
+	removed, err := m.DisconnectMCPServer(req.ServerName)
+	if err != nil {
+		return vodka.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(map[string]any{"ok": true, "server_name": req.ServerName, "tools_removed": removed})
+}
+
+// DisconnectMCPServer 断开并清理一台 MCP 服务器：删登记、注销工具、清曝光记录。
+// 返回注销的工具数。
+//
+// 与 ConnectMCPServer 对称，是唯一的断开实现（管理 API、模型侧 mcp_disconnect、
+// 以及将来的其它入口都走它）。三步必须一起做：只删登记会让工具留在注册表里，成为
+// 一批永远调不通的幽灵；只注销工具会让 mcpClients 里留下一个空壳，重复 connect 会被
+// 判「已连接」而永远连不上。
+func (m *Manager) DisconnectMCPServer(serverName string) (int, error) {
+	m.mu.Lock()
+	m.ensureMCPClients()
+	client, ok := m.mcpClients[serverName]
+	if !ok {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("MCP server %q is not connected", serverName)
+	}
+	delete(m.mcpClients, serverName)
 	m.mu.Unlock()
 
-	client.Disconnect()
+	// 先取数量再断开：Disconnect 会清空工具表，之后读就是 0（管理 API 的
+	// tools_removed 与模型侧的回执都靠这个数）。
+	count := client.ToolCount()
+	client.Disconnect() // 内部已按 c.tools 逐个 Unregister
 
-	// 注销该服务器的所有工具
-	if m.toolRegistry != nil {
-		for rawName := range client.tools {
-			publicName := mcpPublicName(req.ServerName, rawName)
-			m.toolRegistry.Unregister(publicName)
-		}
-	}
 	// 曝光记录一并清掉：否则重新连上同名服务器时，同一批工具会「凭空」直接可见，
 	// 而模型上一轮明明是卸载过的。
-	m.forgetMCPTools(req.ServerName)
-	return c.JSON(map[string]any{"ok": true, "server_name": req.ServerName, "tools_removed": len(client.tools)})
+	m.forgetMCPTools(serverName)
+	return count, nil
 }
 
 func (m *Manager) handleMCPList(c *vodka.Context) error {

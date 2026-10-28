@@ -378,6 +378,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	// mcp_unload）。全部由宿主执行——「哪些工具该出现在模型目录里」必须由
 	// AllToolsProto 一处裁定，否则子代理与 run_code 会拿到另一份目录。
 	_ = m.toolRegistry.Register(&mcpConnectTool{m: m})
+	_ = m.toolRegistry.Register(&mcpDisconnectTool{m: m})
 	_ = m.toolRegistry.Register(&mcpListTool{m: m})
 	_ = m.toolRegistry.Register(&mcpLoadTool{m: m})
 	_ = m.toolRegistry.Register(&mcpUnloadTool{m: m})
