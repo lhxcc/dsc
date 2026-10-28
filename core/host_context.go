@@ -32,6 +32,10 @@ type hostMeterState struct {
 	// 真实表面判断「还没到阈值」——用户看到的现象就是「都 90% 了还不压缩」。
 	// 展示口径必须跟真正发出去的东西走，否则数字只是在描述一个不存在的请求。
 	actual int
+	// seed 是启动时用会话日志里的**历史**读数预置的提示值（上一次请求的用量）。
+	// 它不是测量：换了模型/窗口之后就只是在说「这份历史大概多大」。因此写在单独
+	// 字段、优先级最低，且不参与 MeasuredPromptTokens（否则会被误当成实测）。
+	seed int
 }
 
 // Seed 用会话日志里的历史读数预置展示值（启动时、还没有任何 usage 帧）。
@@ -40,14 +44,18 @@ type hostMeterState struct {
 // 此前标题栏的「已用」一直是 0——明明上下文里已经躺着几十万 token 的历史。品牌新会话
 // 显示 0 是对的（确实空），有历史时显示 0 就是在说假话。
 //
-// 只填「兜底」那一层：不写 reported，也不写 actual，第一帧真实用量到达后被自然替换。
+// 只填「兜底」那一层：不写 reported、不写 actual、也不写进 meter（那是实测位），
+// 第一帧真实用量到达后被自然替换。
+//
+// 注意这个数来自**旧配置**下的一次请求：用户可能已经把 1M 云模型换成本地 128K。
+// 它不会被当成测量，读取时还会被当前窗口夹住（见 ContextTokens）。
 func (h *HostContextMeters) Seed(sessionID string, tokens int) {
 	if sessionID == "" || tokens <= 0 {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.stateLocked(sessionID).meter.SampleUsage(tokens, 0)
+	h.stateLocked(sessionID).seed = tokens
 }
 
 // NoteActualSurface 记录本步改写后实际发出的表面大小（消息 + 工具目录，同一个
@@ -105,11 +113,17 @@ func (h *HostContextMeters) NoteUsage(sessionID string, u *Usage, reportedContex
 //   - 本步有插件改写过请求 → 用实际发出的表面（否则压缩后数字永远虚高）
 //   - 否则用 agent 上报的投影值（与决策同源）
 //   - 都没有 → 退回实测 prompt 侧用量
+//   - 再没有 → 用启动预置的历史读数
 //   - 全无 → 0（前端显示"未知"而不是 0%）
 //
 // 兜底必须读「实测用量」本身，不能用 meter.Project(0)：那算的是
 // `实测 − 该次请求的估算`（启发式误差），在小窗口长会话里会是一个几万的小常数，
 // 而且几乎不随会话增长——界面上的「已用」因此永远钉在一个假数字上。
+//
+// **结果一律夹在当前窗口内**：超过容量的部分根本发不出去——agent 会先把它裁掉
+// （裁剪是非破坏性的，历史仍在会话里）。这条对启动预置尤其要紧：预置值来自上一次
+// 请求，用户可能已经把 1M 云模型换成本地 128K，不夹的话标题会显示「714K/128K」，
+// 那是一个永远不会被发出的请求。
 func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -117,13 +131,19 @@ func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	if !ok {
 		return 0
 	}
-	if st.actual > 0 {
-		return st.actual
+	v := st.seed
+	switch {
+	case st.actual > 0:
+		v = st.actual
+	case st.reported > 0:
+		v = st.reported
+	case st.meter.MeasuredPromptTokens() > 0:
+		v = st.meter.MeasuredPromptTokens()
 	}
-	if st.reported > 0 {
-		return st.reported
+	if h.window > 0 && v > h.window {
+		v = h.window
 	}
-	return st.meter.MeasuredPromptTokens()
+	return v
 }
 
 // Reset 清空某会话的计量（切会话 / 压缩改写历史后调用）。

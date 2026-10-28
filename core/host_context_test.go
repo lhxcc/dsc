@@ -183,6 +183,42 @@ func TestHostContextMetersSeed(t *testing.T) {
 	}
 }
 
+// TestHostContextMetersSeedClampedToCurrentWindow 预置值来自上一次请求，而那次可能是
+// 在 1M 云模型上跑的；用户这次换成 128K 本地模型，预置值必须被**当前**窗口夹住。
+//
+// 真实时序：LoadHistoryReplay 先 Seed（此刻计量器窗口还是 0，因为 SetContextWindow
+// 还没跑），tui.New 才把 128K 设进来。所以夹取只能在读取时做——写入时还不知道窗口。
+// 不夹的话标题会显示「714K/128K」（557%），那是一个永远不会被发出的请求：
+// 发之前 agent 会先把它裁进窗口。
+func TestHostContextMetersSeedClampedToCurrentWindow(t *testing.T) {
+	h := NewHostContextMeters(0) // 宿主装配时的初始值：窗口未知
+	h.Seed("s1", 714_000)        // 上一次在 1M 窗口下的请求
+	h.SetWindow(131_072)         // 这次换成本地 128K
+
+	if got := h.ContextTokens("s1"); got != 131_072 {
+		t.Fatalf("预置值应被当前窗口夹住 131072，got %d（否则显示 714K/128K）", got)
+	}
+
+	// 接上第一帧真实用量：按实测走（已经裁进窗口）
+	h.NoteUsage("s1", &Usage{PromptTokens: 120_000, ContextTokens: 120_000}, 120_000)
+	if got := h.ContextTokens("s1"); got != 120_000 {
+		t.Fatalf("首帧用量应替换预置值，got %d", got)
+	}
+
+	// 上报值本身超窗（理论上不该出现）：同样夹住，界面不显示 >100%
+	h.NoteUsage("s1", &Usage{PromptTokens: 300_000, ContextTokens: 300_000}, 300_000)
+	if got := h.ContextTokens("s1"); got != 131_072 {
+		t.Fatalf("超窗的上报值应被夹住，got %d", got)
+	}
+
+	// 窗口未知（0）时无从比较：原样返回，不臆造上限
+	unknown := NewHostContextMeters(0)
+	unknown.Seed("s2", 714_000)
+	if got := unknown.ContextTokens("s2"); got != 714_000 {
+		t.Fatalf("窗口未知时应原样返回 714000，got %d", got)
+	}
+}
+
 // TestHostContextMetersReset 切会话/压缩改写历史后清空，避免旧数字残留。
 func TestHostContextMetersReset(t *testing.T) {
 	h := NewHostContextMeters(1000)
