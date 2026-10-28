@@ -524,17 +524,6 @@ func deriveMessageRole(ev *Event) string {
 // deriveEventMessage 单事件投影：surface 事件 → 消息；log-only 事件 → nil。
 // system/message 空 content 投影为 nil（保留 surface 位置但不发模型消息，
 // 对齐 DSH "空内容 system 节点投影为 null" 设计）。
-// messageID 返回一条派生消息的稳定标识：直接用其 surface 事件的 seq。
-//
-// 为什么必须是 seq：消息内容会变（工具结果被 TOON 规范化、compress 块被替换），
-// 列表下标更会变（请求级裁剪、历史注入只带最近 N 条）。seq 是事件日志里的位置，
-// append-only 且与派生范围无关——同一个事件永远派生出同一个 id。
-//
-// 消费方（如压缩后端的消息引用）据此跨请求指认同一条消息；拿下标当 id 会在裁剪
-// 发生的下一步整体错位，指认落到别的消息身上。
-func messageID(ev *Event) string {
-	return fmt.Sprintf("e%d", ev.Seq)
-}
 
 func deriveEventMessage(ev *Event) *proto.Message {
 	switch d := ev.Data.(type) {
@@ -562,6 +551,24 @@ func deriveEventMessage(ev *Event) *proto.Message {
 		return &proto.Message{Id: messageID(ev), Role: "system", Content: d.Content}
 	}
 	return nil
+}
+
+// messageID 返回一条派生消息的稳定标识：`e<seq>`。
+//
+// 「e」只是命名空间前缀，含义是「来源为**事件**序号」（event seq）。没有任何代码
+// 解析它——不承重，换成纯数字或别的写法都等价。保留它的两个理由：
+//   - 落盘状态里一眼可辨：`byRaw: {"e3921": "m00542"}` 与块 id `b3`、后端合成的
+//     `acp_summary_b0` 不会混成一类；
+//   - 它**不再是数字下标**这件事在字面上就成立，避免后人顺手拿去当索引运算
+//     （那正是旧方案 `msg-<idx>` 的错：列表起点一变就指到别的消息）。
+//
+// 为什么必须是 seq：消息内容会变（工具结果被 TOON 规范化、compress 块被替换），
+// 列表下标更会变（请求级裁剪、历史注入只带最近 N 条）。seq 是事件日志里的位置，
+// append-only 且与派生范围无关——同一个事件永远派生出同一个 id。
+//
+// 消费方（如压缩后端的消息引用）据此跨请求指认同一条消息。
+func messageID(ev *Event) string {
+	return fmt.Sprintf("e%d", ev.Seq)
 }
 
 // toonizeToolContent 在「事件 → 模型消息」投影层把工具结果的 Content 做确定性
