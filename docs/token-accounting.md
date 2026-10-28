@@ -382,6 +382,32 @@ default:
 | `dsc-billion-context` | `last_usage_tokens` | 它的真实载荷是自己渲染出的视图 |
 | 宿主 TUI | `HostContextMeters.ContextTokens`（agent 随帧上报的投影） | 只保管与发布，不重算 |
 
+### 8.1 谁在什么时候动历史（分层与顺序）
+
+多轮迭代后最容易搞混的就是这件事。按「从不可变到最激进」排列：
+
+| # | 层 | 位置 | 触发条件 | 做什么 | 会话日志 |
+|---|---|---|---|---|---|
+| 0 | 会话日志 | `session/`（`*.jsonl`） | 每次事件 | 只追加。**任何裁剪都不改它** | — |
+| 1 | 派生 | `session.DeriveMessagesLimited(n)` | 每次请求 | 事件 → 消息；`n` 只限制**从存档恢复**的历史（`config.history_injection`），当前进程内的轮次不受影响 | 不改 |
+| 2 | agent 请求级裁剪 | `plugins/agent-react-loop`：`trimToWindow` / `fitMessagesToWindow` / `foldOversizeMessages` | **仅当没有压缩后端**，且历史超窗 | 丢弃最旧的完整轮次（多档收紧 90%/60%/35%/15%），单条超大消息折叠为首尾 | 不改（只影响本次请求） |
+| 3 | agent 内联压缩 | 同上：`compactHistory` | **仅当没有后端**，且投影 ≥ 80% | 调模型把旧前缀摘要成一条，**写回会话**（永久） | **改写** |
+| 4 | 压缩后端改写 | `agent/pre-step`：`dsc-system`(compaction-basic) 或 `dsc-billion-context` | 有后端时**每次请求** | 按自己的策略渲染（块遮蔽 / 保留尾部 / 摘要注入）。多个插件都收到事件，但**只有 `compaction` 字段选中的那个的改写被采纳** | 通常不改（billion-context 会持久化自己的 state） |
+| 5 | 宿主收口 | `core/llm_router.go finishPreStep` + `core/context_ceiling.go` | 每次请求（改写之后） | 量最终表面；超窗先请后端紧急压缩一次（`agent/request-error`），仍超才从头部丢到 90% 窗口 | 不改 |
+| 6 | 展示口径 | `HostContextMeters`（`NoteActualSurface` / `ContextTokens`） | 每次请求 | 把「实际发出去的大小」发布给 TUI；不是另算一份 | 不改 |
+
+几条由此推出的结论：
+
+- **同时只有一条裁剪路径在干活**：有后端时是 4（+5 兜底），没有后端时是 2/3。所以
+  「为什么我看到的裁剪数变了」先确认 `compaction` 配的是哪个后端、它是否真的加载了
+  （`CompactionBackendState`）。
+- **前四层里只有第 3 层会写回会话**，其余都只影响「这一次请求」。所以「切回大窗口还能
+  看到原文」成立的前提是没走内联压缩（压缩过的那段真的没了）。
+- **前端不输出任何裁剪/压缩提示**：滑动窗口是本产品的常态工作方式，不是要用户处理的
+  异常。要看诊断就开 `-log`，那里有 `context trimmed to fit the window` /
+  `oversized messages folded` / `compacting history (inline)` /
+  `llm request: trimmed to fit the context window`。
+
 ---
 
 ## 9. 规范清单
@@ -390,6 +416,8 @@ default:
 
 - 估算只用 `core/token_meter.go` 的公式，插件经 `dsc.Estimate*`。
 - 「请求大小」= 消息 + 工具目录，任何压力/裁剪/预算都不得漏工具。
+- **裁剪/压缩/折叠只记日志，不输出到前端**（`agent.logger` / 宿主 `m.logger`，`-log` 可见）：
+  这些是常态运行状态，不是需要用户处理的异常；打到消息区只会把对话刷成同一句话。
 - **发出去的请求必须有硬上限**：pre-step 改写后的表面超窗时，必须由宿主收口（§7.2），
   不允许「渲染多大就发多大」。后端没有「必须塞进窗口」的义务，provider 的 400 不是可接受的
   检测手段。
