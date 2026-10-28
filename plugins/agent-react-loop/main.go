@@ -521,16 +521,18 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
-		// 有压缩后端时**不做请求级裁剪**：裁剪会改变消息在列表里的位置，而后端给
-		// 消息分配引用是按位置的（msg-<idx> → mNNNNN）。一旦丢掉头部，同一个 mNNNNN
-		// 就落到了另一条消息身上——已有的压缩块于是遮错内容（实测同一会话内渲染结果
-		// 在 169K 与 26K 之间逐步交替，把模型当前的工作内容也一起遮掉），前缀缓存
-		// 也跟着失效。后端看完整 append-only 历史才谈得上稳定寻址，窗口适配本就是它
-		// 的职责（也是它能压到窗口内的唯一前提）。
+		// 有压缩后端时**不做请求级裁剪**：这里拿到的是改写**前**的列表，裁它等于在
+		// 后端接手之前就替它丢了材料——而后端的状态（块覆盖、保留区）是按完整
+		// append-only 历史建立的，喂它一份被裁过的列表会让覆盖关系错位，渲染结果在
+		// 相邻两步之间摆动（实测 1M 窗口下 169K/26.5K 交替），前缀缓存每步失效。
 		//
-		// 压不下来的兜底不是盲发：provider 4xx → 宿主 request-error → 后端紧急压缩
-		// → 重试（见 notify 的 retry 采纳）。因此这里也不再做「单轮超窗」硬报错，
-		// 那是拿**改写前**的规模去判**改写后**的请求，有后端时必然误判。
+		// 「谁保证发出去的 ≤ 窗口」由宿主统一收口：pre-step 改写完成后、请求发出之前，
+		// 宿主量最终表面并按需裁剪（core/context_ceiling.go，超窗时先请后端紧急压缩，
+		// 压不下去才丢最旧的一段）。那里看到的是**真正要发的那一份**，且消息身份已是
+		// 宿主下发的稳定 id，裁剪不会让压缩块指错消息。
+		//
+		// 因此这里也不再做「单轮超窗」硬报错，那是拿**改写前**的规模去判**改写后**的
+		// 请求，有后端时必然误判。
 		var droppedMsgs int
 		if !a.hasCompactionBackend {
 			msgs, droppedMsgs = a.trimToWindow(msgs, availableTools, projectedTokens)

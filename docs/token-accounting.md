@@ -310,6 +310,32 @@ default:
   （`notify` 只采纳选定后端的 `retry`）。
 - 无后端时裁剪照旧（§11「动裁剪逻辑」），两条路径不要互相「统一」。
 
+### 7.2 发出去的那一份必须有硬上限（宿主侧收口）
+
+§7.1 的「agent 不裁剪」有个必须补的另一半：**谁保证最终发出去的 ≤ 窗口？** 谁都没有——
+后端渲染多大由它自己决定，而它并没有「必须塞进窗口」的义务。真实事故：1M 窗口的会话，
+后端把 1.66M 历史渲染成 1.07M 就发了，provider 回
+`prompt is too long: 1075596 tokens > 1048576 maximum`，整轮失败；`request-error` 的
+重试确实触发了，但每次紧急压缩只压一个范围，3 次重试仍没压到窗口以内。
+
+所以在 pre-step 改写**之后**、请求发出之前，宿主统一收口（`core/context_ceiling.go`，
+`finishPreStep`）：
+
+1. 量最终表面（消息 + 工具目录）。装得下就**一字不改**（零成本、前缀缓存不动）；
+2. 装不下先给压缩后端一次机会：复用 `agent/request-error`（code=context_window_exceeded）
+   请它紧急压缩，然后**基于原始请求**重新 pre-step 渲染（不能喂它已被裁过的列表——它的
+   状态是按完整历史建立的）。每轮只给一次机会，避免抖动；
+3. 仍装不下才丢历史：从头丢到「真实估算 × 偏差系数」落进 `90% × 窗口`。首条 system 保留，
+   保留段不以 tool 结果开头，至少保留最后一条。
+
+**偏差系数**（`estimateInflation`）是这次事故的另一半成因的修正：锚点里同时存着同一请求的
+`sentEstimate`（我们算的）与 `promptTokens`（provider 报的），两者相除就是这一模型、这类
+内容的系统性低估倍数。判定上限时用它把估算放大（上限 1.5×），而不是继续相信自己的算数。
+只放大不缩小：偏大只会白丢历史。
+
+裁剪在宿主侧重新变得安全，正是因为 §7.1 那条：**消息身份是宿主下发的稳定 id**
+（`event-<seq>`），丢掉头部不会让压缩块的 `mNNNNN` 指到别的消息——那才是当初取消裁剪的原因。
+
 配套硬约束：**消息身份必须是宿主下发的稳定 id**（`proto.Message.id`，派生时取 surface
 事件的 seq）。后端的压缩块用 `mNNNNN` 指认消息，而 `mNNNNN` 由消息 id 映射而来；一旦
 用列表下标当 id，`history_injection` 只带最近 N 条、fork、或任何裁剪都会让同一个引用
@@ -364,6 +390,9 @@ default:
 
 - 估算只用 `core/token_meter.go` 的公式，插件经 `dsc.Estimate*`。
 - 「请求大小」= 消息 + 工具目录，任何压力/裁剪/预算都不得漏工具。
+- **发出去的请求必须有硬上限**：pre-step 改写后的表面超窗时，必须由宿主收口（§7.2），
+  不允许「渲染多大就发多大」。后端没有「必须塞进窗口」的义务，provider 的 400 不是可接受的
+  检测手段。
 - **工具目录的裁剪只准在 `AllToolsProto()` 出口做**（`filterMCPCatalog`，见 §3.3.1）：
   它同时供主 agent、子代理、`run_code` 的 SDK 清单。在单一消费者旁边过滤会漏掉另外两路，
   而那两路照旧把整份目录发出去——MCP 一台服务器就可能是 7 万 tokens。
@@ -413,7 +442,9 @@ default:
 `TestEstimateProtoToolTokens`、`TestCompactionBasicMeasuresItsOwnSurface`、
 `TestLsPipedIsOnePerLine`、`TestBackendActiveSkipsHistoryTrim`（有后端时不裁）、
 `TestStableIDsSurviveHeadTrimming`（id 不随列表起点变）、
-`TestRetainBoundaryKeepsToolPairing`（压缩切点不切断 tool 配对）。
+`TestRetainBoundaryKeepsToolPairing`（压缩切点不切断 tool 配对）、
+`TestFinishPreStepTrimsOversizedRequest`（超窗请求被收口压进窗口）、
+`TestEstimateInflation`（偏差系数只放大不缩小、信封不可比时退回 1）。
 
 **构建期契约检查**：`tools/backendcheck`（builder 打包后自动跑，见 AGENTS.md
 「共享模块改动的最小验证面」）。它按 `compaction` 能力扫全部插件，用真实派生历史驱动
