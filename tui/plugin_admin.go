@@ -21,7 +21,9 @@ import (
 //     运行态 + 磁盘三方），与模型看到的是同一份事实，不维护第二份清单。
 //  2. 执行走宿主工具流水线（manager.ExecuteTool），与模型调用**同一实现**——校验、
 //     备份 config、热加载、审批语义都不在前端复制一份。
-//  3. 用户手打命令本身即授权，故注入 approval=never；工具内部的校验与回滚照旧。
+//  3. 用户手打命令本身即授权：经 core.WithUserGrant 让审批门跳过询问；工具内部的
+//     校验与回滚照旧。（不能用 approval=never 代替——never 的语义是自动拒绝，那样
+//     用户手打的安装命令会被审批门直接拒掉。）
 
 // pluginAdminTimeout 插件管理命令的超时：安装/升级要拷贝目录并热加载进程，
 // 比普通工具慢，但不能无限等（界面不能卡死）。
@@ -198,8 +200,9 @@ func (m *Model) runPluginAdmin(sub string, argv []string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), pluginAdminTimeout)
 		defer cancel()
-		// 用户手打命令即授权：审批门不必再问一次（工具内部校验与回滚不变）。
-		ctx = core.WithApprovalPolicy(ctx, "never")
+		// 用户手打命令即授权（WithUserGrant）；approval=never 同时满足「要求 never 的
+		// 工具能力闸门」（如插件安装族），两者不是同一件事。
+		ctx = core.WithUserGrant(core.WithApprovalPolicy(ctx, "never"))
 		raw, _ := json.Marshal(args)
 		text, err := manager.ExecuteTool(ctx, spec.tool, raw)
 		return pluginAdminMsg{sub: sub, text: text, err: err}

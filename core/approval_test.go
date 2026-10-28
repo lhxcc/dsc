@@ -495,3 +495,43 @@ func TestToolDeclaredApprovalEmptyReasonPasses(t *testing.T) {
 		t.Fatalf("空 reason 应正常执行，got %v", err)
 	}
 }
+
+// TestUserGrantBypassesApprovalGate 用户在前端手打命令即授权：带 core.WithUserGrant
+// 的调用不再经审批门询问。
+//
+// 为什么需要这条通道：approval=never 的语义是**自动拒绝**，斜杆命令那条路此前正是
+// 用 never 当「已批准」，于是用户手打的 /plugin install、/mcp connect 一定被拒。
+// 现在前端显式打标记，策略语义保持不变（never 仍然自动拒）。
+func TestUserGrantBypassesApprovalGate(t *testing.T) {
+	m := approvalTestManager(t, SandboxWorkspaceWrite, ApprovalAsk)
+	_ = m.toolRegistry.Register(&askApprovalTool{name: "needs_approval", reason: "changes something"})
+
+	// 手打命令（带授权标记）：直接执行
+	ctx := WithUserGrant(context.Background())
+	out, err := m.ExecuteTool(ctx, "needs_approval", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("带用户授权应放行: %v", err)
+	}
+	if out != "mock-result" {
+		t.Fatalf("out = %q", out)
+	}
+
+	// 没有授权标记 + ask 策略 + 无评审通道：fail-closed 拒绝（防止该标记被滥用成默认）
+	_, err = m.ExecuteTool(context.Background(), "needs_approval", json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "no approval channel") {
+		t.Fatalf("无授权标记应询问/失败，got %v", err)
+	}
+
+	// never 策略下仍然自动拒（授权标记之外的语义没变）
+	ctxNever := WithApprovalPolicy(context.Background(), "never")
+	_, err = m.ExecuteTool(ctxNever, "needs_approval", json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "approval prompts are disabled") {
+		t.Fatalf("never 仍应自动拒，got %v", err)
+	}
+
+	// 授权标记优先级更高：即使策略是 never 也放行（用户在 never 会话里手打命令）
+	ctxBoth := WithUserGrant(WithApprovalPolicy(context.Background(), "never"))
+	if _, err := m.ExecuteTool(ctxBoth, "needs_approval", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("手打命令在 never 会话里也应放行: %v", err)
+	}
+}
