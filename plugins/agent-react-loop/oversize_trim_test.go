@@ -568,3 +568,63 @@ func TestReportedUsageFollowsSentSurface(t *testing.T) {
 		t.Fatalf("裁剪前的投影应明显高于裁剪后（got %d vs %d）", got, a.meter.Project(sentEstimate))
 	}
 }
+
+// TestBackendActiveSkipsHistoryTrim 有压缩后端时，**不得**做请求级裁剪。
+//
+// 现场（1M 窗口、~1.6M 历史会话）：
+//   - 每一步请求都在 932K / 610K 两个规模之间交替，provider 侧对应 169K / 26.5K；
+//   - 界面上「上下文容量」也跟着百几K ↔ 廿几K 来回跳，前缀缓存每步失效。
+//
+// 根因不是压缩算法，而是裁剪与后端的**寻址方式**冲突：后端给消息分配引用按位置
+// （msg-<idx> → mNNNNN），一旦裁掉头部，同一个 mNNNNN 就落到另一条消息上——已有的
+// 压缩块遮掉了模型的当前工作内容（渲染结果因此塌到 26K），下一步裁剪深度一变又恢复。
+//
+// 不变量：有后端时派生历史原样下发（后端看完整 append-only 历史才谈得上稳定寻址），
+// 窗口适配交给后端 + request-error 重试兜底；无后端时裁剪行为不变（见本文件其余用例）。
+func TestBackendActiveSkipsHistoryTrim(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 50000
+	a.llmServiceID, a.toolServiceID = 1, 1
+	a.hasCompactionBackend = true
+	buildOversizeSession(t, a, 10, 10000) // 20 条 × 10k ≈ 200K ≈ 4 倍窗口
+
+	full := dsc.EstimateProtoMessagesTokens(a.sess.DeriveMessages())
+	if full <= a.contextWindow*2 {
+		t.Fatalf("夹具不够大：估算 %d，应至少为窗口两倍", full)
+	}
+
+	llm := &compactMockLLM{done: make(chan struct{})} // 不判超窗：真实 provider 看到的是后端改写后的视图
+	a.llmClient = llm
+	a.toolClient = &mockToolClient{}
+
+	res, err := a.runLoop(context.Background(), "继续", nil, func(f *dsc.RunStreamResponse) {})
+	if err != nil {
+		t.Fatalf("有后端时不应因「改写前超窗」整轮报错: %v", err)
+	}
+	if res.Status != "success" {
+		t.Fatalf("结果状态 = %s, 期望 success", res.Status)
+	}
+
+	llm.mu.Lock()
+	sent := llm.streamMsgs
+	calls := llm.streamCalls
+	llm.mu.Unlock()
+	if calls == 0 || len(sent) == 0 {
+		t.Fatal("主请求未发出")
+	}
+	// 1) 未裁剪：发出去的就是全量派生历史（裁剪会把它压到 0.9×窗口以下）
+	if got := dsc.EstimateProtoMessagesTokens(sent); got <= a.contextWindow {
+		t.Fatalf("有后端时历史被裁到 %d（窗口 %d）——位置的引用语义会被打断", got, a.contextWindow)
+	}
+	// 2) 最早一轮仍在（裁剪会从最旧处丢）
+	found := false
+	for _, m := range sent {
+		if strings.Contains(m.GetContent(), "#round-0") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("最早一轮历史不见了：有后端时不得做请求级裁剪")
+	}
+}

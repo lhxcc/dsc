@@ -64,6 +64,9 @@ type BillionContext struct {
 	// prunedState 启动时清理的孤儿状态文件数（首次 pre-step 时随窗口日志一起打印：
 	// 启动期 stderr 尚未被宿主转发）。
 	prunedState int
+
+	// lastMsgCount 上一次 pre-step 收到的消息条数（只用于发现「历史被外部截短」）。
+	lastMsgCount int
 }
 
 func main() {
@@ -383,6 +386,22 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// 转换为 acp 核心消息格式
 	coreMsgs := bcadapter.ToCoreMessages(protoMsgs, nil)
+
+	// 位置引用的**前提**：pre-step 收到的必须是 append-only 全量历史——消息 id 是
+	// 列表下标（msg-<idx>），压缩块用它寻址。历史一旦被截短（宿主做了请求级裁剪、
+	// 用户改了恢复历史条数、会话 fork），同一个 mNNNNN 就落到别的消息上，块会遮错
+	// 内容，渲染结果在相邻两步之间剧烈摆动（实测 169K ↔ 26K），前缀缓存随之失效。
+	//
+	// 这里只告警、不做补偿：插件无从得知「被谁截掉了哪些」，自己猜着平移引用只会把
+	// 错误藏得更深。该修的是「谁在截历史」——agent 有压缩后端时本就不该做请求级裁剪。
+	bc.mu.Lock()
+	prevCount := bc.lastMsgCount
+	bc.lastMsgCount = len(coreMsgs)
+	bc.mu.Unlock()
+	if prevCount > 0 && len(coreMsgs) < prevCount {
+		fmt.Fprintf(os.Stderr, "[billion-context] history shrank %d -> %d messages: positional refs (msg-<idx> -> mNNNNN) may now point at different messages; block coverage is unreliable for this request\n",
+			prevCount, len(coreMsgs))
+	}
 
 	// 缓存消息列表供 handleCompress 使用（解决"compress 工具调用时无消息列表"的致命 bug）
 	bc.mu.Lock()

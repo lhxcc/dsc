@@ -521,7 +521,20 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
-		msgs, droppedMsgs := a.trimToWindow(msgs, availableTools, projectedTokens)
+		// 有压缩后端时**不做请求级裁剪**：裁剪会改变消息在列表里的位置，而后端给
+		// 消息分配引用是按位置的（msg-<idx> → mNNNNN）。一旦丢掉头部，同一个 mNNNNN
+		// 就落到了另一条消息身上——已有的压缩块于是遮错内容（实测同一会话内渲染结果
+		// 在 169K 与 26K 之间逐步交替，把模型当前的工作内容也一起遮掉），前缀缓存
+		// 也跟着失效。后端看完整 append-only 历史才谈得上稳定寻址，窗口适配本就是它
+		// 的职责（也是它能压到窗口内的唯一前提）。
+		//
+		// 压不下来的兜底不是盲发：provider 4xx → 宿主 request-error → 后端紧急压缩
+		// → 重试（见 notify 的 retry 采纳）。因此这里也不再做「单轮超窗」硬报错，
+		// 那是拿**改写前**的规模去判**改写后**的请求，有后端时必然误判。
+		var droppedMsgs int
+		if !a.hasCompactionBackend {
+			msgs, droppedMsgs = a.trimToWindow(msgs, availableTools, projectedTokens)
+		}
 		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
 		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
 		// 掉的内容重新装回去——等于白折。
@@ -548,7 +561,9 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 裁剪只能从「最旧的完整轮次」开始丢，遇到「这一轮本身就超窗」（一次巨大的工具
 		// 输出、一次长粘贴）时它无历史可裁——以前只能整轮失败。折叠一条消息（丢掉中间的
 		// 过程、保留头尾与结论）比让整轮一事无成要强；会话还能继续走下去。
-		if a.contextWindow > 0 && !a.fitsWindow(msgs, availableTools) {
+		// 有压缩后端时不做：后端改写后的载荷由它自己负责，这里折叠只会重复劳动，
+		// 而且折叠会改写正文（位置不变，但内容变了），白白牺牲前缀缓存。
+		if a.contextWindow > 0 && !a.hasCompactionBackend && !a.fitsWindow(msgs, availableTools) {
 			if folded, n := a.foldOversizeMessages(msgs, availableTools); n > 0 {
 				msgs = folded
 				historySlimmed = true
@@ -577,7 +592,10 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 
 		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
 		// 被 provider 拒绝的请求。
-		if a.contextWindow > 0 {
+		// 有压缩后端时不做这个判定：这里量的是**改写前**的列表，而真正发出去的是后端
+		// 渲染后的视图（可能小一个数量级）。拿前者判后者会把一个完全装得下的请求判死，
+		// 正是「1M 窗口、历史 1.6M、后端已压到 170K 却整轮报单轮超窗」的成因。
+		if a.contextWindow > 0 && !a.hasCompactionBackend {
 			// 工具目录同样占窗口：只算消息会把「单轮超窗」判晚。
 			// 报错取两个口径的较严者——投影（实测为底数）与估算都可能偏，取大者才不会
 			// 出现「判定说装得下、provider 说超窗」。
