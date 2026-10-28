@@ -1,8 +1,10 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +34,25 @@ type MCPClient struct {
 	httpClient *http.Client
 	tools      map[string]*MCPTool // rawName → tool
 	manager    *Manager
+
+	// sessionID 是 initialize 响应头 Mcp-Session-Id 带回的会话标识。
+	//
+	// streamable HTTP 传输把「一次连接」建模成服务端会话：initialize 的响应用
+	// `Mcp-Session-Id` 头下发标识，**之后每个请求都必须原样回带**，否则服务端直接
+	// 400（"Bad Request: Mcp-Session-Id header is required"）。此前这里完全没保存
+	// 这个头，于是 initialize 成功、紧接着的 tools/list 就 400——连接看起来「连不上」，
+	// 实际是第二次请求被拒，一个工具也注册不上。
+	sessionID string
+	// protocolVersion 是 initialize 协商出的版本，后续请求按规范放在
+	// MCP-Protocol-Version 头里（缺失时部分服务端直接拒绝）。
+	protocolVersion string
+	// nextID 下一次请求的 JSON-RPC id（单调递增的小整数）。
+	//
+	// 不能用 time.Now().UnixNano()：那串值约 1.79e18，超过 IEEE-754 的安全整数
+	// 上限 2^53。服务端是 JS（官方 SDK 就是），解析后数值被舍入，严格校验会直接判
+	// 「Invalid JSON-RPC message」并回 400——实测同一个 tools/call，小整数 200、
+	// UnixNano 400、字符串 200。id 只用于配对响应，小整数足够且无精度问题。
+	nextID int64
 }
 
 // MCPTool 一个经 MCP 桥接的工具。
@@ -62,12 +83,26 @@ func NewMCPClient(mgr *Manager, serverName, endpoint string) (*MCPClient, error)
 	}, nil
 }
 
-// Connect 连接 MCP 服务器并发现工具。
+// nextRequestID 取下一个请求 id（小整数，单调递增，永不超出 2^53）。
+func (c *MCPClient) nextRequestID() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextID++
+	return c.nextID
+}
+
+// Connect 连接 MCP 服务器并发现工具。重复调用即重新握手（工具会被重复注册，
+// 注册表按名字覆盖，幂等）。
 func (c *MCPClient) Connect(ctx context.Context) error {
+	// 清空上一次的会话：重连必须拿新会话，旧 id 在新连接上一定 404
+	c.mu.Lock()
+	c.sessionID = ""
+	c.mu.Unlock()
+
 	// MCP 协议：发送 initialize 请求
 	initReq := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      1,
+		"id":      c.nextRequestID(),
 		"method":  "initialize",
 		"params": map[string]any{
 			"protocolVersion": "2024-11-05",
@@ -83,10 +118,15 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("MCP initialize failed: %w", err)
 	}
-	_ = resp
-	// 验证响应中有 capabilities
-	if _, ok := resp["result"]; !ok {
+	// 验证响应中有 capabilities；记下协商出的协议版本，后续请求要带
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
 		return fmt.Errorf("MCP initialize: no result in response")
+	}
+	if v, ok := result["protocolVersion"].(string); ok && v != "" {
+		c.mu.Lock()
+		c.protocolVersion = v
+		c.mu.Unlock()
 	}
 
 	// 发送 initialized 通知
@@ -104,7 +144,7 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 func (c *MCPClient) discoverTools(ctx context.Context) error {
 	listReq := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      2,
+		"id":      c.nextRequestID(),
 		"method":  "tools/list",
 		"params":  map[string]any{},
 	}
@@ -173,7 +213,7 @@ func (c *MCPClient) discoverTools(ctx context.Context) error {
 func (c *MCPClient) CallTool(ctx context.Context, rawName string, args json.RawMessage) (string, error) {
 	callReq := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      time.Now().UnixNano(),
+		"id":      c.nextRequestID(),
 		"method":  "tools/call",
 		"params": map[string]any{
 			"name":      rawName,
@@ -182,6 +222,13 @@ func (c *MCPClient) CallTool(ctx context.Context, rawName string, args json.RawM
 	}
 
 	resp, err := c.doJSON(ctx, callReq)
+	if errors.Is(err, errMCPSessionExpired) {
+		// 服务端重启或会话超时：重新握手一次再试，别把「会话过期」报成工具失败
+		if cerr := c.Connect(ctx); cerr != nil {
+			return "", fmt.Errorf("MCP tools/call %q: session expired and reconnect failed: %w", rawName, cerr)
+		}
+		resp, err = c.doJSON(ctx, callReq)
+	}
 	if err != nil {
 		return "", fmt.Errorf("MCP tools/call %q failed: %w", rawName, err)
 	}
@@ -252,13 +299,17 @@ func (c *MCPClient) Tools() []*MCPTool {
 // 新版服务器经 Accept 头检测客户端能力——缺 text/event-stream 会返回
 // HTTP 406 "Not Acceptable"。设上两个类型后，旧版服务器忽略 Accept、
 // 新版服务器选择其中一种响应（简单请求通常返回 application/json）。
+// errMCPSessionExpired 表示服务端不再认识当前会话（streamable HTTP 的 404）。
+// 调用方据此重新 initialize，而不是把「会话过期」当成工具调用失败。
+var errMCPSessionExpired = fmt.Errorf("mcp: session expired")
+
 func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]any, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, strings.NewReader(string(body)))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -268,25 +319,50 @@ func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]
 	// 旧版 JSON-RPC 服务器忽略 Accept 头，不受影响。
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
 
+	c.mu.Lock()
+	sid, ver := c.sessionID, c.protocolVersion
+	c.mu.Unlock()
+	if sid != "" {
+		httpReq.Header.Set("Mcp-Session-Id", sid)
+	}
+	if ver != "" {
+		httpReq.Header.Set("MCP-Protocol-Version", ver)
+	}
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	// 服务端可能在任意响应上重新下发会话标识（initialize 一定有），有就更新。
+	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" && newSID != sid {
+		c.mu.Lock()
+		c.sessionID = newSID
+		c.mu.Unlock()
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		// 正常响应，按内容类型解析（JSON 或 SSE）
+	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
+		// 通知（如 notifications/initialized）按规范回 202/204 且无正文
+		return map[string]any{}, nil
+	case resp.StatusCode == http.StatusNotFound && sid != "":
+		// 会话已失效：交给调用方重新 initialize
+		return nil, errMCPSessionExpired
+	default:
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
 	// streamable-http 服务器可能以 text/event-stream（SSE）响应：
-	// 每行 "data: <json>\n\n" 格式。取首个 data: 行的 JSON 负载解析。
-	contentType := resp.Header.Get("Content-Type")
-	if strings.Contains(contentType, "text/event-stream") {
+	// 每行 "data: <json>\n\n" 格式。
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
 		return ParseSSEResponse(respBody)
 	}
 
@@ -294,7 +370,6 @@ func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("invalid JSON response: %w", err)
 	}
-
 	return result, nil
 }
 

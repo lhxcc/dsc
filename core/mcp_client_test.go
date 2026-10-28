@@ -1,7 +1,15 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestMCPPublicName(t *testing.T) {
@@ -86,4 +94,93 @@ func repeatStr(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+// TestMCPClientKeepsSessionAndUsesSafeID 客户端必须做对 streamable HTTP 的两件事，
+// 否则「连不上」：
+//
+//  1. initialize 响应头 Mcp-Session-Id 必须保存，并在**之后每个请求**上回带。
+//     缺了它，服务端（官方 SDK）直接 400 "Bad Request: Mcp-Session-Id header is
+//     required"——现场就是这样：initialize 成功、tools/list 立刻 400，一个 MCP 工具
+//     都注册不上，模型只好去 shell 里另起一个 dsc。
+//  2. JSON-RPC id 必须是小整数。原先用 time.Now().UnixNano()（≈1.79e18），超过
+//     IEEE-754 安全整数 2^53，JS 服务端解析后判 "Invalid JSON-RPC message" 回 400；
+//     实测同一请求：小整数 200、UnixNano 400、字符串 200。
+//
+// 这个假服务端照着官方 SDK 的行为校验这两点，所以一旦退回旧实现就会红。
+func TestMCPClientKeepsSessionAndUsesSafeID(t *testing.T) {
+	const sessionID = "sess-1"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// 请求体形态校验：id 必须能解析成不超过 2^53 的整数（模拟 JS 服务端的严格校验）
+		if len(req.ID) > 0 && string(req.ID) != "null" {
+			raw := strings.Trim(string(req.ID), `"`)
+			n, err := strconv.ParseFloat(raw, 64)
+			if err != nil || n > 9007199254740992 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error: Invalid JSON-RPC message"},"id":null}`))
+				return
+			}
+		}
+
+		if req.Method == "initialize" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Mcp-Session-Id", sessionID)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}`))
+			return
+		}
+		// 其余请求：会话头与协议版本头必须齐
+		if r.Header.Get("Mcp-Session-Id") != sessionID {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: Mcp-Session-Id header is required"},"id":null}`))
+			return
+		}
+		if r.Header.Get("Mcp-Protocol-Version") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"missing MCP-Protocol-Version"},"id":null}`))
+			return
+		}
+		switch req.Method {
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","description":"ping tool","inputSchema":{"type":"object"}}]}}`))
+		case "tools/call":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"pong"}]}}`))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := NewMCPClient(nil, "fake", srv.URL)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	tools := c.Tools()
+	if len(tools) != 1 || tools[0].Name != "mcp__fake__ping" {
+		t.Fatalf("工具发现结果 = %+v", tools)
+	}
+	out, err := c.CallTool(ctx, "ping", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if out != "pong" {
+		t.Fatalf("CallTool 返回 %q, 期望 pong", out)
+	}
 }
