@@ -216,9 +216,9 @@ func TestApplyPreStepHookCarriesLastUsageTokens(t *testing.T) {
 		SessionId: "sess-x",
 		Messages:  []*proto.Message{{Role: "user", Content: "hi"}},
 	}
-	out, err := srv.applyPreStepHook(context.Background(), req)
-	if err != nil {
-		t.Fatalf("pre-step: %v", err)
+	out, hookErr := srv.applyPreStepHook(context.Background(), req)
+	if hookErr != nil {
+		t.Fatalf("applyPreStepHook: %v", hookErr)
 	}
 	if out == nil || len(out.Messages) != 1 || out.Messages[0].Content != "hi" {
 		t.Fatalf("无改写插件时请求必须原样通过, got %+v", out)
@@ -275,7 +275,7 @@ func TestApplyPreStepHookProjectsPressure(t *testing.T) {
 	})
 	req := &proto.ChatRequest{SessionId: "sess-p", Messages: msgs, Tools: tools}
 	if _, err := srv.applyPreStepHook(context.Background(), req); err != nil {
-		t.Fatalf("pre-step: %v", err)
+		t.Fatalf("applyPreStepHook: %v", err)
 	}
 	ev := <-f.events
 	var payload AgentPreStepEvent
@@ -296,7 +296,7 @@ func TestApplyPreStepHookProjectsPressure(t *testing.T) {
 	otherTools := []*proto.Tool{{Name: "shell2", Description: "run2", ParametersJson: `{"type":"object"}`}}
 	req2 := &proto.ChatRequest{SessionId: "sess-p", Messages: msgs, Tools: otherTools}
 	if _, err := srv.applyPreStepHook(context.Background(), req2); err != nil {
-		t.Fatalf("pre-step: %v", err)
+		t.Fatalf("applyPreStepHook: %v", err)
 	}
 	ev2 := <-f.events
 	var payload2 AgentPreStepEvent

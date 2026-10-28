@@ -40,14 +40,57 @@ func TestCapMessagesToWindowKeepsSystemAndPairing(t *testing.T) {
 	if kept[len(kept)-1].GetContent() != msgs[len(msgs)-1].GetContent() {
 		t.Fatal("最后一条不能被裁掉")
 	}
-	if kept[1].GetRole() == "tool" {
+	// 窗口开头是一行「切除说明」，之后才是保留段
+	if !strings.HasPrefix(kept[1].GetContent(), "[滑窗]") {
+		t.Fatalf("第二条应是滑窗切除说明，实际 %q", kept[1].GetContent()[:40])
+	}
+	if kept[2].GetRole() == "tool" {
 		t.Fatal("保留段不能以 tool 结果开头（孤儿结果会让 provider 直接 400）")
 	}
 	if got := EstimateProtoMessagesTokens(kept); got > limit {
-		t.Fatalf("裁剪后仍超预算：%d > %d", got, limit)
+		t.Fatalf("裁剪后仍超预算：%d > %d（说明切除说明没算进预算）", got, limit)
 	}
-	if len(kept) != len(msgs)-dropped-0 && len(kept) != len(msgs)-dropped {
-		t.Fatalf("条数不自洽：原 %d，丢 %d，留 %d", len(msgs), dropped, len(kept))
+	if len(kept) != len(msgs)-dropped+1 {
+		t.Fatalf("条数不自洽：原 %d，丢 %d，留 %d（留 = 原 - 丢 + 1 条切除说明）", len(msgs), dropped, len(kept))
+	}
+}
+
+// TestSlideKeepsOriginalMessages 滑窗的**不变量**：窗口里除了开头那一行说明，每条都是
+// 原始消息本身——同一个对象、内容一字不改。
+//
+// 这不是「实现细节」：滑窗的语义是「换一个起点重新读同一份历史」。一旦某条消息被折叠、
+// 截断或摘要替换，它就不再是原文，模型看到的是一份被改写过的对话，而用户以为只是
+// 「从中间开始读」。所以这里按**指针相等**断言，并核对内容。
+func TestSlideKeepsOriginalMessages(t *testing.T) {
+	msgs := []*proto.Message{{Role: "system", Content: "部署指令"}}
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, mkTurn(i, "abcdefghij")...)
+	}
+	limit := EstimateProtoMessagesTokens(msgs) / 5
+
+	kept, dropped := CapMessagesToWindow(msgs, 0, limit)
+	if dropped == 0 {
+		t.Fatal("夹具应触发裁剪")
+	}
+	if kept[0] != msgs[0] {
+		t.Fatal("首条 system 应是原对象（指针相等）")
+	}
+	if !strings.HasPrefix(kept[1].GetContent(), "[滑窗]") || kept[1].GetRole() != "system" {
+		t.Fatalf("第二条应是切除说明，实际 %+v", kept[1])
+	}
+	// 其余全部是原始指针，且内容未被改写
+	body := kept[2:]
+	want := msgs[len(msgs)-len(body):]
+	if len(body) == 0 {
+		t.Fatal("保留段不应为空")
+	}
+	for i := range body {
+		if body[i] != want[i] {
+			t.Fatalf("第 %d 条不是原对象（滑窗不得复制/改写消息）", i)
+		}
+	}
+	if len(body) != len(msgs)-1-dropped {
+		t.Fatalf("保留条数 = %d，丢 %d，原 %d", len(body), dropped, len(msgs))
 	}
 }
 
@@ -75,16 +118,19 @@ func TestEnforceRequestCeilingAppliesInflation(t *testing.T) {
 		t.Fatalf("夹具不足：%d", raw)
 	}
 
-	trimmed, dropped, _, _ := enforceRequestCeiling(msgs, 0, window, 1)
+	trimmed, dropped, _, _, fits := enforceRequestCeiling(msgs, 0, window, 1)
 	if dropped == 0 {
 		t.Fatal("超窗必须裁")
 	}
 	if got := sizeOf(trimmed); got > int(float64(window)*contextCeilingRatio) {
 		t.Fatalf("裁剪后仍超 90%% 上限：%d", got)
 	}
+	if !fits {
+		t.Fatal("这个夹具丢完历史应该装得下（每条约 260K，窗口 1M）")
+	}
 
 	// 放大系数只会更严
-	trimmed2, _, _, _ := enforceRequestCeiling(msgs, 0, window, 1.2)
+	trimmed2, _, _, _, _ := enforceRequestCeiling(msgs, 0, window, 1.2)
 	if sizeOf(trimmed2) > sizeOf(trimmed) {
 		t.Fatal("放大系数应让结果更小")
 	}
@@ -151,7 +197,11 @@ func TestFinishPreStepTrimsOversizedRequest(t *testing.T) {
 		t.Fatalf("夹具不足：%d 未超窗口 %d", sizeOf(msgs), m.contextWindow)
 	}
 	req := &proto.ChatRequest{Messages: msgs, SessionId: "s"}
-	out, dropped := srv.finishPreStep(req, msgs, false)
+	out, err := srv.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("finishPreStep: %v", err)
+	}
+	dropped := len(msgs) - len(out.Messages)
 	if dropped == 0 {
 		t.Fatal("应发生裁剪")
 	}
@@ -186,7 +236,7 @@ func TestFinishPreStepKeepsFittingRequestUntouched(t *testing.T) {
 	srv := &llmAggregateServer{m: m}
 	msgs := []*proto.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: "hi"}}
 	req := &proto.ChatRequest{Messages: msgs, SessionId: "s"}
-	if out, dropped := srv.finishPreStep(req, msgs, false); out != req || dropped != 0 {
+	if out, err := srv.finishPreStep(req, msgs, false); err != nil || out != req {
 		t.Fatal("装得下应原样返回同一个请求且不裁")
 	}
 }
@@ -225,7 +275,7 @@ func TestOverWindowSlidesInsteadOfAskingBackendToCompress(t *testing.T) {
 	srv := &llmAggregateServer{m: m}
 	out, err := srv.applyPreStepHook(context.Background(), &proto.ChatRequest{SessionId: "s", Messages: msgs})
 	if err != nil {
-		t.Fatalf("pre-step: %v", err)
+		t.Fatalf("applyPreStepHook: %v", err)
 	}
 	if got := sizeOf(out.Messages) + EstimateProtoToolTokens(out.Tools); got > m.contextWindow {
 		t.Fatalf("发出的请求仍超窗：%d > %d", got, m.contextWindow)
@@ -252,5 +302,33 @@ func TestOverWindowSlidesInsteadOfAskingBackendToCompress(t *testing.T) {
 	}
 	if preSteps != 1 {
 		t.Fatalf("pre-step 应只跑一次（不重来），实际 %d 次", preSteps)
+	}
+}
+
+// TestSingleOversizedMessageFailsLocally 单条消息本身超窗时：本地明确报错，**不**改写原文、
+// 也不发出去换一个 400。
+//
+// 这是滑窗的边界：它能丢的只有「更早的消息」，丢不掉「这一轮本身就是 200K」。可选的错误
+// 做法有两种——把这条消息截断（模型看到的不再是原文，而用户以为只是滑窗），或者照发然后
+// 靠 provider 报错（把一轮失败当检测手段）。两种都不做，直接说清「你这一轮太大了」。
+func TestSingleOversizedMessageFailsLocally(t *testing.T) {
+	m := newRouterManager()
+	m.contextWindow = 2000
+	big := &proto.Message{Role: "user", Content: strings.Repeat("数据", 20_000)} // ≈60K tokens
+	orig := big.Content
+
+	srv := &llmAggregateServer{m: m}
+	_, err := srv.applyPreStepHook(context.Background(), &proto.ChatRequest{
+		SessionId: "s",
+		Messages:  []*proto.Message{{Role: "system", Content: "sys"}, big},
+	})
+	if err == nil {
+		t.Fatal("单条超窗应在本地报错")
+	}
+	if !strings.Contains(err.Error(), "超出上下文窗口") {
+		t.Fatalf("错误应说清是超窗: %v", err)
+	}
+	if big.Content != orig || len(big.Content) != len(orig) {
+		t.Fatal("不得截断/改写原文（那会让「窗口内都是原文」不成立）")
 	}
 }

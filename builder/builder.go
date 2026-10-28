@@ -188,7 +188,7 @@ func main() {
 // 因此对任何后端都成立。
 //
 // DSC_SKIP_BACKENDCHECK=false 可显式关闭（opt-out）：仅在确认检查本身不可用
-//（如目标平台无法启动插件）时用于紧急出包，正常构建不应关闭。
+// （如目标平台无法启动插件）时用于紧急出包，正常构建不应关闭。
 func verifyBackendContracts(repoRoot string, p platform) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DSC_SKIP_BACKENDCHECK"))) {
 	case "false", "0":

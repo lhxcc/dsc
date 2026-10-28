@@ -91,7 +91,10 @@ func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
 
 	srv := &llmAggregateServer{m: m}
 	req := &proto.ChatRequest{SessionId: "sess-x", Messages: big, Tools: tools}
-	out, _ := srv.applyPreStepHook(context.Background(), req)
+	out, hookErr := srv.applyPreStepHook(context.Background(), req)
+	if hookErr != nil {
+		t.Fatalf("applyPreStepHook: %v", hookErr)
+	}
 	if len(out.Messages) != 2 || out.Messages[1].Content != "tail" {
 		t.Fatalf("改写未生效: %+v", out.Messages)
 	}
@@ -105,7 +108,9 @@ func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
 
 	// 下一步没有插件改写（result 为空）：展示退回 agent 上报的投影
 	f.eventResult = ""
-	_, _ = srv.applyPreStepHook(context.Background(), req)
+	if _, err := srv.applyPreStepHook(context.Background(), req); err != nil {
+		t.Fatalf("applyPreStepHook: %v", err)
+	}
 	if got := m.ContextTokens("sess-x"); got != 180_000 {
 		t.Fatalf("未改写的一步应回到上报投影 180000，got %d", got)
 	}
@@ -150,7 +155,9 @@ func TestPreStepWithoutRewriteClearsStaleActualSurface(t *testing.T) {
 	// 本步没有任何 hook 客户端（提前返回路径）→ 必须清掉残留
 	srv := &llmAggregateServer{m: m}
 	req := &proto.ChatRequest{SessionId: "sess-x", Messages: []*proto.Message{{Role: "user", Content: "hi"}}}
-	_, _ = srv.applyPreStepHook(context.Background(), req)
+	if _, err := srv.applyPreStepHook(context.Background(), req); err != nil {
+		t.Fatalf("applyPreStepHook: %v", err)
+	}
 	if got := m.ContextTokens("sess-x"); got != 731_391 {
 		t.Fatalf("未改写的一步应回到上报投影 731391，got %d（残留的实际表面没被清掉）", got)
 	}
