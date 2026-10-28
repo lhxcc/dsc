@@ -376,6 +376,9 @@ type Model struct {
 
 	// 当前会话 id（初始 default；/session 切换或新建时更新，供 /export 使用）
 	currentSessionID string
+	// inputTheme 是终端底色的探测结果（见 inputTheme）。输入区据此选择正文
+	// 前景色；零值（未探测到）表示沿用终端默认前景。
+	inputTheme inputTheme
 	// 用户评审通道：program 供 askProvider 把问题送进事件循环；question 为待回答的问题
 	program  *tea.Program
 	question *pendingQuestion
@@ -460,10 +463,9 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		key.WithHelp("ctrl+j/shift+enter", "换行"),
 	)
 	// 输入区配色：textarea 默认的 Focused.Text 不带前景色（完全继承终端默认
-	// 前景），在「深色背景 + 深色默认前景」的终端主题上会黑底黑字。先按深色
-	// 主题给默认值，Init 再向终端查询实际底色并据此自适应（见 applyInputPalette
-	// 与 BackgroundColorMsg）。
-	applyInputPalette(&input, true)
+	// 前景）。先按「底色未知」给默认值（保留继承），Init 再向终端查询实际底色，
+	// 探测到后按明暗写死高对比前景（见 applyInputPalette 与 BackgroundColorMsg）。
+	applyInputPalette(&input, inputThemeUnknown)
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -565,16 +567,32 @@ func mouseCaptureOffByDefault() bool {
 	return v != "" && v != "0"
 }
 
-// applyInputPalette 按终端明暗设置输入区配色。textarea 的默认 Focused.Text
-// 没有前景色（完全继承终端默认前景），在「深底深字」的主题下会黑底黑字；
-// 这里显式给出高对比前景色，提示符与真实光标沿用主题 accent。
-func applyInputPalette(input *textarea.Model, isDark bool) {
-	textHex, hintHex := inputPaletteFor(isDark)
-	styles := textarea.DefaultStyles(isDark)
-	styles.Focused.Base = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
-	styles.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
+// inputTheme 是终端底色的探测结果。零值表示尚未探测到：并非所有终端都回答
+// OSC 11 底色查询，此时输入区不写死正文前景，直接继承终端默认前景——默认前景
+// 本就和终端自身底色成对配好，白底自然给出深字，不会出现「浅底浅字」。
+type inputTheme int
+
+const (
+	inputThemeUnknown inputTheme = iota
+	inputThemeDark
+	inputThemeLight
+)
+
+// applyInputPalette 按终端底色给输入区配色。探测到底色时显式给出高对比正文
+// 前景（深底近白、浅底近黑）——textarea 默认的 Focused.Text 不带前景色，在
+// 「深底深字」这类主题上会黑底黑字；未探测到底色时保留继承，免得在浅色终端上
+// 反而写死成浅色字。提示符与真实光标沿用主题 accent。
+func applyInputPalette(input *textarea.Model, theme inputTheme) {
+	textHex, hintHex := inputPaletteFor(theme)
+	text := lipgloss.NewStyle()
+	if textHex != "" {
+		text = text.Foreground(lipgloss.Color(textHex))
+	}
+	styles := textarea.DefaultStyles(theme != inputThemeLight)
+	styles.Focused.Base = text
+	styles.Focused.Text = text
 	// 光标行只换前景色：默认样式会铺一层背景色，在非纯黑主题上反而形成色带。
-	styles.Focused.CursorLine = lipgloss.NewStyle().Foreground(lipgloss.Color(textHex))
+	styles.Focused.CursorLine = text
 	styles.Focused.Prompt = lipgloss.NewStyle().Foreground(accent)
 	styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color(hintHex))
 	styles.Blurred = styles.Focused
@@ -582,20 +600,28 @@ func applyInputPalette(input *textarea.Model, isDark bool) {
 	input.SetStyles(styles)
 }
 
-// inputPaletteFor 返回输入区正文（text）与占位提示（hint）的前景色：
-// 深色终端用近白正文，浅色终端用近黑正文；提示色始终比正文暗一档但仍可读。
-func inputPaletteFor(isDark bool) (text, hint string) {
-	if isDark {
+// inputPaletteFor 返回输入区正文（text）与占位提示（hint）的前景色。text 为空串
+// 表示「不写死前景」，交由终端默认前景；提示色始终比正文暗一档但仍可读。
+func inputPaletteFor(theme inputTheme) (text, hint string) {
+	switch theme {
+	case inputThemeDark:
 		return "#F2F2F2", "#7C7C7C"
+	case inputThemeLight:
+		return "#1F1F1F", "#8A8A8A"
+	default:
+		// 底色未知：占位提示取中性灰，在深底、浅底上都还能读。
+		return "", "#888888"
 	}
-	return "#1F1F1F", "#8A8A8A"
 }
 
-// Init 启动输入框焦点。
+// Init 启动输入框焦点，并向终端查询底色。
 func (m *Model) Init() tea.Cmd {
 	// 工作行时钟不在这里点火：它由 armAnim 在进入工作态时点火、离场时停止
 	// （见 workingLineVisible），启动时没有工作行可画。
-	return m.input.Focus()
+	//
+	// 底色查询的结果经 BackgroundColorMsg 回来，据此选定输入区配色；终端不回应
+	// 就一直停在 inputThemeUnknown，输入区沿用终端默认前景（见 applyInputPalette）。
+	return tea.Batch(m.input.Focus(), tea.RequestBackgroundColor)
 }
 
 // submitCmd 发起一次 agent.RunStream，结果通过 streamFrame 消息返回
@@ -798,9 +824,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.BackgroundColorMsg:
-		// 终端底色查询结果：据此选择输入区前景色（深底近白、浅底近黑），
-		// 避免默认「继承终端前景」在深底深字主题上不可读。
-		applyInputPalette(&m.input, msg.IsDark())
+		// 终端底色查询结果（由 Init 的 tea.RequestBackgroundColor 触发）：
+		// 据此选择输入区正文前景色，深底近白、浅底近黑。
+		m.inputTheme = inputThemeLight
+		if msg.IsDark() {
+			m.inputTheme = inputThemeDark
+		}
+		applyInputPalette(&m.input, m.inputTheme)
 		return m, nil
 
 	case tea.WindowSizeMsg:
