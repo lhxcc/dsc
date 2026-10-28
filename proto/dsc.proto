@@ -55,6 +55,22 @@ service ToolService {
   // 与事件总线，无需在插件启动时注入 env（避开握手时序）。
   // 旧插件未实现时返回 Unimplemented，宿主应跳过。
   rpc SetInterconnect(InterconnectRequest) returns (InterconnectResponse);
+  // GetActivity 查询某次工具调用最近一次活动的时间（由执行方在产生输出/进度时上报）。
+  //
+  // 存在的理由：活跃续命看门狗的判定在宿主（它决定「还要不要继续等」），而活动信号
+  // 只在执行方产生。ctx 跨 gRPC 传递时不会带上 ctx value，插件里的 TouchActivity 拿到
+  // 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
+  // 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
+  rpc GetActivity(GetActivityRequest) returns (GetActivityResponse);
+}
+
+message GetActivityRequest {
+  string tool_call_id = 1; // 执行方在 ExecuteTool 请求里收到的 ToolCallId
+}
+
+message GetActivityResponse {
+  // 最近一次活动时间（Unix 毫秒）。0 = 本次调用尚未上报过任何活动。
+  int64 last_activity_unix_ms = 1;
 }
 
 message InterconnectRequest {

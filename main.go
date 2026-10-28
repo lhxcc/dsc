@@ -339,8 +339,15 @@ func main() {
 	// 临时目录（操作截图等 24 小时生命周期的工具产物，宿主启动时对 temp/
 	// 内超时子目录统一清理，见 core/manager.go cleanupOldTempDirs）：未显式
 	// 配置 DSC_TEMP_DIR 时注入 <ExecDir>/temp，插件进程继承后引用解析路径一致。
+	//
+	// 目录必须在这里就建好：模型习惯写 `cd /tmp && …`，而虚拟根表把 /tmp 映射到
+	// 这个目录——它不存在时 cd 直接失败，`&&` 后面的命令一条都不跑，输出只剩一句
+	// 找不到目录，看起来就像「这个环境不支持我的写法」。
 	if os.Getenv("DSC_TEMP_DIR") == "" {
 		os.Setenv("DSC_TEMP_DIR", core.PJoin(execDir, "temp"))
+	}
+	if dir := os.Getenv("DSC_TEMP_DIR"); dir != "" {
+		_ = os.MkdirAll(dir, 0o755) // fail-soft：建不出来也不阻断启动
 	}
 
 	// 会话目录（agent 写会话日志、压缩后端插件写自己的状态文件）：

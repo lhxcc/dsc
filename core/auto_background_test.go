@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,5 +125,93 @@ func TestAutoBackgroundWithoutCapabilityStaysSync(t *testing.T) {
 	}
 	if n := len(m.jobs.List("")); n != 0 {
 		t.Fatalf("未声明能力的工具不应登记任务，job_list = %d", n)
+	}
+}
+
+// chattyTool 持续产生「活动」（模拟有输出的长命令），并实现 activityProbe。
+type chattyTool struct {
+	name     string
+	d        time.Duration
+	interval time.Duration
+
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (t *chattyTool) Name() string                      { return t.name }
+func (t *chattyTool) Description() string               { return "chatty tool" }
+func (t *chattyTool) ParametersSchema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (t *chattyTool) HasCapability(cap string) bool     { return cap == CapabilityAutoBackground }
+
+func (t *chattyTool) touch() {
+	t.mu.Lock()
+	t.last = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *chattyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	deadline := time.After(t.d)
+	tick := time.NewTicker(t.interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-deadline:
+			return "chatty-done", nil
+		case <-tick.C:
+			t.touch()
+		}
+	}
+}
+
+func (t *chattyTool) LastActivity(_ context.Context, _ string) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.last.IsZero() {
+		return time.Time{}, false
+	}
+	return t.last, true
+}
+
+// TestAutoBackgroundExtendsOnActivity 活跃续命：只要还在产生输出，前台预算不断重置，
+// 命令可以一直在前台跑完；只有真的安静下来超过预算才转后台。
+func TestAutoBackgroundExtendsOnActivity(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 100*time.Millisecond)
+	tool := &chattyTool{name: "chatty", d: 600 * time.Millisecond, interval: 40 * time.Millisecond}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	out, err := m.ExecuteTool(context.Background(), "chatty", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("ExecuteTool: %v", err)
+	}
+	if out != "chatty-done" {
+		t.Fatalf("持续有输出时应前台跑完，got %q（说明预算没有被活动重置）", out)
+	}
+	if n := len(m.jobs.List("")); n != 0 {
+		t.Fatalf("前台跑完的任务应被丢弃，job_list = %d", n)
+	}
+}
+
+// TestAutoBackgroundGoesBackgroundWhenSilent 同一个工具停止上报活动后，预算照常耗尽
+// 转后台（续命不是永久的）。
+func TestAutoBackgroundGoesBackgroundWhenSilent(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 60*time.Millisecond)
+	tool := &chattyTool{name: "quiet-after-start", d: 500 * time.Millisecond, interval: 10 * time.Second}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	tool.touch() // 只有进入时那一次活动
+
+	out, err := m.ExecuteTool(context.Background(), "quiet-after-start", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("ExecuteTool: %v", err)
+	}
+	if !strings.Contains(out, "moved to background") {
+		t.Fatalf("长时间无输出应转后台，got %q", out)
 	}
 }

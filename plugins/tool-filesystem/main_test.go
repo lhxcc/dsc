@@ -43,7 +43,7 @@ func TestFormatShellResult(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := formatShellResult(c.output, c.exitCode); got != c.want {
+			if got := formatShellResult("", c.output, c.exitCode); got != c.want {
 				t.Errorf("formatShellResult(%q, %d) = %q, want %q", c.output, c.exitCode, got, c.want)
 			}
 		})

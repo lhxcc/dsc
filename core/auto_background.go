@@ -25,15 +25,19 @@ import (
 // 与 sdk 侧 dsc.CapabilityAutoBackground 同值（对齐同一 wire token）。
 const CapabilityAutoBackground = "auto-background"
 
-// defaultAutoBackgroundGrace 前台宽限期：命令在这个时间内跑完就同步返回结果。
+// defaultAutoBackgroundGrace 前台**空闲预算**：命令前端等待期间，超过这么久没有
+// 任何输出（活动）就转入后台。
 //
-// 刻意取小（5s）：「启动一个任务」的体验必须是**立刻把控制权还给模型**。宽限期越
-// 长，模型在工具调用里干等的时间就越长，而等待期间它不能推理、任何通知与用户插话
-// 都递不进来——用户看到的就是「一说启动就卡住，直到那张结果卡消失」。5s 足够覆盖
-// ls/cat/git status 这类即时应答，真正的构建/测试/起服务会立刻转后台。
-const defaultAutoBackgroundGrace = 5 * time.Second
+// 这不是「最多等多久」：只要有输出，预算就重新计时（活跃续命），命令可以一直在
+// 前台跑完；只有真的安静下来（编译中、阻塞在网络、卡在交互）才把控制权交回模型。
+// 30s 是「这么久没动静，基本不是它能自己好起来的事」的经验值。
+const defaultAutoBackgroundGrace = 30 * time.Second
 
-// autoBackgroundGrace 生效的前台宽限期（0 = 关闭自动后台）。
+// maxAutoBackgroundForeground 前台等待的硬上限：即便命令一直在输出，也不能让模型
+// 无限期被占住——到点同样转后台（任务继续跑，只是先把它交出去）。
+const maxAutoBackgroundForeground = 10 * time.Minute
+
+// autoBackgroundGrace 生效的前台空闲预算（0 = 关闭自动后台，工具永远同步执行）。
 // 可用 DSC_AUTO_BACKGROUND_SECS 覆盖（正数秒数；0 或负数表示关闭）。
 var autoBackgroundGrace = autoBackgroundGraceFromEnv()
 
@@ -50,6 +54,12 @@ func autoBackgroundGraceFromEnv() time.Duration {
 		return 0
 	}
 	return time.Duration(n) * time.Second
+}
+
+// activityProbe 可选接口：工具能报告「本次调用最近一次活动时间」。
+// *RemoteTool 实现它（转发插件侧 GetActivity）；旧插件不实现 → 退回固定预算。
+type activityProbe interface {
+	LastActivity(ctx context.Context, callID string) (time.Time, bool)
 }
 
 // autoBackgroundable 报告该工具是否声明了自动后台能力。
@@ -114,23 +124,59 @@ func (m *Manager) runWithGrace(ctx context.Context, toolName string, argsJSON js
 	// 调用会既返回结果又弹一条「job finished」，模型被喂两遍）。
 	_ = m.jobs.Claim(jobID)
 
-	snap, out, done := m.jobs.AwaitBudget(jobID, autoBackgroundGrace)
-	if done {
-		// 宽限期内跑完 = 一次普通工具调用：结果返回，任务记录一并丢弃，
-		// 不让 job_list 里堆满一大堆 finished 的瞬时命令。
-		m.jobs.Discard(jobID)
-		view, runErr := sink.get()
-		// 管道错误（策略拒绝、执行失败）原样回到 err 通道，与同步路径完全一致；
-		// 命令非零退出不是 Go 错误（退出码已在结果文本里），照常返回结果。
-		return out, view, true, runErr
+	// 前台等待：按「距上次活动」计时（活跃续命）。有输出就重新记时，命令可以一直
+	// 在前台跑完；持续安静超过预算，或到了硬顶，就把任务转入后台、控制权还给模型。
+	// 活动来自插件侧的 GetActivity（旧插件不支持时 probe 为 nil → 退化为固定预算）。
+	var probe activityProbe
+	if tool, ok := m.toolRegistry.Get(toolName); ok {
+		probe, _ = tool.(activityProbe)
 	}
+	callID := ToolCallIDFromContext(ctx)
+	lastActivity := time.Now()
+	foregroundDeadline := lastActivity.Add(maxAutoBackgroundForeground)
 
-	// 超时：任务留在后台继续跑。必须 Release——不放开的话它落定时一声不响，
-	// 正是「长任务完成了没人知道」的老毛病。
-	m.jobs.Release(jobID)
-	result = fmt.Sprintf(
-		"Command still running after %s; moved to background (job_id: %s, status: %s). "+
-			"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill if needed.",
-		autoBackgroundGrace, jobID, snap.Status, jobID)
-	return result, "", true, nil
+	for {
+		// 单次等待不超过「剩余预算」与 250ms 的较小者：否则短预算会被一次长等待
+		// 整个吞掉（命令在预算之外又多跑了一会儿才返回，导致本该转后台的没转）。
+		wait := autoBackgroundGrace - time.Since(lastActivity)
+		if wait <= 0 {
+			wait = 0
+		}
+		if wait > 250*time.Millisecond {
+			wait = 250 * time.Millisecond
+		}
+		snap, out, done := m.jobs.AwaitBudget(jobID, wait)
+		if done {
+			// 前台跑完 = 一次普通工具调用：结果返回，任务记录一并丢弃，
+			// 不让 job_list 里堆满一大堆 finished 的瞬时命令。
+			m.jobs.Discard(jobID)
+			view, runErr := sink.get()
+			// 管道错误（策略拒绝、执行失败）原样回到 err 通道，与同步路径完全一致；
+			// 命令非零退出不是 Go 错误（退出码已在结果文本里），照常返回结果。
+			return out, view, true, runErr
+		}
+		if probe != nil {
+			if ts, ok := probe.LastActivity(ctx, callID); ok && ts.After(lastActivity) {
+				lastActivity = ts
+			}
+		}
+		idle := time.Since(lastActivity)
+		if idle < autoBackgroundGrace && time.Now().Before(foregroundDeadline) {
+			continue
+		}
+
+		// 预算耗尽（或到硬顶）：任务留在后台继续跑。必须 Release——不放开的话它落定
+		// 时一声不响，正是「长任务完成了没人知道」的老毛病。
+		m.jobs.Release(jobID)
+		reason := fmt.Sprintf("no output for %s", idle.Round(time.Second))
+		if idle < autoBackgroundGrace {
+			reason = "foreground budget exhausted"
+		}
+		m.logger.Info("auto background: moved to job", "tool", toolName, "job", jobID, "reason", reason)
+		result = fmt.Sprintf(
+			"Command still running (%s); moved to background (job_id: %s, status: %s). "+
+				"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill if needed.",
+			reason, jobID, snap.Status, jobID)
+		return result, "", true, nil
+	}
 }

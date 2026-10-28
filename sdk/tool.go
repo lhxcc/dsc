@@ -114,6 +114,10 @@ func (s *toolServiceServer) ExecuteTool(ctx context.Context, req *proto.ExecuteT
 	// 调用方身份放进 ctx：插件做「按会话隔离」的状态（持久 shell 等）时不必自己
 	// 找 session_id——它在请求里，插件侧原本根本拿不到。
 	callCtx := WithCallInfo(ctx, CallInfo{SessionID: req.GetSessionId(), ToolCallID: req.GetToolCallId()})
+	// 登记初始活动并清理收尾：宿主轮询 GetActivity 时，至少要能区分「刚进工具、
+	// 还没输出」与「跑了一阵子没有任何输出」——两者对活跃续命的意义完全不同。
+	recordActivity(req.GetToolCallId())
+	defer clearActivity(req.GetToolCallId())
 	for _, t := range s.sdk.snapshotTools() {
 		if t.Name == req.ToolName {
 			ctx = callCtx

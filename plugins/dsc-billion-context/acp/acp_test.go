@@ -133,13 +133,11 @@ func TestRenderMessagesPrefixStable(t *testing.T) {
 	_, _ = ApplyCompression(ranges1, msgs, state, config)
 
 	rendered1 := RenderMessages(msgs, state, config, true)
-	// 验证：summary 在最前（insertAt=a 的位置=0）
-	// 原版 acp-kernel 保留首条 user 消息（firstUserIndex），故 a 也保留
+	// 验证：summary 在最前（insertAt=a 的位置=0）。a、b 已被压缩进 b0，不再逐字保留——
+	// 是否保留由模型自己的压缩选择决定（首条消息在超长会话里往往是失效旧需求，不应程序钉死）。
 	if rendered1[0].ID != "acp_summary_b0" {
 		t.Errorf("first rendered = %q, want acp_summary_b0", rendered1[0].ID)
 	}
-	// 第二条应是 a（首条 user 保留规则）或 c（如果 a 在 firstUserIndex 处被替换）
-	// 原版语义：firstUserIndex 处的 a 即使被覆盖也保留——验证此行为
 	foundA := false
 	for _, m := range rendered1 {
 		if m.ID == "a" {
@@ -147,8 +145,8 @@ func TestRenderMessagesPrefixStable(t *testing.T) {
 			break
 		}
 	}
-	if !foundA {
-		t.Errorf("first user message 'a' should be retained (firstUserIndex rule)")
+	if foundA {
+		t.Errorf("first user message 'a' must NOT be force-retained once compressed")
 	}
 
 	// 现在把 rendered1 当作"上一轮发给 LLM 的消息列表"（含已渲染 summary）

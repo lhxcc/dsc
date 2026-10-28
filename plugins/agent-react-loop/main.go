@@ -131,9 +131,11 @@ type ReactLoopAgent struct {
 	// TUI 显示的就是这个数——与裁剪/压缩决策同源，不再另算一套。
 	lastContextTokens int
 
-	// lastTrimDropped 上一轮超窗裁剪省略的消息条数（0 = 未裁剪）。仅用于提示去重：
-	// 真超窗时每轮都会裁掉同样一段，逐轮打印提示只会刷屏。
-	lastTrimDropped int
+	// trimNoticeSession / foldNoticeSession：裁剪与折叠提示已提示过的会话 id。
+	// 小窗口读越窗口的会话是常态（一个项目积累数月的会话），逐轮提示等于刷屏；
+	// 每个会话只说明一次，之后静默。会话 id 变化（切会话）即自然重置。
+	trimNoticeSession string
+	foldNoticeSession string
 
 	// meter 上下文占用的唯一计量（dsc.TokenMeter）：实测锚点 + 启发式增量。
 	// 裁剪/压缩/提示文案/单轮超窗判定全部读它，不得各自再用估算另算一遍。
@@ -513,37 +515,60 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		a.usageMu.Lock()
 		a.lastContextTokens = projectedTokens
 		a.usageMu.Unlock()
-		msgs, droppedMsgs := fitMessagesToWindow(msgs, a.contextWindow, projectedTokens)
+		msgs, droppedMsgs := a.trimToWindow(msgs, availableTools, projectedTokens)
+		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
+		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
+		// 掉的内容重新装回去——等于白折。
+		historySlimmed := droppedMsgs > 0
 		if droppedMsgs > 0 {
-			if len(msgs) > 0 && msgs[0].Role == "system" {
-				// 重新构造而非复制：proto.Message 内含 protobuf 的内部状态（含 mutex），
-				// 值拷贝会触发 vet 的 copylocks 告警；system 消息只用到 role+content。
-				msgs[0] = &proto.Message{
-					Role: msgs[0].Role,
-					Content: strings.TrimRight(msgs[0].Content, "\n") + fmt.Sprintf(
-						"\n\n（注意：因当前上下文窗口仅 %d tokens，本次请求已省略较早的 %d 条对话记录；"+
-							"如需那些内容请重新读取相关文件或改用更大窗口的模型。）\n", a.contextWindow, droppedMsgs),
-				}
-			}
-			// 同一「省略条数」只在首次裁剪时提示一次：真需要裁剪时（历史确实超窗）
-			// 每轮都会裁掉同样的一段，逐轮重复打印只会把消息区刷满，没有新信息。
-			// 条数变化（历史继续增长）时才再次提示。
-			if emit != nil && droppedMsgs != a.lastTrimDropped {
+			// 不往 system 里追加「已省略 N 条」的说明：system 是缓存前缀，每次改写都会
+			// 让整段前缀缓存失效；而且小窗口读越窗口的会话是常态（一个项目积累数月的
+			// 会话），这句话会一直挂在每一轮里。信息改由下面的提示帧一次性给出。
+			//
+			// 提示只在本会话**第一次**裁剪时出现：常态事件不该反复出声，用户需要知道的
+			// 是「这个会话被裁了」这一件事，不是每轮的省略条数。
+			if emit != nil && trimNoticeEnabled() && a.trimNoticeSession != a.sess.ID() {
+				a.trimNoticeSession = a.sess.ID()
 				emit(&dsc.RunStreamResponse{
-					Output: fmt.Sprintf("\n[上下文裁剪: 预计占用 %d / %d tokens，已省略最早 %d 条消息（会话记录未删除）]\n",
-						projectedTokens, a.contextWindow, droppedMsgs),
+					Output: fmt.Sprintf("\n[上下文裁剪: 本会话历史超出 %d tokens 窗口，较早的记录将只随本次请求省略（会话记录未删除）；"+
+						"本提示只出现一次。当前预计占用 %d / %d。]\n",
+						a.contextWindow, a.projectedFit(msgs, availableTools), a.contextWindow),
 					Status: "tool",
 				})
 			}
-			a.lastTrimDropped = droppedMsgs
-		} else {
-			a.lastTrimDropped = 0
 		}
-		// 裁完仍超窗口：只可能是「单轮内容本身超窗」（例如一次粘贴 200K tokens），
-		// 无论怎么丢历史都塞不进。此时明确报错，而不是把注定被 provider 拒绝的请求发出去。
+		// 历史已裁到无可再裁，仍然超窗 → 折叠过长的单条消息（保留首尾）。
+		//
+		// 裁剪只能从「最旧的完整轮次」开始丢，遇到「这一轮本身就超窗」（一次巨大的工具
+		// 输出、一次长粘贴）时它无历史可裁——以前只能整轮失败。折叠一条消息（丢掉中间的
+		// 过程、保留头尾与结论）比让整轮一事无成要强；会话还能继续走下去。
+		if a.contextWindow > 0 && !a.fitsWindow(msgs, availableTools) {
+			if folded, n := a.foldOversizeMessages(msgs, availableTools); n > 0 {
+				msgs = folded
+				historySlimmed = true
+				// 同样只提示一次，理由同上（常态事件不出声）。
+				if emit != nil && trimNoticeEnabled() && a.foldNoticeSession != a.sess.ID() {
+					a.foldNoticeSession = a.sess.ID()
+					emit(&dsc.RunStreamResponse{
+						Output: fmt.Sprintf("\n[上下文折叠: %d 条过长消息已保留首尾（预计占用 %d / %d tokens）；本提示只出现一次。]\n",
+							n, a.projectedFit(msgs, availableTools), a.contextWindow),
+						Status: "tool",
+					})
+				}
+			}
+		}
+
+		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
+		// 被 provider 拒绝的请求。
 		if a.contextWindow > 0 {
 			// 工具目录同样占窗口：只算消息会把「单轮超窗」判晚。
-			if est := a.tokenMeter().Project(dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)); est > a.contextWindow {
+			// 报错取两个口径的较严者——投影（实测为底数）与估算都可能偏，取大者才不会
+			// 出现「判定说装得下、provider 说超窗」。
+			est := a.projectedFit(msgs, availableTools)
+			if raw := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools); raw > est {
+				est = raw
+			}
+			if est > a.contextWindow {
 				err := fmt.Errorf("单轮内容超出上下文窗口（约 %d > %d tokens）：请拆分输入、减少一次性粘贴的内容，或改用更大窗口的模型", est, a.contextWindow)
 				if emit != nil {
 					emit(&dsc.RunStreamResponse{Status: "error", Error: err.Error()})
@@ -574,7 +599,7 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		//        而压缩会把它摘要化、永久改写会话。既然本次请求已在窗口内（≤90%），
 		//        没理由为省这点余量把「留给大窗口的那部分历史」销毁掉。
 		compacted := false
-		if droppedMsgs == 0 && a.contextWindow > 0 && a.historyInjection == 0 &&
+		if !historySlimmed && a.contextWindow > 0 && a.historyInjection == 0 &&
 			float64(projectedTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
 			if emit != nil {
 				emit(&dsc.RunStreamResponse{
@@ -1476,6 +1501,24 @@ var oversizeTrimRatio = 0.90
 // ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
 var oversizeTrimTriggerRatio = 0.95
 
+// trimNoticeEnabled 是否输出裁剪/折叠的提示帧。
+//
+// 默认关闭：小窗口读超窗口的会话是**常态**——一个项目积累数月的会话，配 128K 窗口
+// 就是一台滑动窗口机器，每轮都在把最早的一段滑出去。常态事件不该出声，否则消息区
+// 会被同一句话刷满，而它从不携带新信息。需要核对时设 DSC_TRIM_NOTICE=1。
+func trimNoticeEnabled() bool {
+	return os.Getenv("DSC_TRIM_NOTICE") == "1"
+}
+
+// oversizeTrimFallbackRatios 闭环裁剪时逐档收紧的目标比例。
+//
+// 为什么要多档：裁剪按**消息估算**算预算，而超窗判定读的是 TokenMeter 的投影值
+// （provider 实测锚点 + 增量）。两者口径不同——CJK/JSON 密集的会话里实测可能是估算的
+// 两三倍，一次裁到「估算预算」往往仍旧超窗（实测现象：裁掉六千多条历史之后，判定值
+// 仍是窗口的三倍多）。所以裁完要按同一个口径复核，不满足就继续收紧，直到装得进
+// 或者确实无历史可裁（那才是真正的单轮内容超窗）。
+var oversizeTrimFallbackRatios = []float64{oversizeTrimRatio, 0.60, 0.35, 0.15}
+
 // fitMessagesToWindow 把待发历史裁进上下文窗口：允许接近上限，但不允许超过。
 //
 // 存在理由：内联压缩是把「整段历史」交给同一个模型做摘要，因此它只能处理「历史本身还
@@ -1494,10 +1537,20 @@ var oversizeTrimTriggerRatio = 0.95
 //   - 连最后一条 user 起的后缀都超窗（单轮本身超窗，如一次粘贴 200K tokens）时原样返回，
 //     由调用方报错——这种情况没有正确的自动解
 func fitMessagesToWindow(msgs []*proto.Message, window, effectiveTokens int) (out []*proto.Message, dropped int) {
+	return fitMessagesToWindowTo(msgs, window, effectiveTokens, 0, false)
+}
+
+// fitMessagesToWindowTo 与 fitMessagesToWindow 相同，但预算与「是否强制再裁」由调用方给：
+//   - budgetTokens <= 0 时用默认目标比例（oversizeTrimRatio）；
+//   - force=true 时跳过「估算显示已在窗口内」的早退——闭环收紧就是靠它反复裁。
+func fitMessagesToWindowTo(msgs []*proto.Message, window, effectiveTokens, budgetTokens int, force bool) (out []*proto.Message, dropped int) {
 	if window <= 0 || len(msgs) == 0 {
 		return msgs, 0
 	}
-	budget := int(float64(window) * oversizeTrimRatio)
+	budget := budgetTokens
+	if budget <= 0 {
+		budget = int(float64(window) * oversizeTrimRatio)
+	}
 	if effectiveTokens <= 0 {
 		// 兜底只算消息：本函数看不到工具目录。调用方应传入「消息 + 工具目录」的
 		// 整体估算（dsc.EstimateProtoMessagesTokens + dsc.EstimateProtoToolTokens），
@@ -1506,7 +1559,7 @@ func fitMessagesToWindow(msgs []*proto.Message, window, effectiveTokens int) (ou
 	}
 	// 用「已用容量」而不是「消息总估算」决定是否裁剪：前者含服务端上报值，最接近真实；
 	// 后者在图片、工具定义等未计入的部分之外还会因启发式口径漂移（见 dsc.EstimateTextTokens）。
-	if effectiveTokens <= int(float64(window)*oversizeTrimTriggerRatio) {
+	if !force && effectiveTokens <= int(float64(window)*oversizeTrimTriggerRatio) {
 		return msgs, 0 // 窗口内（含稍超压缩线）：交给压缩路径，不在这里丢历史
 	}
 	head := 0
@@ -1666,7 +1719,8 @@ func (a *ReactLoopAgent) SwitchSession(ctx context.Context, sessionID string) er
 	a.usageMu.Lock()
 	a.lastPromptTokens = 0
 	a.lastUsage = nil
-	a.lastTrimDropped = 0
+	a.trimNoticeSession = ""
+	a.foldNoticeSession = ""
 	a.usageMu.Unlock()
 	a.tokenMeter().Reset()
 	fmt.Printf("[Agent Loop] switched to session %s (%d events, last turn %d)\n",
@@ -1921,6 +1975,102 @@ func (a *ReactLoopAgent) tokenMeter() *dsc.TokenMeter {
 	return a.meter
 }
 
+// trimToWindow 把派生历史裁进窗口，返回裁剪后的消息与被丢弃的条数。
+//
+// 闭环：先按默认目标裁一次，再按**判定所用的同一口径**（投影值，含工具目录）复核，
+// 装不进就逐档收紧预算继续裁。
+//
+// 为什么不能只裁一次：裁剪按消息估算算预算，判定却读投影值（provider 实测锚点 +
+// 增量）。CJK/JSON 密集的会话里两者可能差两三倍，于是出现「估算已经裁进窗口、判定
+// 仍然超窗」——正是「省略六千多条历史之后还报 441195 / 131072」的成因。多档收紧让
+// 两边收敛到同一个数；真的无历史可裁时，才说明是单轮内容本身超窗。
+func (a *ReactLoopAgent) trimToWindow(msgs []*proto.Message, tools []*proto.Tool, projectedTokens int) ([]*proto.Message, int) {
+	if a.contextWindow <= 0 || len(msgs) == 0 {
+		return msgs, 0
+	}
+	out, dropped := fitMessagesToWindow(msgs, a.contextWindow, projectedTokens)
+	for _, ratio := range oversizeTrimFallbackRatios[1:] {
+		if a.fitsWindow(out, tools) {
+			break
+		}
+		more, d := fitMessagesToWindowTo(out, a.contextWindow, projectedTokens,
+			int(float64(a.contextWindow)*ratio), true)
+		if d <= 0 || len(more) == len(out) {
+			break // 无历史可再裁：剩下的就是这一轮内容本身
+		}
+		out, dropped = more, dropped+d
+	}
+	return out, dropped
+}
+
+// foldOversizeMessages 单条消息过长导致整轮超窗时的兜底：循环挑出最长的一条折叠
+// （保留首尾 + 标注原规模），直到投影值落进窗口或无可再折。
+//
+// 只折叠 user / tool 两类：assistant 消息里可能有 tool_calls 结构，截断会破坏调用与
+// 结果的对应关系。system 永不折叠（丢掉基础指令模型会乱答）。
+func (a *ReactLoopAgent) foldOversizeMessages(msgs []*proto.Message, tools []*proto.Tool) ([]*proto.Message, int) {
+	if a.contextWindow <= 0 || len(msgs) == 0 {
+		return msgs, 0
+	}
+	const maxPasses = 16
+	out := append([]*proto.Message(nil), msgs...)
+	folded := 0
+	for pass := 0; pass < maxPasses; pass++ {
+		if a.fitsWindow(out, tools) {
+			return out, folded
+		}
+		bestIdx, bestTokens := -1, 0
+		for i, m := range out {
+			if m.Role != "user" && m.Role != "tool" {
+				continue
+			}
+			if t := dsc.EstimateProtoMessageTokens(m); t > bestTokens {
+				bestIdx, bestTokens = i, t
+			}
+		}
+		// 太短的消息折了没意义（也说明超窗不来自消息正文，别再白折腾）
+		if bestIdx < 0 || bestTokens < 512 {
+			return out, folded
+		}
+		out[bestIdx] = foldMessage(out[bestIdx], bestTokens, a.contextWindow)
+		folded++
+	}
+	return out, folded
+}
+
+// foldMessage 把一条消息折叠为「首尾保留 + 中间标注」的形态。保留量按窗口比例给：
+// 窗口越大，能留的越多；窗口很小时宁可多折一点，也要把请求发出去。
+func foldMessage(m *proto.Message, tokens, window int) *proto.Message {
+	runes := []rune(m.Content)
+	head := window / 10
+	tail := window / 20
+	if head < 512 {
+		head = 512
+	}
+	if tail < 256 {
+		tail = 256
+	}
+	if len(runes) <= head+tail+64 {
+		return m
+	}
+	return &proto.Message{
+		Role: m.Role,
+		Content: string(runes[:head]) +
+			fmt.Sprintf("\n\n…（本条内容过长，已折叠：原约 %d tokens，保留首尾，中间过程省略）…\n\n", tokens) +
+			string(runes[len(runes)-tail:]),
+		ToolCallId: m.ToolCallId,
+		Images:     m.Images,
+	}
+}
+
+// projectedFit 报告把这份消息列表发出去的预计占用（投影口径，含工具目录）。
+//
+// 裁剪、压缩、超窗判定、界面显示全部读这一个数——口径一旦分叉就会出现「裁掉了
+// 六千条、判定却说还超窗三倍」这种自己打自己的结果。
+func (a *ReactLoopAgent) projectedFit(msgs []*proto.Message, tools []*proto.Tool) int {
+	return a.tokenMeter().Project(dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools))
+}
+
 // seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
 // 服务端 usage 可依）：
 //   - lastPromptTokens/lastUsage 供 usageSnapshot 上报「已用」；
@@ -2088,4 +2238,20 @@ func buildTodoNudgePrompt(todos []session.TodoItem) string {
 		"请逐项继续处理，直到清单清空再结束回复：完成的项、已失效或无需进行的项，"+
 		"都必须以 todo_write 更新（标记为 completed 或从清单中移除），不得保留无人处理的待办项；"+
 		"若某项暂时无法推进，请改为 in_progress 并说明阻塞原因。", len(pending), strings.Join(pending, "\n"))
+}
+
+// fitsWindow 报告这份消息列表是否装得进窗口：投影口径与估算口径**都要满足**。
+//
+// 两个口径都会偏：投影以 provider 实测为底数，在 CJK/JSON 密集的会话里可能高估两三倍
+// （于是「裁掉了六千条还判超窗」）；反过来，若锚点来自一次规模小得多的请求，投影又会
+// 低于真实估算（于是裁完发出去被 provider 拒）。所以这里取两者的较严者——宁可多裁一点，
+// 也不能把一个注定被拒的请求发出去。
+func (a *ReactLoopAgent) fitsWindow(msgs []*proto.Message, tools []*proto.Tool) bool {
+	if a.contextWindow <= 0 {
+		return true
+	}
+	if raw := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools); raw > a.contextWindow {
+		return false
+	}
+	return a.projectedFit(msgs, tools) <= a.contextWindow
 }

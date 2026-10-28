@@ -219,7 +219,7 @@ func main() {
 			return "", fmt.Errorf("failed to execute command in session: %w", err)
 		}
 
-		return formatShellResult(output, exitCode), nil
+		return formatShellResult(params.Command, output, exitCode), nil
 	}
 
 	sdk := dsc.New(dsc.Config{
@@ -331,7 +331,19 @@ func shellView(_ context.Context, _ json.RawMessage, result string) (json.RawMes
 // 最後一條是刻意的：只回 [exit_code: 0] 時，模型分不清「命令沒東西可說」與
 // 「工具沒抓到輸出」，往往把乾淨工作區的 `git status` 當成工具壞了、反复重跑。
 // 明確寫出無輸出，配合退出碼即可唯一確定「跑成功了，只是沒有任何輸出」。
-func formatShellResult(output string, exitCode int32) string {
+// formatShellResult 根據命令輸出與退出碼組裝最終返回文本：
+// - 非 0 退出碼：無論是否有輸出，都追加 [exit_code: N]。
+// - 0 退出碼且有輸出：直接返回輸出，不附加 [exit_code: 0]。
+// - 無輸出：顯式寫出 (no output)。
+//
+// 最後一條是刻意的：只回 [exit_code: 0] 時，模型分不清「命令沒東西可說」與
+// 「工具沒抓到輸出」，往往把乾淨工作區的 `git status` 當成工具壞了、反复重跑。
+// 明確寫出無輸出，配合退出碼即可唯一確定「跑成功了，只是沒有任何輸出」。
+//
+// command 用于诊断「命令链在 && 处中断」：`cd <不存在目录> && python3 << 'PY' …`
+// 每条后续命令都不会执行，输出只剩一句 cd 失败——模型极易误判成「这个环境不支持
+// heredoc / 多行脚本」，然后换着写法反复重试同一个错误。
+func formatShellResult(command, output string, exitCode int32) string {
 	// 进度条式输出先归一（ 重绘只保留最终帧，CRLF 归一为 LF）：这些中间帧模型
 	// 永远用不上，却可能占掉结果的绝大部分（实测一条 git 结果 2415 字符里 2112 是
 	// 中间帧）。渲染侧同样会归一，这里做在出口上让「模型看到＝人眼看到」。
@@ -339,10 +351,17 @@ func formatShellResult(output string, exitCode int32) string {
 	output = dsc.CollapseCarriageReturns(output)
 	empty := strings.TrimSpace(output) == ""
 	if exitCode != 0 {
+		var b strings.Builder
 		if empty {
-			return fmt.Sprintf("\n[exit_code: %d]\n(no output)\n", exitCode)
+			fmt.Fprintf(&b, "\n[exit_code: %d]\n(no output)\n", exitCode)
+		} else {
+			b.WriteString(output)
+			fmt.Fprintf(&b, "\n[exit_code: %d]\n", exitCode)
 		}
-		return output + fmt.Sprintf("\n[exit_code: %d]\n", exitCode)
+		if strings.Contains(command, "&&") {
+			b.WriteString("[note: the command chain stopped at a failing step; commands after && were not run]\n")
+		}
+		return b.String()
 	}
 	if empty {
 		return "\n[exit_code: 0]\n(no output)\n"

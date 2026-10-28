@@ -324,15 +324,6 @@ func RenderMessages(messages []CoreMessage, state *CompressionState, config Conf
 		return renderTaggedMessages(messages, state, renderTags)
 	}
 
-	// 找到第一条 user 消息索引（始终保留，即使被覆盖）
-	firstUserIndex := -1
-	for i, msg := range messages {
-		if msg.Role == RoleUser {
-			firstUserIndex = i
-			break
-		}
-	}
-
 	// 构建消息 ID → 索引映射（含已渲染 summary 的位置）
 	indexByID := map[string]int{}
 	summaryIndexByID := map[string]int{}
@@ -351,7 +342,7 @@ func RenderMessages(messages []CoreMessage, state *CompressionState, config Conf
 	anchors := collectSummaryAnchors(messages, state, indexByID, summaryIndexByID)
 
 	// 重建消息列表：在锚点位置插入 summary，跳过被覆盖的原始消息
-	out := rebuildMessagesWithAnchors(messages, covered, firstUserIndex, anchors)
+	out := rebuildMessagesWithAnchors(messages, covered, anchors)
 
 	// 清理孤儿配对（压缩边界可能切断 tool-call ↔ tool-result / reasoning ↔ assistant）
 	// 顺序对齐 acp-kernel：先 strip orphaned tool results → 再 strip orphaned tool calls
@@ -581,7 +572,7 @@ func collectSummaryAnchors(messages []CoreMessage, state *CompressionState, inde
 
 // rebuildMessagesWithAnchors 重建消息列表：在锚点位置插入 summary，跳过被覆盖的原始消息。
 // 对齐 acp-kernel rebuildMessages。
-func rebuildMessagesWithAnchors(messages []CoreMessage, covered map[string]bool, firstUserIndex int, anchors []summaryAnchor) []CoreMessage {
+func rebuildMessagesWithAnchors(messages []CoreMessage, covered map[string]bool, anchors []summaryAnchor) []CoreMessage {
 	result := make([]CoreMessage, 0, len(messages)+len(anchors))
 	anchoredSummaryIDs := map[string]bool{}
 	for _, a := range anchors {
@@ -594,11 +585,6 @@ func rebuildMessagesWithAnchors(messages []CoreMessage, covered map[string]bool,
 		for len(pending) > 0 && pending[0].insertAt == index {
 			result = append(result, renderSummary(pending[0]))
 			pending = pending[1:]
-		}
-		// 第一条 user 消息始终保留（即使被覆盖）
-		if index == firstUserIndex && firstUserIndex >= 0 {
-			result = append(result, messages[index])
-			continue
 		}
 		// 跳过被覆盖的原始消息
 		if covered[messages[index].ID] {

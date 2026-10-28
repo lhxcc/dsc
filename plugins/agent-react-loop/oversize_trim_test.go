@@ -141,10 +141,14 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 		t.Fatal("最早一轮的历史应从会话中仍然可派生（切回大窗口时应原样恢复）")
 	}
 
-	// 4) 模型被明确告知历史被省略（否则它以为自己看到了全部）
-	if len(streamMsgs) == 0 || streamMsgs[0].Role != "system" ||
-		!strings.Contains(streamMsgs[0].Content, "已省略") {
-		t.Fatalf("system 应说明历史被省略，实际首条 = %+v", streamMsgs[0])
+	// 4) system 保持原样，不追加「已省略 N 条」的说明：它是 prompt 缓存前缀，每次改写
+	//    都会让整段前缀失效；而且小窗口读越窗口会话是滑动窗口式常态，这句话会挂在
+	//    每一轮里，价值却为零（模型并不需要知道省略了几条）。
+	if len(streamMsgs) == 0 || streamMsgs[0].Role != "system" {
+		t.Fatalf("首条应为 system，实际 = %+v", streamMsgs[0])
+	}
+	if strings.Contains(streamMsgs[0].Content, "已省略") {
+		t.Fatalf("system 不得被追加省略说明（破坏前缀缓存且是常态噪声）: %q", streamMsgs[0].Content)
 	}
 
 	// 5) 用户可见提示
@@ -157,8 +161,8 @@ func TestOversizeHistoryTrimmedToWindow(t *testing.T) {
 		}
 	}
 	mu.Unlock()
-	if !notified {
-		t.Fatal("未输出上下文裁剪提示帧")
+	if notified {
+		t.Fatal("默认不应输出裁剪提示帧：小窗口读越窗口会话是滑动窗口式常态")
 	}
 }
 
@@ -207,9 +211,10 @@ func TestOversizeTrimKeepsUserBoundary(t *testing.T) {
 	}
 }
 
-// TestSingleTurnOverflowReportsError 单轮自身就超窗（当前输入一次 60k token 到 50k 窗口）：
-// 历史怎么丢都救不回来，必须明确报错且不发出请求，而不是盲发给 provider 被拒。
-func TestSingleTurnOverflowReportsError(t *testing.T) {
+// TestSingleTurnOverflowFoldsAndContinues 单轮自身就超窗（当前输入一次 60k token 到
+// 50k 窗口）：历史怎么丢都救不回来，但把这条过长的消息折叠（保留首尾、省略中间）之后
+// 请求照发——会话继续走下去，而不是整轮失败。
+func TestSingleTurnOverflowFoldsAndContinues(t *testing.T) {
 	a := newTestAgent(t)
 	a.contextWindow = 50000
 	a.llmServiceID, a.toolServiceID = 1, 1
@@ -223,33 +228,47 @@ func TestSingleTurnOverflowReportsError(t *testing.T) {
 	a.llmClient = llm
 	a.toolClient = &mockToolClient{}
 
-	var mu sync.Mutex
-	var errs []string
-	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *dsc.RunStreamResponse) {
-		if f.Error != "" {
-			mu.Lock()
-			errs = append(errs, f.Error)
-			mu.Unlock()
-		}
-	})
-	if err == nil {
-		t.Fatal("单轮超窗应报错")
+	_, err := a.runLoop(context.Background(), strings.Repeat("x", 60*1000*4), nil, func(f *dsc.RunStreamResponse) {})
+	if err != nil {
+		t.Fatalf("折叠后应能继续（原先是整轮报错），实际: %v", err)
 	}
-	if !strings.Contains(err.Error(), "单轮内容超出上下文窗口") {
-		t.Fatalf("错误文案应说明单轮超窗，实际 %v", err)
-	}
-
 	llm.mu.Lock()
 	streamCalls := len(llm.streamIn)
+	folded := false
+	for _, m := range llm.streamMsgs {
+		if strings.Contains(m.GetContent(), "已折叠") {
+			folded = true
+		}
+	}
 	llm.mu.Unlock()
-	if streamCalls != 0 {
-		t.Fatalf("单轮超窗不应发出请求，实际发了 %d 次", streamCalls)
+	if streamCalls == 0 {
+		t.Fatal("应发出请求（折叠后装进窗口）")
 	}
-	mu.Lock()
-	if len(errs) == 0 {
-		t.Fatal("应向上层报错误帧")
+	if !folded {
+		t.Fatal("过长的那条消息应被折叠（保留首尾）后再发出")
 	}
-	mu.Unlock()
+}
+
+// TestFoldOversizeMessagesHasFloor 折叠有下限：过短的消息不值得折（超窗不来自消息正文
+// 时反复折叠只会破坏上下文），且折叠绝不能丢掉 tool_call_id——那是结果配对的凭据。
+func TestFoldOversizeMessagesHasFloor(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 200
+	msgs := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "短"},
+		{Role: "tool", Content: "结果", ToolCallId: "c1"},
+	}
+	out, n := a.foldOversizeMessages(msgs, nil)
+	if n != 0 {
+		t.Fatalf("过短消息不应折叠，got %d", n)
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("条数不得变化: %d", len(out))
+	}
+	if out[2].GetToolCallId() != "c1" {
+		t.Fatalf("折叠不得丢失 tool_call_id: %q", out[2].GetToolCallId())
+	}
 }
 
 // TestNoTrimForAsciiHistoryWithinWindow 纯 ASCII/代码会话不得被误判超窗。
@@ -337,12 +356,17 @@ func TestTrimNoticePrintedOncePerDropCount(t *testing.T) {
 		return n
 	}
 
-	if got := countTrimFrames(); got != 1 {
-		t.Fatalf("首次裁剪应提示 1 次，实际 %d 次", got)
-	}
-	// 第二轮：历史结构不变（只是多了当前用户消息与助手回复），省略条数应相同 → 不再提示
+	// 默认静默：小窗口读越窗口的会话是常态（滑动窗口式工作），提示帧不该打扰
 	if got := countTrimFrames(); got != 0 {
-		t.Fatalf("同一省略条数不应重复提示，第二轮实际提示 %d 次", got)
+		t.Fatalf("默认不应输出裁剪提示帧（滑动窗口是常态），实际 %d 次", got)
+	}
+	// 显式开启后：每会话只提示一次，第二轮不再重复
+	t.Setenv("DSC_TRIM_NOTICE", "1")
+	if got := countTrimFrames(); got != 1 {
+		t.Fatalf("开启提示后首次裁剪应提示 1 次，实际 %d 次", got)
+	}
+	if got := countTrimFrames(); got != 0 {
+		t.Fatalf("同一会话不应重复提示，第二轮实际提示 %d 次", got)
 	}
 }
 
@@ -356,10 +380,11 @@ func TestSwitchSessionResetsUsage(t *testing.T) {
 	a.contextWindow = 1000000
 	a.llmServiceID, a.toolServiceID = 1, 1
 
-	// 模拟上一会话已用到 900K，且上一轮做过裁剪
+	// 模拟上一会话已用到 900K，且上一会话已经提示过裁剪
 	a.usageMu.Lock()
 	a.lastPromptTokens = 900000
-	a.lastTrimDropped = 93
+	a.trimNoticeSession = "prev-session"
+	a.foldNoticeSession = "prev-session"
 	a.usageMu.Unlock()
 
 	if err := a.SwitchSession(context.Background(), "another-session"); err != nil {
@@ -367,13 +392,13 @@ func TestSwitchSessionResetsUsage(t *testing.T) {
 	}
 
 	a.usageMu.Lock()
-	gotTokens, gotDropped := a.lastPromptTokens, a.lastTrimDropped
+	gotTokens, gotTrim, gotFold := a.lastPromptTokens, a.trimNoticeSession, a.foldNoticeSession
 	a.usageMu.Unlock()
 	if gotTokens != 0 {
 		t.Fatalf("切会话后 lastPromptTokens 应清零，实际 %d", gotTokens)
 	}
-	if gotDropped != 0 {
-		t.Fatalf("切会话后裁剪提示状态应清零，实际 %d", gotDropped)
+	if gotTrim != "" || gotFold != "" {
+		t.Fatalf("切会话后裁剪/折叠提示状态应清零（新会话要能再提示一次），实际 %q / %q", gotTrim, gotFold)
 	}
 }
 
@@ -437,5 +462,70 @@ func TestUsageFramesCarryContextTokens(t *testing.T) {
 	}
 	if !sawUsage {
 		t.Fatal("未发出任何带 usage 的帧")
+	}
+}
+
+// TestTrimToWindowClosesLoopWhenProjectionFarAboveEstimate 投影值远高于消息估算时，
+// 裁剪必须收敛到判定口径，而不是「裁一次就判超窗」。
+//
+// 修复前的真实行为：裁剪按消息估算算预算，超窗判定却读投影值（实测锚点 + 差量）。
+// 两者差两三倍时会出现「已省略最早 6384 条消息」之后仍然报 441195 > 131072——消息区
+// 看着像裁剪没执行，其实是裁完仍不满足判定口径。闭环收紧让两边收敛到同一个数。
+func TestTrimToWindowClosesLoopWhenProjectionFarAboveEstimate(t *testing.T) {
+	a := newTestAgent(t)
+	a.contextWindow = 10000
+	a.meter = dsc.NewTokenMeter(10000)
+	// 锚点仍在窗口内（不触发「锚点超窗」降级），但 provider 实测是启发式估算的 3 倍
+	a.meter.SampleUsage(9000, 3000)
+
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: strings.Repeat("内容", 100)})
+	}
+	projected := a.projectedFit(msgs, nil)
+	if projected <= a.contextWindow {
+		t.Fatalf("夹具无效：裁前应超窗，got %d", projected)
+	}
+
+	out, dropped := a.trimToWindow(msgs, nil, projected)
+	if dropped == 0 {
+		t.Fatal("应发生裁剪")
+	}
+	if fit := a.projectedFit(out, nil); fit > a.contextWindow {
+		t.Fatalf("闭环裁剪后仍超窗 %d > %d（说明只裁了一次就判超窗）", fit, a.contextWindow)
+	}
+	if len(out) == 0 || out[0].Role != "system" {
+		t.Fatalf("system 消息不得被裁掉，got %d 条，首条 %v", len(out), out)
+	}
+}
+
+// TestOversizeTrimIsSlidingWindow 裁剪是滑动窗口：超窗时从最旧处丢轮次，system 与最近
+// 一段保留，最早的用户消息（往往是很久以前的旧需求）可以被丢弃——这正是小窗口读超长
+// 会话的常态，不该靠程序钉死「首条消息」。当前任务靠模型自身的压缩选择保留，不靠这里。
+func TestOversizeTrimIsSlidingWindow(t *testing.T) {
+	const window = 10000
+	msgs := []*proto.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "很久以前的旧需求"},
+	}
+	for i := 0; i < 40; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: strings.Repeat("内容", 200)})
+	}
+	if got := dsc.EstimateProtoMessagesTokens(msgs); got <= window {
+		t.Fatalf("夹具无效：应超窗，got %d", got)
+	}
+	out, dropped := fitMessagesToWindow(msgs, window, 10*window)
+	if dropped == 0 {
+		t.Fatal("应发生裁剪")
+	}
+	// system 必须保留在最前
+	if out[0].Role != "system" {
+		t.Fatalf("system 必须保留在最前，实际首条 %v", out[0].Role)
+	}
+	// 滑动窗口下最早的旧需求应可被丢弃（这才是本来行为）
+	for _, m := range out {
+		if m.Role == "user" && strings.Contains(m.Content, "很久以前的旧需求") {
+			t.Fatalf("滑动窗口下最早的旧需求应可被丢弃，但它被保留了（dropped=%d）", dropped)
+		}
 	}
 }
