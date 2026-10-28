@@ -229,4 +229,12 @@ func (m *Manager) seedSessionPromptFromLog(sessionID string, sess *session.Sessi
 		model:         a.Model,
 		contextWindow: a.ContextWindow,
 	})
+	// 同时预置展示用的「已用」：恢复有历史的会话时，用户发出第一个请求之前
+	// 标题栏不该显示 0——上下文里已经躺着这段历史了。取上一次请求的 prompt 侧实测
+	// （没有则退回当时的表面估算），第一帧真实用量到达后自然被替换。
+	seed := a.PromptTokens
+	if seed <= 0 {
+		seed = a.SentEstimate
+	}
+	m.SeedContextUsage(sessionID, seed)
 }

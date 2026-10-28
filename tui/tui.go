@@ -483,6 +483,16 @@ func New(agent core.Agent, manager *core.Manager, ctx context.Context, modelName
 		mouseCaptureOff:  mouseCaptureOffByDefault(),
 		pinnedToBottom:   true,
 	}
+	// 启动即有读数：恢复有历史的会话时，上下文里已经躺着几十万 token，标题栏不该在
+	// 用户发出第一个请求之前一直显示 0（那是「空会话」的含义）。
+	//
+	// 历史读数在 tui.New 之前已由 core.LoadHistoryReplay → seedSessionPromptFromLog
+	// 预置进宿主计量实例；这里只把它读到界面。真·新会话仍是 0——确实空。
+	if manager != nil {
+		if v := manager.ContextTokens(m.currentSessionID); v > 0 {
+			m.usedTokens = v
+		}
+	}
 	return m
 }
 
@@ -3637,6 +3647,7 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 					m.appendMessage(errorSty.Render("切换会话失败: ") + err.Error())
 				} else {
 					m.currentSessionID = id
+					m.syncContextForSession()
 					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 会话") + fmt.Sprintf("\n已新建并切换到会话 %s。", id))
 				}
 			}
@@ -3665,6 +3676,7 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 					m.appendMessage(errorSty.Render("切换会话失败: ") + err.Error())
 				} else {
 					m.currentSessionID = target
+					m.syncContextForSession()
 					m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 会话") + fmt.Sprintf("\n已切换到会话 %s。", target))
 				}
 			}
@@ -4147,6 +4159,17 @@ func (m *Model) noteContextUsage(u *core.Usage) {
 	} else if u.TotalTokens > 0 {
 		m.usedTokens = int(u.TotalTokens)
 	}
+}
+
+// syncContextForSession 切会话后重读「已用」：各会话的上下文大小互不相干，
+// 沿用上一个会话的数字比显示 0 更容易误判（新会话显示 0 是诚实的，带着旧会话的
+// 读数就是错的）。计量实例按会话 id 分开保管，没跑过请求的会话自然是 0。
+func (m *Model) syncContextForSession() {
+	if m.manager == nil {
+		m.usedTokens = 0
+		return
+	}
+	m.usedTokens = m.manager.ContextTokens(m.currentSessionID)
 }
 
 // trackTurnUsage 累計當前輪的運行指標：下行生成 token 與 prompt 緩存命中/寫入。

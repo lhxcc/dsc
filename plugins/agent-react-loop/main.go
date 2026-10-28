@@ -126,6 +126,13 @@ type ReactLoopAgent struct {
 	// 无事件时退回 DSC_HISTORY_INJECTION 环境变量默认。用于控制本地模型预填充长度。
 	historyInjection int
 
+	// contextSearchSeen 本会话是否已出现过「历史装不进窗口」。
+	//
+	// 一旦成立就保持常开：会话检索工具（core/context_search_tool.go）只在滑窗真的
+	// 裁掉了历史时才有增量价值，而工具目录是提示缓存前缀的一部分——每步增删会让
+	// 整段前缀缓存失效。条件本身是单调的（历史只增不减），所以最多只变一次。
+	contextSearchSeen bool
+
 	// lastContextTokens 本步请求的上下文占用投影（core.TokenMeter 的 Project 结果）。
 	// 随 usage 帧（Usage.ContextTokens）上报给宿主：宿主侧计量实例据此对外发布，
 	// TUI 显示的就是这个数——与裁剪/压缩决策同源，不再另算一套。
@@ -507,14 +514,14 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 单轮超窗判定全部读这同一个数——此前这里各算各的（一处看服务端值、一处看纯估算），
 		// 口径一偏就整盘错：纯 ASCII 高估 4~5 倍时，1M 窗口、服务端实测 332K 的会话
 		// 被判超窗，每轮都裁历史并打印提示。
+		// 会话检索工具只在「历史已经装不进窗口」时才出现在目录里：整个历史都在眼前时，
+		// 检索没有增量价值；而一旦滑窗开始裁历史，模型就失去了那部分内容的唯一入口。
+		availableTools = a.filterContextSearch(availableTools, dsc.EstimateProtoMessagesTokens(msgs))
+
 		meter := a.tokenMeter()
 		meter.UpdateContextWindow(a.contextWindow)
 		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		projectedTokens := meter.Project(currentEstimate)
-		// 决策用的这个数同时是展示口径：随帧上报宿主（见 usageSnapshot）
-		a.usageMu.Lock()
-		a.lastContextTokens = projectedTokens
-		a.usageMu.Unlock()
 		msgs, droppedMsgs := a.trimToWindow(msgs, availableTools, projectedTokens)
 		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
 		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
@@ -557,6 +564,17 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				}
 			}
 		}
+
+		// 展示/上报的「已用」必须是**真正要发出去的那份表面**（裁剪、折叠都做完之后）：
+		// 拿裁剪前的估算上报，等于向界面上报一个没有发出去的请求。
+		//
+		// 这在小窗口读超长会话（滑动窗口）时尤其要紧：历史每轮都被裁掉一大段，裁剪前
+		// 的估算可能几倍于窗口、而真正发出的是裁完的那一段。此前这里在裁剪前赋值，
+		// 界面上的占用与实际请求之间差着「被裁掉的那部分」。
+		sentSurface := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
+		a.usageMu.Lock()
+		a.lastContextTokens = meter.Project(sentSurface)
+		a.usageMu.Unlock()
 
 		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
 		// 被 provider 拒绝的请求。
@@ -795,14 +813,18 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 					a.lastPromptTokens = cr.Usage.PromptTokens
 					a.lastUsage = dsc.UsageFromProto(cr.Usage)
 					a.usageMu.Unlock()
-					// 锚定上下文计量：实测 prompt 侧用量 + 本次所发消息的估算。
-					// 之后 Project(currentEstimate) = 实测 + 增量，绝对误差被实测抵消。
+					// 锚定上下文计量：实测 prompt 侧用量 + **本次实际发出**的消息估算。
+					// 之后 Project(sentSurface) = 实测 + 增量，绝对误差被实测抵消。
 					//
-					// 只在「本次请求未被裁剪」时锚定：裁剪是请求级的（历史仍全在会话里），
-					// 发出的列表与后续派生的历史不同源，拿它当增量基线会把差额算成增长。
-					if droppedMsgs == 0 {
-						a.tokenMeter().SampleUsage(dsc.PromptSideTokens(dsc.UsageFromProto(cr.Usage)), sentEstimate)
-					}
+					// 不再因为「本步裁剪过」就跳过锚定。跳过会让 meter 永远拿不到增量
+					// 基线（只有重启倒查来的一个旧实测值），而滑動窗口模式下每步都在裁剪
+					// ——于是 Project 恒等于那个旧值，界面上的「已用」从首帧起就不动
+					// （实测：会话涨到 730K，界面一直是 33K/3.29%）。
+					//
+					// 之所以以前担心「把差额算成增长」：基线取自裁剪后的列表，而投影输入
+					// 是裁剪前的全量历史，两者不同源。现在投影输入统一改成裁剪后的表面
+					// （见上面的 sentSurface），基线与投影同源，增量才有意义。
+					a.tokenMeter().SampleUsage(dsc.PromptSideTokens(dsc.UsageFromProto(cr.Usage)), sentEstimate)
 				}
 				content += cr.Content
 				if cr.Content != "" {
@@ -1161,6 +1183,8 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			if tc.Name == "load_dsc_plugin" || tc.Name == "unload_dsc_plugin" || tc.Name == "install_dsc_plugin" || tc.Name == "uninstall_dsc_plugin" {
 				if refreshed, err := toolClient.ListTools(ctx, &proto.ListToolsRequest{}); err == nil {
 					availableTools = append(refreshed.Tools, a.hostTools()...)
+					// 刷新是全量替换：会话检索工具的可见性要重新按同一规则裁定
+					availableTools = a.filterContextSearch(availableTools, dsc.EstimateProtoMessagesTokens(msgs))
 					// 同步更新 a.lastToolNames，避免下次 RunStream 误判为变更触发不必要的 system prompt 重建
 					refreshedNames := make([]string, len(availableTools))
 					for i, t := range availableTools {
@@ -1722,6 +1746,7 @@ func (a *ReactLoopAgent) SwitchSession(ctx context.Context, sessionID string) er
 	a.trimNoticeSession = ""
 	a.foldNoticeSession = ""
 	a.usageMu.Unlock()
+	a.contextSearchSeen = false // 会话检索工具的可见性随会话重新裁定
 	a.tokenMeter().Reset()
 	fmt.Printf("[Agent Loop] switched to session %s (%d events, last turn %d)\n",
 		sessionID, sess.Len(), a.turnCounter)
@@ -2063,6 +2088,52 @@ func foldMessage(m *proto.Message, tokens, window int) *proto.Message {
 	}
 }
 
+// contextSearchToolName 宿主内置的会话检索工具名（实现在 core/context_search_tool.go）。
+// agent 只决定「要不要把它放进目录」，搜索本身在宿主侧执行——数据（会话日志）归宿主。
+const contextSearchToolName = "context_search"
+
+// filterContextSearch 按会话状态决定是否暴露 context_search。
+//
+// 判据：历史（消息 + 工具目录）已经装不进窗口 → 滑窗正在裁掉内容 → 模型需要一个
+// 精确回取的手段。反过来，整个历史都塞得下时不暴露：那时检索没有增量价值，白占
+// 目录与提示前缀。
+//
+// 注入被显式关闭（historyInjection < 0）时永不暴露——那是用户明确表示不要让模型
+// 翻旧账，再给一个检索工具等于绕过这个决定。
+//
+// 一旦成立就保持常开（见 contextSearchSeen）：避免工具目录每步抖动导致提示缓存
+// 整段失效。
+func (a *ReactLoopAgent) filterContextSearch(tools []*proto.Tool, msgsEstimate int) []*proto.Tool {
+	if a.contextSearchSeen {
+		return tools
+	}
+	fits := a.contextWindow <= 0 ||
+		msgsEstimate+dsc.EstimateProtoToolTokens(tools) <= a.contextWindow
+	if fits || a.historyInjection < 0 {
+		return dropToolByName(tools, contextSearchToolName)
+	}
+	a.contextSearchSeen = true
+	return tools
+}
+
+// dropToolByName 返回去掉指定名字后的工具目录副本（不改原切片：调用方可能与
+// 快照共享底层数组）。名字不存在时原样返回。
+func dropToolByName(tools []*proto.Tool, name string) []*proto.Tool {
+	idx := -1
+	for i, t := range tools {
+		if t.GetName() == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return tools
+	}
+	out := make([]*proto.Tool, 0, len(tools)-1)
+	out = append(out, tools[:idx]...)
+	return append(out, tools[idx+1:]...)
+}
+
 // projectedFit 报告把这份消息列表发出去的预计占用（投影口径，含工具目录）。
 //
 // 裁剪、压缩、超窗判定、界面显示全部读这一个数——口径一旦分叉就会出现「裁掉了
@@ -2074,8 +2145,12 @@ func (a *ReactLoopAgent) projectedFit(msgs []*proto.Message, tools []*proto.Tool
 // seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
 // 服务端 usage 可依）：
 //   - lastPromptTokens/lastUsage 供 usageSnapshot 上报「已用」；
-//   - tokenMeter().UpdateUsage 建立锚点，使 Project 退化为该实测值，而不是把全量
-//     派生历史（含被压缩后端遮蔽、模型看不到的部分）当作已用。
+//   - tokenMeter().UpdateUsage 记住这个实测值，供 MeasuredPromptTokens 与
+//     「锚点是否已超窗」的判断使用。
+//
+// 注意它**不**会让 Project 退化为该实测值：没有增量基线的实测值只描述那一次请求，
+// 拿它当投影会把界面钉在一个旧数字上（见 core.TokenMeter.projectLocked）。投影在
+// 拿到第一发真实响应（SampleUsage 锚定实测 + 当次表面估算）之后才精确。
 //
 // 倒查逻辑在 dsc.LastPromptUsage（唯一实现，宿主 core 用同一份），此处不再自己
 // 遍历事件——同一规则写两遍就会出现「宿主和插件挑到不同锚点」的漂移。

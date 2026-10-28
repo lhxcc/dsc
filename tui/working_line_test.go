@@ -340,3 +340,28 @@ func TestNoteContextUsageUsesHostMeter(t *testing.T) {
 		t.Fatalf("无上报值时应退回实测 prompt 1234，got %d", m2.usedTokens)
 	}
 }
+
+// TestNewSeedsUsedTokensFromHostMeter 启动即有读数：恢复有历史的会话时，宿主在
+// tui.New 之前已把上一次请求的用量预置进计量实例（core.LoadHistoryReplay →
+// seedSessionPromptFromLog），界面应在构造时就把它读进来。
+//
+// 此前 usedTokens 只在 noteContextUsage 里赋值，于是「已用」在用户发出第一个请求
+// 之前一直显示 0——新会话显示 0 是对的，载入几十万 token 历史后仍是 0 就是在说假话。
+func TestNewSeedsUsedTokensFromHostMeter(t *testing.T) {
+	manager := core.NewManager(&core.ManagerConfig{})
+	manager.SeedContextUsage(manager.DefaultSessionID(), 40347)
+
+	m := New(&stubAgent{}, manager, context.Background(), "Agentic-Turbo-Coder", "minimal", 1048576)
+	if m.usedTokens != 40347 {
+		t.Fatalf("启动时应读到预置的已用 40347，got %d", m.usedTokens)
+	}
+	if !strings.Contains(m.capacityTag(), "39K") {
+		t.Fatalf("容量标签应显示 39K/1.0M，got %q", m.capacityTag())
+	}
+
+	// 真·新会话：没有预置 → 仍是 0（前端据此显示「未知」而不是 0%）
+	fresh := New(&stubAgent{}, core.NewManager(&core.ManagerConfig{}), context.Background(), "Agentic-Turbo-Coder", "minimal", 1048576)
+	if fresh.usedTokens != 0 {
+		t.Fatalf("无历史的会话应为 0，got %d", fresh.usedTokens)
+	}
+}

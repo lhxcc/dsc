@@ -211,12 +211,13 @@ func sanitizeRequestPairing(m *Manager, req *proto.ChatRequest) *proto.ChatReque
 //
 // 改写协议：插件返回的 result_json 应为 {"messages": [...]} 形式，其中 messages
 // 为改写后的 proto.Message 数组。宿主解析后替换 req.Messages。
-//
-// 插件返回 error 即 veto：不再发送 LLM 请求，错误原样回给调用方。
 func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.ChatRequest) (*proto.ChatRequest, error) {
+	// 先清掉上一发的「实际表面」：它只描述那一次请求，任何一条提前返回的路径
+	// （无插件、分发出错）都必须把它作废，否则一份过时的数字会一直压着界面，
+	// 让「已用」冻在一个不存在的请求上。
+	s.m.NoteActualSurface(req.GetSessionId(), 0)
 	if len(s.m.hookClientsSnapshot()) == 0 {
-		s.m.NoteActualSurface(req.GetSessionId(), 0) // 无插件改写：展示回到上报值
-		return req, nil                              // 无插件监听：直接返回，零开销
+		return req, nil // 无插件监听：直接返回，零开销
 	}
 	msgsJSON, _ := json.Marshal(req.Messages)
 	// 估算当前 token 数（复用 core 公用启发式 EstimateProtoMessagesTokens，
@@ -246,10 +247,7 @@ func (s *llmAggregateServer) applyPreStepHook(ctx context.Context, req *proto.Ch
 		// 能走到这里的都是插件显式拒绝，请求本身不该带着未改写的全量历史发出。
 		return nil, fmt.Errorf("agent/pre-step vetoed request: %w", err)
 	}
-	// 解析改写后的消息列表
-	// 本步没有插件改写请求：展示口径回到 agent 上报的投影值（清掉上一步的
-	// 「实际表面」，否则一份过时的数字会一直压着界面）。
-	s.m.NoteActualSurface(req.GetSessionId(), 0)
+	// 解析改写后的消息列表（「实际表面」已在函数入口清空，见上）
 	if result == nil {
 		return req, nil
 	}

@@ -127,6 +127,12 @@ LLM 请求的前缀（system prompt、工具目录、上下文片段等）参与
     ```
     完成后用 `./builder clean` 及 `bash clean.sh` 清掉 `dist/`目录，及源码目录开发期间的产物而不带入仓库。
 
+  - **外部工具链由 builder 自己找，不要凭「PATH 里没有」就断定缺失**。查找顺序：`DSC_TOOL_ROOTS`（显式，路径分隔符分隔）→ `PATH` → 仓库根（工具链随仓库放置，如 `protoc_dir/bin/protoc.exe`）→ `~/.bun/bin`、`~/.local/bin` → `%LOCALAPPDATA%\Programs`、`C:\Programs`、`C:\Tools` → 各磁盘的 `<盘>:\winkit\share`、`<盘>:\tools`。命中版本化目录（如 `E:\winkit\share\zig-x86_64-windows-0.17.0\zig.exe`）同样算找到。
+    - CGO 插件（`tool-computer-use` 等）的编译器链：`CC` 环境变量 → 自动找到的 `zig`（自动拼 `"<path> cc"`）→ `gcc` → `clang` → go 默认 `cc`。全都没有时，错误信息里会列出**已查过的目录**，并提示用 `CC` / `DSC_TOOL_ROOTS` 指定；zig 缺可写缓存目录（受限环境 `APPDATA` 不可见时报 `AppDataDirUnavailable`）时 builder 会自动给临时缓存目录。
+    - `tool-harness-webui` 的前端由 `bun` 构建（`bun install` → `bun run build`，产物 `go:embed`）。bun 同样自动发现；找不到时日志会写明查过哪里。
+    - 构建前 builder 会用 Go 侧 `RemoveAll` 清空 `webui/dist` 与 `webui/.svelte-kit`：受限环境给 Node 装了 safe-delete 垫片，svelte-kit/adapter 的批量 `rimraf` 会被当成「批量删用户文件」拦下（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）。清空后它面对空目录，**不需要关闭任何安全机制**。
+    - 跳过与失败要分清：插件编译失败仍会让整轮构建失败（避免悄悄少发插件）；日志里的「跳过」必须写明真实原因（缺 bun / 缺前端目录 / 前端构建失败三者不同），不要一律写成「需 bun」。
+
   - **次选：手敲逐平台**（仅当只改动主模块、无需走 builder 全量打包时）——PowerShell：`$env:GOOS='<goos>'; $env:GOARCH='<goarch>'; go build ./...`；Unix shell：`GOOS=<goos> GOARCH=<goarch> go build ./...`。**注意 `freebsd/amd64` 必须额外附 `-gcflags=github.com/ebitengine/purego/internal/fakecgo=-std`**，否则会编不过——这是优先用 builder 的核心理由。
 
   - 平台 API/签名用错应在交叉编译期暴露，勿拖到真机。

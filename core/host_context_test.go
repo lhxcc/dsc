@@ -110,6 +110,115 @@ func TestPreStepRewriteUpdatesDisplayedSurface(t *testing.T) {
 	}
 }
 
+// TestHostContextMetersFallsBackToMeasurement 兜底必须读「实测用量」本身，而不是
+// meter.Project(0) 算出的启发式误差。
+//
+// Project(0) = 实测 − 该次请求的估算，是「估算偏差」，量级几万且几乎不随会话增长。
+// 曾经它被当成「已用」的兜底：会话涨到 730K（provider 实测），界面却一直显示
+// 33K / 3.29%，整轮不动——而速率、缓存命中照常变（它们读的是另一个数）。
+func TestHostContextMetersFallsBackToMeasurement(t *testing.T) {
+	h := NewHostContextMeters(1_048_576)
+	// 只有实测、没有上报投影：兜底应给出 731391 本身
+	h.NoteUsage("s1", &Usage{PromptTokens: 731_391}, 0)
+	if got := h.ContextTokens("s1"); got != 731_391 {
+		t.Fatalf("无上报值时应退回实测 731391，got %d（这是误差值而非规模）", got)
+	}
+	// 会话继续增长：兜底跟着涨，不再钉在原处
+	h.NoteUsage("s1", &Usage{PromptTokens: 780_000}, 0)
+	if got := h.ContextTokens("s1"); got != 780_000 {
+		t.Fatalf("实测增长时必须跟着变，got %d", got)
+	}
+}
+
+// TestPreStepWithoutRewriteClearsStaleActualSurface 没有插件改写的那一步必须作废上一发
+// 记录的「实际表面」，否则界面会一直显示一份不存在的请求。
+//
+// 这是「已用」冻结的另一条路径：某一步被改写成很小的表面（例如 33K），之后每一步
+// 都没有改写（或分发提前返回），残留的 33K 就永远压着上报值不动。
+func TestPreStepWithoutRewriteClearsStaleActualSurface(t *testing.T) {
+	m := newRouterManager()
+	m.ctxMeters = NewHostContextMeters(1_048_576)
+	m.ctxMeters.NoteUsage("sess-x", &Usage{PromptTokens: 731_391, ContextTokens: 731_391}, 731_391)
+
+	// 模拟「上一步被压缩后端改写成了很小的表面」
+	m.NoteActualSurface("sess-x", 33_000)
+	if got := m.ContextTokens("sess-x"); got != 33_000 {
+		t.Fatalf("改写时应显示实际表面 33000，got %d", got)
+	}
+
+	// 本步没有任何 hook 客户端（提前返回路径）→ 必须清掉残留
+	srv := &llmAggregateServer{m: m}
+	req := &proto.ChatRequest{SessionId: "sess-x", Messages: []*proto.Message{{Role: "user", Content: "hi"}}}
+	_ = srv.applyPreStepHook(context.Background(), req)
+	if got := m.ContextTokens("sess-x"); got != 731_391 {
+		t.Fatalf("未改写的一步应回到上报投影 731391，got %d（残留的实际表面没被清掉）", got)
+	}
+}
+
+// TestHostContextMetersSeed 启动预置：恢复有历史的会话时，用户发出第一个请求之前
+// 就该有读数（上下文里已经躺着这段历史），第一帧真实用量到达后被替换。
+//
+// 预置只填「兜底」那一层：不写上报值、不写实际表面，避免把历史读数当成当前请求的
+// 权威值。
+func TestHostContextMetersSeed(t *testing.T) {
+	h := NewHostContextMeters(1_048_576)
+	h.Seed("s1", 40347)
+	if got := h.ContextTokens("s1"); got != 40347 {
+		t.Fatalf("预置后应显示 40347，got %d", got)
+	}
+	// 新会话不预置：仍是 0（前端显示「未知」而不是 0%）
+	if got := h.ContextTokens("brand-new"); got != 0 {
+		t.Fatalf("未预置的会话应为 0，got %d", got)
+	}
+	// 第一帧真实用量到达：预置值被替换，不再残留
+	h.NoteUsage("s1", &Usage{PromptTokens: 512_000, ContextTokens: 512_000}, 512_000)
+	if got := h.ContextTokens("s1"); got != 512_000 {
+		t.Fatalf("首帧用量应替换预置值，got %d", got)
+	}
+	// 非法入参不写脏数据
+	h.Seed("s2", 0)
+	h.Seed("", 1234)
+	if got := h.ContextTokens("s2"); got != 0 {
+		t.Fatalf("非正预置值应被忽略，got %d", got)
+	}
+}
+
+// TestHostContextMetersSeedClampedToCurrentWindow 预置值来自上一次请求，而那次可能是
+// 在 1M 云模型上跑的；用户这次换成 128K 本地模型，预置值必须被**当前**窗口夹住。
+//
+// 真实时序：LoadHistoryReplay 先 Seed（此刻计量器窗口还是 0，因为 SetContextWindow
+// 还没跑），tui.New 才把 128K 设进来。所以夹取只能在读取时做——写入时还不知道窗口。
+// 不夹的话标题会显示「714K/128K」（557%），那是一个永远不会被发出的请求：
+// 发之前 agent 会先把它裁进窗口。
+func TestHostContextMetersSeedClampedToCurrentWindow(t *testing.T) {
+	h := NewHostContextMeters(0) // 宿主装配时的初始值：窗口未知
+	h.Seed("s1", 714_000)        // 上一次在 1M 窗口下的请求
+	h.SetWindow(131_072)         // 这次换成本地 128K
+
+	if got := h.ContextTokens("s1"); got != 131_072 {
+		t.Fatalf("预置值应被当前窗口夹住 131072，got %d（否则显示 714K/128K）", got)
+	}
+
+	// 接上第一帧真实用量：按实测走（已经裁进窗口）
+	h.NoteUsage("s1", &Usage{PromptTokens: 120_000, ContextTokens: 120_000}, 120_000)
+	if got := h.ContextTokens("s1"); got != 120_000 {
+		t.Fatalf("首帧用量应替换预置值，got %d", got)
+	}
+
+	// 上报值本身超窗（理论上不该出现）：同样夹住，界面不显示 >100%
+	h.NoteUsage("s1", &Usage{PromptTokens: 300_000, ContextTokens: 300_000}, 300_000)
+	if got := h.ContextTokens("s1"); got != 131_072 {
+		t.Fatalf("超窗的上报值应被夹住，got %d", got)
+	}
+
+	// 窗口未知（0）时无从比较：原样返回，不臆造上限
+	unknown := NewHostContextMeters(0)
+	unknown.Seed("s2", 714_000)
+	if got := unknown.ContextTokens("s2"); got != 714_000 {
+		t.Fatalf("窗口未知时应原样返回 714000，got %d", got)
+	}
+}
+
 // TestHostContextMetersReset 切会话/压缩改写历史后清空，避免旧数字残留。
 func TestHostContextMetersReset(t *testing.T) {
 	h := NewHostContextMeters(1000)

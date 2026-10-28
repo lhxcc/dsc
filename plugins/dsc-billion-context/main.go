@@ -628,12 +628,12 @@ func (bc *BillionContext) setSessionID(id string) {
 //
 // 优先级：**上一轮 provider 上报的 prompt 用量** > 宿主对原始历史的估算 > SDK 估算。
 //
-// 为什么不能直接用 ev.TokenCount：它是宿主对 req.Messages 的估算，而那是 agent 的
-// append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent 侧「有后端时
-// 跳过内联 compactHistory」）。于是原始历史只增不减：一旦越过使用率阈值，压缩再怎么
-// 压都不会让它回落，插件便每一轮都提示「该压缩了」，模型只能每隔几步压一小段，而
-// 主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`（上一轮
-// provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
+// 为什么不能直接用 ev.TokenCount：它虽然已经是「消息 + 工具目录」的完整估算，
+// 但那是 agent 的 append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent
+// 侧「有后端时跳过内联 compactHistory」）。于是原始历史只增不减：一旦越过使用率阈值，
+// 压缩再怎么压都不会让它回落，插件便每一轮都提示「该压缩了」，模型只能每隔几步压
+// 一小段，而主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`
+// （上一轮 provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。
 //
 // 注意这里**不能**直接用宿主的 ev.ProjectedTokens：那是按「原始消息列表 + 工具」算的
 // 表面（约 900k），而本插件会把大部分历史遮蔽掉，真实载荷是压缩后视图（约 40k）。
@@ -646,7 +646,10 @@ func usageTokens(ev dsc.AgentPreStepEvent, msgs []*proto.Message) int {
 	if ev.TokenCount > 0 {
 		return ev.TokenCount
 	}
-	return dsc.EstimateProtoMessagesTokens(msgs)
+	// 本地兜底必须与「请求大小」同口径：**消息 + 工具目录**。工具目录每次请求都带、
+	// 且不随会话增长消失（十几到几十个工具约 10k token），漏掉它就是低估压力——
+	// 阈值前不动手，等真超窗才慌张。
+	return dsc.EstimateProtoMessagesTokens(msgs) + ev.ToolTokens
 }
 
 // containsStr 报告 s 是否包含 sub（轻量实现，避免引入 strings 包）。

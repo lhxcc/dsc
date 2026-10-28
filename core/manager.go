@@ -259,6 +259,15 @@ func (m *Manager) ContextTokens(sessionID string) int {
 	return m.ctxMeters.ContextTokens(sessionID)
 }
 
+// SeedContextUsage 用会话日志里的历史读数预置「已用」（启动时、还没有 usage 帧）。
+// 恢复有历史的会话时，标题栏不该在用户发出第一个请求之前一直显示 0。
+func (m *Manager) SeedContextUsage(sessionID string, tokens int) {
+	if m == nil || m.ctxMeters == nil {
+		return
+	}
+	m.ctxMeters.Seed(sessionID, tokens)
+}
+
 // ResetContextMeters 清空某会话的计量（切会话 / 压缩改写历史后）。
 func (m *Manager) ResetContextMeters(sessionID string) {
 	if m == nil || m.ctxMeters == nil {
@@ -364,6 +373,8 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	for _, t := range m.cronTools() {
 		_ = m.toolRegistry.Register(t) // 宿主内置 CRON 管理工具（让模型在评测中可真实调用 DSC 的 CRON 机制）
 	}
+	// 宿主内置会话检索工具：滑窗把早期记录裁掉后，模型仍能按关键词精确取回原话。
+	_ = m.toolRegistry.Register(&contextSearchTool{m: m})
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
 		// 已完成却只会造成重复唤醒的两种情形直接丢弃：

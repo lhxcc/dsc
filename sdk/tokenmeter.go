@@ -16,11 +16,18 @@ package dsc
 // 用法：
 //
 //	meter := dsc.NewTokenMeter(window)
-//	// 每次请求拿到服务端上报的 usage 后，与「该次实际发出的消息估算」一起锚定：
-//	meter.SampleUsage(dsc.PromptSideTokens(usage), dsc.EstimateProtoMessagesTokens(sent))
+//	// 每次请求拿到服务端上报的 usage 后，与「该次实际发出的表面」一起锚定
+//	// ——消息 **和工具目录**，两者是同一个请求的两半：
+//	meter.SampleUsage(dsc.PromptSideTokens(usage),
+//		dsc.EstimateProtoMessagesTokens(sent)+dsc.EstimateProtoToolTokens(tools))
 //	// 之后问「下一发大概多少」，不要让插件自己再估一遍：
-//	projected := meter.Project(dsc.EstimateProtoMessagesTokens(pending))
+//	projected := meter.Project(dsc.EstimateProtoMessagesTokens(pending)+dsc.EstimateProtoToolTokens(tools))
 //	over := meter.Window() > 0 && projected > meter.Window()*95/100
+//
+// 注意 `SampleUsage` 的第二个参数必须与 `Project` 的入参**同源**（都是将发出的那份
+// 表面的估算）：差量是拿两者相减算出来的，不同源就会把「被裁掉/被压缩掉的部分」
+// 算成增长。没有基线（只调了 `UpdateUsage`）时 `Project` 直接返回入参估算，
+// 不会拿旧实测值糊弄你——见 core.TokenMeter.projectLocked。
 
 import (
 	"dsc/core"
@@ -78,7 +85,10 @@ func FormatPressure(pressure float64) string { return core.FormatPressure(pressu
 // （唯一实现在 session.LastPromptUsage）。重启后的首发请求没有服务端锚点，
 // 用它把计量器接上「上次真实值」，不要在插件里自己遍历事件。
 //
-// 用法：拿到会话后 `meter.UpdateUsage(usage)`，之后 Project 即为「实测 + 增量」。
+// 用法：拿到会话后 `meter.UpdateUsage(usage)`，之后可用 `meter.MeasuredPromptTokens()`
+// 读到这个实测值。注意它**不会**让 `Project` 变成「实测 + 增量」：`UpdateUsage` 没有
+// 增量基线（不知道那次请求发的表面有多大），`Project` 会退回调用方给的估算。要精确
+// 投影请在拿到真实响应后用 `SampleUsage(用量, 当次发出的表面估算)`。
 func LastPromptUsage(sess *session.Session) (int, *Usage, bool) {
 	promptTokens, usage, ok := session.LastPromptUsage(sess)
 	if !ok {

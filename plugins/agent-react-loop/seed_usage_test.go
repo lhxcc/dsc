@@ -8,8 +8,14 @@ import (
 )
 
 // TestSeedUsageFromHistory 重启恢复时用「上次成功请求」的 prompt 用量作锚点：
-// 首发 Project 应退回该实测值，而不是全量派生估算（后者会把压缩后端遮蔽、
-// 模型看不到的历史也算进「已用」，标题虚高）。
+// 它被记进 meter（MeasuredPromptTokens 可读，供展示兜底与「锚点是否已超窗」判断），
+// 但**不得**直接充当投影。
+//
+// 曾经这里断言 Project 退回该实测值（把全量派生估算「压」下去，避免标題虚高）。
+// 那在小窗口读超长会话时是灾难：滑動窗口每步裁剪 → 拿不到增量基线 → Project 恒等于
+// 这个旧值，界面上的「已用」从首帧起就不动（实测 33K/3.29%，而 provider 实测 730K）。
+// 现在投影退回估算，并由调用方按**裁剪后真正发出的表面**计算；压缩后的大小由宿主
+// 记录的「实际表面」接管，不会虚高。
 func TestSeedUsageFromHistory(t *testing.T) {
 	a := &ReactLoopAgent{contextWindow: 1048576}
 	s := session.New()
@@ -28,7 +34,12 @@ func TestSeedUsageFromHistory(t *testing.T) {
 	if a.lastPromptTokens != 40347 {
 		t.Fatalf("lastPromptTokens = %d, want 40347", a.lastPromptTokens)
 	}
-	if got := a.tokenMeter().Project(913292); got != 40347 {
-		t.Fatalf("Project(全量估算 913292) = %d, want 锚点实测 40347（不应退回全量估算）", got)
+	// 实测值仍可作为展示兜底读到
+	if got := a.tokenMeter().MeasuredPromptTokens(); got != 40347 {
+		t.Fatalf("MeasuredPromptTokens = %d, want 40347", got)
+	}
+	// 但没有增量基线时不能拿它当投影——投影必须描述「即将发出的这一发」
+	if got := a.tokenMeter().Project(913292); got != 913292 {
+		t.Fatalf("Project(913292) = %d, want 913292（无基线时应退回估算，不是旧实测值）", got)
 	}
 }

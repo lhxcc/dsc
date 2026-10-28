@@ -88,6 +88,9 @@ func (tm *TokenMeter) UpdateUsage(usage *Usage) {
 	tm.totalTokens = fullPrompt + int(usage.CompletionTokens)
 	// 只有用量、不掌握「当次所发消息的估算」时也建立锚点，但不设增量基线：
 	// 投影会退化为实测值（保守下界），而不是把整段估算加到实测上（那会重复计）。
+	// 不设增量基线：我们不知道这次请求发出去时消息的估算是多少，无法换算增量。
+	// 此后 Project 会**退回调用方给的估算**（见 projectLocked），而不是把这个
+	// 实测值当投影——实测值只描述那一次请求，钉住它就是「已用永远不动」。
 	tm.pressureTokens = fullPrompt
 	tm.sampledEstimate = 0
 	tm.hasSample = true
@@ -223,14 +226,37 @@ func (tm *TokenMeter) projectLocked(currentEstimate int) int {
 	if tm.contextWindow > 0 && tm.pressureTokens > tm.contextWindow {
 		return currentEstimate
 	}
-	delta := 0
-	if tm.sampledEstimate > 0 {
-		delta = currentEstimate - tm.sampledEstimate
+	// 没有增量基线（只有用量、不知道那一次请求的表面）：实测值**不能**替换当前估算。
+	//
+	// 它描述的是「那一次请求」，而 currentEstimate 描述的是「即将发出的这一发」；两者
+	// 之间没有任何可换算的关系，拿实测当投影就等于把一个旧数字钉死在界面上。
+	//
+	// 曾经这里返回实测值当「保守下界」。在小窗口读超长会话（滑动窗口）的常态下那是
+	// 灾难：每步都在裁剪 → 裁剪后不重新锚定 → sampledEstimate 永远是 0 → Project 恒等
+	// 于启动时倒查到的那个旧用量。实测现场：会话已涨到 730K（provider 实测），界面
+	// 「已用」从首帧起一直是 33K / 3.29% 不动，而速率、命中率照常变（它们读的是另一
+	// 个数）。无基线就退回估算——它会随历史增长，且与裁剪判定同口径。
+	if tm.sampledEstimate <= 0 {
+		return currentEstimate
 	}
-	if p := tm.pressureTokens + delta; p > 0 {
+	if p := tm.pressureTokens + (currentEstimate - tm.sampledEstimate); p > 0 {
 		return p
 	}
 	return 0
+}
+
+// MeasuredPromptTokens 返回最近一次采样到的 provider prompt 侧用量（0 = 尚无采样）。
+//
+// 只用于**展示**的兜底（宿主侧计量实例在没有上报值、也没有改写表面时读它）：
+// 那是一个真实发生过的请求规模，不需要再拿估算去换算。注意不能拿 Project(0) 代替
+// ——那算的是 «实测 − 该次请求的估算»，也就是启发式的**误差**，不是规模。
+func (tm *TokenMeter) MeasuredPromptTokens() int {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if !tm.hasSample {
+		return 0
+	}
+	return tm.pressureTokens
 }
 
 // EstimateMessagesTokens 估算消息列表的总 token 数（对齐 DSH estimateMessage）。
