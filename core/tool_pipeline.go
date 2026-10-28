@@ -545,6 +545,16 @@ func detachJobContext(ctx context.Context) context.Context {
 	if pol := ApprovalPolicyFromContext(ctx); pol != "" {
 		dctx = WithApprovalPolicy(dctx, pol)
 	}
+	// 工具调用 id 必须一起带过去。
+	//
+	// 它是插件侧活跃上报的键：sdk 用 CallInfo.ToolCallID 把「这次调用还在动」记进
+	// GetActivity 的表里，宿主的前台宽限期轮询的正是这个键。此前这里只复制了会话与
+	// 审批策略，id 被丢成空串 → 插件把活动记在 "" 上（recordActivity 直接 return）→
+	// 宿主永远读到 0 → 任何长命令都在固定预算（30s）后被判 "no output" 转后台，
+	// 哪怕它一直在打印。这正是「几乎所有长命令都被无谓转后台」的根因。
+	if id := ToolCallIDFromContext(ctx); id != "" {
+		dctx = WithToolCallID(dctx, id)
+	}
 	// 打上后台任务标记：装空闲看门狗的一律跳过（见 background_ctx.go）。
 	// 后台任务已经交出去了，用「无输出」判死它既有害也自相矛盾——几十秒不吐字的
 	// 构建/测试是常态，而前台等待阶段本来就是允许它安静跑着的。

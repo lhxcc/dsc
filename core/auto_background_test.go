@@ -215,3 +215,76 @@ func TestAutoBackgroundGoesBackgroundWhenSilent(t *testing.T) {
 		t.Fatalf("长时间无输出应转后台，got %q", out)
 	}
 }
+
+// callIDProbeTool 记录执行时看到的工具调用 id（插件侧正是拿它当活跃上报的键）。
+type callIDProbeTool struct {
+	name    string
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	seen    string
+}
+
+func (t *callIDProbeTool) Name() string        { return t.name }
+func (t *callIDProbeTool) Description() string { return "call id probe" }
+func (t *callIDProbeTool) ParametersSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object"}`)
+}
+func (t *callIDProbeTool) HasCapability(cap string) bool { return cap == CapabilityAutoBackground }
+
+func (t *callIDProbeTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	t.mu.Lock()
+	t.seen = ToolCallIDFromContext(ctx)
+	t.mu.Unlock()
+	select {
+	case <-t.started:
+	default:
+		close(t.started)
+	}
+	select {
+	case <-t.release:
+	case <-time.After(3 * time.Second):
+	}
+	return "probe-done", nil
+}
+
+func (t *callIDProbeTool) seenID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.seen
+}
+
+// TestBackgroundPipelinePreservesToolCallID 后台管道必须把「工具调用 id」带进执行 ctx。
+//
+// 这不是内部细节：插件侧的活跃上报（sdk.TouchActivity → GetActivity）以这个 id 为键，
+// 宿主的前台宽限期轮询的也是它。曾经 detachJobContext 只复制会话与审批策略，id 被丢成
+// 空串——插件于是把活动记在 ""（recordActivity 直接 return）→ 宿主永远读到 0 →
+// 任何有输出的长命令都会在固定预算（30s）后被判 "no output" 转后台。实测现场就是
+// 「几乎所有长命令都无谓转后台，然后模型又不得不反复查 job_output」。
+func TestBackgroundPipelinePreservesToolCallID(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 5*time.Millisecond)
+	tool := &callIDProbeTool{name: "call-id-probe", started: make(chan struct{}), release: make(chan struct{})}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := WithToolCallID(context.Background(), "call-abc")
+	out, err := m.ExecuteTool(ctx, "call-id-probe", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("ExecuteTool: %v", err)
+	}
+	if !strings.Contains(out, "moved to background") {
+		t.Fatalf("夹具无效：应在宽限后转后台，got %q", out)
+	}
+
+	select {
+	case <-tool.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("后台执行没有开始")
+	}
+	if got := tool.seenID(); got != "call-abc" {
+		t.Fatalf("后台执行看到的 call id = %q，期望 call-abc（丢了它，插件侧活动上报就落在空键上，宿主永远读不到）", got)
+	}
+	close(tool.release)
+}
