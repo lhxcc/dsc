@@ -369,3 +369,35 @@ func TestCompactionWindowFromContextWindowEnv(t *testing.T) {
 		t.Fatalf("显式 0 应禁用，got %d", s.window)
 	}
 }
+
+// TestRetainBoundaryKeepsToolPairing 保留区起点不得落在 assistant(tool_calls) 与其
+// tool_result 之间。
+//
+// 预算边界是纯按 token 累积出来的，落在中间就会把调用压进摘要、结果留在保留区——
+// provider 收到孤立的 tool 消息直接 400，整轮失败。契约检查工具
+// （tools/backendcheck，按 compaction 能力扫全部插件）在真实派生历史上抓到过这个
+// 切点，这里用同一形状的历史把边界钉住：任何预算下保留区首条都不能是 tool。
+func TestRetainBoundaryKeepsToolPairing(t *testing.T) {
+	msgs := []*proto.Message{{Role: "user", Content: strings.Repeat("x", 400)}}
+	for i := 0; i < 5; i++ {
+		callID := "c" + string(rune('0'+i))
+		msgs = append(msgs,
+			&proto.Message{Role: "assistant", ToolCalls: []*proto.ToolCall{{Id: callID, Name: "shell", ArgumentsJson: "{}"}}},
+			&proto.Message{Role: "tool", ToolCallId: callID, Content: strings.Repeat("y", 400)},
+		)
+	}
+
+	s := newCompactionBasicServer()
+	s.window = 0 // 预算只由 retainMin 决定，便于逐档扫
+	for budget := 1; budget <= 3000; budget++ {
+		s.retainMin = budget
+		idx := s.retainBoundary(msgs)
+		if idx < len(msgs) && msgs[idx].GetRole() == "tool" {
+			t.Fatalf("预算 %d 时保留区首条是孤立 tool 结果（下标 %d，callID=%s）；provider 会 400",
+				budget, idx, msgs[idx].GetToolCallId())
+		}
+		if idx < 1 || idx > len(msgs) {
+			t.Fatalf("预算 %d 时边界越界: %d", budget, idx)
+		}
+	}
+}

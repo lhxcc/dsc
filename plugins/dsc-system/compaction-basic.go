@@ -403,10 +403,26 @@ func (s *compactionBasicServer) retainBoundary(msgs []*proto.Message) int {
 	for i := len(msgs) - 1; i >= lower; i-- {
 		acc += dsc.EstimateProtoMessageTokens(msgs[i])
 		if acc > budget {
-			return i + 1
+			return s.snapToPairBoundary(msgs, i+1)
 		}
 	}
 	return len(msgs)
+}
+
+// snapToPairBoundary 把「保留区起点」推到不切断 tool_call ↔ tool_result 的位置。
+//
+// 预算边界是纯按 token 累积出来的，可能正好落在 assistant(tool_calls) 与其
+// tool_result 之间：调用被压进摘要、结果留在保留区，provider 收到孤立的 tool 消息
+// 会直接 400（整轮失败）。这里把落单的结果一并划进压缩区（起点后移），保留区略微
+// 变小，但配对完整——这是硬要求，不是优化。
+func (s *compactionBasicServer) snapToPairBoundary(msgs []*proto.Message, idx int) int {
+	for idx < len(msgs) && msgs[idx].GetRole() == "tool" {
+		idx++
+	}
+	if idx >= len(msgs) {
+		return len(msgs)
+	}
+	return idx
 }
 
 // truncateSummary 截断式退化摘要：取首条+末条拼接（对齐宿主引擎 truncateCompact，
