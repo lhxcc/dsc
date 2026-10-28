@@ -105,20 +105,15 @@ func ApplyPatchOverlays(base *Config, overlays []*PatchOverlay) *Config {
 	if base == nil {
 		base = &Config{}
 	}
-	merged := &Config{
-		WorkspaceRoot:    base.WorkspaceRoot,
-		Mode:             base.Mode,
-		DefaultLLM:       base.DefaultLLM,
-		ContextWindow:    base.ContextWindow,
-		Persona:          base.Persona,
-		PlanSection:      base.PlanSection,
-		SessionID:        base.SessionID,
-		HistoryInjection: base.HistoryInjection,
-		HotReload:        base.HotReload,
-		Compaction:       base.Compaction,
-		Plugins:          make([]PluginEntry, len(base.Plugins)),
-	}
-	copy(merged.Plugins, base.Plugins)
+	// 值拷贝整份配置，再只对 overlay 覆盖的字段动手。
+	//
+	// 这里曾经是逐字段列举（WorkspaceRoot/Mode/…/Compaction），新加的配置项只要忘了
+	// 加一行，用 -patch 启动时就会被静默抹掉——MCP 开关和 history_shows 正是这样漏的。
+	// 「合并」的语义是「除被 patch 的字段外一律原样保留」，那就该由结构体拷贝表达，
+	// 而不是靠人记住维护一份字段清单。
+	merged := *base
+	// 切片必须深拷贝：后面的追加/替换不能写到 base 的底层数组。
+	merged.Plugins = append([]PluginEntry(nil), base.Plugins...)
 
 	for _, overlay := range overlays {
 		for _, entry := range overlay.Entries {
@@ -163,7 +158,7 @@ func ApplyPatchOverlays(base *Config, overlays []*PatchOverlay) *Config {
 			}
 		}
 	}
-	return merged
+	return &merged
 }
 
 // LoadPatchFiles 加载多个 -patch 文件（按命令行顺序）。
