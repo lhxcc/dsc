@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"dsc/proto"
+
 	"google.golang.org/grpc"
 )
 
@@ -43,6 +44,9 @@ func (m *lctxMockClient) ListContext(context.Context, *proto.ListContextRequest,
 }
 func (*lctxMockClient) SetInterconnect(context.Context, *proto.InterconnectRequest, ...grpc.CallOption) (*proto.InterconnectResponse, error) {
 	return &proto.InterconnectResponse{}, nil
+}
+func (*lctxMockClient) GetActivity(context.Context, *proto.GetActivityRequest, ...grpc.CallOption) (*proto.GetActivityResponse, error) {
+	return &proto.GetActivityResponse{}, nil
 }
 
 // TestListContextStableOrder 校验 ListContext 按插件名稳定排序拼接上下文片段：
