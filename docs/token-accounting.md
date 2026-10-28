@@ -259,12 +259,44 @@ default:
 }
 ```
 
-`toolTokens = ev.TokenCount − EstimateProtoMessagesTokens(msgs)`（宿主算过工具目录，
-直接取差值，不重复计算）。
+`toolTokens`：优先用 `ev.ToolTokens`（宿主直接给出）；只有旧宿主没带该字段时才反推
+`ev.TokenCount − EstimateProtoMessagesTokens(msgs)`。反推只作兜底——同一条瀑布里若别的
+插件先改写过消息，这个减法会把差额算成工具开销，甚至算成负数。
 
 另一个后端 `dsc-billion-context` 同理但更极端：它把绝大部分历史遮蔽成引用，真实载荷是
-渲染后的视图（~40K vs 原始 900K），因此它用 `last_usage_tokens`（上一次真正发出去的量），
-**不用** `projected_tokens`，代码注释里写明理由，防止后来者"顺手统一"。
+渲染后的视图（1M 窗口的真实会话实测 765K vs 原始 1.66M；早期样本 40K vs 900K），因此它用
+`last_usage_tokens`（上一次真正发出去的量），**不用** `projected_tokens`，代码注释里写明
+理由，防止后来者"顺手统一"。
+
+### 7.1 有压缩后端时，agent 不做请求级裁剪
+
+承接上一条「谁能改写表面，谁就必须自己量」：**既然后端把表面改小了，agent 手里的
+投影就不再描述将要发出的东西**，任何基于它的裁剪都是瞎猜。
+
+`TokenMeter.Project` 的锚点一头是**改写后**的 usage（比如 169K），一头是**改写前**的
+估算（比如 932K）——两者描述的是两个不同的列表。`usage + (x − sentEstimate)` 于是把
+后端省下的量当成「历史缩水」，投影在相邻两步之间来回摆：实测同一会话里 agent 的发送面
+在 932K / 610K 交替（对应 provider 的 169K / 26.5K），裁剪深度也跟着每步翻转，前缀缓存
+每次全废。
+
+因此裁定（`plugins/agent-react-loop` 的 step 循环）：
+
+- 有后端（`hasCompactionBackend`）时：**不裁剪、不折叠、不做「单轮内容超出上下文窗口」
+  硬报错**。这三件事量的都是改写前的列表，而真正上线的是后端的渲染结果（实测 765K vs
+  原始 1.66M），拿前者判后者会把完全装得下的请求判死。
+- 窗口适配是后端的职责：它看得到完整的 append-only 历史，也只有它能决定保留什么。
+- 兜底不是盲发：provider 4xx → 宿主 `agent/request-error` → 后端紧急压缩 → 重试
+  （`notify` 只采纳选定后端的 `retry`）。
+- 无后端时裁剪照旧（§11「动裁剪逻辑」），两条路径不要互相「统一」。
+
+配套硬约束：**消息身份必须是宿主下发的稳定 id**（`proto.Message.id`，派生时取 surface
+事件的 seq）。后端的压缩块用 `mNNNNN` 指认消息，而 `mNNNNN` 由消息 id 映射而来；一旦
+用列表下标当 id，`history_injection` 只带最近 N 条、fork、或任何裁剪都会让同一个引用
+指到另一条消息——不是「压得不准」，是**遮错内容**（实测最坏时整段对话只剩 2 条）。
+
+状态文件带 `schema` 版本，与当前不符即整体丢弃、由事件日志重建（`compress` 调用自带
+范围与摘要）。不写逐字段迁移：旧格式里记的是位置式 id，硬迁等于给已废弃的寻址方式
+留实现分支（AGENTS.md §4）。
 
 ---
 
@@ -272,7 +304,7 @@ default:
 
 ```
 ① agent 组装请求
-   msgs = sess.DeriveMessages()
+   msgs = sess.DeriveMessagesLimited(historyInjection)
    sentEstimate = Estimate(msgs) + EstimateTools(tools)
    sess.Append(request/header, {Turn,Step,ToolsHash,Model,Window,SentEstimate})
 
@@ -280,7 +312,7 @@ default:
    tokenCount = Estimate(msgs) + EstimateTools(tools)
    anchor     = 该会话上一次成功请求的 {usage, sentEstimate, ToolsHash, Model, Window}
    projected  = projectPressure(anchor, tokenCount, hash(tools), model, window)
-   → 广播 agent/pre-step{messages_json, token_count, last_usage_tokens,
+   → 广播 agent/pre-step{messages_json, token_count, tool_tokens, last_usage_tokens,
                           projected_tokens, envelope_matched}
    → 压缩后端（waterfall）改写 messages 或返回空（不改写）
 
@@ -311,9 +343,13 @@ default:
 
 - 估算只用 `core/token_meter.go` 的公式，插件经 `dsc.Estimate*`。
 - 「请求大小」= 消息 + 工具目录，任何压力/裁剪/预算都不得漏工具。
+- **消息身份 = 宿主下发的稳定 id**（`proto.Message.id`，派生时取 surface 事件 seq）。
+  任何跨请求指认同一条消息的东西（压缩块的覆盖集合、`mNNNNN` 映射）都用它；列表下标
+  不是身份，只是位置（§7.1）。
 - 压力必须量在"将要发出的表面"上（§7）；改写者自测。
-- **裁剪与超窗判定必须同一口径**：裁剪按消息估算选起点，判定读投影值，两者可能差数倍，
-  故裁剪要闭环（裁完用 `projectedFit` 复核，不满足就收紧预算再裁，见 §11「动裁剪逻辑」）。
+- **裁剪与超窗判定必须同一口径**（仅无压缩后端时，见 §7.1）：裁剪按消息估算选起点，
+  判定读投影值，两者可能差数倍，故裁剪要闭环（裁完用 `projectedFit` 复核，不满足就收紧
+  预算再裁，见 §11「动裁剪逻辑」）。
 - **压缩提示词必须命令模型在摘要里保留用户「当前最紧要任务/事项」**：`dsc-system`
   的 `llmSummary` 与 `dsc-billion-context` 的 `compress` 描述都写明——压缩后模型仍须知道
   现在要做什么、卡在哪、下一步是什么。当前任务靠模型自己的压缩选择保留，不靠程序钉死某条。
@@ -342,12 +378,24 @@ default:
 - 靠程序僵硬地「钉死首条消息 / 首条 user 不被裁不压缩」：超长会话（数十 MB 级）的「首条
   user 消息」大概率是几周前的失效旧需求，强行保留既无效又架空模型自身的压缩判断。裁剪/压缩
   只需保 `system` + 最近 N 条（保留尾），早期历史随滑动窗口自然淘汰即可。
+- 用列表下标（`msg-<n>`）当消息身份：`history_injection`、请求级裁剪、fork 都会让
+  同一个引用指到另一条消息——那是「遮错内容」，不是「压得不准」。
+- 在有压缩后端时于 agent 里做请求级裁剪、折叠，或拿改写前的估算做「单轮超窗」硬报错
+  （§7.1）。这三件事量的都不是将要发出的那份表面。
 - 宿主按插件名分发用量相关能力（应走声明式/事件）。
 
 **守卫测试**（改坏了会红）：`plugin_names_guard_test.go`、`TestToolsFingerprint`、
 `TestProjectPressure`、`TestLastUsageAnchor`、`TestRequestHeaderLogOnly`、
 `TestEstimateProtoToolTokens`、`TestCompactionBasicMeasuresItsOwnSurface`、
-`TestLsPipedIsOnePerLine`。
+`TestLsPipedIsOnePerLine`、`TestBackendActiveSkipsHistoryTrim`（有后端时不裁）、
+`TestStableIDsSurviveHeadTrimming`（id 不随列表起点变）、
+`TestRetainBoundaryKeepsToolPairing`（压缩切点不切断 tool 配对）。
+
+**构建期契约检查**：`tools/backendcheck`（builder 打包后自动跑，见 AGENTS.md
+「共享模块改动的最小验证面」）。它按 `compaction` 能力扫全部插件，用真实派生历史驱动
+**实际二进制**，校验结构约束（配对完整 / 条数不膨胀 / 首条 system 保留 / id 唯一且非
+位置式）。这条通道专门抓「改了一处、另一处静默变形」——各插件自己的单测手搓消息，
+天然绕过共享派生路径，抓不到。
 
 ---
 
@@ -381,11 +429,23 @@ default:
 **换压缩后端**：它必须自己回答"我要发的表面是什么"，然后按 §7 决定读哪个数；
 新后端不得直接照抄 `dsc-system` 的分支，而要先说清自己的表面是否被改写。
 
+另外三条硬要求：
+
+- 消息身份用 `proto.Message.id`（稳定 id），**不要**按列表下标编号（§7.1）。
+- 状态文件带 `schema` 版本；格式变了就加一，旧文件整体丢弃、由事件日志重建，
+  不写逐字段迁移（AGENTS.md §4）。
+- 打包后跑 `builder`，`tools/backendcheck` 会按能力找到你并验结构约束；配对被切断、
+  条数膨胀、首条 system 丢失、出现位置式 id 都会让构建失败。
+
 **调阈值**：窗口 `DSC_CONTEXT_WINDOW`（宿主注入）/ `DSC_COMPACTION_BASIC_CONTEXT_WINDOW`（插件专属，优先）；
 触发比例 `DSC_COMPACTION_BASIC_THRESHOLD`（默认 0.80）；保留尾部 `DSC_COMPACTION_BASIC_RETAIN_RATIO`（默认 0.16）。
 注意阈值比较的是"投影压力"，不是原始历史大小。
 
-**动裁剪逻辑**（`trimToWindow` / `fitMessagesToWindow*`）：裁剪按消息估算选起点，超窗判定
+**动裁剪逻辑**（`trimToWindow` / `fitMessagesToWindow*`）：**先确认没有压缩后端**——
+有后端时这条路径整段不执行（§7.1），把它改成无条件执行就会重现「发送面 932K/610K
+交替、前缀缓存每步失效」。以下仅适用于无后端的兜底路径。
+
+裁剪按消息估算选起点，超窗判定
 却读投影值，两者口径不同（差两三倍并不罕见）。所以裁剪是**闭环**的：裁一次 → 用
 `projectedFit`（投影口径，含工具目录）复核 → 不满足就按
 `oversizeTrimFallbackRatios`（0.90 → 0.60 → 0.35 → 0.15）逐档收紧再裁，直到装得进或
@@ -415,3 +475,4 @@ default:
 | **信封（envelope）** | 产生该用量的请求身份：工具目录指纹 + 模型 + 窗口 |
 | **投影（projection）** | 锚点 + 表面差量得到的"下一次大概多少"，用于决策 |
 | **可比（comparable）** | 锚点信封与当前请求一致，且用量不低于该信封的启发式估值 |
+| **稳定消息 id** | `proto.Message.id`，派生时取 surface 事件 seq：唯一、与派生范围无关，是跨请求指认消息的唯一身份 |
