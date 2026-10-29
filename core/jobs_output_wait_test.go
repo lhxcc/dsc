@@ -246,3 +246,46 @@ func TestJobOutputDoesNotWaitLongForFinalOutput(t *testing.T) {
 		t.Fatalf("应说明这类任务只在结束时才有输出（避免模型反复轮询），得到 %q", out)
 	}
 }
+
+// TestJobOutputReturnsTailPromptly 尾部快照任务：即使没有任何输出，也不该按分钟级
+// 预算阻塞——它随时可读，等只是接住刚巧正在打印的那几行。返回时要带上进度摘要，
+// 让模型能判断「还在动」还是「安静很久」。
+//
+// 现场：25 秒不出声的后台命令，旧行为会把 job_output 按 60s 预算卡到任务结束，
+// 回来时已经 completed；模型想要的「现在在干什么」反而拿不到。
+func TestJobOutputReturnsTailPromptly(t *testing.T) {
+	t.Setenv("DSC_JOB_OUTPUT_WAIT_SECS", "60")
+	m := NewManager(&ManagerConfig{})
+
+	done := make(chan jobs.JobOutcome, 1)
+	id, err := m.jobs.Start(jobs.StartSpec{
+		Kind:  "shell",
+		Label: "quiet but tailable",
+		Start: func() (jobs.JobHooks, error) {
+			return jobs.JobHooks{
+				Done:       done,
+				TailOutput: func() (string, int64) { return "", 0 }, // 还没吐字，但通道存在
+				Activity:   func() (time.Time, bool) { return time.Now(), true },
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { done <- jobs.JobOutcome{Status: jobs.StatusCompleted} }()
+
+	start := time.Now()
+	out, err := jobOutputOf(t, m, id)
+	if err != nil {
+		t.Fatalf("job_output: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("尾部快照任务不该按 60s 预算等待，实际等了 %v", elapsed)
+	}
+	if !strings.Contains(out, "(no output yet)") || !strings.Contains(out, "[status: running]") {
+		t.Fatalf("应如实回报运行中且暂无输出：%q", out)
+	}
+	if !strings.Contains(out, "running for") || !strings.Contains(out, "last activity") {
+		t.Fatalf("应带进度摘要（跑了多久 / 上次活动）：%q", out)
+	}
+}

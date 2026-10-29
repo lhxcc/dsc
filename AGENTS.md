@@ -351,3 +351,31 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
 
 - 若改动较为局部、不影响 README 概述，可标注「README 无需变更」以便复核。
 
+
+### 15. 工具结果必须是合法 UTF-8，还原归工具自己（不是宿主）
+
+- proto 的 `string` 字段强制合法 UTF-8：非法字节会让**整个**工具结果 marshal 失败（模型
+  只收到一句 "grpc: error while marshaling"，输出全丢）。SDK 因此兜底 `sanitizeUTF8`
+  （非法字节 → U+FFFD），但那是**止损**，不是还原。
+- **还原必须在工具侧做**，因为只有工具知道自己的输出来自哪里：外部进程在中文 Windows
+  上按系统码页（OEM/ANSI 936）输出，并且会与我们的 UTF-8 混在同一份结果里——`python3`
+  打印中文（GBK）+ 内建 `echo` 打印中文（UTF-8），或 stdout 与 stderr 直接拼在一起。
+- 解码要**两级**：先整段按系统码页严格解码（单一编码一次成功）；整段失败再**逐行**重试，
+  合法行原样保留、非法行单独解码。只做整段解码会把混编码输出整片退化成 U+FFFD（现场：
+  `合并: v7 线程` 显示成 `�ϲ�: v7 �߳�`）。参考
+  `plugins/tool-filesystem/encoding.go` 的 `ensureUTF8` / `decodeMixedLines`。
+- 流式上报（`dsc.AppendOutput`）的尾部同样要先还原：宿主只把它原样交给 UI，不会替任何
+  工具猜码页。
+- **码页取自系统，不写死**：`CP_OEMCP` / `CP_ACP` 交给 Windows 解析，zh-CN 得到 936、
+  zh-TW 得到 950（Big5）、ja-JP 得到 932、ko-KR 得到 949，不需要判断「这是不是简体系统」。
+  需要确定性时用 `DSC_OUTPUT_CODEPAGE` 显式钉死（码页号 `950` 或字符集名 `big5` 都行），
+  此时不再试探。
+- **两个解码后端，按平台各司其职**：Windows 走 `MultiByteToWideChar`（严格模式）——它是
+  唯一覆盖**全部**系统码页的解码器（含 mahonia 不收的韩文 949）；非 Windows 走 mahonia
+  （纯 Go），因为那边没有「系统码页」可问，没显式覆盖时老实给 U+FFFD。
+  **mahonia 是转换器，不做编码检测**：所谓「检测」只能拿 U+FFFD 当失败信号，与严格解码
+  等价，同样区分不了 GBK 与 Big5。因此它只当解码后端，码页仍由系统或显式配置决定。
+- **已知边界（别当它能猜对）**：GBK 与 Big5 都是双字节且区间重叠，交叉解码会**成功但给出
+  错字**（GBK `合并` 按 Big5 解出 `磁甜`），而不是 U+FFFD。单凭字节无法判断码页——这正是
+  需要 `DSC_OUTPUT_CODEPAGE` 的原因。
+- **不要把「猜码页」当默认行为**：解不出就老实给 U+FFFD——猜出一段假文本比乱码更难发现。

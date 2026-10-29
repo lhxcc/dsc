@@ -189,6 +189,19 @@ func TouchActivity(ctx context.Context) {
 	}
 }
 
+// AppendOutput 登记一段刚产生的输出（同时算一次活动）。
+//
+// 给「会被转到后台」的流式工具用：后台任务在另一个进程里跑，宿主拿不到它的管道，
+// 唯一能读到「跑到一半说了什么」的线路就是 GetActivity，所以工具在**写自己的输出
+// 缓冲时**顺手把同一段字节登记到这里。只保留尾部若干 KB，完整输出仍走工具结果。
+//
+// 不属于热路径上的必需动作：没调用它，宿主只会看到「没有可读输出」，其余一切照旧。
+func AppendOutput(ctx context.Context, p []byte) {
+	if info, ok := CallInfoFrom(ctx); ok {
+		recordOutput(info.ToolCallID, p)
+	}
+}
+
 // IdleDeadlineExceeded 报告上下文是否因空闲超时被取消。
 func IdleDeadlineExceeded(ctx context.Context) bool { return core.IdleDeadlineExceeded(ctx) }
 

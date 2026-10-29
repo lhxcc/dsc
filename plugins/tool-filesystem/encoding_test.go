@@ -54,3 +54,44 @@ func TestEnsureUTF8GBKOnWindows(t *testing.T) {
 		t.Fatalf("GBK 字节应还原为「你好」, got %q", got)
 	}
 }
+
+// TestEnsureUTF8MixedEncodings 混编码输出：同一段里既有 GBK 行、又有 UTF-8 行。
+//
+// 现场（2026-10-29 三张截图）：`python3 - <<PY` 打印的中文按系统码页（GBK）出来，
+// 而同一份结果里还有我们按 UTF-8 写的行；整段严格解码因一行不合法而全盘放弃，
+// 于是 `合并: v7 线程` 显示成 `�ϲ�: v7 �߳�`。逐行重试后两种编码各归各位。
+func TestEnsureUTF8MixedEncodings(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("系统码页还原仅 Windows 有意义")
+	}
+	if systemOEMCodePage() != 936 {
+		t.Skipf("系统 OEM 码页 %d ≠ 936（GBK），跳过", systemOEMCodePage())
+	}
+	// 第 1 行 GBK：合并: v7 线程；第 2 行 UTF-8：已解决
+	mixed := "\xba\xcf\xb2\xa2: v7 \xcf\xdf\xb3\xcc\n已解决\n"
+	got := ensureUTF8(mixed)
+	if !utf8.ValidString(got) {
+		t.Fatalf("结果必须为合法 UTF-8, got %q", got)
+	}
+	if !strings.Contains(got, "合并: v7 线程") {
+		t.Fatalf("GBK 行应还原为中文, got %q", got)
+	}
+	if !strings.Contains(got, "已解决") {
+		t.Fatalf("UTF-8 行应原样保留, got %q", got)
+	}
+	if strings.Contains(got, "\uFFFD") {
+		t.Fatalf("不应残留占位符, got %q", got)
+	}
+}
+
+// TestDecodeMixedLinesKeepsValidLines 逐行解码的边界：全合法输入不标记 changed，
+// 全非法且解不出时逐行兜底为 U+FFFD（不返回错误，结果是合法 UTF-8）。
+func TestDecodeMixedLinesKeepsValidLines(t *testing.T) {
+	if got, changed := decodeMixedLines("完全合法\nstill ascii\n"); changed || got != "完全合法\nstill ascii\n" {
+		t.Fatalf("全合法输入不应改动：changed=%v got=%q", changed, got)
+	}
+	got, changed := decodeMixedLines("abc\xffdef\n")
+	if !changed || !utf8.ValidString(got) {
+		t.Fatalf("非法行必须被净化：changed=%v got=%q", changed, got)
+	}
+}

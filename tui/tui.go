@@ -4079,10 +4079,28 @@ func (m *Model) runJobsCommand(rest string) {
 		if rd.Snapshot.Detail != "" {
 			msg += " (" + rd.Snapshot.Detail + ")"
 		}
-		if rd.Text != "" {
+		// 运行中也可能有可读内容（尾部快照）：人正看着这个视图，不该只给 (no output yet)。
+		running := rd.Snapshot.Status == jobs.StatusRunning || rd.Snapshot.Status == jobs.StatusStopping
+		switch {
+		case rd.Text != "":
 			msg += "\n" + rd.Text
-		} else {
+		case rd.Partial != "":
+			if rd.PartialBytes > int64(len(rd.Partial)) {
+				msg += fmt.Sprintf("\n(最近 %d 字节 / 共 %d 字节；结束后给完整结果)", len(rd.Partial), rd.PartialBytes)
+			} else {
+				msg += "\n(任务未结束，以下是目前的全部输出)"
+			}
+			msg += "\n" + rd.Partial
+		default:
 			msg += "\n(no output yet)"
+		}
+		if running {
+			if !rd.Snapshot.StartedAt.IsZero() {
+				msg += "\n已运行 " + time.Since(rd.Snapshot.StartedAt).Round(time.Second).String()
+			}
+			if !rd.LastActivity.IsZero() {
+				msg += "；上次活动 " + time.Since(rd.LastActivity).Round(time.Second).String() + " 前"
+			}
 		}
 		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · 后台任务") + "\n" + msg)
 	case strings.HasPrefix(rest, "kill "):

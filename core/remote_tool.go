@@ -179,3 +179,25 @@ func (r *RemoteTool) LastActivity(ctx context.Context, callID string) (time.Time
 	}
 	return time.UnixMilli(resp.GetLastActivityUnixMs()), true
 }
+
+// OutputTail 查询本次调用已产生输出的尾部与总字节数（插件侧 GetActivity 的同一趟）。
+//
+// 这是「后台任务跑到一半能看到什么」的唯一通道：任务在插件进程里跑，宿主拿不到
+// 它的管道，只能问执行方。尾部由插件自己截断到几 KB；total 是累计字节数，用来在
+// 界面上说清楚「你看到的是最后一段，总共已经有多少」。
+//
+// 与 LastActivity 分两个方法而不是一个：调用方要的东西不同（一个问「还活着吗」，
+// 一个问「它在说什么」），合成一个返回值会让两处都读到不关心的字段。
+func (r *RemoteTool) OutputTail(ctx context.Context, callID string) (tail string, total int64, ok bool) {
+	if r.client == nil || callID == "" {
+		return "", 0, false
+	}
+	resp, err := r.client.GetActivity(ctx, &proto.GetActivityRequest{ToolCallId: callID})
+	if err != nil {
+		return "", 0, false
+	}
+	if len(resp.GetOutputTail()) == 0 && resp.GetOutputBytes() == 0 {
+		return "", 0, false
+	}
+	return sanitizeUTF8(string(resp.GetOutputTail())), resp.GetOutputBytes(), true
+}
