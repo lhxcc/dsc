@@ -96,8 +96,14 @@ func (m *Manager) StartAdmin(addr string) string {
 	lsp.Use(adminAuth)
 	m.registerLSPAdminRoutes(lsp)
 
-	// MCP 管理（认证与 /plugins 一致）——盘活 core/mcp_client.go 死模块，
-	// 对齐 DSH packages/mcp/mcp-client 的能力暴露面。
+	// 通用管理操作端点（认证与 /plugins 一致）：任何声明了管理面的插件都经这里暴露，
+	// 宿主不认识具体名字（见 core/admin_operations.go）。
+	// 它取代了下面那组 MCP 专属路由——后者保留到 MCP 搬成插件为止，届时整组删除。
+	ops := e.Group("/operations")
+	ops.Use(adminAuth)
+	m.registerOperationAdminRoutes(ops)
+
+	// MCP 管理（已由 /operations 取代，待 MCP 搬成插件后删除）。
 	mcp := e.Group("/mcp")
 	mcp.Use(adminAuth)
 	m.registerMCPAdminRoutes(mcp)
