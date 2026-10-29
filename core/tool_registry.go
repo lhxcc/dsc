@@ -31,6 +31,18 @@ func (r *ToolRegistry) Register(t ToolDefinition) error {
 	return nil
 }
 
+// Replace 註冊或取代工具（線程安全）。熱同步用。
+//
+// Register 對同名工具回報錯誤（那是啟動期的重複註冊，值得說出來）；但熱同步的語義
+// 是「插件這次上報的就是現在的真相」——工具名不變、但 description / schema / hidden /
+// scopes 都可能變（MCP 的 load 就只是把 hidden 翻成 false）。用 Register 處理這種
+// 情況會靜默失敗，模型看到的一直是舊定義。
+func (r *ToolRegistry) Replace(t ToolDefinition) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tools[t.Name()] = t
+}
+
 // Unregister 卸載工具（線程安全）
 func (r *ToolRegistry) Unregister(name string) bool {
 	r.mu.Lock()

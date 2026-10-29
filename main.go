@@ -646,8 +646,8 @@ func main() {
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
 
-	// MCP 的开关不在这里：它归 tool-mcp 插件自己的状态（/mcp on|off 写插件状态文件）。
-	// 宿主不认识 MCP，连「MCP 是否启用」都不该知道——插件不报工具，目录成本自然为 0。
+	// 「MCP 是否启用」不在这里：那是插件自己的状态（由插件写自己的状态文件）。
+	// 宿主不认识任何具体协议，插件不报工具，目录成本自然为 0。
 
 	// 外部脚本钩子（-hooks hooks.json）：严格 LUA 脚本（go-lua 进程内解释）或
 	// 原生可执行文件（直接 exec 不经 shell），在工具流水线 BeforeTool/AfterTool
