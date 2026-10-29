@@ -15,18 +15,19 @@ import (
 	"io"
 	"strings"
 
-	"dsc/core/llmclient"
-	"dsc/core/notify"
-	"dsc/core/toolclient"
+	dsc "dsc-sdk"
+
 	"dsc/proto"
 	lua "github.com/wippyai/go-lua"
 )
 
 // Services 宿主互通服务的集合（由 tool-lua-host 在 SetInterconnect 时建立）。
 type Services struct {
-	LLM    *llmclient.Client
-	Tool   *toolclient.Client
-	Notify *notify.Notifier
+	// 客户端类型走 SDK 别名（core ← sdk ← plugins）：绑定层不再 import core 子包，
+	// 内核重构时这里不会被动漂移（AGENTS.md §10.5）。
+	LLM    *dsc.LLMClient
+	Tool   *dsc.ToolClient
+	Notify *dsc.NotifyClient
 	Store  *Store        // 插件进程内 KV（脚本间共享）
 	Hook   *HookRegistry // 脚本注册的宿主钩子
 	// Register 脚本注册工具的回调（由 host 提供）：script 为脚本名（去重命名空间）。

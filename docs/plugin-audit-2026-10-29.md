@@ -82,12 +82,23 @@ core」，例外表也写着「当前为空」——守卫在说谎。
 | 审批语义 | 插件只声明 `requires-never-approval` 能力，没有把 `approval=never` 当「自动放行」的地方；`agent` 只负责把策略渲染成提示文案。 |
 | `mcp_*` 工具名 | 只在 agent 的「工具目录会变，需要重新取目录」判定里出现（`mcp_connect` / `mcp_load` / `mcp_unload`），宿主侧仍是唯一注册点。 |
 
-## 四、留给以后的两件事（本次未动）
+## 四、层间依赖：LUA/SQL 绑定层已改走 SDK
 
-1. `tool-lua-host` / `tool-sql-host` 对 core 子包的依赖：需要先在 `sdk/` 为 `llmclient` /
-   `toolclient` / `notify` 补别名，再删例外。属于重构，不是缺陷。
-2. `tool-computer-use` 在本机测试需要 C 工具链（`zig`/`gcc`/`clang` 之一）：CI 或无工具链
-   机器上它会红，而 `builder` 会正常构建（本机走 `E://winkit//share//zig-...//zig.exe cc`）。
+`tool-lua-host` / `tool-sql-host` 的绑定层原来直接 `import dsc/core/llmclient|toolclient|notify`
+（因为它们需要把聚合客户端存进 `Services` 结构体、再交给脚本侧使用）。按既定分层
+（**core ← sdk ← plugins**）补齐了 SDK 面：
+
+- `sdk/clients.go` 新增四个**类型别名**：`dsc.AgentClient` / `dsc.LLMClient` /
+  `dsc.ToolClient` / `dsc.NotifyClient`（`type X = core.X`，方法集与类型身份一致，无包装层、
+  无转换）；
+- 两个绑定层改用别名，只 `import dsc-sdk`；
+- `TestPluginsDoNotImportCore` 的例外表**清空**——现在全部插件确实只依赖 SDK，守卫那句
+  「全部插件均已脱离 core」才成立。
+
+## 五、留给以后的一件事（本次未动）
+
+1. `tool-computer-use` 在本机测试需要 C 工具链（`zig`/`gcc`/`clang` 之一）：CI 或无工具链
+   机器上它会红，而 `builder` 会正常构建（本机走 `E:\winkit\share\zig-...\zig.exe cc`）。
    要不要在测试里检测工具链并 `t.Skip`，由部署策略定。
 
    顺带记录一次**构建偶发**：同一台机器同一命令，一次 zig 编译失败（`所有编译器均失败`）、

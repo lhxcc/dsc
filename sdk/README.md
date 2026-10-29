@@ -220,6 +220,23 @@ sdk.SetInterconnect(func(ctx context.Context, ic *dsc.Interconnect) error {
 宿主掛載聚合服務後回調一次；獨立插件之間互不感知——經宿主聚合路由調用其他
 插件能力，無需知道對方的存在。
 
+**要給客戶端命名時用 SDK 別名，不要 import core**（分層：core ← sdk ← plugins）：
+`dsc.AgentClient` / `dsc.LLMClient` / `dsc.ToolClient` / `dsc.NotifyClient` 是
+`core/*client` 的**類型別名**（方法集與類型身份一致，無包裝層）。典型場景：把客戶端存進
+自己的 `Services` 結構體字段，或傳給內部包（LUA / SQL 綁定層就是這樣把
+`dsc.llm` / `dsc.tool` / `dsc.notify` 暴露給腳本的）：
+
+```go
+type Services struct {
+        LLM    *dsc.LLMClient    // 而不是 *llmclient.Client
+        Tool   *dsc.ToolClient
+        Notify *dsc.NotifyClient
+}
+```
+
+插件直接 `import "dsc/core/..."` 會被 `core/plugin_sdk_boundary_test.go::TestPluginsDoNotImportCore`
+擋下（含子包）。
+
 ## Agent 類型插件接入宿主服務（AgentBroker）
 
 `dsc.TypeAgent` 插件在 gRPC server 建立時收到 SDK 對 go-plugin broker 的隔離封裝

@@ -23,8 +23,8 @@ import (
 	"sort"
 	"strings"
 
-	"dsc/core/llmclient"
-	"dsc/core/toolclient"
+	dsc "dsc-sdk"
+
 	"dsc/proto"
 	lua "github.com/wippyai/go-lua"
 )
@@ -32,8 +32,9 @@ import (
 // Services 宿主互通服务与插件自持能力的集合（由 tool-sql-host 在 SetInterconnect 时
 // 按插件建立；每个插件一份副本，Register/Store/Self/Info 指向该插件自身）。
 type Services struct {
-	LLM    *llmclient.Client
-	Tool   *toolclient.Client
+	// 客户端类型走 SDK 别名（core ← sdk ← plugins）：绑定层不再 import core 子包。
+	LLM    *dsc.LLMClient
+	Tool   *dsc.ToolClient
 	Notify Notifier
 	// Store 插件自持状态（落盘在插件自身 .dsp）。
 	Store StateStore
