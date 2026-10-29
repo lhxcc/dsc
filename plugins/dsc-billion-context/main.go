@@ -61,6 +61,9 @@ type BillionContext struct {
 	// 「是压缩块覆盖了」还是「视图被谁掏空了」——历史上那类请求面摆动的排查靠它定位。
 	lastViewIn, lastViewInTok   int
 	lastViewOut, lastViewOutTok int
+	// preStepSeq pre-step 调用序号（宿主载荷里没有轮/步号——ChatRequest 不带它们，
+	// 事件里的 Turn/Step 因此恒为 0；用本地序号至少能把相邻几步排成序列看摆动）。
+	preStepSeq int
 
 	// lastMessages 缓存最近一次 pre-step 收到的 CoreMessage 列表，供 handleCompress
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
@@ -370,12 +373,14 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	bc.lastTokenCount = tokenCount
 	bc.lastViewIn, bc.lastViewInTok = len(coreMsgs), tokenCount
 	bc.lastViewOut, bc.lastViewOutTok = len(result.Messages), outTok
+	bc.preStepSeq++
+	seqNo := bc.preStepSeq
 	bc.mu.Unlock()
 	// 一行视图账：进来多少条/多少 token、发出去多少条/多少 token。渲染后远小于输入是
 	// 正常的（压缩块覆盖旧消息），但**同一个会话里忽大忽小**就是问题——排查请求面摆动
 	// 时先看这行，别再从 provider 用量反推。
-	fmt.Fprintf(os.Stderr, "[billion-context] view: turn=%d step=%d in=%d(%d tok) out=%d(%d tok) blocks=%d\n",
-		ev.Turn, ev.Step, len(coreMsgs), tokenCount, len(result.Messages), outTok, len(result.State.Blocks))
+	fmt.Fprintf(os.Stderr, "[billion-context] view: #%d in=%d(%d tok) out=%d(%d tok) blocks=%d\n",
+		seqNo, len(coreMsgs), tokenCount, len(result.Messages), outTok, len(result.State.Blocks))
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
