@@ -53,3 +53,6 @@ bun.lockb
 /dist/
 # 用户贴图的临时目录（截图不是源码，勿提交）
 /ERRRRR/
+
+# 插件运行期临时目录（如 tool-pdf 的 /tmp 映射），是产物不是源码
+plugins/*/temp/

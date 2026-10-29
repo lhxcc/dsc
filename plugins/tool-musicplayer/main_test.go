@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	dsc "dsc-sdk"
 )
 
 // setUserHome 临时把 Windows 主目录切换到 temp 目录，测试结束后还原，
@@ -46,9 +48,12 @@ func TestCollectAudioFilesDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect dir: %v", err)
 	}
+	// 期望值按产品口径构造（dsc.PJoin → 正斜杆）：插件输出面向模型，路径一律正斜杆。
+	// 用 filepath.Join 会在 Windows 上产出反斜杆，必然不等——这是测试的假设错，
+	// 不是产品错。
 	want := []string{
-		filepath.Join(dir, "a.mp3"),
-		filepath.Join(dir, "b.wav"),
+		dsc.PJoin(dir, "a.mp3"),
+		dsc.PJoin(dir, "b.wav"),
 	}
 	if !reflect.DeepEqual(files, want) {
 		t.Fatalf("got %v, want %v", files, want)
@@ -166,15 +171,15 @@ func TestDefaultSrcPersistence(t *testing.T) {
 	if err := saveDefaultSrc(dir); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if got := loadDefaultSrc(); got != filepath.Clean(dir) {
-		t.Fatalf("load after save = %q, want %q", got, filepath.Clean(dir))
+	if got := loadDefaultSrc(); got != dsc.PJoin(dir) {
+		t.Fatalf("load after save = %q, want %q", got, dsc.PJoin(dir))
 	}
 	data, err := os.ReadFile(defaultSrcFile())
 	if err != nil {
 		t.Fatalf("default src file not written: %v", err)
 	}
-	if string(data) != filepath.Clean(dir) {
-		t.Fatalf("file content = %q, want %q", string(data), filepath.Clean(dir))
+	if string(data) != dsc.PJoin(dir) {
+		t.Fatalf("file content = %q, want %q", string(data), dsc.PJoin(dir))
 	}
 }
 

@@ -46,11 +46,12 @@ import (
 
 	dsc "dsc-sdk"
 
-	"dsc/core/llmclient"
 	"dsc/proto"
 )
 
-// llmChat 聚合 LLM 的最小接口（*llmclient.Client 满足；单测以 fake 注入）。
+// llmChat 聚合 LLM 的最小接口（宿主 interconnect 的 *llmclient.Client 满足；单测以
+// fake 注入）。这里刻意只声明接口、不 import core 的 llmclient 子包：插件只依赖
+// dsc-sdk（AGENTS.md §10.5），少一个 core 子包就少一处随内核重构漂移的面。
 type llmChat interface {
 	Chat(ctx context.Context, messages []*proto.Message, maxTokens int32) (*proto.ChatResponse, error)
 }
@@ -143,7 +144,7 @@ func newCompactionBasicServer() *compactionBasicServer {
 
 // attachLLM 缓存 interconnect 聚合 LLM 客户端（宿主挂载后回调注入）。
 // nil 不覆盖：未互联时保持 nil，摘要走截断式退化（对齐宿主引擎 nil-LLM 路径）。
-func (s *compactionBasicServer) attachLLM(c *llmclient.Client) {
+func (s *compactionBasicServer) attachLLM(c llmChat) {
 	if c == nil {
 		return
 	}
@@ -259,8 +260,9 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		}
 	}
 	if retainIdx >= len(msgs) || retainIdx <= base {
-		// 可压缩段已被既有记录覆盖（或全部落在保留区）：尽力返回当前改写；
-		// 用量仍超阈值时溢出紧急压缩（agent/request-error）仍是安全阀
+		// 可压缩段已被既有记录覆盖（或全部落在保留区）：尽力返回当前改写。
+		// 仍然超窗时由宿主滑窗兜住（provider 4xx → 收紧预算 → 重试），本插件不再
+		// 做有损的紧急压缩。
 		if len(records) > 0 {
 			return rewriteJSON(rewritten)
 		}

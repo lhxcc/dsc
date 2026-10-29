@@ -54,13 +54,15 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
 4. agent 每輪 `buildSystemPrompt` 經 `ListContext` 拉取 ACP 指導（對齊 DSH `ctx.systemPrompt.section`）
 5. agent 發起 LLM 請求前，宿主 emit `agent/pre-step` 事件
 6. 插件收到事件，經 `acp.ProcessTurn` 跑 pipeline：
-   - 分配 `mNNNNN` ref 給每條消息（FNV-1a 內容 hash 生成穩定 ID）
+   - 分配 `mNNNNN` ref 給每條消息（以宿主下發的穩定消息 id 為鍵：`proto.Message.id`＝
+     surface 事件 seq；沒有 id 的消息不參與壓縮，絕不退回流位置或內容 hash）
    - 應用 prune（被壓縮塊覆蓋的消息替換為 summary，原位嵌入保持前綴穩定）
    - 清理孤兒 tool-call/result/reasoning 配對
    - 決策是否注入 nudge 提示（45% 閾值 + 隨窗口縮放的增長門 + T2/T3 蒸餾（質量優先））
 7. 返回改寫後的消息列表給宿主，宿主透傳給 LLM
 8. 模型調 `compress` 工具時，插件從緩存的 `lastMessages` 解析 `mNNNNN` 邊界執行壓縮
-9. 上下文溢出時，插件經 `agent/request-error` 事件觸發緊急壓縮後返回 `{"retry": true}`，宿主重新走 pre-step + 重新調 provider
+9. 上下文溢出不由插件處理：超窗的處置權在宿主（收緊預算 → 滑窗 → 重試，全程無損）。
+   本插件不再訂閱 `agent/request-error`——有損的緊急壓縮會把整段真實消息換成佔位摘要
 
 ## 前綴緩存穩定性
 
@@ -125,8 +127,8 @@ plugins:
 - 孤兒 tool-call/result/reasoning 配對清理
 - nudge 決策（閾值門 + 增長門（隨窗口縮放）+ baseline 重置 + T2/T3 **質量觸發**：可回收摘要 tokens ≥ 1.5×nudgeGrowthTokens；計數路徑默認關閉，對齊 acp-kernel #379「block COUNT is not a need signal」）
 - ACP system prompt 經 `Hook.ContextFn` 貢獻（對齊 DSH `ctx.systemPrompt.section`）
-- 穩定消息 ID（FNV-1a 內容 hash，不含視圖 index）
-- request-error 重試閉環（溢出緊急壓縮 + `{"retry": true}`）
+- 穩定消息 ID（宿主下發的 `event-<seq>`，不含視圖 index／內容 hash）
+- 超窗交給宿主滑窗（不再訂閱 `agent/request-error`，不做有損緊急壓縮）
 - state JSON 文件持久化
 - 4 個工具 handler
 - 18 個單元測試

@@ -20,7 +20,11 @@ import (
 // 迁移是渐进的：下列插件仍持有 core 依赖（多为协议实现边界，需要先在 SDK 补齐转发面），
 // 登记在此以便只允许减少、不允许新增。补齐后把条目删掉即可。
 var pluginsStillOnCore = map[string]string{
-	// 当前为空：全部插件已改为只依赖 dsc-sdk。新增条目须写明具体理由与迁移计划。
+	// LUA/SQL 宿主的互通绑定：把宿主聚合服务（LLM/Tool/Notify）暴露给脚本与 SQL，
+	// 绑定层需要具体的 *llmclient.Client / *toolclient.Client / notify API 形态，
+	// 而不是 interface。迁移计划：在 sdk/ 补齐对应别名后删除本条。
+	"tool-lua-host": "脚本绑定层需要 core/llmclient|toolclient|notify 的具体 API",
+	"tool-sql-host": "SQL 绑定层需要 core/llmclient|toolclient 的具体 API",
 }
 
 // TestPluginsDoNotImportCore 扫描 plugins/ 下所有 Go 源文件（含测试），禁止 import "dsc/core"。
@@ -53,7 +57,10 @@ func TestPluginsDoNotImportCore(t *testing.T) {
 		if readErr != nil {
 			return nil
 		}
-		if !strings.Contains(string(data), `"dsc/core"`) {
+		// 前缀匹配：`"dsc/core"` 与 `"dsc/core/llmclient"` 都是 core 依赖。
+		// 只匹配精确串会漏掉子包——这里曾经漏过（三个文件用着 core/llmclient，
+		// 守卫却报「全部插件已脱离 core」）。
+		if !strings.Contains(string(data), `"dsc/core`) {
 			return nil
 		}
 		rel, _ := filepath.Rel(repoRoot, path)

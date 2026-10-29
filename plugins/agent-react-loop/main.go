@@ -1826,7 +1826,7 @@ func newAgent() (*ReactLoopAgent, error) {
 func agentSDKConfig() dsc.Config {
 	return dsc.Config{
 		Name:    "agent-react-loop",
-		Version: "1.1.0",
+		Version: "1.2.0",
 		Type:    dsc.TypeAgent,
 		Requires: []dsc.CapabilityRequirement{
 			{Type: "llm", Capability: "llm"},

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -59,7 +58,7 @@ func (c *compactionStore) path(sessID string) (string, bool) {
 	if c == nil || c.dir == "" || !dsc.ValidSessionID(sessID) {
 		return "", false
 	}
-	return filepath.Join(c.dir, sessID+".dsc-system.json"), true
+	return dsc.PJoin(c.dir, sessID+".dsc-system.json"), true
 }
 
 // Load 读回该会话的记录。文件不存在 / 损坏 / schema 不符 / 串档 → nil（等同未压缩过）。
