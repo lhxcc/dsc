@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // defaultProtocolVersion 握手时请求的协议版本（服务端可回落到自己支持的版本）。
@@ -76,6 +77,18 @@ type ServerCapabilities struct {
 	Prompts   bool
 }
 
+// CatalogChange 服务器通知「目录变了」时，变的是哪一类。
+type CatalogChange string
+
+const (
+	// CatalogTools notifications/tools/list_changed
+	CatalogTools CatalogChange = "tools"
+	// CatalogResources notifications/resources/list_changed
+	CatalogResources CatalogChange = "resources"
+	// CatalogPrompts notifications/prompts/list_changed
+	CatalogPrompts CatalogChange = "prompts"
+)
+
 // Client 一个 MCP 服务器会话。
 //
 // 生命周期：New* → Connect（握手 + 发现工具/资源/提示词）→ 调用 → Disconnect。
@@ -91,6 +104,13 @@ type Client struct {
 	resources []Resource
 	prompts   []Prompt
 	nextID    int64
+
+	// 目录变更通知（服务器主动推）
+	notesMu      sync.Mutex
+	notesRun     bool
+	notesStop    chan struct{}
+	onCatalogSet bool
+	onCatalog    func(CatalogChange)
 }
 
 // NewHTTPClient 连接一个 streamable HTTP 端点的客户端。
@@ -115,7 +135,126 @@ func NewClient(serverName string, transport Transport, logger Logger) *Client {
 	if logger == nil {
 		logger = nopLogger{}
 	}
-	return &Client{serverName: serverName, transport: transport, logger: logger}
+	return &Client{
+		serverName: serverName,
+		transport:  transport,
+		logger:     logger,
+		notesStop:  make(chan struct{}),
+	}
+}
+
+// SetCatalogChangeHandler 注册「服务器说目录变了」的回调（在后台 goroutine 里调用）。
+//
+// 回调触发前**已经重新拉取过**对应的列表：回调里读 Tools()/Resources()/Prompts()
+// 拿到的一定是新数据。回调可能被并发触发（不同类别的通知），实现方自己注意。
+//
+// 为什么不直接暴露一个通知通道：调用方几乎总要做同一件事——重新列一遍再决定要不要
+// 重新注册。让每个调用方各写一遍「收到 tools/list_changed 就去 tools/list」，
+// 迟早有一边忘了处理 nextCursor 或能力判断。
+func (c *Client) SetCatalogChangeHandler(fn func(CatalogChange)) {
+	c.notesMu.Lock()
+	c.onCatalog = fn
+	c.onCatalogSet = fn != nil
+	c.notesMu.Unlock()
+}
+
+// notificationsActive 通知订阅是否仍在运行（Disconnect 之后为 false）。
+func (c *Client) notificationsActive() bool {
+	c.notesMu.Lock()
+	defer c.notesMu.Unlock()
+	return c.notesRun
+}
+
+// startNotifications 订阅服务器主动通知（传输层支持才有）。
+//
+// 只订阅一次；Connect 会被重连路径反复调用，重复起 goroutine 会让同一条通知被处理多次。
+func (c *Client) startNotifications() {
+	n, ok := c.transport.(Notifier)
+	if !ok {
+		return
+	}
+	// HTTP 需要额外打开一条 GET SSE 流；stdio 的 stdout 本来就一直在读。
+	if starter, ok := c.transport.(interface {
+		beginNotifications(Logger)
+	}); ok {
+		starter.beginNotifications(c.logger)
+	}
+
+	c.notesMu.Lock()
+	if c.notesRun {
+		c.notesMu.Unlock()
+		return
+	}
+	c.notesRun = true
+	stop := c.notesStop
+	c.notesMu.Unlock()
+
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case msg := <-n.Notifications():
+				if msg == nil {
+					continue
+				}
+				// 通道可能一直有积压（服务器在断开前猛推）：停止后必须**不再处理**，
+				// 否则卸载中的会话还在改目录。select 在 stop 与 notes 同时就绪时是随机
+				// 选一个的，光靠 select 保证不了这条。
+				if !c.notificationsActive() {
+					return
+				}
+				c.handleNotification(msg)
+			}
+		}
+	}()
+}
+
+// handleNotification 处理一条服务器通知：目录类通知先刷新缓存，再叫回调。
+func (c *Client) handleNotification(msg map[string]any) {
+	method, _ := msg["method"].(string)
+	var (
+		kind CatalogChange
+		load func(context.Context) error
+	)
+	caps := c.Capabilities()
+	switch method {
+	case "notifications/tools/list_changed":
+		kind = CatalogTools
+		load = func(ctx context.Context) error { return c.discoverTools(ctx, caps) }
+	case "notifications/resources/list_changed":
+		kind = CatalogResources
+		load = c.discoverResources
+	case "notifications/prompts/list_changed":
+		kind = CatalogPrompts
+		load = c.discoverPrompts
+	default:
+		// 其它通知（日志、进度、资源更新…）当前没有消费者，静默丢弃是故意的：
+		// 我们没有声明对应能力，也没有人去用它们。
+		c.logger.Debug("mcp notification ignored", "server", c.serverName, "method", method)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := load(ctx)
+	cancel()
+	if err != nil {
+		// 刷新失败不推翻已有目录：旧列表仍然可用，下次通知或重连再试。
+		c.logger.Info("mcp catalog refresh failed after notification",
+			"server", c.serverName, "kind", string(kind), "error", err.Error())
+		return
+	}
+	c.logger.Debug("mcp catalog refreshed", "server", c.serverName, "kind", string(kind))
+
+	c.notesMu.Lock()
+	active := c.notesRun
+	handler := c.onCatalog
+	c.notesMu.Unlock()
+	// 刷新可能花了几秒，期间可能已经 Disconnect：这时代理已经不该再改目录了。
+	if !active || handler == nil {
+		return
+	}
+	handler(kind)
 }
 
 // ServerName 服务器名（调用方用它组工具名前缀）。
@@ -254,6 +393,9 @@ func (c *Client) Connect(ctx context.Context) error {
 				"server", c.serverName, "error", err.Error())
 		}
 	}
+	// 订阅服务器主动通知（tools/resources/prompts 的 list_changed）。
+	// 放在发现之后：连接期间积压的通知不会白拉一次目录。
+	c.startNotifications()
 	return nil
 }
 
@@ -641,8 +783,16 @@ func renderPromptBlock(block map[string]any) string {
 	return fmt.Sprintf("[%s block omitted]", kind)
 }
 
-// Disconnect 关闭传输（stdio 回收子进程）。可重复调用。
+// Disconnect 关闭传输（stdio 回收子进程）并停掉通知订阅。可重复调用。
+//
+// 断开之后不要再用这个 client：它不再接受通知，重连路径也应新建一个。
 func (c *Client) Disconnect() {
+	c.notesMu.Lock()
+	if c.notesRun {
+		c.notesRun = false
+		close(c.notesStop)
+	}
+	c.notesMu.Unlock()
 	if c.transport != nil {
 		c.transport.Close()
 	}

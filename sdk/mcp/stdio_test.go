@@ -55,6 +55,9 @@ func runStdioHelper(stdin *os.File, stdout, stderr *os.File) {
 	fmt.Fprintf(stderr, "%s\n", strings.Repeat("stderr-noise ", 64*1024))
 	_ = stderr.Sync()
 	replySeen := false
+	// 动态工具表：add_tool 会往里加一条并推 notifications/tools/list_changed，
+	// 用来验证「服务器运行期新增工具，客户端不用重连就能看见」。
+	toolNames := []string{"echo", "big", "die", "reply_seen", "add_tool"}
 
 	for {
 		line, err := in.ReadBytes('\n')
@@ -78,12 +81,14 @@ func runStdioHelper(stdin *os.File, stdout, stderr *os.File) {
 				case "notifications/initialized":
 					// 通知无响应
 				case "tools/list":
-					write(result(id, map[string]any{"tools": []any{
-						map[string]any{"name": "echo", "description": "echo args", "inputSchema": map[string]any{"type": "object"}},
-						map[string]any{"name": "big", "description": "large result", "inputSchema": map[string]any{"type": "object"}},
-						map[string]any{"name": "die", "description": "exit the server", "inputSchema": map[string]any{"type": "object"}},
-						map[string]any{"name": "reply_seen", "description": "did client answer our request", "inputSchema": map[string]any{"type": "object"}},
-					}}))
+					items := make([]any, 0, len(toolNames))
+					for _, name := range toolNames {
+						items = append(items, map[string]any{
+							"name": name, "description": name + " tool",
+							"inputSchema": map[string]any{"type": "object"},
+						})
+					}
+					write(result(id, map[string]any{"tools": items}))
 				case "tools/call":
 					params, _ := msg["params"].(map[string]any)
 					name, _ := params["name"].(string)
@@ -94,6 +99,14 @@ func runStdioHelper(stdin *os.File, stdout, stderr *os.File) {
 						write(result(id, map[string]any{"content": []any{map[string]any{
 							"type": "text", "text": strings.Repeat("x", largeBytes),
 						}}}))
+					case "add_tool":
+						toolNames = append(toolNames, "late_tool")
+						write(result(id, map[string]any{"content": []any{map[string]any{
+							"type": "text", "text": "added",
+						}}}))
+						write(map[string]any{
+							"jsonrpc": "2.0", "method": "notifications/tools/list_changed",
+						})
 					case "die":
 						os.Exit(3)
 					case "reply_seen":
@@ -143,10 +156,10 @@ func TestStdioConnectAndCall(t *testing.T) {
 		t.Fatalf("TransportKind = %q, want stdio", kind)
 	}
 	tools := c.Tools()
-	if len(tools) != 4 {
-		t.Fatalf("工具数 = %d, want 4: %+v", len(tools), tools)
+	if len(tools) != 5 {
+		t.Fatalf("工具数 = %d, want 5: %+v", len(tools), tools)
 	}
-	if tools[0].Name != "big" && tools[0].Name != "die" &&
+	if tools[0].Name != "add_tool" && tools[0].Name != "big" && tools[0].Name != "die" &&
 		tools[0].Name != "echo" && tools[0].Name != "reply_seen" {
 		t.Fatalf("工具命名不符: %+v", tools)
 	}

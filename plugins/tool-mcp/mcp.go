@@ -194,6 +194,44 @@ func specsFromEnv() []serverSpec {
 	return []serverSpec{spec}
 }
 
+// onCatalogChange 服务器推送目录变更后的清理与留痕。
+//
+// 只做两件事：把已消失工具从 loaded 里摘掉（否则「已加载」会指向不存在的名字，
+// /mcp status 与目录成本都跟着虚高），以及写一行日志。工具本身的增删由宿主的
+// 工具同步机制（每 ~800ms 重新 ListTools）体现在模型目录里，插件不必推。
+func (a *app) onCatalogChange(server string, kind dscmcp.CatalogChange) {
+	a.mu.Lock()
+	conn, ok := a.clients[server]
+	if !ok {
+		a.mu.Unlock()
+		return // 已经断开：这次通知作废
+	}
+	alive := map[string]bool{}
+	for _, t := range conn.client.Tools() {
+		alive[publicName(server, t.Name)] = true
+	}
+	var dropped []string
+	for name := range a.loaded {
+		if serverOf(name) != server {
+			continue
+		}
+		if !alive[name] {
+			delete(a.loaded, name)
+			dropped = append(dropped, name)
+		}
+	}
+	tools, resources, prompts := conn.client.ToolCount(), conn.client.ResourceCount(), conn.client.PromptCount()
+	a.mu.Unlock()
+
+	fmt.Fprintf(os.Stderr, "tool-mcp: %s: server reported %s changed → tools=%d resources=%d prompts=%d\n",
+		server, kind, tools, resources, prompts)
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		fmt.Fprintf(os.Stderr, "tool-mcp: %s: unloaded tools that no longer exist: %s\n",
+			server, strings.Join(dropped, ", "))
+	}
+}
+
 // connect 建立（或重建）一台服务器的连接并登记它的工具。
 func (a *app) connect(spec serverSpec) error {
 	spec.Name = strings.TrimSpace(spec.Name)
@@ -225,6 +263,13 @@ func (a *app) connect(spec serverSpec) error {
 	default:
 		return fmt.Errorf("server %q: unsupported transport %q (http or stdio)", spec.Name, spec.Transport)
 	}
+
+	// 服务器说「目录变了」时：清掉已不存在的加载记录，让人在日志里看得见。
+	// 不需要通知宿主——它每次取工具目录都会重新问本插件（ListTools 每 ~800ms 同步一次），
+	// 插件这边缓存一更新，新工具自然出现在下一次请求里。
+	client.SetCatalogChangeHandler(func(kind dscmcp.CatalogChange) {
+		a.onCatalogChange(spec.Name, kind)
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
