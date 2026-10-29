@@ -46,7 +46,6 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 	"off":    {usage: "off", tool: ""},
 	"list": {
 		usage: "list [server]",
-		tool:  "mcp_list",
 		build: func(pos []string, _ map[string]string) (map[string]any, error) {
 			args := map[string]any{"limit": 200} // 人工查看时默认给全（模型侧默认 40 是为了省上下文）
 			if len(pos) > 0 {
@@ -57,7 +56,6 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 	},
 	"connect": {
 		usage: "connect <name> <endpoint|command> [args...]",
-		tool:  "mcp_connect",
 		build: func(pos []string, _ map[string]string) (map[string]any, error) {
 			if len(pos) < 2 {
 				return nil, fmt.Errorf("需要 <name> <endpoint 或 command>")
@@ -81,7 +79,6 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 	},
 	"disconnect": {
 		usage: "disconnect [server]",
-		tool:  "mcp_disconnect",
 		build: func(pos []string, _ map[string]string) (map[string]any, error) {
 			args := map[string]any{}
 			if len(pos) > 0 {
@@ -92,7 +89,6 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 	},
 	"load": {
 		usage: "load <tool...> | load --server <name>",
-		tool:  "mcp_load",
 		build: func(pos []string, opts map[string]string) (map[string]any, error) {
 			if srv := opts["server"]; srv != "" {
 				return map[string]any{"server": srv}, nil
@@ -105,7 +101,6 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 	},
 	"unload": {
 		usage: "unload [tool...] | unload --server <name>",
-		tool:  "mcp_unload",
 		build: func(pos []string, opts map[string]string) (map[string]any, error) {
 			if srv := opts["server"]; srv != "" {
 				return map[string]any{"server": srv}, nil
@@ -132,6 +127,22 @@ func normalizeMCPSub(sub string) string {
 	}
 	if _, ok := mcpAdminSubs[sub]; ok {
 		return sub
+	}
+	return ""
+}
+
+// mcpOperationTool 在管理面清单里按操作名找工具名（找不到返回空串）。
+//
+// 这是 TUI 与管理面之间唯一的接缝：TUI 知道自己要呈现 "mcp" 这个面，但不需要知道
+// 哪个工具实现 connect——插件把实现换掉、或者一个操作换名字，这里自动跟上。
+func mcpOperationTool(mgr *core.Manager, op string) string {
+	if mgr == nil {
+		return ""
+	}
+	for _, oper := range mgr.ManagementOperations() {
+		if oper.Group == "mcp" && oper.Name == op {
+			return oper.Tool
+		}
 	}
 	return ""
 }
@@ -228,6 +239,17 @@ func (m *Model) runMCPAdmin(sub string, argv []string) tea.Cmd {
 		return nil
 	}
 
+	// 子命令 → 工具名不再写死在表里：由管理面清单给出（谁声明了"mcp"就归这里）。
+	// 这样 /mcp 的帮助与派发都跟着声明走，呈现层不认识任何具体工具名。
+	toolName := spec.tool
+	if toolName == "" {
+		toolName = mcpOperationTool(m.manager, sub)
+	}
+	if toolName == "" {
+		m.appendMessage(errorSty.Render("未知的 MCP 操作："+sub) + "\n" + mcpAdminUsage())
+		return nil
+	}
+
 	manager := m.manager
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), mcpAdminTimeout)
@@ -236,7 +258,7 @@ func (m *Model) runMCPAdmin(sub string, argv []string) tea.Cmd {
 		// 「要求审批策略为 never」的工具能力闸门，两者不是同一件事。
 		ctx = core.WithUserGrant(core.WithApprovalPolicy(ctx, "never"))
 		raw, _ := json.Marshal(args)
-		text, err := manager.ExecuteTool(ctx, spec.tool, raw)
+		text, err := manager.ExecuteTool(ctx, toolName, raw)
 		return mcpAdminMsg{sub: sub, text: text, err: err}
 	}
 }

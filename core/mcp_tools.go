@@ -154,6 +154,12 @@ func (m *Manager) mcpManagementVisible(entry bool) bool {
 	return entry || m.mcpServerCount.Load() > 0
 }
 
+// ManagementGroup 实现 ManagementDeclarer：这些是 MCP 管理面里的操作。
+//
+// 归属写在工具自己身上（而不是一张 TUI 里的子命令表）：呈现层由此得到「有哪些管理
+// 操作、各自要什么参数、现在对模型可见吗」，不需要认识 MCP 这个名字。
+func (t *mcpConnectTool) ManagementGroup() string { return "mcp" }
+
 // Scopes 实现 ScopeDeclarer：连接/拉起 MCP 服务器会触碰两个范围。
 //
 // 一律两个都声明（即使这次只给 endpoint）：声明是「这个工具**可能**做什么」，不是
@@ -167,15 +173,23 @@ func (t *mcpConnectTool) Scopes() []string {
 func (t *mcpConnectTool) IsHidden() bool { return !t.m.mcpManagementVisible(true) }
 
 // IsHidden 实现 HiddenTool：没有服务器时「列出/加载/卸载/断开」都是空操作，藏起来。
+func (t *mcpListTool) ManagementGroup() string { return "mcp" }
+
 func (t *mcpListTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
 
 // IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpLoadTool) ManagementGroup() string { return "mcp" }
+
 func (t *mcpLoadTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
 
 // IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpUnloadTool) ManagementGroup() string { return "mcp" }
+
 func (t *mcpUnloadTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
 
 // IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpDisconnectTool) ManagementGroup() string { return "mcp" }
+
 func (t *mcpDisconnectTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
 
 // MCPToolsEnabled 报告 MCP 注入开关的状态。

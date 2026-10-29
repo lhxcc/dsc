@@ -321,6 +321,17 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
   那个岗位的性质（压缩只能有一个写者），**不是岗位概念的通则**。管理这类能力天然多提供方
   （编制 N）；呈现层若抢同一端口/路径，则那个岗位编制 1。新增岗位时先声明编制，再谈解析。
 
+- **管理是能力，呈现是消费方**（`ManagementDeclarer` + `Manager.ManagementOperations` +
+  `proto.Tool.management`）：
+  - 操作声明**独立于工具表**：`mcp_load` 模型能用，`mcp on|off` 只给人用；混在工具表里
+    只能再补一个 `hidden_for_model`，而那个补丁迟早跑到装配点或审批门里去。
+  - 归属由工具自己说（`ManagementGroup() == "mcp"`），呈现层（TUI / admin REST / 未来的
+    WEB）统一从 `ManagementOperations()` 取清单——**不得**各自去扫工具表、也不得写死
+    "哪个子命令对应哪个工具名"（TUI 已改为按清单解析，`/mcp connect` 不再认识 `mcp_connect`）。
+  - 清单里包含当前对模型隐藏的操作（`ModelVisible=false`）：否则呈现层连「怎么打开它」
+    都显示不出来。
+  - 岗位语义：管理面编制 N（多提供方）；若多个呈现层抢同一个端口/路径，那个岗位编制 1。
+
 - **跨层字段只有一个赋值点**：`remoteToolFromProto`。`listStagedTools`（启动期）与
   `syncPluginTools`（运行期）曾经各拼一遍 `RemoteTool`，加字段时只改一处 → 插件声明了、
   宿主听不见。新增 proto 字段时改这一个函数即可。

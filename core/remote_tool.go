@@ -27,6 +27,8 @@ type RemoteTool struct {
 
 	// hidden 由插件声明：注册了但不进模型可见目录（见 HiddenTool）。
 	hidden bool
+	// management 由插件声明：该工具属于哪个管理面（空 = 普通工具）。
+	management string
 	// scopes 由插件声明：本工具可能触碰的权限范围（见 core/authorization.go）。
 	// 非空即表示需要审批——审批是能力的权限属性，不是一段文案；具体到这一次的说明
 	// 由 ApprovalReason RPC 给（同一工具不同参数，风险不同）。
@@ -57,6 +59,7 @@ func remoteToolFromProto(client proto.ToolServiceClient, t *proto.Tool) *RemoteT
 		client:       client,
 		capabilities: t.GetCapabilities(),
 		hidden:       t.GetHidden(),
+		management:   t.GetManagement(),
 		scopes:       t.GetScopes(),
 	}
 }
@@ -70,6 +73,9 @@ func (r *RemoteTool) IsHidden() bool { return r.hidden }
 
 // Scopes 实现 ScopeDeclarer：插件声明的权限范围。
 func (r *RemoteTool) Scopes() []string { return r.scopes }
+
+// ManagementGroup 实现 ManagementDeclarer：插件声明的管理面归属。
+func (r *RemoteTool) ManagementGroup() string { return r.management }
 
 // approvalReason 返回本次调用需要审批的理由（空串 = 不需要）。
 //
