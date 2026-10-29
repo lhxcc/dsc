@@ -56,6 +56,12 @@ type BillionContext struct {
 	// logWindowOnce 首次 pre-step 打印生效窗口一次（启动期 stderr 尚未被宿主转发）。
 	logWindowOnce sync.Once
 
+	// lastViewIn / lastViewOut 最近一次 pre-step 的「进来多少 / 出去多少」
+	// （消息条数 + 估算 token）。渲染后视图与输入差得离谱时，只有这两个数能说明
+	// 「是压缩块覆盖了」还是「视图被谁掏空了」——历史上那类请求面摆动的排查靠它定位。
+	lastViewIn, lastViewInTok   int
+	lastViewOut, lastViewOutTok int
+
 	// lastMessages 缓存最近一次 pre-step 收到的 CoreMessage 列表，供 handleCompress
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
 	// 每次 handlePreStep 更新此缓存；handleCompress 从中读取。
@@ -64,34 +70,6 @@ type BillionContext struct {
 	// prunedState 启动时清理的孤儿状态文件数（首次 pre-step 时随窗口日志一起打印：
 	// 启动期 stderr 尚未被宿主转发）。
 	prunedState int
-}
-
-// envCompat 读新名字，回退旧名字（一次性迁移）。
-//
-// 这些开关原叫 DSC_ACP_*——「ACP」是上游算法项目的缩写，但读者极易把它与另一套
-// 完全不同的 **ACP 协议**（Agent Client Protocol）混淆，故统一改成 DSC_BILLION_*。
-// 旧名继续生效（已有部署的 env 块不必改），但每次启动提示一句，免得永远留着。
-func envCompat(newName, oldName string) string {
-	if v := strings.TrimSpace(os.Getenv(newName)); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(os.Getenv(oldName)); v != "" {
-		fmt.Fprintf(os.Stderr, "[billion-context] %s is deprecated, use %s (still honored)\n", oldName, newName)
-		return v
-	}
-	return ""
-}
-
-// envBoolCompat 同 envCompat，按 SDK 的布尔语义解析。
-func envBoolCompat(newName, oldName string, def bool) bool {
-	if strings.TrimSpace(os.Getenv(newName)) != "" {
-		return dsc.EnvBool(newName, def)
-	}
-	if strings.TrimSpace(os.Getenv(oldName)) != "" {
-		fmt.Fprintf(os.Stderr, "[billion-context] %s is deprecated, use %s (still honored)\n", oldName, newName)
-		return dsc.EnvBool(oldName, def)
-	}
-	return def
 }
 
 func main() {
@@ -117,9 +95,9 @@ func main() {
 
 	// 即时工具结果吸收开关（默认关闭，DSC_BILLION_ABSORB=1 启用）：
 	// 启用后达标大工具结果被追加强制提示，模型经 absorb 蒸馏后消息对被隐藏
-	if envBoolCompat("DSC_BILLION_ABSORB", "DSC_ACP_ABSORB", false) {
+	if dsc.EnvBool("DSC_BILLION_ABSORB", false) {
 		bc.config.Absorb.Enabled = true
-		if n := envCompat("DSC_BILLION_ABSORB_MIN_TOKENS", "DSC_ACP_ABSORB_MIN_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_ABSORB_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {
 				bc.config.Absorb.MinToolTokens = v
 			}
@@ -129,14 +107,14 @@ func main() {
 	// 内容缓存回取（CCR）开关（默认关闭，DSC_BILLION_CCR=1 启用）。
 	// 与 absorb 相互独立：absorb 是有损蒸馏，CCR 是把原文按内容 hash 存起来随时取回；
 	// 两者可以只开一个，也可以都开（CCR 的占位符很短，absorb 不会再要求蒸馏它）。
-	if envBoolCompat("DSC_BILLION_CCR", "DSC_ACP_CCR", false) {
+	if dsc.EnvBool("DSC_BILLION_CCR", false) {
 		bc.config.CCR.Enabled = true
-		if n := envCompat("DSC_BILLION_CCR_MIN_TOKENS", "DSC_ACP_CCR_MIN_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_CCR_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {
 				bc.config.CCR.MinToolTokens = v
 			}
 		}
-		if n := envCompat("DSC_BILLION_CCR_INLINE_TOKENS", "DSC_ACP_CCR_INLINE_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_CCR_INLINE_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v > 0 {
 				bc.config.CCR.InlineLimitTokens = v
 			}
@@ -383,10 +361,21 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// 缓存 state 与最近一次 token 数：status 报告与 context/status 事件都要用真实占用，
 	// 之前 handleStatus 用「已压缩 token + 1000」当占用，报出来的百分比毫无意义。
+	outTok := 0
+	for _, m := range result.Messages {
+		outTok += dsc.EstimateTextTokens(m.Text)
+	}
 	bc.mu.Lock()
 	bc.state = result.State
 	bc.lastTokenCount = tokenCount
+	bc.lastViewIn, bc.lastViewInTok = len(coreMsgs), tokenCount
+	bc.lastViewOut, bc.lastViewOutTok = len(result.Messages), outTok
 	bc.mu.Unlock()
+	// 一行视图账：进来多少条/多少 token、发出去多少条/多少 token。渲染后远小于输入是
+	// 正常的（压缩块覆盖旧消息），但**同一个会话里忽大忽小**就是问题——排查请求面摆动
+	// 时先看这行，别再从 provider 用量反推。
+	fmt.Fprintf(os.Stderr, "[billion-context] view: in=%d(%d tok) out=%d(%d tok) blocks=%d\n",
+		len(coreMsgs), tokenCount, len(result.Messages), outTok, len(result.State.Blocks))
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -551,9 +540,14 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 	// 用最近一次 pre-step 的真实占用；没有时退回 0（而不是拿"已压缩量"冒充占用）
 	bc.mu.Lock()
 	tokenCount := bc.lastTokenCount
+	inN, inTok := bc.lastViewIn, bc.lastViewInTok
+	outN, outTok := bc.lastViewOut, bc.lastViewOutTok
 	bc.mu.Unlock()
 	report := billion.BuildStatus(nil, state, bc.config, tokenCount)
 	text := billion.FormatStatus(report)
+	if inN > 0 {
+		text += fmt.Sprintf("\n  Last view: in=%d (%d tok) → out=%d (%d tok)", inN, inTok, outN, outTok)
+	}
 
 	out, _ := json.Marshal(map[string]any{
 		"ok":     true,
