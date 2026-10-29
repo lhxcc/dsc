@@ -51,6 +51,17 @@ type JobHooks struct {
 	Done <-chan JobOutcome
 	// ReadOutput 消费自上次调用以来的输出增量；nil 标记最终输出任务。
 	ReadOutput func() string
+	// TailOutput 运行期可读的**最近输出快照**（末尾若干 KB）与累计字节数；可选。
+	//
+	// 与 ReadOutput 的区别是「消费 vs 快照」：增量读一次少一段（适合真流式生产方），
+	// 快照每次都给同一段尾巴（适合「工具在别的进程里跑、只能问到最近状态」）。
+	// 提供它的任务仍以 Done.Output 为权威终态输出——尾部只用于任务未落定时的观察。
+	TailOutput func() (tail string, totalBytes int64)
+	// Activity 最近一次活动时间（有输出即算活动）；可选。
+	//
+	// 用来回答「它还在动吗」：final-output 任务运行期没有可读输出，模型唯一能问的
+	// 就是「上次动是多久之前」。返回 false 表示生产方不提供。
+	Activity func() (time.Time, bool)
 }
 
 // JobOutcome 生产方终态结果（对齐 DSH JobOutcome）。
@@ -77,10 +88,23 @@ type StartSpec struct {
 type Read struct {
 	Text     string
 	Snapshot JobSnapshot
-	// Streaming 该任务的输出是**增量可读**的（生产方提供了 ReadOutput），
-	// 还是**只在落定时一次性可读**（final-output）。调用方据此决定「等首块输出」
-	// 值不值得等：增量任务随时可能有新内容，final-output 任务在结束前永远是空的。
+	// Streaming 该任务的输出在**运行期就可读**（生产方提供了 ReadOutput 增量，
+	// 或 TailOutput 尾部快照），还是**只在落定时一次性可读**（final-output）。
+	// 调用方据此决定「等首块输出」值不值得等：可读任务随时可能有新内容，
+	// final-output 任务在结束前永远是空的。
 	Streaming bool
+	// Tailable 生产方提供了 TailOutput（运行期可读到「最近输出快照」）。
+	//
+	// 调用方据此决定等多久：真增量任务值得等着看下一块，而尾部快照随时可读——
+	// 等只是「接住刚好正在打印的那几行」，不该按分钟级预算阻塞。
+	Tailable bool
+	// Partial 任务**未落定**时能看到的最近输出快照（来自 TailOutput）；落定后为空，
+	// 完整输出走 Text。它不消费、不推进任何游标，连读两次拿到的是同一段尾巴。
+	Partial string
+	// PartialBytes 已产生的输出总字节数（Partial 只是其中最后一段）。0 表示未知。
+	PartialBytes int64
+	// LastActivity 上次活动时间（生产方提供 Activity 时）；零值表示未知。
+	LastActivity time.Time
 	// ReadCount 该任务终态输出被读取的次数（1 = 第一次读到终态）。
 	// 最终输出任务读起来是幂等的，模型却不知道自己已经读过——同一个任务被连读
 	// 两三次、每次都拿到同样一段输出，界面看起来就像"重复渲染"。这个计数让
@@ -196,8 +220,10 @@ type Job struct {
 	output        string // final-output 终态输出（幂等读）
 	terminalReads int    // 终态输出被读次数（见 Read.ReadCount）
 	cancel        func(reason string)
-	readOutput    func() string // nil = final-output-only
-	settled       chan struct{} // 落定后 close
+	readOutput    func() string            // nil = 非增量
+	tailOutput    func() (string, int64)   // 可选：运行期输出快照
+	activity      func() (time.Time, bool) // 可选：最近活动时间
+	settled       chan struct{}            // 落定后 close
 }
 
 // Start 预检 + 同步启动 + 登记（对齐 DSH）：预检失败或 Start 抛错都不产生
@@ -228,6 +254,8 @@ func (r *Registry) Start(spec StartSpec) (string, error) {
 		},
 		cancel:     hooks.Cancel,
 		readOutput: hooks.ReadOutput,
+		tailOutput: hooks.TailOutput,
+		activity:   hooks.Activity,
 		settled:    make(chan struct{}),
 	}
 	r.jobs[id] = j
@@ -371,16 +399,40 @@ func (r *Registry) ListAll() []JobSnapshot {
 
 // readLocked 读取单个任务输出（需已持有锁）：流式任务消费自上次以来的增量；
 // 最终输出任务在终止后幂等返回终态输出（运行中为空）。终止读取标记 reported。
+//
+// 运行期还有两条「观察」通道（都不消费）：TailOutput 给最近输出快照、Activity 给
+// 上次活动时间。它们只对未落定任务有意义——落定后完整输出就在 Text 里，尾部是冗余。
 func (r *Registry) readLocked(j *Job) Read {
+	rd := Read{Snapshot: j.snapshot}
 	if j.readOutput != nil {
-		return Read{Text: j.readOutput(), Snapshot: j.snapshot, Streaming: true}
+		rd.Text = j.readOutput()
+		rd.Streaming = true
 	}
-	if j.snapshot.Status != StatusRunning && j.snapshot.Status != StatusStopping {
-		j.snapshot.Reported = true
-		j.terminalReads++
-		return Read{Text: j.output, Snapshot: j.snapshot, ReadCount: j.terminalReads}
+	running := j.snapshot.Status == StatusRunning || j.snapshot.Status == StatusStopping
+	if j.tailOutput != nil {
+		rd.Tailable = true
+		if running {
+			rd.Partial, rd.PartialBytes = j.tailOutput()
+		}
+		// 尾部快照也算「运行期可读」：调用方据此决定等不等首块内容。
+		rd.Streaming = true
 	}
-	return Read{Text: "", Snapshot: j.snapshot}
+	if j.activity != nil {
+		if ts, ok := j.activity(); ok {
+			rd.LastActivity = ts
+		}
+	}
+	if j.readOutput != nil || running {
+		return rd
+	}
+	// 终态：幂等返回最终输出，并计数（见 Read.ReadCount）
+	j.snapshot.Reported = true
+	j.terminalReads++
+	rd.Snapshot = j.snapshot // 上面动过 snapshot（reported），快照要跟着更新
+	rd.Text = j.output
+	rd.Partial = ""
+	rd.ReadCount = j.terminalReads
+	return rd
 }
 
 // Read 读取输出：流式任务消费自上次以来的增量（单一游标）；最终输出任务在

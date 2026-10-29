@@ -467,6 +467,11 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 	//（会话、审批策略）到独立 ctx，生命周期交给 job 注册表（job_kill/进程退出）。
 	jobCtx := detachJobContext(ctx)
 
+	// 观察通道：能流式上报的工具（插件把自己的输出登记进 GetActivity）在这里被探测出
+	// 尾部输出与最近活动时间，job_output 于是在任务落定前也能回答「它在说什么」。
+	// 探测不到就是 nil——任务退回原来的 final-output 行为。
+	tailFn, activityFn := m.jobProbes(toolName, ToolCallIDFromContext(ctx))
+
 	jobID, err := m.jobs.Start(jobs.StartSpec{
 		Kind:  toolName,
 		Label: label,
@@ -490,8 +495,11 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 					default:
 					}
 				},
-				Done:       doneCh,
-				ReadOutput: nil, // final-output 模式（完成后一次性返回全部输出）
+				Done: doneCh,
+				// 最终输出仍以 Done.Output 为权威；TailOutput 只服务「任务还没结束」的观察。
+				ReadOutput: nil,
+				TailOutput: tailFn,
+				Activity:   activityFn,
 			}, nil
 		},
 	})

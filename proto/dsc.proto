@@ -79,6 +79,14 @@ message GetActivityRequest {
 message GetActivityResponse {
   // 最近一次活动时间（Unix 毫秒）。0 = 本次调用尚未上报过任何活动。
   int64 last_activity_unix_ms = 1;
+  // 最近输出的尾部（UTF-8 安全，最多几 KB）与本次调用已产生的总字节数。
+  //
+  // 存在的理由：工具跑在**另一个进程**里，宿主拿不到它的管道。后台任务转入
+  // final-output 模式后，「跑到一半在说什么」无处可问——同一根 GetActivity 线顺带
+  // 带回尾部，job_output 才能在任务结束前回答「它现在在干什么」，而不是只回一行
+  // (no output yet)。旧插件不填这两个字段即为空，宿主按「无可读输出」处理。
+  bytes output_tail = 2;
+  int64 output_bytes = 3;
 }
 
 message InterconnectRequest {

@@ -122,6 +122,12 @@ const outputWaitPoll = 120 * time.Millisecond
 // 留 3s 只为接住「刚转后台就收尾」的短命令；真要阻塞等结果请显式 wait:true。
 const finalOutputWait = 3 * time.Second
 
+// tailOutputWait 尾部快照任务的等待上限。
+//
+// 它比 final-output 长一点（接住「刚启动、插件还没吐字」的那几百毫秒），又远短于
+// 增量任务的预算：快照类任务的价值在于「马上告诉我现在是什么样」，而不是赌它结束。
+const tailOutputWait = 2 * time.Second
+
 // jobWaitCap 生效的 wait 上限。DSC_JOB_WAIT_MAX_SECS 可覆盖：
 // 设为 0（或负数）即彻底禁止阻塞式等待——此时 wait:true 会被直接拒绝并提示
 // 「完成会通知你」，适合完全不允许工具调用占死模型的场景。
@@ -179,7 +185,7 @@ func (t *jobTool) Name() string { return t.name }
 func (t *jobTool) Description() string {
 	switch t.name {
 	case "job_output":
-		return "Read a background job's output and status. Background commands expose their output only when they finish, so a still-running job answers '(no output yet)' — that is not bad luck, and polling will not change it: a completion notice reaches you automatically when the job ends. This call waits a few seconds first (to catch jobs that are about to finish), then reports the current state. Do not poll or sleep; if you need a live signal, run a separate short command (e.g. a curl/health check) instead of re-reading the job. Only use wait:true when you cannot take another step without the settled result: it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
+		return "Read a background job's output and status. While the job runs you get whatever is observable at that moment: tools that stream report a partial tail ('[partial output — last 4.0 KB of 37.0 KB so far]'), and every running job reports how long it has been running plus when it last produced output — that is how you tell 'still working' from 'stuck'. Tools that only produce output at the end answer '(no output yet)'; polling will not change that, and a completion notice reaches you automatically when the job ends. This call waits a few seconds first (to catch jobs that are about to finish or that just started printing), then reports the current state. Do not poll in a loop; if you need a fresh signal, one re-read after a short separate command (e.g. a curl/health check) is enough. Only use wait:true when you cannot take another step without the settled result: it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
@@ -254,7 +260,7 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 		rd = t.awaitFirstOutput(ctx, p.JobID, caller, rd)
 	}
 	out := renderJobOutput(rd)
-	if rd.Text == "" && jobRunning(rd.Snapshot.Status) && !rd.Streaming {
+	if rd.Text == "" && rd.Partial == "" && jobRunning(rd.Snapshot.Status) && !rd.Streaming {
 		// 这类任务运行期没有可读输出：说清楚「别轮询」，否则模型会反复读空串。
 		out += "\n[note: this job exposes output only when it finishes; it is still running. " +
 			"Stop polling — a completion notice will reach you. Use wait:true only if you truly cannot proceed without the result.]"
@@ -280,10 +286,20 @@ func jobRunning(status jobs.JobStatus) bool {
 // 内容（流式任务本来就还没产生，最终输出任务在落定后仍可幂等读）。
 func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last jobs.Read) jobs.Read {
 	budget := jobOutputWait()
-	// final-output 任务：运行期没有可读输出，长等只是赌它马上结束。
-	// 催它快点没用，等满 60s 也一样是空——上限压到 finalOutputWait。
-	if !last.Streaming && budget > finalOutputWait {
-		budget = finalOutputWait
+	switch {
+	case last.Tailable:
+		// 尾部快照随时可读：等只是接住「刚巧正在打印的那几行」。没有内容就直接
+		// 报进度（跑了多久、上次活动多久前），不该按分钟级预算把人卡住——这正是
+		// 之前「等满一分钟还是 (no output yet)」被诟病的形态。
+		if budget > tailOutputWait {
+			budget = tailOutputWait
+		}
+	case !last.Streaming:
+		// final-output 任务：运行期没有可读输出，长等只是赌它马上结束。
+		// 催它快点没用，等满 60s 也一样是空——上限压到 finalOutputWait。
+		if budget > finalOutputWait {
+			budget = finalOutputWait
+		}
 	}
 	if budget <= 0 {
 		return last
@@ -302,7 +318,9 @@ func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last 
 			return last // 任务被剔掉/权限变化：退回上一次的结果，不把错误伪装成空输出
 		}
 		last = rd
-		if rd.Text != "" || !jobRunning(rd.Snapshot.Status) {
+		// 尾部快照也算拿到内容：这类任务（后台 shell 等）在落定前只能给这一段，
+		// 继续等下去拿到的还是同一段尾巴。
+		if rd.Text != "" || rd.Partial != "" || !jobRunning(rd.Snapshot.Status) {
 			return rd
 		}
 		if !time.Now().Before(deadline) {
@@ -319,19 +337,85 @@ func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last 
 // 输出卡）。这里在第 2 次及以后的读取尾部标注次数与「内容未变」，模型据此收手。
 func renderJobOutput(rd jobs.Read) string {
 	var b strings.Builder
-	if rd.Text != "" {
+	switch {
+	case rd.Text != "":
 		b.WriteString(rd.Text)
-	} else {
+	case rd.Partial != "":
+		// 任务还没结束，但执行方已经能给出最近一段输出（尾部快照）。
+		// 明说这是尾部与总量：模型不该把「最后 4 KB」当成完整结果。
+		fmt.Fprintf(&b, "[partial output — last %s of %s so far; the full output arrives when the job finishes]\n",
+			humanBytes(int64(len(rd.Partial))), humanBytes(rd.PartialBytes))
+		b.WriteString(rd.Partial)
+	default:
 		b.WriteString("(no output yet)")
 	}
 	b.WriteString("\n[status: " + string(rd.Snapshot.Status) + "]")
 	if rd.Snapshot.Detail != "" {
 		b.WriteString(" " + rd.Snapshot.Detail)
 	}
+	// 运行中补一句「跑了多久 / 上次动是多久前」：final-output 任务这时没有可读输出，
+	// 模型唯一能判断的是它还在动、还是已经安静很久（那才是该考虑 job_kill 的时候）。
+	if jobRunning(rd.Snapshot.Status) {
+		b.WriteString("\n" + jobProgressNote(rd))
+	}
 	if rd.ReadCount > 1 {
 		fmt.Fprintf(&b, "\n[note: read #%d of this job's final output; it has not changed since your previous read — no need to read it again]", rd.ReadCount)
 	}
 	return b.String()
+}
+
+// jobProgressNote 运行中任务的进度摘要（elapsed + 上次输出）。
+func jobProgressNote(rd jobs.Read) string {
+	parts := make([]string, 0, 2)
+	if !rd.Snapshot.StartedAt.IsZero() {
+		parts = append(parts, "running for "+humanDuration(time.Since(rd.Snapshot.StartedAt)))
+	}
+	switch {
+	case !rd.LastActivity.IsZero():
+		// 说 activity 而不是 output：SDK 在工具进入时就登记过一次活动，所以这个时间戳
+		// 也可能表示「刚进工具、还什么都没打印」——写成 last output 会误导。
+		parts = append(parts, "last activity "+humanDuration(time.Since(rd.LastActivity))+" ago")
+	case !rd.Snapshot.StartedAt.IsZero():
+		// 工具不上报活动（旧插件）：不编造「多久没输出」，只说明这一点。
+		parts = append(parts, "this tool does not report activity")
+	}
+	if len(parts) == 0 {
+		return "[still running]"
+	}
+	return "[" + strings.Join(parts, "; ") + "]"
+}
+
+// humanDuration 人类可读的时长（42s / 4m12s / 1h03m）。
+//
+// 不复用 time.Duration.String()：那会给 "4m12.318s"，模型和人都只需要到秒。
+func humanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+// humanBytes 人类可读的字节数（4.0 KB / 37.2 KB / 812 B）。
+func humanBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	kb := float64(n) / unit
+	if kb < unit {
+		return fmt.Sprintf("%.1f KB", kb)
+	}
+	return fmt.Sprintf("%.1f MB", kb/unit)
 }
 
 // execList 列出调用方可见任务（对齐 DSH job_list：<id> [<kind>] <status> — <label>）。

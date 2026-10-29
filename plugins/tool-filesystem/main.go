@@ -91,30 +91,38 @@ const maxSessions = 64
 // 输出到达即活动，不感知预算与策略。回调随每次命令执行换绑；未换绑
 // （无进行中的命令）时 no-op。
 type activityWriter struct {
-	mu    sync.Mutex
-	w     io.Writer
-	touch func()
+	mu      sync.Mutex
+	w       io.Writer
+	onWrite func([]byte)
 }
 
 func (a *activityWriter) Write(p []byte) (int, error) {
 	a.mu.Lock()
-	f, w := a.touch, a.w
+	f, w := a.onWrite, a.w
 	a.mu.Unlock()
 	if f != nil {
-		f()
+		f(p)
 	}
 	return w.Write(p)
 }
 
-// bind 把活动回调换绑到本次调用的 ctx；run 结束后以 bind(nil) 解绑。
+// bind 把输出回调换绑到本次调用的 ctx；run 结束后以 bind(nil) 解绑。
+//
+// 回调做两件事，走的是同一条 ctx：
+//   - TouchActivity：告诉宿主的活跃续命看门狗「还在动」；
+//   - AppendOutput：把这段字节登记进跨进程活动表，宿主转后台之后 job_output 就能
+//     读到「最近在说什么」。命令跑完仍以完整输出为权威结果，这里只是尾部快照。
 func (a *activityWriter) bind(ctx context.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if ctx == nil {
-		a.touch = nil
+		a.onWrite = nil
 		return
 	}
-	a.touch = func() { dsc.TouchActivity(ctx) }
+	a.onWrite = func(p []byte) {
+		dsc.TouchActivity(ctx)
+		dsc.AppendOutput(ctx, p)
+	}
 }
 
 // main 以公共 SDK（dsc-sdk）声明式启动：SDK 自动提供 ToolService /

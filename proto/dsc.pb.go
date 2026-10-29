@@ -69,8 +69,16 @@ type GetActivityResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// 最近一次活动时间（Unix 毫秒）。0 = 本次调用尚未上报过任何活动。
 	LastActivityUnixMs int64 `protobuf:"varint,1,opt,name=last_activity_unix_ms,json=lastActivityUnixMs,proto3" json:"last_activity_unix_ms,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// 最近输出的尾部（UTF-8 安全，最多几 KB）与本次调用已产生的总字节数。
+	//
+	// 存在的理由：工具跑在**另一个进程**里，宿主拿不到它的管道。后台任务转入
+	// final-output 模式后，「跑到一半在说什么」无处可问——同一根 GetActivity 线顺带
+	// 带回尾部，job_output 才能在任务结束前回答「它现在在干什么」，而不是只回一行
+	// (no output yet)。旧插件不填这两个字段即为空，宿主按「无可读输出」处理。
+	OutputTail    []byte `protobuf:"bytes,2,opt,name=output_tail,json=outputTail,proto3" json:"output_tail,omitempty"`
+	OutputBytes   int64  `protobuf:"varint,3,opt,name=output_bytes,json=outputBytes,proto3" json:"output_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetActivityResponse) Reset() {
@@ -106,6 +114,20 @@ func (*GetActivityResponse) Descriptor() ([]byte, []int) {
 func (x *GetActivityResponse) GetLastActivityUnixMs() int64 {
 	if x != nil {
 		return x.LastActivityUnixMs
+	}
+	return 0
+}
+
+func (x *GetActivityResponse) GetOutputTail() []byte {
+	if x != nil {
+		return x.OutputTail
+	}
+	return nil
+}
+
+func (x *GetActivityResponse) GetOutputBytes() int64 {
+	if x != nil {
+		return x.OutputBytes
 	}
 	return 0
 }
@@ -3865,9 +3887,12 @@ const file_proto_dsc_proto_rawDesc = "" +
 	"\x0fproto/dsc.proto\x12\x03dsc\"6\n" +
 	"\x12GetActivityRequest\x12 \n" +
 	"\ftool_call_id\x18\x01 \x01(\tR\n" +
-	"toolCallId\"H\n" +
+	"toolCallId\"\x8c\x01\n" +
 	"\x13GetActivityResponse\x121\n" +
-	"\x15last_activity_unix_ms\x18\x01 \x01(\x03R\x12lastActivityUnixMs\"\xb9\x01\n" +
+	"\x15last_activity_unix_ms\x18\x01 \x01(\x03R\x12lastActivityUnixMs\x12\x1f\n" +
+	"\voutput_tail\x18\x02 \x01(\fR\n" +
+	"outputTail\x12!\n" +
+	"\foutput_bytes\x18\x03 \x01(\x03R\voutputBytes\"\xb9\x01\n" +
 	"\x13InterconnectRequest\x12$\n" +
 	"\x0ellm_service_id\x18\x01 \x01(\rR\fllmServiceId\x12*\n" +
 	"\x11notify_service_id\x18\x02 \x01(\rR\x0fnotifyServiceId\x12&\n" +
