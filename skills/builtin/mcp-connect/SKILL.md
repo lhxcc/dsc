@@ -1,6 +1,6 @@
 ---
 name: mcp-connect
-description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP）：運行期用 mcp_connect/mcp_list/mcp_load 接上並按需加載工具、或用 overlay 配置持久化；驗證 mcp__<server>__* 是否可用，並排查「連不上／看不到工具」的常見原因。
+description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP 或 stdio 本機子進程）：運行期用 mcp_connect/mcp_list/mcp_load 接上並按需加載工具、或用 overlay 配置持久化；驗證 mcp__<server>__* 是否可用，並排查「連不上／看不到工具」的常見原因。
 ---
 
 # mcp-connect — 用 DSC 連接 MCP 伺服器
@@ -22,70 +22,61 @@ description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP）：運行期
 3. **連上 ≠ 看得見**。工具被接進宿主後仍**不進你的工具目錄**（一台伺服器可能有幾百個工具）。
    要用 `mcp_load` 明確加載，用完 `mcp_unload` 撤出。
 
-## 前提：只支援 streamable HTTP
+## 兩種傳輸：先看伺服器是哪一種
 
-DSC 的 MCP 客戶端只實作 **streamable HTTP**（`http(s)://host:port/mcp`）。
-**stdio 尚未支援**——很多 MCP 伺服器預設走 stdio（例如 `rea mcp`），必須讓它改成 HTTP 監聽，
-否則永遠連不上（表現為 connection refused，或根本沒有端口）。
+| 傳輸 | 伺服器形態 | 連接方式 |
+|---|---|---|
+| **stdio** | 需要你啟動的命令（`node x.mjs mcp`、`python -m …`、`uvx …`、自帶二進制）。**多數 MCP 伺服器是這種** | 給 `command` + `args`，DSC 拉起子進程，講它的 stdin/stdout |
+| **streamable HTTP** | 已經在監聽的服務（`http(s)://host:port/mcp`） | 給 `endpoint` |
+
+判別方法：伺服器的說明文件有沒有讓你執行一個命令？有 → stdio；有沒有給 URL？有 → HTTP。
+**不要**為了 HTTP 而去找「怎麼讓它開 HTTP 監聽」——stdio 是原生形態，直接用。
+
+stdio 的兩條邊界（配錯會踩很久）：
+
+- 子進程**只繼承基線環境**（`PATH`/`HOME`/`TEMP` 等），**不繼承宿主整份環境**。伺服器要的
+  token 必須寫進 `env`——這是明確的授權動作，不是遺漏。
+- 建議 `command` 直接寫解釋器或二進制，別用 `npx`/`uvx` 這類**啟動器**：被回收的是啟動器
+  本身，POSIX 上它拉起的真實伺服器可能變成孤兒進程。一次性試用可以。
 
 ## 路線 A：運行期接上（推薦，不用改配置、不用重啟）
 
-### 1. 讓 MCP 伺服器以 HTTP 監聽
-
-以 REA 為例（其他伺服器看各自的 `--http`／`--port` 參數）：
-
-```bash
-cd <rea 目錄> && rea mcp --http --port 8765
-```
-
-成功的日誌會出現一行（記下 url）：
-
-```json
-{"transport":"streamable-http","url":"http://127.0.0.1:8765/mcp","msg":"MCP transport listening"}
-```
-
-先確認它真的在聽（端口要和上面一致）：
-
-```bash
-curl -sS --noproxy '*' -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
-# 期望 200（并带 Mcp-Session-Id 响应头）
-```
-
-> `--noproxy '*'` 不是可選項：本機設了 `HTTP_PROXY` 時，curl 會把 127.0.0.1 也發給代理，得到 502。
-> DSC 自己不會（Go 對 loopback 預設繞過代理），但手動驗證時會踩。
-
-### 2. 連接伺服器
+### 1. 連接伺服器
 
 ```
-mcp_connect(server_name="rea", endpoint="http://127.0.0.1:8765/mcp")
+# stdio（推薦給本機命令型伺服器）
+mcp_connect(server_name="srv", command="node", args=["O:/path/server.mjs", "mcp"], cwd="O:/path")
+
+# streamable HTTP
+mcp_connect(server_name="srv", endpoint="http://127.0.0.1:8765/mcp")
 ```
 
-- `server_name` 決定工具名前綴：`mcp__rea__<tool>`，只允許 `[A-Za-z0-9_-]`，≤32 字符；
+- `server_name` 決定工具名前綴：`mcp__srv__<tool>`，只允許 `[A-Za-z0-9_-]`，≤32 字符；
 - 多台伺服器用不同 `server_name`（同名會互相覆蓋）；
-- 這個工具需要審批（它等於對外擴張能力）；被拒時停下來問使用者，不要改參數硬試。
+- `transport` 可省略：給了 `endpoint` 就是 http，給了 `command` 就是 stdio；
+- 這個工具需要審批（它等於對外擴張能力；stdio 還會在本機拉起一個進程）。被拒時停下來
+  問使用者，不要改參數硬試。
 
 回傳會告訴你發現了幾個工具——**那是註冊數，不是可見數**。
 
-### 3. 看清有哪些工具，再按需加載
+### 2. 看清有哪些工具，再按需加載
 
 ```
-mcp_list(server="rea", query="unit")     # 名字 + 一行說明，不含參數 schema
-mcp_load(tools=["mcp__rea__list_jeb_units", "mcp__rea__get_jeb_unit"])
+mcp_list(server="srv", query="unit")     # 名字 + 一行說明，不含參數 schema
+mcp_load(tools=["mcp__srv__list_units", "mcp__srv__get_unit"])
 ```
 
 - 只加載這次任務真正要用的。目錄每個請求都發：實測一台 229 個工具的伺服器佔 **約 7.4 萬 tokens**
   （1M 窗口 7%，128K 模型 57%），加載 10 個只要 ~2.5K；
 - 加載在**下一跳**生效（工具目錄變了），不要在同一跳就假設能調；
-- 裸工具名（`list_jeb_units`）在唯一時可用，重名會報歧義並列出候選。
+- 裸工具名（`list_units`）在唯一時可用，重名會報歧義並列出候選。
 
-### 4. 用完撤出
+### 3. 用完撤出
 
 ```
 mcp_unload()                              # 全部卸載
-mcp_unload(server="rea")                  # 卸載某台伺服器的
-mcp_unload(tools=["mcp__rea__list_jeb_units"])
+mcp_unload(server="srv")                  # 卸載某台伺服器的
+mcp_unload(tools=["mcp__srv__list_units"])
 ```
 
 卸載只是把工具移出目錄，**連接還在**——再 `mcp_load` 即可回來，不用重連。
@@ -98,38 +89,47 @@ mcp_unload(tools=["mcp__rea__list_jeb_units"])
 
 | 命令 | 作用 |
 |---|---|
-| `/mcp` | 狀態：開關、已連伺服器、已加載工具與其目錄成本 |
+| `/mcp` | 狀態：開關、已連伺服器（含傳輸與目標）、已加載工具與其目錄成本 |
 | `/mcp on` / `/mcp off` | 注入開關（默認關，寫回 `config.yaml` 的 `mcp.enabled`，重啟保持）。關掉後模型看不到任何 MCP 工具（含 `mcp_connect`），連接與加載記錄保留 |
 | `/mcp list [server]` | 列出工具（`[loaded]` 表示已在模型目錄裡） |
-| `/mcp connect <name> <endpoint>` | 連接（streamable HTTP） |
-| `/mcp disconnect [server]` | 斷開並註銷工具（不帶參數=全部） |
+| `/mcp connect <name> <endpoint 或 command> [args...]` | 連接：`http(s)://` 開頭按 endpoint；其餘按 stdio 命令。命令參數帶 `-` 時用 `--` 隔開，例如 `/mcp connect srv node -- server.mjs --root .` |
+| `/mcp disconnect [server]` | 斷開並註銷工具（不帶參數=全部；stdio 同時回收子進程） |
 | `/mcp load <tool...>` / `--server <name>` | 加載進模型目錄 |
 | `/mcp unload [tool...]` / `--server <name>` | 卸載（不帶參數=全部） |
 
 ## 路線 B：寫進配置（需要每次啟動都連時用）
 
 ```yaml
-# mcp-rea.yaml
-- name: mcp-rea          # 條目名，任意
+# mcp-srv.yaml
+- name: mcp-srv           # 條目名，任意
   type: dsc
-  enabled: true          # ★ 必須寫：省略等於 false，整條會被跳過（日誌會有 WARN）
+  enabled: true           # ★ 必須寫：省略等於 false，整條會被跳過（日誌會有 WARN）
   config:
     mcp:
-      server_name: rea   # ★ 工具名前綴：mcp__rea__*
-      endpoint: http://127.0.0.1:8765/mcp
+      server_name: srv    # ★ 工具名前綴：mcp__srv__*
+      # —— stdio ——
+      transport: stdio
+      command: node
+      args: ["O:/path/server.mjs", "mcp"]
+      cwd: O:/path        # 伺服器按相對路徑找資源時才需要
+      # env:              # 只有這裡寫明的變量才會進子進程
+      #   SOME_TOKEN: ""
+      # —— 或者 streamable HTTP ——
+      # endpoint: http://127.0.0.1:8765/mcp
 ```
 
 ```bash
-dsc -patch <絕對路徑>/mcp-rea.yaml
+dsc -patch <絕對路徑>/mcp-srv.yaml
 ```
 
 也可以把同樣的 `config.mcp` 塊寫進 `config/config.yaml` 的 `plugins:` 條目裡（效果相同）。
+現成示例：`config/examples/mcp-stdio/`（stdio）、`config/examples/mcp-memory/`（HTTP）。
 
 **注意**：路線 B 只解決「連接」，不解決「可見」——工具照樣要 `mcp_load` 才會進目錄。
 
 ## 驗證
 
-1. 啟動日誌（路線 B）：`patch MCP connected  server_name=rea tools=<N>`；
+1. 啟動日誌（路線 B）：`patch MCP connected  server_name=srv transport=stdio tools=<N>`；
 2. `mcp_list` 能列出具名工具（說明連接與發現都成功）；
 3. `mcp_load` 之後，工具名出現在你的工具清單裡，直接調用能拿到結果。
 
@@ -137,7 +137,9 @@ dsc -patch <絕對路徑>/mcp-rea.yaml
 
 | 症狀 | 原因 | 處理 |
 |---|---|---|
-| `connection refused` / 端口沒在聽 | 伺服器沒起，或起成了 **stdio** 模式 | 加 `--http --port N`；確認日誌有 `MCP transport listening` |
+| `connection refused` / 端口沒在聽 | 走 HTTP 但伺服器沒起（或它本來就是 stdio 型） | 改走 stdio（`command` + `args`）；或確認它真的在監聽 |
+| `start stdio MCP server …: executable file not found` | `command` 不在 `PATH`，或寫了相對路徑 | 寫絕對路徑，或先確認哪個解釋器存在 |
+| `stdio MCP server … exited: …` | 子進程啟動即退出（參數錯、缺依賴、cwd 不對） | 先用同一個 `command/args/cwd` 在終端手動跑一遍，看它的報錯 |
 | 工具清單裡連 `mcp_connect` 都沒有 | MCP 未啟用（默認關） | 請使用者 `/mcp on`；模型側沒有開關它的工具 |
 | `mcp_list` 說沒有伺服器 | 還沒連，或連的是另一個 DSC 進程 | 用 `mcp_connect` 在本會話連（不要 shell 起新 dsc） |
 | 連上了，但工具清單裡看不到那批工具 | 正常：預設不曝光 | `mcp_load` 你要用的那幾個 |
@@ -146,9 +148,10 @@ dsc -patch <絕對路徑>/mcp-rea.yaml
 | HTTP 400 `Parse error: Invalid JSON-RPC message` | 請求 id 超過 JS 安全整數 2^53（舊版用 UnixNano，已修） | 升級 DSC |
 | HTTP 404 `Session not found` | 伺服器重啟過，會話失效 | DSC 會自動重新握手一次；持續出現則重連 |
 | HTTP 406 `Not Acceptable` | 端點不是 streamable HTTP（可能是舊式 SSE 端點） | 換成 `/mcp` 端點 |
-| 日誌 `patch MCP stdio transport not yet supported` | 配置寫了 `transport: stdio` | 改讓伺服器開 HTTP；stdio 目前不支援 |
+| 伺服器說要某個 token，但子進程讀不到 | stdio 子進程只繼承基線環境 | 把該變量寫進 `env`（顯式授權） |
 
 ## 安全邊界
 
 MCP 工具的權限等於**本機執行 DSC 的使用者**（加載後即可被調用），請只連接 loopback 或你信任的位址；
-不要把帶憑據的 endpoint 寫進會被提交的配置文件。
+stdio 等於在本機執行那條命令，連接前先確認 `command`/`args` 就是使用者想跑的那個。
+不要把帶憑據的 endpoint 或 token 寫進會被提交的配置文件。

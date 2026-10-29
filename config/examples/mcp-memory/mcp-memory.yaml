@@ -8,7 +8,7 @@
 #
 # 对齐 DSH apps/cli/config/examples/mcp-memory/mcp-reference-memory.cordis.yml。
 # 传输：endpoint（streamable HTTP）或 transport: stdio + command/args（本机拉起
-# 子进程，另见 config/examples/mcp-rea-stdio/）。
+# 子进程，另见 config/examples/mcp-stdio/）。
 - name: mcp-memory
   type: dsc
   # enabled 必须显式写 true：普通 bool，省略即 false，整条会被跳过（日志里有告警）。
