@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -199,23 +200,6 @@ type Manager struct {
 	overflowMu  sync.Mutex
 	overflowAdj map[string]overflowAdjustment
 
-	// mcpClients MCP 客户端实例表（对齐 DSH packages/mcp/mcp-client）。
-	// 经 admin API /mcp/* 管理生命周期，discoverTools 自动注册 mcp__<server>__<rawName>
-	// 工具到 ToolRegistry。盘活 core/mcp_client.go 死模块。key = serverName。
-	mcpClients map[string]*MCPClient
-	// mcpExpose / mcpExposeOnce 模型可见的 MCP 工具集合（见 core/mcp_tools.go）。
-	// 连接与注册都是进程级的，所以「哪些已加载」也按进程级管理；懒初始化，
-	// 让零值 Manager（测试里常见）也能直接用。
-	mcpExpose     *mcpExposure
-	mcpExposeOnce sync.Once
-
-	// mcpServerCount 已连接 MCP 服务器的数量（原子，供工具的 IsHidden 判定）。
-	//
-	// 为什么单独计数而不是读 m.mcpClients：工具的可见性判定发生在目录装配里，那是最热
-	// 的路径之一，且装配期间不该去拿 m.mu（有调用方就持着它）。三个写入点各自维护这个
-	// 计数（登记 / 单个断开 / 全部断开），读侧永远只做一次原子读。
-	mcpServerCount atomic.Int32
-
 	// scopeLedger 授权账本（见 core/authorization.go）：范围级审批粒度下的用户决定。
 	scopeLedger     *scopeLedger
 	scopeLedgerOnce sync.Once
@@ -389,14 +373,6 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	// 宿主内置会话检索工具：滑窗把早期记录裁掉后，模型仍能按关键词精确取回原话。
 	_ = m.toolRegistry.Register(&contextSearchTool{m: m})
-	// 宿主内置 MCP 工具族：连接（mcp_connect）与运行期加载/卸载（mcp_list/mcp_load/
-	// mcp_unload）。全部由宿主执行——「哪些工具该出现在模型目录里」必须由
-	// AllToolsProto 一处裁定，否则子代理与 run_code 会拿到另一份目录。
-	_ = m.toolRegistry.Register(&mcpConnectTool{m: m})
-	_ = m.toolRegistry.Register(&mcpDisconnectTool{m: m})
-	_ = m.toolRegistry.Register(&mcpListTool{m: m})
-	_ = m.toolRegistry.Register(&mcpLoadTool{m: m})
-	_ = m.toolRegistry.Register(&mcpUnloadTool{m: m})
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
 		// 已完成却只会造成重复唤醒的两种情形直接丢弃：
@@ -1235,15 +1211,6 @@ func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	m.stopCronLocked() // 先停调度，避免新任务触发时插件已退出
 
-	// MCP stdio 服务器是本机子进程，必须显式关：Windows 上 EnableProcessJob 的 Job
-	// Object 会在宿主退出时兜底杀掉，但 Linux/macOS 没有这层保障——不关就会留下孤儿
-	// node/python 进程。先摘表再关，避免并发 connect 又把它们塞回去。
-	mcpToClose := make([]*MCPClient, 0, len(m.mcpClients))
-	for name, client := range m.mcpClients {
-		mcpToClose = append(mcpToClose, client)
-		delete(m.mcpClients, name)
-	}
-
 	// 收集所有插件 client 用于后续等待退出
 	type clientInfo struct {
 		name   string
@@ -1275,11 +1242,6 @@ func (m *Manager) Shutdown() {
 	m.pendingEntries = make(map[string]PluginEntry)
 	m.resolvedDeps = make(map[string][]ResolvedDep)
 	m.mu.Unlock()
-
-	// 关 MCP 子进程（在释放 m.mu 之后：Close 要等进程退出，不该占着锁）。
-	for _, client := range mcpToClose {
-		client.Disconnect() // 注销工具 + 关闭传输（stdio 关 stdin 并回收子进程）
-	}
 
 	// 等待所有插件子进程确实退出：go-plugin 的 client.Kill() 会阻塞等待进程退出，
 	// 但某些插件可能有自己的清理逻辑导致 Kill 在退出后进程未完全终止。
@@ -2576,6 +2538,16 @@ func buildEnv(pluginName string, custom map[string]string, allowSecrets bool) []
 // shell 等工具进程读出。
 func (m *Manager) coreEnv(entry PluginEntry) []string {
 	env := buildEnv(entry.Name, entry.Env, entry.Type == "llm")
+	// 插件条目的 config: 块以 JSON 原样交给插件（DSC_PLUGIN_CONFIG），解释权在插件。
+	//
+	// 这是**通用**机制：宿主不解析、不认任何子系统。历史上 MCP 的配置是宿主自己读
+	// entry.Config["mcp"] 再连服务器（main_mcp_autoload.go），等于让核心认识一个插件
+	// 的配置形状——换个人接 MCP 就得改核心。
+	if len(entry.Config) > 0 {
+		if data, err := json.Marshal(entry.Config); err == nil {
+			env = append(env, "DSC_PLUGIN_CONFIG="+string(data))
+		}
+	}
 	if entry.Type == "llm" {
 		// LLM 插件额外把 DSC_ 组回写到无前缀旧名（见函数注释），避免第三方 SDK
 		// 在 NewClient 内部的环境变量凭据链里抢先命中终端遗留的认证变量。

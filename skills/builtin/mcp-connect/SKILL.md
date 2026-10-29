@@ -11,9 +11,9 @@ description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP 或 stdio 本�
 
 1. **不要**用 `shell` 再起一個 `dsc …` 進程去「連 MCP」。那是另一個進程，有它自己的工具表，
    當前會話永遠看不到那些工具，還會多一份會話與任務狀態。
-2. **MCP 默認關閉，且只有人能打開**。開關在 `config.yaml` 的 `mcp.enabled`（無此段即未啟用），
-   由使用者執行 `/mcp on|off` 改寫並持久化。關閉時 MCP 相關工具**一個都不注入**——連入口
-   `mcp_connect` 都沒有，目錄成本恰為 0。所以你會看到三種狀態：
+2. **MCP 默認關閉，且只有人能打開**。開關屬於 MCP 插件自己（`/mcp on|off` 寫它的狀態
+   文件，宿主不認識這個開關）。關閉時 MCP 相關工具**一個都不注入**——連入口 `mcp_connect`
+   都沒有，目錄成本恰為 0。所以你會看到三種狀態：
    - 工具清單裡**完全沒有** `mcp_connect`/`mcp_list`/`mcp_load` → MCP 未啟用。請使用者
      執行 `/mcp on`（或請他在 `/mcp connect …` 裡自己連）。**不要**自己改配置文件，也
      不要起新進程繞過去。
@@ -90,9 +90,9 @@ mcp_unload(tools=["mcp__srv__list_units"])
 | 命令 | 作用 |
 |---|---|
 | `/mcp` | 狀態：開關、已連伺服器（含傳輸與目標）、已加載工具與其目錄成本 |
-| `/mcp on` / `/mcp off` | 注入開關（默認關，寫回 `config.yaml` 的 `mcp.enabled`，重啟保持）。關掉後模型看不到任何 MCP 工具（含 `mcp_connect`），連接與加載記錄保留 |
+| `/mcp on` / `/mcp off` | 注入開關（默認關，插件寫自己的狀態文件，重啟保持）。關掉後模型看不到任何 MCP 工具（含 `mcp_connect`），連接與加載記錄保留 |
 | `/mcp list [server]` | 列出工具（`[loaded]` 表示已在模型目錄裡） |
-| `/mcp connect <name> <endpoint 或 command> [args...]` | 連接：`http(s)://` 開頭按 endpoint；其餘按 stdio 命令。命令參數帶 `-` 時用 `--` 隔開，例如 `/mcp connect srv node -- server.mjs --root .` |
+| `/mcp connect <name> <endpoint 或 command> [args...]` | 連接：`http(s)://` 開頭按 endpoint；其餘按 stdio 命令（這些都是插件聲明的命令，前端只負責轉發） |
 | `/mcp disconnect [server]` | 斷開並註銷工具（不帶參數=全部；stdio 同時回收子進程） |
 | `/mcp load <tool...>` / `--server <name>` | 加載進模型目錄 |
 | `/mcp unload [tool...]` / `--server <name>` | 卸載（不帶參數=全部） |
@@ -100,22 +100,25 @@ mcp_unload(tools=["mcp__srv__list_units"])
 ## 路線 B：寫進配置（需要每次啟動都連時用）
 
 ```yaml
-# mcp-srv.yaml
-- name: mcp-srv           # 條目名，任意
-  type: dsc
+# mcp-srv.yaml（override tool-mcp 插件的配置：同名條目替換其 config）
+- name: tool-mcp          # ★ 必須是插件名，這樣才是覆蓋而不是新增一實例
+  type: tool
   enabled: true           # ★ 必須寫：省略等於 false，整條會被跳過（日誌會有 WARN）
   config:
     mcp:
-      server_name: srv    # ★ 工具名前綴：mcp__srv__*
-      # —— stdio ——
-      transport: stdio
-      command: node
-      args: ["O:/path/server.mjs", "mcp"]
-      cwd: O:/path        # 伺服器按相對路徑找資源時才需要
-      # env:              # 只有這裡寫明的變量才會進子進程
-      #   SOME_TOKEN: ""
-      # —— 或者 streamable HTTP ——
-      # endpoint: http://127.0.0.1:8765/mcp
+      servers:
+        - name: srv       # ★ 工具名前綴：mcp__srv__*
+          # —— stdio ——
+          transport: stdio
+          command: node
+          args: ["O:/path/server.mjs", "mcp"]
+          cwd: O:/path    # 伺服器按相對路徑找資源時才需要
+          # env:            # 只有這裡寫明的變量才會進子進程
+          #   SOME_TOKEN: ""
+        # —— 或者 streamable HTTP ——
+        # - name: other
+        #   transport: http
+        #   endpoint: http://127.0.0.1:8765/mcp
 ```
 
 ```bash

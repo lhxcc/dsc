@@ -64,6 +64,7 @@ var publicPlugins = []string{
 	"tool-lisp-eval",
 	"tool-pdf",
 	"tool-memory-service",
+	"tool-mcp",
 	"dsc-notify",
 	"tool-lua-host",
 	"tool-sql-host",

@@ -1,19 +1,20 @@
-# MCP Memory Server 配置示例（HTTP 传输）
+# MCP 配置示例：HTTP 传输（服务器已在监听）
 #
 # 用法：
 #   dsc -patch config/examples/mcp-memory/mcp-memory.yaml
 #
-# 启动时自动连接 MCP 服务器，工具注册为 mcp__memory__<rawName>。
-# 模型可经这些工具名调用 MCP 服务器的功能。
+# 这条 patch 覆盖的是 **tool-mcp 插件**（type: tool）：宿主原样把 config: 块以 JSON
+# 交给插件（DSC_PLUGIN_CONFIG），形状与含义由插件解释——宿主不解析、不认识 MCP。
 #
-# 对齐 DSH apps/cli/config/examples/mcp-memory/mcp-reference-memory.cordis.yml。
-# 传输：endpoint（streamable HTTP）或 transport: stdio + command/args（本机拉起
-# 子进程，另见 config/examples/mcp-stdio/）。
-- name: mcp-memory
-  type: dsc
+# 连接时机是插件启动；发现的工具注册为 mcp__<name>__<rawName>，但对模型**默认不可见**
+# （一台服务器可能有几百个工具）。用 /mcp on 打开总闸，再 /mcp load 加载要用的那几个。
+- name: tool-mcp
+  type: tool
   # enabled 必须显式写 true：普通 bool，省略即 false，整条会被跳过（日志里有告警）。
   enabled: true
   config:
     mcp:
-      server_name: memory
-      endpoint: http://localhost:3100/mcp
+      servers:
+        - name: memory                 # 工具名前缀：mcp__memory__*
+          transport: http
+          endpoint: http://localhost:3100/mcp

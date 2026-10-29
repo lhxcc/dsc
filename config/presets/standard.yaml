@@ -24,6 +24,9 @@ plugins:
   - name: tool-str-replace-editor
     type: tool
     enabled: true
+  - name: tool-mcp
+    type: tool
+    enabled: true
   - name: tool-filesystem
     type: tool
     enabled: true

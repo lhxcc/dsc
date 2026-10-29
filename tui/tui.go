@@ -930,17 +930,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.render()
 		m.virtualGotoBottom()
 
-	case mcpAdminMsg:
-		// MCP 管理命令结果：工具返回的是给模型看的纯文本，人工侧原样展示即可
-		// （它已经写清了发现数/加载数/目录成本，不再包装一层）。
-		if msg.err != nil {
-			m.appendMessage(errorSty.Render("/mcp "+msg.sub+" 失败: ") + msg.err.Error())
-			break
-		}
-		m.appendMessage(assistantNameSty.Render(assistantMark+" DSC · MCP") + "\n" + strings.TrimSpace(msg.text))
-		m.render()
-		m.virtualGotoBottom()
-
 	case jobNoticeInjectedMsg:
 		// 注入失败（agent 不在运行等）：回落到队列，由回合结束/下一条用户输入补送，
 		// 不静默丢掉一条「任务已完成」的通知。
@@ -2746,7 +2735,6 @@ var slashCommands = []compItem{
 	{label: "/plugins", insert: "/plugins", hint: "列出插件（= /plugin list，动态枚举）"},
 	{label: "/config", insert: "/config", hint: "切换 config/config.*.yaml 配置档（列表可选、可翻页，切换后需重启）"},
 	{label: "/plugin", insert: "/plugin ", hint: "插件管理（list / install / remove / upgrade / load / unload）", descend: true},
-	{label: "/mcp", insert: "/mcp ", hint: "MCP 管理（status / on / off / list / connect / disconnect / load / unload），默认关闭", descend: true},
 	{label: "/plan", insert: "/plan", hint: "进入 plan 模式（先探索设计，再经 exit_plan_mode 呈现计划）"},
 	{label: "/plan off", insert: "/plan off", hint: "退出 plan 模式"},
 	{label: "/session new", insert: "/session new", hint: "新建会话并切换"},
@@ -2865,19 +2853,6 @@ var slashGroups = []slashGroup{
 			{label: "/cron on", insert: "/cron on ", hint: "启用定时任务"},
 			{label: "/cron off", insert: "/cron off ", hint: "停用定时任务"},
 			{label: "/cron notify", insert: "/cron notify ", hint: "跑完是否即时通知模型（on/off）"},
-		},
-	},
-	{
-		entry: compItem{label: "/mcp", insert: "/mcp ", hint: "MCP 管理子命令（status / on / off / list / connect / disconnect / load / unload）", descend: true},
-		subs: []compItem{
-			{label: "/mcp status", insert: "/mcp status", hint: "查看开关、已连服务器、已加载工具与其目录成本（= /mcp）"},
-			{label: "/mcp on", insert: "/mcp on", hint: "打开注入：MCP 工具随请求发给模型（默认关闭，用不到就不付成本）"},
-			{label: "/mcp off", insert: "/mcp off", hint: "关闭注入：模型看不到任何 MCP 工具；连接与加载记录保留"},
-			{label: "/mcp list", insert: "/mcp list ", hint: "列出某服务器的工具（可跟 server 名）"},
-			{label: "/mcp connect", insert: "/mcp connect ", hint: "连接 MCP 服务器（如 /mcp connect rea http://127.0.0.1:8765/mcp）"},
-			{label: "/mcp disconnect", insert: "/mcp disconnect ", hint: "断开服务器并注销其工具（不带参数=全部断开）"},
-			{label: "/mcp load", insert: "/mcp load ", hint: "加载工具进模型目录（可跟工具名或 --server <name>）"},
-			{label: "/mcp unload", insert: "/mcp unload ", hint: "卸载工具（不带参数=全部卸载）"},
 		},
 	},
 	{
@@ -3462,21 +3437,6 @@ func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
 
 	// /mcp <sub> ...（前缀匹配）：与模型同一套 MCP 管理工具；开关（on/off）由前端
 	// 直接改宿主状态——那是部署决定，不该由模型自己按。
-	if strings.HasPrefix(cmd, "/mcp ") || cmd == "/mcp" {
-		argv := strings.Fields(strings.TrimPrefix(cmd, "/mcp"))
-		sub, args := "status", []string(nil)
-		if len(argv) > 0 {
-			sub, args = argv[0], argv[1:]
-		}
-		exec := m.runMCPAdmin(sub, args)
-		m.input.SetValue("")
-		m.completion = completion{}
-		m.syncInputHeight()
-		m.render()
-		m.virtualGotoBottom()
-		return true, exec
-	}
-
 	// /plugin <sub> ...（前缀匹配）：与模型同一套插件管理工具，动态枚举插件。
 	if strings.HasPrefix(cmd, "/plugin ") || cmd == "/plugin" {
 		argv := strings.Fields(strings.TrimPrefix(cmd, "/plugin"))

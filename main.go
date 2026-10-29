@@ -646,14 +646,8 @@ func main() {
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
 
-	// MCP 注入开关（config.yaml 的 mcp.enabled）：**缺省即未启用**。
-	// 关闭时 MCP 相关工具（含入口 mcp_connect）一个都不进模型目录，日常会话因此不付
-	// 任何目录成本；启用后按 mcp_load 逐个曝光。开关只由人经 /mcp on|off 改写（写回
-	// 本文件），模型侧没有关掉/打开它的工具——目录预算是部署决定，不是模型决定。
-	if mainCfg != nil && mainCfg.MCP != nil && mainCfg.MCP.Enabled {
-		mgr.SetMCPToolsEnabled(true)
-		logger.Info("MCP tools enabled from config", "config", core.ConfigPath)
-	}
+	// MCP 的开关不在这里：它归 tool-mcp 插件自己的状态（/mcp on|off 写插件状态文件）。
+	// 宿主不认识 MCP，连「MCP 是否启用」都不该知道——插件不报工具，目录成本自然为 0。
 
 	// 外部脚本钩子（-hooks hooks.json）：严格 LUA 脚本（go-lua 进程内解释）或
 	// 原生可执行文件（直接 exec 不经 shell），在工具流水线 BeforeTool/AfterTool
@@ -937,11 +931,6 @@ func main() {
 	// 后台监听/调度仅在常规模式启用；-headless 精简无头模式不开端口、不起常驻轮询，
 	// 对齐 harness headless「进程只存活于单发、不留任何后台」的契约。
 	if !headless {
-		// -patch overlay 注入的 MCP 客户端配置：扫描 merged.Plugins 中含
-		// config.mcp 的条目，启动时自动连接（对齐 DSH cordis.yml 的 mcp-client
-		// 插件实例化）。每个条目的 config.mcp 字段含 server_name/endpoint 等。
-		autoConnectMCPFromConfig(mgr, merged, logger)
-
 		// 版本化二进制自动热重载（config.yaml hot_reload: true 时启用）：fsnotify + 周期扫描
 		if err := mgr.StartHotReloadWatcher(); err != nil {
 			logger.Warn("failed to start hot-reload watcher", "err", err)

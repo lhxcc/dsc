@@ -6,7 +6,6 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.1.0
 	charm.land/lipgloss/v2 v2.0.6
-	dsc-sdk v0.0.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/casbin/casbin v1.9.1
 	github.com/charmbracelet/x/ansi v0.11.9
@@ -105,8 +104,3 @@ replace github.com/valyala/fasttemplate => ./libs/fasttemplate
 replace github.com/valyala/bytebufferpool => ./libs/bytebufferpool
 
 replace github.com/wippyai/go-lua => ./libs/go-lua
-
-// sdk/mcp 是纯 MCP 客户端（只依赖标准库），宿主与插件共用同一份实现。
-// 这是**过渡性**依赖：core 目前还留着 MCP 的薄封装（命名 / 注册 / 曝光），
-// 等 MCP 整体搬成插件后 core 不再引用 dsc-sdk，这行随之删除（分层仍是 core ← sdk ← plugins）。
-replace dsc-sdk => ./sdk

@@ -94,6 +94,21 @@ plugins:
     type: dsc
     binary_path: ./plugins/dsc-notify/dsc-notify.exe
     enabled: true
+  # MCP 客户端（插件）：连接外部 MCP 服务器（stdio / streamable HTTP），把它们的工具
+  # 接成 mcp__<server>__<tool>。默认**不注入**（连接与开关都在插件自己的状态里，
+  # `/mcp on` 打开），日常会话目录成本为 0。
+  # 服务器配置写在 config: 块里（宿主原样以 JSON 交给插件，不解析）：
+  #   config:
+  #     mcp:
+  #       servers:
+  #         - name: fs
+  #           transport: stdio
+  #           command: node
+  #           args: ["O:/tools/mcp-fs.mjs"]
+  - name: tool-mcp
+    type: tool
+    binary_path: ./plugins/tool-mcp/tool-mcp.exe
+    enabled: true
   # LUA HOST：空壳工具插件，加载 LUA 脚本（运行已创建的工具；新脚本仅在创造模式生效）
   - name: tool-lua-host
     type: tool

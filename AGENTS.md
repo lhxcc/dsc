@@ -210,11 +210,10 @@ DSC 的命令解析使用内置 POSIX shell 实现（mvdan/sh），所有路径�
 
 ### 10.5 分層：core ← sdk ← plugins（插件不得 import core）
 
-**临时例外（MCP 搬迁期）**：`core` 目前 `import dsc-sdk/mcp`，因为 MCP 客户端已经搬进
-SDK、而宿主还留着薄封装（命名/注册/曝光）。这条边**必须随 MCP 搬成插件一起删掉**。
-维持它的前提是 `sdk/mcp` 只依赖标准库——一旦它 import SDK 根（根里 re-export 了 core 的
-类型），`core → sdk/mcp → sdk → core` 就成了包级循环。`sdk/mcp` 因此自带
-`proc_windows.go`（隐藏控制台）而不是调 `dsc.ConfigureChildProcessAttrs`。
+**反向依赖已清除（MCP 插件化完成）**：`core` 不再 import 任何 `dsc-sdk` 包。`sdk/mcp`
+仍然只依赖标准库（自带 `proc_windows.go` 隐藏控制台而不调 `dsc.ConfigureChildProcessAttrs`）
+——这条约束要留着，否则将来谁把 SDK 根引进 `sdk/mcp`，又会把
+`core → sdk/mcp → sdk → core` 变成包级循环。
 
 
 插件一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`：
@@ -303,7 +302,8 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
   （`AllToolsProto`）只做「取 VisibleTools → 转 proto」，**不得**再按工具名前缀/名字
   判断谁能出现。历史教训：MCP 的曝光规则（关闭、已加载、有没有服务器）曾以
   `filterMCPCatalog` 的形式住在这个唯一装配点里，靠 `mcp__` 前缀认人——每加一个「有
-  曝光策略」的提供方，就要在这里再加一段特例。
+  曝光策略」的提供方，就要在这里再加一段特例（MCP 现已整体搬成 `tool-mcp` 插件，
+  宿主连它的名字都不再认识）。
   - 隐藏 ≠ 不可用：隐藏的工具仍在注册表里，后台任务、子代理、按名调用照常；只是不随
     请求发给模型（目录每个请求都要付成本）。
   - 判定每次现读、不缓存：提供方改主意后下一次 `ListTools` 就生效（宿主约 800ms 同步）。

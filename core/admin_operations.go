@@ -33,10 +33,10 @@ const (
 
 // registerOperationAdminRoutes 注册通用管理操作端点。
 //
-//   GET  /operations/list            管理操作目录（group / name / tool / summary / schema /
-//                                    model_visible）
-//   POST /operations/<group>/<name>  执行一条操作，body 即操作参数（JSON 对象）
-//                                    （路径模板是 vodka 的 <name> 语法，不是 {name}）
+//	GET  /operations/list            管理操作目录（group / name / tool / summary / schema /
+//	                                 model_visible）
+//	POST /operations/<group>/<name>  执行一条操作，body 即操作参数（JSON 对象）
+//	                                 （路径模板是 vodka 的 <name> 语法，不是 {name}）
 func (m *Manager) registerOperationAdminRoutes(g *vodka.RouteGroup) {
 	g.Get("/list", m.handleOperationList)
 	g.Post("/<group>/<name>", m.handleOperationExecute)
