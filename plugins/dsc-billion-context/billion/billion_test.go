@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"fmt"
@@ -93,9 +93,9 @@ func TestRenderMessages(t *testing.T) {
 	if len(rendered) < 2 {
 		t.Fatalf("rendered messages = %d, want ≥2 (summary + c)", len(rendered))
 	}
-	// 第一条应是块 summary（ID 形如 acp_summary_b0，role=system）
-	if rendered[0].ID != "acp_summary_b0" {
-		t.Errorf("first rendered msg ID = %q, want acp_summary_b0", rendered[0].ID)
+	// 第一条应是块 summary（ID 形如 billion_summary_b0，role=system）
+	if rendered[0].ID != "billion_summary_b0" {
+		t.Errorf("first rendered msg ID = %q, want billion_summary_b0", rendered[0].ID)
 	}
 	if rendered[0].Role != RoleSystem {
 		t.Errorf("summary role = %q, want system", rendered[0].Role)
@@ -135,8 +135,8 @@ func TestRenderMessagesPrefixStable(t *testing.T) {
 	rendered1 := RenderMessages(msgs, state, config, true)
 	// 验证：summary 在最前（insertAt=a 的位置=0）。a、b 已被压缩进 b0，不再逐字保留——
 	// 是否保留由模型自己的压缩选择决定（首条消息在超长会话里往往是失效旧需求，不应程序钉死）。
-	if rendered1[0].ID != "acp_summary_b0" {
-		t.Errorf("first rendered = %q, want acp_summary_b0", rendered1[0].ID)
+	if rendered1[0].ID != "billion_summary_b0" {
+		t.Errorf("first rendered = %q, want billion_summary_b0", rendered1[0].ID)
 	}
 	foundA := false
 	for _, m := range rendered1 {
@@ -162,19 +162,19 @@ func TestRenderMessagesPrefixStable(t *testing.T) {
 		t.Fatalf("rendered2 = %d msgs, want ≥3", len(rendered2))
 	}
 	// b0 summary 仍是第一条（前缀稳定）
-	if rendered2[0].ID != "acp_summary_b0" {
-		t.Errorf("after second compress: first rendered = %q, want acp_summary_b0 (prefix stable)", rendered2[0].ID)
+	if rendered2[0].ID != "billion_summary_b0" {
+		t.Errorf("after second compress: first rendered = %q, want billion_summary_b0 (prefix stable)", rendered2[0].ID)
 	}
 	// b1 summary 应存在（在 b0 之后某位置）
 	foundB1 := false
 	for _, m := range rendered2 {
-		if m.ID == "acp_summary_b1" {
+		if m.ID == "billion_summary_b1" {
 			foundB1 = true
 			break
 		}
 	}
 	if !foundB1 {
-		t.Errorf("acp_summary_b1 should be present after second compress")
+		t.Errorf("billion_summary_b1 should be present after second compress")
 	}
 	// 最后是 e
 	last := rendered2[len(rendered2)-1]
@@ -275,8 +275,8 @@ func TestProcessTurn(t *testing.T) {
 	if len(result.State.MessageRefs.ByRaw) != 2 {
 		t.Errorf("refs assigned = %d, want 2", len(result.State.MessageRefs.ByRaw))
 	}
-	// renderTags=false：不注入 <acp> 标签到消息文本（保持前缀缓存稳定）
-	// 验证 ref 映射已建立（模型经 acp_status 工具查询 ref）
+	// renderTags=false：不注入 <billion> 标签到消息文本（保持前缀缓存稳定）
+	// 验证 ref 映射已建立（模型经 billion_status 工具查询 ref）
 	if RefForRaw("a", result.State) != "m00000" {
 		t.Errorf("ref for 'a' = %q, want m00000", RefForRaw("a", result.State))
 	}
@@ -714,10 +714,10 @@ func indexOf(s, sub string) int {
 }
 
 // TestComputeCompressibleRangesSkipsRenderedSummary 回归测试：
-// 已渲染的 summary 消息（ID 前缀 acp_summary_）不应被纳入可压缩范围。
+// 已渲染的 summary 消息（ID 前缀 billion_summary_）不应被纳入可压缩范围。
 //
 // Bug 重现：原实现用 strings.HasPrefix(msg.ID, "block:") 判断 summary，但实际
-// summary ID 前缀是 "acp_summary_"（见 prune.go summaryIDPrefix）。结果 summary
+// summary ID 前缀是 "billion_summary_"（见 prune.go summaryIDPrefix）。结果 summary
 // 被错误地纳入 compressible range，模型按 nudge 提示调用 compress 时又因
 // isRenderedSummary 跳过（prune.go:83），最终报 "no compressible messages"，
 // 形成 "nudge→compress→error→再 nudge" 死循环。
@@ -730,7 +730,7 @@ func TestComputeCompressibleRangesSkipsRenderedSummary(t *testing.T) {
 	// summary + 1 条长消息（≥500 token 才进入范围）+ 1 条短尾部（在保留区）
 	longText := strings.Repeat("x", 2500) // ~625 tokens
 	msgs := []CoreMessage{
-		{ID: "acp_summary_b0", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed section] earlier discussion"},
+		{ID: "billion_summary_b0", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed section] earlier discussion"},
 		{ID: "new1", Role: RoleUser, Text: longText},
 		{ID: "new2", Role: RoleAssistant, Text: "short tail"},
 	}
@@ -763,8 +763,8 @@ func TestComputeCompressibleRangesSkipsRenderedSummary(t *testing.T) {
 func TestSyncBlocks(t *testing.T) {
 	msgs := []CoreMessage{
 		{ID: "a", Role: RoleUser, Text: "u1"},
-		{ID: "acp_summary_b2", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed conversation section]\nsummary"},
-		{ID: "acp_summary_b5", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed conversation section]\ndistilled"},
+		{ID: "billion_summary_b2", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed conversation section]\nsummary"},
+		{ID: "billion_summary_b5", Role: RoleSystem, ContentType: ContentTypeText, Text: "[Compressed conversation section]\ndistilled"},
 	}
 	state := CreateInitialState()
 	state.Blocks = []CompressionBlock{
@@ -871,7 +871,7 @@ func TestAbsorbFlow(t *testing.T) {
 		{ID: "result", Role: RoleTool, ContentType: ContentTypeToolResult, ToolCallID: "c1", ToolName: "shell", Text: strings.Repeat("log ", 200)},
 	}
 	AssignRefs(msgs, state)
-	// 候选：非 ACP 工具的 tool-result
+	// 候选：非 billion 工具的 tool-result
 	if !IsAbsorbCandidate(msgs[1], config) {
 		t.Fatalf("tool result must be an absorb candidate")
 	}
@@ -894,10 +894,10 @@ func TestAbsorbFlow(t *testing.T) {
 	if len(hidden) != 0 {
 		t.Fatalf("absorbed pair must be hidden, got %d messages", len(hidden))
 	}
-	// ACP 管理工具不可吸收
-	acpMsg := CoreMessage{ID: "r2", Role: RoleTool, ContentType: ContentTypeToolResult, ToolCallID: "c2", ToolName: "compress", Text: "x"}
-	if IsAbsorbCandidate(acpMsg, config) {
-		t.Fatalf("ACP-managed tool result must not be absorbable")
+	// billion 管理工具不可吸收
+	billionMsg := CoreMessage{ID: "r2", Role: RoleTool, ContentType: ContentTypeToolResult, ToolCallID: "c2", ToolName: "compress", Text: "x"}
+	if IsAbsorbCandidate(billionMsg, config) {
+		t.Fatalf("billion-managed tool result must not be absorbable")
 	}
 }
 
@@ -1055,12 +1055,12 @@ func TestRebuildStateFromMessages(t *testing.T) {
 	if rebuilt.MessageRefs.ByRaw["c"] != liveState.MessageRefs.ByRaw["c"] {
 		t.Fatalf("ref map must reproduce identically")
 	}
-	// HasACPStateTrace 探测
-	if !HasACPStateTrace(original) {
+	// HasBillionStateTrace 探测
+	if !HasBillionStateTrace(original) {
 		t.Fatalf("trace must be detected")
 	}
 	plain := []CoreMessage{{ID: "a", Role: RoleUser, Text: "hi"}}
-	if HasACPStateTrace(plain) {
+	if HasBillionStateTrace(plain) {
 		t.Fatalf("plain history must not carry trace")
 	}
 }

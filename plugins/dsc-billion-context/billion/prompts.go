@@ -1,19 +1,19 @@
-package acp
+package billion
 
-// ACP system prompt 文本（对齐 acp-kernel compression-rules.ts + billion-context-dsh prompts.ts）。
+// billion system prompt 文本（对齐 acp-kernel compression-rules.ts + billion-context-dsh prompts.ts）。
 //
-// 这是模型可见的 ACP 压缩指导，经 handlePreStep 注入消息列表头部（system 角色）。
+// 这是模型可见的 billion 压缩指导，经 handlePreStep 注入消息列表头部（system 角色）。
 // 包含：
 //   - 压缩哲学（COMPRESS_PHILOSOPHY）
 //   - 何时压缩 / 何时不要压缩
 //   - 如何压缩规则（HOW_TO_COMPRESS_RULES）
-//   - 工具使用说明（compress/decompress/search_context/acp_status）
+//   - 工具使用说明（compress/decompress/search_context/billion_status）
 //   - 多层蒸馏规则（TIER2_DISTILL_RULES / TIER3_CONDENSE_RULES）
 //
 // 这段文本每轮都注入（作为第一条 system 消息），对齐 DSH 的 systemPrompt.section
 // 机制——DSH 把它作为 system prompt 的一个 section 一次性注入，DSC 多进程架构下
 // 经 agent/pre-step hook 在消息列表头部插入等价。
-const ACPSystemPrompt = `Active Context Pruning — model-driven context management
+const BillionSystemPrompt = `Active Context Pruning — model-driven context management
 
 YOU decide whether and when to compress context. The nudge is an efficiency notification: when you see one, consider which ranges you have genuinely consumed and could summarise to keep working context lean.
 
@@ -37,10 +37,10 @@ WHEN NOT TO COMPRESS:
 ` + HowToCompressRules + `
 
 Compression tools (refs are message refs mNNNNN or block refs bN):
-- compress: replace one or more message ranges, each with your own dense summary. Single range: compress({content:[{startId:"m00150", endId:"m00220", summary:"...", topic:"..."}]}). Batch multiple unrelated ranges in one call (each entry becomes its own block): compress({content:[{startId:"m00150", endId:"m00220", summary:"..."}, {startId:"m00300", endId:"m00350", summary:"..."}]}). Keep ranges disjoint. Use mNNNNN refs (from <acp> tags) for standard T1 compression.
-- decompress: recover a compressed block's original content, read-only. decompress({blockId:"b5"}) — accept the bN ref shown by acp_status.
+- compress: replace one or more message ranges, each with your own dense summary. Single range: compress({content:[{startId:"m00150", endId:"m00220", summary:"...", topic:"..."}]}). Batch multiple unrelated ranges in one call (each entry becomes its own block): compress({content:[{startId:"m00150", endId:"m00220", summary:"..."}, {startId:"m00300", endId:"m00350", summary:"..."}]}). Keep ranges disjoint. Use mNNNNN refs (from <billion> tags) for standard T1 compression.
+- decompress: recover a compressed block's original content, read-only. decompress({blockId:"b5"}) — accept the bN ref shown by billion_status.
 - search_context: when a summary lacks the details you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory; search_context({query:"auth token refresh"}) locates the right block, decompress only that block.
-- acp_status: current context usage and the live compressible-range list. Run it right before compressing — the only refs that never go stale are the ones you just read.
+- billion_status: current context usage and the live compressible-range list. Run it right before compressing — the only refs that never go stale are the ones you just read.
 
 Tiered compression: each compressed block appears on the surface as one summary node. Compressing that node again DISTILLS the block (tier 2): the parent summary folds into your new summary and the original messages are freed. Distilling a tier-2 block yields tier 3. Distill when a summary itself is consumed — use block refs (bN) as startId/endId to trigger distillation: compress({content:[{startId:"b0", endId:"b4", summary:"distilled T2 summary"}]}).
 
@@ -48,7 +48,7 @@ Tiered compression: each compressed block appears on the surface as one summary 
 
 ` + Tier3CondenseRules + `
 
-When you write a summary, it becomes the ONLY record of that range: keep file paths, signatures, exact values, decisions, and error strings verbatim so a later reader (or you, after decompress) can continue without the original. Never reuse historical refs — verify with acp_status.`
+When you write a summary, it becomes the ONLY record of that range: keep file paths, signatures, exact values, decisions, and error strings verbatim so a later reader (or you, after decompress) can continue without the original. Never reuse historical refs — verify with billion_status.`
 
 // CompressPhilosophy 压缩哲学（对齐 acp-kernel COMPRESS_PHILOSOPHY）。
 const CompressPhilosophy = `Compression Philosophy:

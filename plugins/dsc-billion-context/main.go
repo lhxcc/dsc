@@ -3,18 +3,18 @@
 // 接管方式（零 agent 改动）：
 //  1. 注册 Hook.OnEvent 订阅 agent/pre-step 事件
 //  2. 每次进入 LLM 请求前，插件收到当前消息列表 JSON
-//  3. 插件经 bcacp.ProcessTurn 跑 pipeline：分配 ref、注入 <acp> 标签、应用 prune、决策 nudge
+//  3. 插件经 billion.ProcessTurn 跑 pipeline：分配 ref、注入 <billion> 标签、应用 prune、决策 nudge
 //  4. 返回改写后的消息列表（{"messages": [...]}）给宿主，宿主透传给 LLM
-//  5. 模型调用 compress 工具时触发压缩：插件调 bcacp.ApplyCompression 持久化块、遮蔽范围
+//  5. 模型调用 compress 工具时触发压缩：插件调 billion.ApplyCompression 持久化块、遮蔽范围
 //
 // 4 个模型可见工具：
 //   - compress: 把消息范围替换为摘要（模型生成 summary）
 //   - decompress: 恢复压缩块内容
 //   - search_context: 在压缩块摘要中搜索关键词
-//   - acp_status: 查看上下文使用率与可压缩范围
+//   - billion_status: 查看上下文使用率与可压缩范围
 //
 // state 持久化：每个 session 一个 JSON 文件，与宿主会话存档同目录
-// （ExecDir/sessions/<session>.acp.json，后缀区分）。
+// （ExecDir/sessions/<session>.dsc-billion-context.json，后缀区分）。
 // fork/恢复时经 session 事件日志重放重建（后续实现）。
 package main
 
@@ -30,7 +30,7 @@ import (
 
 	"dsc/proto"
 
-	bcacp "dsc-billion-context/acp"
+	billion "dsc-billion-context/billion"
 	bcadapter "dsc-billion-context/adapter"
 )
 
@@ -38,13 +38,13 @@ import (
 type BillionContext struct {
 	mu     sync.Mutex
 	store  *bcadapter.StateStore
-	config bcacp.Config
+	config billion.Config
 	// lastTokenCount 最近一次 pre-step 观测到的上下文占用（宿主估算或本地兜底）。
 	lastTokenCount int
 
 	// state 当前会话的压缩状态（含 CCR 条目索引）；pre-step 每轮刷新，
-	// 供 acp_retrieve 查条目（工具调用不带会话上下文，只能读最近一次快照）。
-	state *bcacp.CompressionState
+	// 供 billion_retrieve 查条目（工具调用不带会话上下文，只能读最近一次快照）。
+	state *billion.CompressionState
 
 	// sessionID 当前会话 ID（须持 mu 读写）。
 	// 取值优先级：pre-step 事件里的 Session（宿主真实会话 ID，见 handlePreStep）>
@@ -56,10 +56,19 @@ type BillionContext struct {
 	// logWindowOnce 首次 pre-step 打印生效窗口一次（启动期 stderr 尚未被宿主转发）。
 	logWindowOnce sync.Once
 
+	// lastViewIn / lastViewOut 最近一次 pre-step 的「进来多少 / 出去多少」
+	// （消息条数 + 估算 token）。渲染后视图与输入差得离谱时，只有这两个数能说明
+	// 「是压缩块覆盖了」还是「视图被谁掏空了」——历史上那类请求面摆动的排查靠它定位。
+	lastViewIn, lastViewInTok   int
+	lastViewOut, lastViewOutTok int
+	// preStepSeq pre-step 调用序号（宿主载荷里没有轮/步号——ChatRequest 不带它们，
+	// 事件里的 Turn/Step 因此恒为 0；用本地序号至少能把相邻几步排成序列看摆动）。
+	preStepSeq int
+
 	// lastMessages 缓存最近一次 pre-step 收到的 CoreMessage 列表，供 handleCompress
 	// 解析 mNNNNN 边界引用（解决"compress 工具调用时无消息列表"的致命 bug）。
 	// 每次 handlePreStep 更新此缓存；handleCompress 从中读取。
-	lastMessages []bcacp.CoreMessage
+	lastMessages []billion.CoreMessage
 
 	// prunedState 启动时清理的孤儿状态文件数（首次 pre-step 时随窗口日志一起打印：
 	// 启动期 stderr 尚未被宿主转发）。
@@ -67,7 +76,7 @@ type BillionContext struct {
 }
 
 func main() {
-	// state 与会话存档同目录，靠 <id>.acp.json 后缀区分，不再单独开 billion-context/。
+	// state 与会话存档同目录，靠 <id>.dsc-billion-context.json 后缀区分，不再单独开 billion-context/。
 	// 目录一律经 SDK 解析（DSC_SESSION_DIR 优先），与宿主 Store 同一来源。
 	sessionsDir := dsc.SessionDir()
 	pruned := bcadapter.PruneOrphans(sessionsDir)
@@ -83,32 +92,32 @@ func main() {
 
 	bc := &BillionContext{
 		store:       store,
-		config:      bcacp.DefaultConfig(contextWindow),
+		config:      billion.DefaultConfig(contextWindow),
 		prunedState: pruned,
 	}
 
-	// 即时工具结果吸收开关（默认关闭，DSC_ACP_ABSORB=1 启用）：
+	// 即时工具结果吸收开关（默认关闭，DSC_BILLION_ABSORB=1 启用）：
 	// 启用后达标大工具结果被追加强制提示，模型经 absorb 蒸馏后消息对被隐藏
-	if dsc.EnvBool("DSC_ACP_ABSORB", false) {
+	if dsc.EnvBool("DSC_BILLION_ABSORB", false) {
 		bc.config.Absorb.Enabled = true
-		if n := os.Getenv("DSC_ACP_ABSORB_MIN_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_ABSORB_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {
 				bc.config.Absorb.MinToolTokens = v
 			}
 		}
 	}
 
-	// 内容缓存回取（CCR）开关（默认关闭，DSC_ACP_CCR=1 启用）。
+	// 内容缓存回取（CCR）开关（默认关闭，DSC_BILLION_CCR=1 启用）。
 	// 与 absorb 相互独立：absorb 是有损蒸馏，CCR 是把原文按内容 hash 存起来随时取回；
 	// 两者可以只开一个，也可以都开（CCR 的占位符很短，absorb 不会再要求蒸馏它）。
-	if dsc.EnvBool("DSC_ACP_CCR", false) {
+	if dsc.EnvBool("DSC_BILLION_CCR", false) {
 		bc.config.CCR.Enabled = true
-		if n := os.Getenv("DSC_ACP_CCR_MIN_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_CCR_MIN_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v >= 0 {
 				bc.config.CCR.MinToolTokens = v
 			}
 		}
-		if n := os.Getenv("DSC_ACP_CCR_INLINE_TOKENS"); n != "" {
+		if n := os.Getenv("DSC_BILLION_CCR_INLINE_TOKENS"); n != "" {
 			if v, err := parseInt(n); err == nil && v > 0 {
 				bc.config.CCR.InlineLimitTokens = v
 			}
@@ -185,7 +194,7 @@ func main() {
 }`),
 	})
 	sdkInst.Tool(dsc.Tool{
-		Name:        "acp_status",
+		Name:        "billion_status",
 		Description: "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
 		Handler:     bc.handleStatus,
 		Schema: json.RawMessage(`{
@@ -199,7 +208,7 @@ func main() {
 	if bc.config.Absorb.Enabled {
 		sdkInst.Tool(dsc.Tool{
 			Name:        bc.config.Absorb.ToolName,
-			Description: "Distill a large tool result into a short summary. Call this IMMEDIATELY for any result marked [ACP absorb]; the original output is removed afterwards and your summary becomes the durable record.",
+			Description: "Distill a large tool result into a short summary. Call this IMMEDIATELY for any result marked [billion absorb]; the original output is removed afterwards and your summary becomes the durable record.",
 			Handler:     bc.handleAbsorb,
 			Schema: json.RawMessage(`{
                           "type": "object",
@@ -216,9 +225,9 @@ func main() {
 	if bc.config.CCR.Enabled {
 		sdkInst.Tool(dsc.Tool{
 			Name:        bc.config.CCR.ToolName,
-			Description: "Fetch the full content behind an [acp-stored cNNNNN] placeholder. Inline up to a size limit; larger payloads are exported to a workspace file you read with your own file tool.",
+			Description: "Fetch the full content behind an [billion-stored cNNNNN] placeholder. Inline up to a size limit; larger payloads are exported to a workspace file you read with your own file tool.",
 			Handler:     bc.handleRetrieve,
-			Schema:      json.RawMessage(bcacp.CCRToolSchema()),
+			Schema:      json.RawMessage(billion.CCRToolSchema()),
 			// 图像条目：把 ref 挂回工具结果，由 provider 解析成真正的图像块
 			ImagesFn: func(ctx context.Context, args json.RawMessage, result string) []string {
 				var in struct {
@@ -232,8 +241,8 @@ func main() {
 				if bc.state == nil {
 					return nil
 				}
-				entry, ok := bcacp.FindCCREntry(bc.state.CCR, in.Ref)
-				if !ok || entry.Kind != bcacp.CCRKindImage {
+				entry, ok := billion.FindCCREntry(bc.state.CCR, in.Ref)
+				if !ok || entry.Kind != billion.CCRKindImage {
 					return nil
 				}
 				return entry.Images
@@ -241,15 +250,15 @@ func main() {
 		})
 	}
 
-	// Hook: 拦截 agent/pre-step 改写消息列表 + ContextFn 贡献 ACP system prompt
+	// Hook: 拦截 agent/pre-step 改写消息列表 + ContextFn 贡献 billion system prompt
 	sdkInst.Hook(dsc.Hook{
 		OnEvent:    bc.onEvent,
 		RunCommand: bc.runCommand,
 		ContextFn: func() string {
 			if bc.config.Absorb.Enabled {
-				return bcacp.ACPSystemPrompt + "\n\n" + bcacp.BuildAbsorbSystemPrompt(bc.config.Absorb.ToolName)
+				return billion.BillionSystemPrompt + "\n\n" + billion.BuildAbsorbSystemPrompt(bc.config.Absorb.ToolName)
 			}
-			return bcacp.ACPSystemPrompt
+			return billion.BillionSystemPrompt
 		},
 	})
 
@@ -257,7 +266,7 @@ func main() {
 }
 
 // onEvent 处理宿主事件。
-// - agent/pre-step：改写消息列表（注入 ACP system prompt、prune、nudge）
+// - agent/pre-step：改写消息列表（注入 billion system prompt、prune、nudge）
 // 其余事件忽略（返回空 result，不影响宿主）。
 //
 // 这里**不再**处理 agent/request-error：超窗的处置权归宿主（收紧预算 + 滑窗 + 重试）。
@@ -271,7 +280,7 @@ func (bc *BillionContext) onEvent(ctx context.Context, eventType, dataJSON strin
 	}
 }
 
-// handlePreStep 处理 agent/pre-step 事件：跑 acp pipeline，返回改写后的消息列表。
+// handlePreStep 处理 agent/pre-step 事件：跑 billion pipeline，返回改写后的消息列表。
 //
 // 协议：dataJSON 为 AgentPreStepEvent 的 JSON（含 MessagesJSON 字段）
 // 返回：resultJSON 为 {"messages": [...]} 形式（改写后的 proto.Message 数组 JSON）
@@ -316,7 +325,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 		return "", fmt.Errorf("billion-context: load state: %w", err)
 	}
 
-	// 转换为 acp 核心消息格式
+	// 转换为 billion 核心消息格式
 	coreMsgs := bcadapter.ToCoreMessages(protoMsgs, nil)
 
 	// 缓存消息列表供 handleCompress 使用（解决"compress 工具调用时无消息列表"的致命 bug）
@@ -324,10 +333,10 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	bc.lastMessages = coreMsgs
 	bc.mu.Unlock()
 
-	// fork/恢复重建：state 空白而历史已有 ACP 压缩痕迹（状态文件缺失/损坏、
+	// fork/恢复重建：state 空白而历史已有 billion 压缩痕迹（状态文件缺失/损坏、
 	// 会话 fork 换 ID、跨机恢复）——消息列表即事件日志，重放 compress 调用链
-	if len(state.Blocks) == 0 && state.Stats.CompressionCount == 0 && bcacp.HasACPStateTrace(coreMsgs) {
-		if rebuilt, n := bcacp.RebuildStateFromMessages(coreMsgs, bc.config); n > 0 {
+	if len(state.Blocks) == 0 && state.Stats.CompressionCount == 0 && billion.HasBillionStateTrace(coreMsgs) {
+		if rebuilt, n := billion.RebuildStateFromMessages(coreMsgs, bc.config); n > 0 {
 			state = rebuilt
 			fmt.Fprintf(os.Stderr, "[billion-context] state rebuilt from history: %d block(s) replayed\n", n)
 		}
@@ -341,13 +350,13 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 	// 本次决策用的上下文用量（口径见 usageTokens）
 	tokenCount := usageTokens(ev, protoMsgs)
 
-	// 跑 pipeline（renderTags=false：不注入 <acp> 标签到消息文本——标签的 tokens
+	// 跑 pipeline（renderTags=false：不注入 <billion> 标签到消息文本——标签的 tokens
 	// 属性每轮估算会变化，破坏前缀缓存。改为仅用 mNNNNN ref 映射，标签信息经
-	// acp_status 工具按需查询）
-	result := bcacp.ProcessTurn(coreMsgs, state, bc.config, tokenCount)
+	// billion_status 工具按需查询）
+	result := billion.ProcessTurn(coreMsgs, state, bc.config, tokenCount)
 
 	// CCR 副作用：把要卸载的正文写进内容寻址附件库（dsc-txt://<sha>），
-	// 并校验 sha 与条目一致——不一致说明正文在 acp 与插件之间被改写过，
+	// 并校验 sha 与条目一致——不一致说明正文在 billion 与插件之间被改写过，
 	// 此时**回滚该条**（恢复原文）而不是留一个取不回来的占位符。
 	if len(result.CCROffloads) > 0 {
 		result.Messages = bc.persistCCROffloads(result.Messages, result.CCROffloads)
@@ -355,10 +364,23 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// 缓存 state 与最近一次 token 数：status 报告与 context/status 事件都要用真实占用，
 	// 之前 handleStatus 用「已压缩 token + 1000」当占用，报出来的百分比毫无意义。
+	outTok := 0
+	for _, m := range result.Messages {
+		outTok += dsc.EstimateTextTokens(m.Text)
+	}
 	bc.mu.Lock()
 	bc.state = result.State
 	bc.lastTokenCount = tokenCount
+	bc.lastViewIn, bc.lastViewInTok = len(coreMsgs), tokenCount
+	bc.lastViewOut, bc.lastViewOutTok = len(result.Messages), outTok
+	bc.preStepSeq++
+	seqNo := bc.preStepSeq
 	bc.mu.Unlock()
+	// 一行视图账：进来多少条/多少 token、发出去多少条/多少 token。渲染后远小于输入是
+	// 正常的（压缩块覆盖旧消息），但**同一个会话里忽大忽小**就是问题——排查请求面摆动
+	// 时先看这行，别再从 provider 用量反推。
+	fmt.Fprintf(os.Stderr, "[billion-context] view: #%d in=%d(%d tok) out=%d(%d tok) blocks=%d\n",
+		seqNo, len(coreMsgs), tokenCount, len(result.Messages), outTok, len(result.State.Blocks))
 
 	// 持久化更新后的 state
 	if err := bc.store.Save(sessionID, result.State); err != nil {
@@ -366,7 +388,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 		fmt.Fprintf(os.Stderr, "[billion-context] save state failed: %v\n", err)
 	}
 
-	// ACP system prompt 经 Hook.ContextFn 贡献（agent 的 buildSystemPrompt
+	// billion system prompt 经 Hook.ContextFn 贡献（agent 的 buildSystemPrompt
 	// 经 ListContext 拉取，宿主聚合后拼到 system prompt 中）。
 	// 不再在 pre-step 改写消息列表注入——前缀缓存稳定性更好（system prompt
 	// 经 ListContext 聚合后位置固定在消息列表头部，每轮不变）。
@@ -374,19 +396,19 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// nudge 作为尾部追加的 user 消息（不影响前缀缓存）
 	if result.Nudge != nil && result.Nudge.ShouldInject {
-		nudgeText := bcacp.FormatNudgeText(*result.Nudge)
+		nudgeText := billion.FormatNudgeText(*result.Nudge)
 		if nudgeText != "" {
 			// 每次提示都留一行数字：窗口、触发线、当前用量、下次需要的增量。
 			// 这些值此前只在首个 pre-step 打一次窗口，出现「怎么老提示压缩」时无法
 			// 判断是窗口取错了、还是用量真的到了，只能靠猜。
 			fmt.Fprintf(os.Stderr, "[billion-context] nudge: reason=%q tokens=%d limit=%d threshold=%d growthFloor=%d baseline=%d\n",
 				result.Nudge.Reason, result.Nudge.Breakdown["usage"], bc.config.ModelContextLimit,
-				result.Nudge.Breakdown["thresholdTokens"], bcacp.GrowthFloorTokens(bc.config),
+				result.Nudge.Breakdown["thresholdTokens"], billion.GrowthFloorTokens(bc.config),
 				result.Nudge.Breakdown["baselineTokens"])
-			renderedMsgs = append(renderedMsgs, bcacp.CoreMessage{
-				ID:          "acp_nudge",
-				Role:        bcacp.RoleUser,
-				ContentType: bcacp.ContentTypeText,
+			renderedMsgs = append(renderedMsgs, billion.CoreMessage{
+				ID:          "billion_nudge",
+				Role:        billion.RoleUser,
+				ContentType: billion.ContentTypeText,
 				Text:        nudgeText,
 			})
 		}
@@ -404,7 +426,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 func (bc *BillionContext) handleCompress(ctx context.Context, args json.RawMessage) (string, error) {
 	// 宽松解析（代码围栏 / 尾逗号 / 输出截断救援 / 字段变体）：compress 的 summary
 	// 常是大段自然语言，严格 json.Unmarshal 失败会让整轮压缩作废、上下文继续膨胀。
-	ranges := bcacp.ParseCompressArgs(string(args))
+	ranges := billion.ParseCompressArgs(string(args))
 	if len(ranges) == 0 {
 		return "", fmt.Errorf("content is required: at least one range with startId/endId/summary")
 	}
@@ -423,7 +445,7 @@ func (bc *BillionContext) handleCompress(ctx context.Context, args json.RawMessa
 		return "", fmt.Errorf("no cached messages: compress must be called after at least one LLM request (pre-step event)")
 	}
 
-	_, result := bcacp.ApplyCompression(ranges, cachedMsgs, state, bc.config)
+	_, result := billion.ApplyCompression(ranges, cachedMsgs, state, bc.config)
 
 	// 持久化
 	if err := bc.store.Save(sessionID, state); err != nil {
@@ -458,7 +480,7 @@ func (bc *BillionContext) handleDecompress(ctx context.Context, args json.RawMes
 		return "", fmt.Errorf("load state: %w", err)
 	}
 
-	summary, err := bcacp.Decompress(req.BlockID, state, req.Full)
+	summary, err := billion.Decompress(req.BlockID, state, req.Full)
 	if err != nil {
 		return "", fmt.Errorf("decompress: %w", err)
 	}
@@ -498,11 +520,11 @@ func (bc *BillionContext) handleSearch(ctx context.Context, args json.RawMessage
 	bc.mu.Lock()
 	cachedMsgs := bc.lastMessages
 	bc.mu.Unlock()
-	docs := bcacp.BlockDocs(state)
+	docs := billion.BlockDocs(state)
 	if len(cachedMsgs) > 0 {
-		docs = append(docs, bcacp.MessageDocs(cachedMsgs, state)...)
+		docs = append(docs, billion.MessageDocs(cachedMsgs, state)...)
 	}
-	results := bcacp.SearchBlocks(docs, req.Query, bcacp.SearchOptions{Limit: req.Limit})
+	results := billion.SearchBlocks(docs, req.Query, billion.SearchOptions{Limit: req.Limit})
 	out, _ := json.Marshal(map[string]any{
 		"ok":      true,
 		"query":   req.Query,
@@ -512,7 +534,7 @@ func (bc *BillionContext) handleSearch(ctx context.Context, args json.RawMessage
 	return string(out), nil
 }
 
-// handleStatus 处理 acp_status 工具调用。
+// handleStatus 处理 billion_status 工具调用。
 func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage) (string, error) {
 	sessionID := bc.getSessionID()
 	state, err := bc.store.Load(sessionID)
@@ -523,9 +545,14 @@ func (bc *BillionContext) handleStatus(ctx context.Context, args json.RawMessage
 	// 用最近一次 pre-step 的真实占用；没有时退回 0（而不是拿"已压缩量"冒充占用）
 	bc.mu.Lock()
 	tokenCount := bc.lastTokenCount
+	inN, inTok := bc.lastViewIn, bc.lastViewInTok
+	outN, outTok := bc.lastViewOut, bc.lastViewOutTok
 	bc.mu.Unlock()
-	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
-	text := bcacp.FormatStatus(report)
+	report := billion.BuildStatus(nil, state, bc.config, tokenCount)
+	text := billion.FormatStatus(report)
+	if inN > 0 {
+		text += fmt.Sprintf("\n  Last view: in=%d (%d tok) → out=%d (%d tok)", inN, inTok, outN, outTok)
+	}
 
 	out, _ := json.Marshal(map[string]any{
 		"ok":     true,
@@ -594,7 +621,7 @@ func containsStr(s, sub string) bool {
 
 // handleAbsorb 处理 absorb 工具调用：记录吸收，消息对下轮 pre-step 隐藏。
 func (bc *BillionContext) handleAbsorb(ctx context.Context, args json.RawMessage) (string, error) {
-	parsed := bcacp.ParseAbsorbInput(args, "")
+	parsed := billion.ParseAbsorbInput(args, "")
 	if parsed == nil {
 		return "", fmt.Errorf("invalid args: need ref (string) + summary (string)")
 	}
@@ -606,7 +633,7 @@ func (bc *BillionContext) handleAbsorb(ctx context.Context, args json.RawMessage
 	bc.mu.Lock()
 	cachedMsgs := bc.lastMessages
 	bc.mu.Unlock()
-	outcome := bcacp.ApplyAbsorb(parsed.Ref, parsed.Summary, parsed.AbsorbCallID, cachedMsgs, state, bc.config)
+	outcome := billion.ApplyAbsorb(parsed.Ref, parsed.Summary, parsed.AbsorbCallID, cachedMsgs, state, bc.config)
 	if outcome.OK {
 		if err := bc.store.Save(sessionID, state); err != nil {
 			fmt.Fprintf(os.Stderr, "[billion-context] absorb save state failed: %v\n", err)
@@ -622,7 +649,7 @@ func (bc *BillionContext) handleAbsorb(ctx context.Context, args json.RawMessage
 // backfillCompressCallIDs 依范围精确匹配把历史 compress 调用的 callId 回塔到
 // 尚无调用标记的 active 块（refs 按首次见到顺序分配且永不改变，
 // 范围对即唯一键；同范围二次压缩会被块消费判定拒绝，不产生歧义）。
-func backfillCompressCallIDs(msgs []bcacp.CoreMessage, state *bcacp.CompressionState) {
+func backfillCompressCallIDs(msgs []billion.CoreMessage, state *billion.CompressionState) {
 	pending := map[string]bool{}
 	for i := range state.Blocks {
 		b := &state.Blocks[i]
@@ -635,10 +662,10 @@ func backfillCompressCallIDs(msgs []bcacp.CoreMessage, state *bcacp.CompressionS
 	}
 	for i := range msgs {
 		m := &msgs[i]
-		if m.ContentType != bcacp.ContentTypeToolCall || m.ToolName != "compress" || m.ToolCallID == "" {
+		if m.ContentType != billion.ContentTypeToolCall || m.ToolName != "compress" || m.ToolCallID == "" {
 			continue
 		}
-		for _, r := range bcacp.ParseCompressArgs(bcacp.CompressCallArgs(m)) {
+		for _, r := range billion.ParseCompressArgs(billion.CompressCallArgs(m)) {
 			if pending[r.StartRef+"::"+r.EndRef] {
 				for j := range state.Blocks {
 					b := &state.Blocks[j]
@@ -672,7 +699,7 @@ func parseInt(s string) (int, error) {
 //
 // 失败处理：附件写不进去（磁盘满、权限）时，**把该条消息的正文恢复原样**——
 // 留一个指向不存在内容的占位符，模型会反复回取失败，比不压缩更糟。
-func (bc *BillionContext) persistCCROffloads(msgs []bcacp.CoreMessage, offloads []bcacp.CCROffload) []bcacp.CoreMessage {
+func (bc *BillionContext) persistCCROffloads(msgs []billion.CoreMessage, offloads []billion.CCROffload) []billion.CoreMessage {
 	restore := map[string]bool{}
 	for _, off := range offloads {
 		if off.Body == "" {
@@ -708,12 +735,12 @@ func (bc *BillionContext) persistCCROffloads(msgs []bcacp.CoreMessage, offloads 
 	return msgs
 }
 
-// handleRetrieve 处理 acp_retrieve 工具调用：把占位符换回原文。
+// handleRetrieve 处理 billion_retrieve 工具调用：把占位符换回原文。
 //
-// 交付形态（见 acp.PlanRetrieval）：
+// 交付形态（见 billion.PlanRetrieval）：
 //   - 图像条目 → 正文给一句话，图像 ref 经 ImagesFn 挂回工具结果（provider 解析）
 //   - 文本且未超内联上限 → 直接内联
-//   - 文本超限 → 导出到工作区 acp-retrieved/，返回指针让模型自己分页读
+//   - 文本超限 → 导出到工作区 billion-retrieved/，返回指针让模型自己分页读
 //
 // 为什么要设上限：回取不设限等于把刚省下的上下文又塞回去，还可能一次撑爆窗口。
 func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessage) (string, error) {
@@ -721,25 +748,25 @@ func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessa
 		Ref string `json:"ref"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
-		return "", fmt.Errorf("acp_retrieve: 参数解析失败: %w", err)
+		return "", fmt.Errorf("billion_retrieve: 参数解析失败: %w", err)
 	}
 	bc.mu.Lock()
 	st := bc.state
 	bc.mu.Unlock()
 	if st == nil {
-		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+		return billion.CCRRetrieveNotFound(in.Ref), nil
 	}
-	entry, ok := bcacp.FindCCREntry(st.CCR, in.Ref)
+	entry, ok := billion.FindCCREntry(st.CCR, in.Ref)
 	if !ok {
 		bc.noteRetrieval(false, false)
-		return bcacp.CCRRetrieveNotFound(in.Ref), nil
+		return billion.CCRRetrieveNotFound(in.Ref), nil
 	}
-	if entry.Kind == bcacp.CCRKindImage {
-		head := fmt.Sprintf("[acp-retrieved %s] 已将 %d 张图像重新挂回本次工具结果，请直接查看。",
+	if entry.Kind == billion.CCRKindImage {
+		head := fmt.Sprintf("[billion-retrieved %s] 已将 %d 张图像重新挂回本次工具结果，请直接查看。",
 			entry.Ref, len(entry.Images))
 		// 图像条目可能还带说明文字：有就一起给（否则模型为看这句话还得再取一次）
 		if txt, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum); err == nil && txt != "" {
-			plan := bcacp.PlanRetrieval(entry, bc.config, txt)
+			plan := billion.PlanRetrieval(entry, bc.config, txt)
 			if plan.Inline {
 				return head + "\n\n" + plan.Text, nil
 			}
@@ -748,24 +775,24 @@ func (bc *BillionContext) handleRetrieve(ctx context.Context, args json.RawMessa
 	}
 	text, err := dsc.ResolveTextRef(dsc.TextRefPrefix + entry.Shasum)
 	if err != nil {
-		return "", fmt.Errorf("acp_retrieve: 读取原文失败（%s）: %w", entry.Ref, err)
+		return "", fmt.Errorf("billion_retrieve: 读取原文失败（%s）: %w", entry.Ref, err)
 	}
-	plan := bcacp.PlanRetrieval(entry, bc.config, text)
+	plan := billion.PlanRetrieval(entry, bc.config, text)
 	if plan.Inline {
 		bc.noteRetrieval(true, false)
 		return plan.Text, nil
 	}
 	// 超限：导出到工作区，返回指针（模型用自己的文件工具分页读）
-	dir := dsc.PJoin(dsc.WorkspaceRoot(), "acp-retrieved")
+	dir := dsc.PJoin(dsc.WorkspaceRoot(), "billion-retrieved")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("acp_retrieve: 创建导出目录失败: %w", err)
+		return "", fmt.Errorf("billion_retrieve: 创建导出目录失败: %w", err)
 	}
 	full := dsc.PJoin(dir, plan.ExportPath)
 	if err := os.WriteFile(full, []byte(text), 0o644); err != nil {
-		return "", fmt.Errorf("acp_retrieve: 导出失败: %w", err)
+		return "", fmt.Errorf("billion_retrieve: 导出失败: %w", err)
 	}
 	bc.noteRetrieval(true, true)
-	return bcacp.CCRPointerText(entry, "acp-retrieved/"+plan.ExportPath, bc.config.CCR.InlineLimitTokens), nil
+	return billion.CCRPointerText(entry, "billion-retrieved/"+plan.ExportPath, bc.config.CCR.InlineLimitTokens), nil
 }
 
 // noteRetrieval 累计回取指标（命中/导出/落空）。
@@ -802,7 +829,7 @@ func (bc *BillionContext) runCommand(ctx context.Context, name, args string) (st
 
 // renderContextStatus 生成状态面板文本（/context 命令的输出）。
 //
-// 排版放在插件里是有意的：这些指标（分层块、确定性压缩、可回取条目）是 ACP 的
+// 排版放在插件里是有意的：这些指标（分层块、确定性压缩、可回取条目）是 billion 的
 // 概念，核心与前端不该认识它们；插件只负责产出一段给人看的文本。
 func (bc *BillionContext) renderContextStatus() string {
 	bc.mu.Lock()
@@ -813,31 +840,31 @@ func (bc *BillionContext) renderContextStatus() string {
 	if state == nil {
 		return "（压缩状态尚未建立：本会话还没跑过一个回合）"
 	}
-	report := bcacp.BuildStatus(nil, state, bc.config, tokenCount)
+	report := billion.BuildStatus(nil, state, bc.config, tokenCount)
 	bd := report.Breakdown
 
 	var b strings.Builder
 	b.WriteString("DSC · 上下文压缩\n")
 	if report.ModelContextLimit > 0 {
 		fmt.Fprintf(&b, "  占用: %s / %s (%.0f%%)\n",
-			bcacp.FormatTokenCount(report.TokenCount), bcacp.FormatTokenCount(report.ModelContextLimit),
+			billion.FormatTokenCount(report.TokenCount), billion.FormatTokenCount(report.ModelContextLimit),
 			float64(report.TokenCount)*100/float64(report.ModelContextLimit))
 	} else {
-		fmt.Fprintf(&b, "  占用: %s\n", bcacp.FormatTokenCount(report.TokenCount))
+		fmt.Fprintf(&b, "  占用: %s\n", billion.FormatTokenCount(report.TokenCount))
 	}
 	fmt.Fprintf(&b, "  块: %d active / %d total（T1=%d T2=%d T3=%d）\n",
 		report.ActiveBlocks, report.TotalBlocks, bd["tier1"], bd["tier2"], bd["tier3"])
 	if bd["tokensCompressed"] > 0 || bd["compressionCount"] > 0 {
-		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", bcacp.FormatTokenCount(bd["tokensCompressed"]), bd["compressionCount"])
+		fmt.Fprintf(&b, "  已压: %s（%d 次压缩）\n", billion.FormatTokenCount(bd["tokensCompressed"]), bd["compressionCount"])
 	}
 	if v := bd["absorbedTokens"]; v > 0 {
-		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", bcacp.FormatTokenCount(v))
+		fmt.Fprintf(&b, "  absorb 蒸馏: %s\n", billion.FormatTokenCount(v))
 	}
 	if bd["crushCount"] > 0 {
-		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], bcacp.FormatTokenCount(bd["crushTokensSaved"]))
+		fmt.Fprintf(&b, "  确定性压缩: %d 次，%s\n", bd["crushCount"], billion.FormatTokenCount(bd["crushTokensSaved"]))
 	}
 	if bd["ccrStored"] > 0 {
-		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], bcacp.FormatTokenCount(bd["ccrStoredTokens"]))
+		fmt.Fprintf(&b, "  已卸载可回取: %d 条，%s\n", bd["ccrStored"], billion.FormatTokenCount(bd["ccrStoredTokens"]))
 		fmt.Fprintf(&b, "  回取: %d 次（导出 %d · 落空 %d）\n",
 			bd["ccrRetrieved"], bd["ccrExported"], bd["retrievalMisses"])
 	}

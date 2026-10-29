@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"fmt"
@@ -320,7 +320,7 @@ func RenderMessages(messages []CoreMessage, state *CompressionState, config Conf
 	}
 	covered := state.CoveredMessageIDs()
 	if len(covered) == 0 {
-		// 无压缩块：仅注入 <acp> 标签
+		// 无压缩块：仅注入 <billion> 标签
 		return renderTaggedMessages(messages, state, renderTags)
 	}
 
@@ -351,7 +351,7 @@ func RenderMessages(messages []CoreMessage, state *CompressionState, config Conf
 	out = stripOrphanedToolCalls(out)
 	out = stripOrphanedReasoning(out)
 
-	// 注入 <acp> 标签（仅非 summary 消息）
+	// 注入 <billion> 标签（仅非 summary 消息）
 	return renderTaggedMessages(out, state, renderTags)
 }
 
@@ -461,7 +461,7 @@ func stripOrphanedReasoning(messages []CoreMessage) []CoreMessage {
 
 // summaryIDPrefix summary 消息 ID 前缀（对齐 acp-kernel SUMMARY_ID_PREFIX）。
 // 经此前缀识别"已渲染的 summary"，下次 prune 时保持其位置稳定。
-const summaryIDPrefix = "acp_summary_"
+const summaryIDPrefix = "billion_summary_"
 
 // summaryMessageId 生成块的 summary 消息 ID（对齐 acp-kernel summaryMessageId）。
 func summaryMessageID(blockID string) string {
@@ -634,7 +634,7 @@ func renderSummary(a summaryAnchor) CoreMessage {
 	}
 }
 
-// renderTaggedMessages 给消息列表注入 <acp> 标签（跳过 summary 消息，避免标签污染摘要文本）。
+// renderTaggedMessages 给消息列表注入 <billion> 标签（跳过 summary 消息，避免标签污染摘要文本）。
 func renderTaggedMessages(messages []CoreMessage, state *CompressionState, renderTags bool) []CoreMessage {
 	if !renderTags {
 		return messages
@@ -650,7 +650,7 @@ func renderTaggedMessages(messages []CoreMessage, state *CompressionState, rende
 	return out
 }
 
-// renderTaggedMessage 给消息注入 <acp> 标签（如果 renderTags 为 true 且消息有 ref）。
+// renderTaggedMessage 给消息注入 <billion> 标签（如果 renderTags 为 true 且消息有 ref）。
 func renderTaggedMessage(msg CoreMessage, state *CompressionState, renderTags bool) CoreMessage {
 	if !renderTags {
 		return msg
@@ -660,7 +660,7 @@ func renderTaggedMessage(msg CoreMessage, state *CompressionState, renderTags bo
 		return msg
 	}
 	tokens := estimateTokensForText(msg.Text)
-	tag := fmt.Sprintf(`<acp tokens="%d" type="%s">%s</acp>`, tokens, msg.ContentType, ref)
+	tag := fmt.Sprintf(`<billion tokens="%d" type="%s">%s</billion>`, tokens, msg.ContentType, ref)
 	if msg.Text == "" {
 		msg.Text = tag
 	} else {

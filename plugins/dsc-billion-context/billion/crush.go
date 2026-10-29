@@ -1,4 +1,4 @@
-package acp
+package billion
 
 // crush：工具结果的**确定性**压缩（对齐 acp-kernel src/crush.ts 的第一段 absorb 门）。
 //
@@ -12,7 +12,7 @@ package acp
 //     原样放行，绝不产出比原文更糟的东西。
 //   - **收益门**：压缩后必须真的小够（MinReduction），否则按未命中处理。
 //
-// 区别：内核的 json-fold 附带 `__acp_crush` 解码器可无损还原。DSC 这里只做
+// 区别：内核的 json-fold 附带 `__billion_crush` 解码器可无损还原。DSC 这里只做
 // **结构保真的因子化**（同值提升 + 相同行折叠），不宣称可逆——模型看得到计数、
 // 常量和样本，足以判断要不要再 absorb。
 
@@ -265,10 +265,10 @@ func crushExcluded(tool string, excludes []string) bool {
 
 // ---- json-fold：同值提升 + 相同行折叠 ----
 
-// crushEnvelope 因子化信封。__acp_crush 标明这是因子化后的结构（不是原始数据），
+// crushEnvelope 因子化信封。__billion_crush 标明这是因子化后的结构（不是原始数据），
 // 计数与样本足以判断是否需要 absorbance。
 type crushEnvelope struct {
-	Kind    string         `json:"__acp_crush"`
+	Kind    string         `json:"__billion_crush"`
 	Count   int            `json:"count,omitempty"`
 	Const   map[string]any `json:"const,omitempty"`
 	Row     map[string]any `json:"row,omitempty"`
@@ -411,7 +411,7 @@ func envelopesToAny(rs []crushEnvelope) []any {
 	out := make([]any, 0, len(rs))
 	for _, r := range rs {
 		if r.Kind == "repeat" {
-			out = append(out, map[string]any{"__acp_crush": "repeat", "count": r.Count, "row": r.Row})
+			out = append(out, map[string]any{"__billion_crush": "repeat", "count": r.Count, "row": r.Row})
 			continue
 		}
 		out = append(out, map[string]any{"row": r.Row})
@@ -579,7 +579,7 @@ func codeTrim(text string) (string, bool) {
 // crushMarkerPrefix 非 JSON 载荷的落线标记：下一轮据此跳过（避免二次压缩把
 // 已经压过的内容再啃一遍）。JSON 不需要前缀——信封本身就是标记，且加了前缀
 // 就不再是合法 JSON，模型想解析反而麻烦。
-const crushMarkerPrefix = "[acp-crushed:"
+const crushMarkerPrefix = "[billion-crushed:"
 
 // isCrushed 判断文本是否已被 crush 过。
 func isCrushed(text string) bool {
@@ -590,7 +590,7 @@ func isCrushed(text string) bool {
 	if strings.HasPrefix(t, "{") {
 		var probe map[string]any
 		if json.Unmarshal([]byte(t), &probe) == nil {
-			if _, ok := probe["__acp_crush"]; ok {
+			if _, ok := probe["__billion_crush"]; ok {
 				return true
 			}
 		}

@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"fmt"
@@ -132,7 +132,7 @@ func BuildStatus(messages []CoreMessage, state *CompressionState, config Config,
 // FormatStatus 把状态报告格式化为模型可读文本。
 func FormatStatus(report StatusReport) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("ACP Context Status:\n"))
+	sb.WriteString(fmt.Sprintf("billion context status:\n"))
 	sb.WriteString(fmt.Sprintf("  Usage: %d / %d tokens (%.0f%%)\n",
 		report.TokenCount, report.ModelContextLimit, report.ContextUsage*100))
 	sb.WriteString(fmt.Sprintf("  Blocks: %d active / %d total\n", report.ActiveBlocks, report.TotalBlocks))
@@ -147,7 +147,7 @@ func FormatStatus(report StatusReport) string {
 				bd["crushCount"], bd["crushTokensSaved"]))
 		}
 		if bd["ccrStored"] > 0 {
-			sb.WriteString(fmt.Sprintf("  Stored: %d payloads (%d tokens) retrievable via acp_retrieve\n",
+			sb.WriteString(fmt.Sprintf("  Stored: %d payloads (%d tokens) retrievable via billion_retrieve\n",
 				bd["ccrStored"], bd["ccrStoredTokens"]))
 			sb.WriteString(fmt.Sprintf("  Retrievals: %d (%d exported to files)\n",
 				bd["ccrRetrieved"], bd["ccrExported"]))
@@ -198,10 +198,10 @@ type ProcessTurnResult struct {
 // hide-compress-calls / absorb(hide+prompt) /
 // decide-nudge（计数+质量双路径）/ emergency-truncate / 孤儿配对清理。
 //
-// 前缀缓存稳定性：renderTags=false——不把 <acp tokens="N">mNNNNN</acp> 标签注入
+// 前缀缓存稳定性：renderTags=false——不把 <billion tokens="N">mNNNNN</billion> 标签注入
 // 消息文本。原因：tokens 属性每轮估算会变化（消息文本可能改变），导致前缀缓存
-// 失效。模型经 acp_status 工具按需查询 ref 映射即可（compress 调用时模型从
-// nudge 提示或 acp_status 获取 mNNNNN refs）。
+// 失效。模型经 billion_status 工具按需查询 ref 映射即可（compress 调用时模型从
+// nudge 提示或 billion_status 获取 mNNNNN refs）。
 func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config, tokenCount int) ProcessTurnResult {
 	// 1. assign-refs：为新消息分配 mNNNNN
 	AssignRefs(messages, state)
@@ -238,7 +238,7 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	}
 
 	// 6. absorb（DSC 扩展，仅 Absorb.Enabled）：先隐藏已吸收的 tool-call/result 对，
-	// 再为达标的大工具结果追加 [ACP absorb] 提示。此前两个节点都没有接线，导致
+	// 再为达标的大工具结果追加 [billion absorb] 提示。此前两个节点都没有接线，导致
 	// absorb 工具只写记录、原文照旧发送——等于不生效。
 	if config.Absorb.Enabled {
 		rendered = HideAbsorbedMessages(rendered, state)

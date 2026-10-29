@@ -1,4 +1,4 @@
-package acp
+package billion
 
 // recommend 节点（对齐 acp-kernel recommend.ts）：把相邻可压缩范围批量合并到
 // minCompressRangeChars 之上——推荐范围永不低于 apply 侧的最小阈值。

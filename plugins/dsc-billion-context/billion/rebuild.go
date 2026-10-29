@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"encoding/json"
@@ -19,12 +19,12 @@ import (
 //  3. 块的 CompressCallID 随重放落位（hide-compress-calls 因此即刻可用）。
 //
 // 触发时机（main.go handlePreStep）：state 为空白（无块、零压缩计数）而
-// 历史中已存在 ACP 压缩痕迹（渲染 summary 消息或 compress 调用）——典型场景：
+// 历史中已存在 billion 压缩痕迹（渲染 summary 消息或 compress 调用）——典型场景：
 // 状态文件缺失/损坏、会话 fork 到新 sessionID、跨机恢复。尽力而为：紧急压缩
 //（request-error 路径）不在历史中，重放后其覆盖关系丢失属可接受降级。
 
-// HasACPStateTrace 报告历史中是否存在 ACP 压缩痕迹（summary 消息或 compress 调用）。
-func HasACPStateTrace(messages []CoreMessage) bool {
+// HasBillionStateTrace 报告历史中是否存在 billion 压缩痕迹（summary 消息或 compress 调用）。
+func HasBillionStateTrace(messages []CoreMessage) bool {
 	for i := range messages {
 		m := &messages[i]
 		if m.ContentType == ContentTypeToolCall && m.ToolName == "compress" {

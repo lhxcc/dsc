@@ -1,4 +1,4 @@
-package acp
+package billion
 
 // sync-blocks 节点（对齐 acp-kernel sync.ts）：把块状态与会话消息列表对齐。
 //

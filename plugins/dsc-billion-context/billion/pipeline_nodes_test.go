@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"strings"
@@ -135,7 +135,7 @@ func TestProcessTurnHidesAbsorbedMessages(t *testing.T) {
 	}
 }
 
-// TestProcessTurnAppendsAbsorbPrompt 达标的大工具结果应被追加 [ACP absorb] 提示，
+// TestProcessTurnAppendsAbsorbPrompt 达标的大工具结果应被追加 [billion absorb] 提示，
 // 否则模型无从知道可以吸收（工具描述本身就要求"看到标记才调用"）。
 func TestProcessTurnAppendsAbsorbPrompt(t *testing.T) {
 	config := DefaultConfig(100000)

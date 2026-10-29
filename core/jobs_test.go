@@ -94,6 +94,9 @@ func TestJobToolsRegistered(t *testing.T) {
 }
 
 func TestJobTools(t *testing.T) {
+	// 这里断言的是「不等」那条路径（立刻回报当前快照）；等首块输出的行为见
+	// jobs_output_wait_test.go，单独用短预算去测。
+	t.Setenv("DSC_JOB_OUTPUT_WAIT_SECS", "0")
 	m := NewManager(&ManagerConfig{})
 	get := func(name string) *jobTool {
 		tool, _ := m.toolRegistry.Get(name)

@@ -5,32 +5,32 @@ DSC 上下文管理插件：以 [acp-kernel](https://github.com/ranxianglei/acp-
 ## 設計
 
 - **Go 原生重實現 acp-kernel 核心**（對齊 MIT 協議，獨立重寫非移植）
-- **經 SDK 通用事件鈎子接管**：`Hook.OnEvent` 攔截 `agent/pre-step` 事件改寫消息列表；`Hook.ContextFn` 貢獻 ACP system prompt（對齊 DSH `ctx.systemPrompt.section`）
+- **經 SDK 通用事件鈎子接管**：`Hook.OnEvent` 攔截 `agent/pre-step` 事件改寫消息列表；`Hook.ContextFn` 貢獻 billion system prompt（對齊 DSH `ctx.systemPrompt.section`）
 - **模型驅動壓縮**：模型決定 *何時* 壓、*壓什麼範圍*，插件編排其他一切
 - **3 層 LSM-tree**：T1 標準壓縮、T2 蒸餾（T1→T2）、T3 凝結（T2→T3）
-- **前綴緩存穩定**：summary 原位嵌入（不堆到頭部）、不注入 `<acp>` 標籤到消息文本、nudge 作為尾部 user 消息
+- **前綴緩存穩定**：summary 原位嵌入（不堆到頭部）、不注入 `<billion>` 標籤到消息文本、nudge 作為尾部 user 消息
 - **孤兒配對清理**：壓縮邊界切斷 tool-call ↔ tool-result / reasoning ↔ assistant 時自動清理
 - **crush 確定性壓縮**（absorb 第一段，默認關）：JSON 同值提升/相同行折疊（結果仍是合法 JSON）、日誌按級篩選（**每個 ERROR 行逐字保留**）、代碼註釋剝離（字符串感知）；純函數、fail-open、帶最小收益門
-- **state 持久化**：每個 session 一個 JSON 文件，與會話存檔同目錄（`ExecDir/sessions/<session>.acp.json`，以 `.acp.json` 後綴與 `<session>.jsonl` 區分）
+- **state 持久化**：每個 session 一個 JSON 文件，與會話存檔同目錄（`ExecDir/sessions/<session>.dsc-billion-context.json`，以 `.dsc-billion-context.json` 後綴與 `<session>.jsonl` 區分）
 
-## CCR：內容緩存回取（默認關，`DSC_ACP_CCR=1`）
+## CCR：內容緩存回取（默認關，`DSC_BILLION_CCR=1`）
 
 absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CCR 讓它可逆——大工具
-結果**到達時**按內容 hash 存一次，線上只留確定性佔位符，模型用 `acp_retrieve` 取回。
+結果**到達時**按內容 hash 存一次，線上只留確定性佔位符，模型用 `billion_retrieve` 取回。
 
 **不另建存儲層**，直接複用 DSC 已有的內容尋址設施：
 
 | 內容 | 存哪 | 回取怎麼交付 |
 | --- | --- | --- |
-| 文本 | 附件庫 `dsc-txt://<sha256>`（`SaveTextAttachment`，同內容自動去重） | ≤ `inlineLimitTokens`（默認 4000）直接內聯；超過則導出到 `<workspace>/acp-retrieved/<sha>.txt`，返回指針由模型自己的文件工具分頁讀 |
+| 文本 | 附件庫 `dsc-txt://<sha256>`（`SaveTextAttachment`，同內容自動去重） | ≤ `inlineLimitTokens`（默認 4000）直接內聯；超過則導出到 `<workspace>/billion-retrieved/<sha>.txt`，返回指針由模型自己的文件工具分頁讀 |
 | 圖像 | 字節本來就在附件庫（`dsc-img://<sha256>`），CCR 只記 ref | 取回時把 ref 掛回工具結果，provider 解析成圖像塊（不佔文本預算） |
 | 其它二進制 | 同上導出路徑 | 返回指針 |
 
 佔位符是**確定性**的（同條目必然同字節），到達時替換一次、此後不變——前綴緩存才不會被打斷：
 
 ```
-📦 [acp-stored c00003 · text · shell · 4213 tok] `npm run build`
-   → acp_retrieve("c00003") 取回完整內容
+📦 [billion-stored c00003 · text · shell · 4213 tok] `npm run build`
+   → billion_retrieve("c00003") 取回完整內容
 ```
 
 邊界：`ref` 單調遞增、**永不複用**（複用會讓「取到的其實是別的内容」無法分辨）；每會話
@@ -44,16 +44,16 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
 | `compress`       | 把消息範圍替換為模型生成的摘要（T1）；用 `bN` 塊引用觸發蒸餾（T2/T3） |
 | `decompress`     | 恢復壓縮塊內容                                   |
 | `search_context` | 在壓縮塊摘要中搜索關鍵詞（子串匹配）                        |
-| `acp_status`     | 查看上下文使用率與可壓縮範圍                            |
+| `billion_status`     | 查看上下文使用率與可壓縮範圍                            |
 
 ## 接管流程
 
 1. 用户在 `config.yaml` 中聲明 `compaction: dsc-billion-context` 顯式選擇後端
 2. 宿主驗證插件聲明瞭 `Provides: {"compaction": "true"}` 能力（對齊 DSH preset + 能力驗證）
-3. 插件經 `Hook.ContextFn` 貢獻 ACP system prompt（壓縮哲學、何時壓縮、工具使用説明、蒸餾規則）
-4. agent 每輪 `buildSystemPrompt` 經 `ListContext` 拉取 ACP 指導（對齊 DSH `ctx.systemPrompt.section`）
+3. 插件經 `Hook.ContextFn` 貢獻 billion system prompt（壓縮哲學、何時壓縮、工具使用説明、蒸餾規則）
+4. agent 每輪 `buildSystemPrompt` 經 `ListContext` 拉取 billion 指導（對齊 DSH `ctx.systemPrompt.section`）
 5. agent 發起 LLM 請求前，宿主 emit `agent/pre-step` 事件
-6. 插件收到事件，經 `acp.ProcessTurn` 跑 pipeline：
+6. 插件收到事件，經 `billion.ProcessTurn` 跑 pipeline：
    - 分配 `mNNNNN` ref 給每條消息（以宿主下發的穩定消息 id 為鍵：`proto.Message.id`＝
      surface 事件 seq；沒有 id 的消息不參與壓縮，絕不退回流位置或內容 hash）
    - 應用 prune（被壓縮塊覆蓋的消息替換為 summary，原位嵌入保持前綴穩定）
@@ -69,10 +69,10 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
 | 設計                              | 説明                                                                        |
 | ------------------------------- | ------------------------------------------------------------------------- |
 | summary 原位嵌入                    | 每個 summary 放在它替換的原始範圍的最早消息位置（`insertAt`），不堆到列表頭部                          |
-| summary 位置穩定                    | 經 `acp_summary_<blockId>` 前綴識別"已渲染的 summary"，下次 prune 時保持位置不變             |
-| 不注入 `<acp>` 標籤                  | `renderTags=false`——標籤的 tokens 屬性每輪估算會變化，破壞前綴緩存                           |
+| summary 位置穩定                    | 經 `billion_summary_<blockId>` 前綴識別"已渲染的 summary"，下次 prune 時保持位置不變             |
+| 不注入 `<billion>` 標籤                  | `renderTags=false`——標籤的 tokens 屬性每輪估算會變化，破壞前綴緩存                           |
 | nudge 尾部追加                      | nudge 文本每次不同（含 usage%、ranges），作為尾部 user 消息，不影響前綴                          |
-| ACP system prompt 經 ListContext | 經 `Hook.ContextFn` 貢獻，agent 的 `buildSystemPrompt` 經 `ListContext` 拉取，位置固定 |
+| billion system prompt 經 ListContext | 經 `Hook.ContextFn` 貢獻，agent 的 `buildSystemPrompt` 經 `ListContext` 拉取，位置固定 |
 
 ## 多層蒸餾
 
@@ -126,7 +126,7 @@ plugins:
 - 前綴緩存穩定（原位嵌入 + 不注入標籤 + nudge 尾部追加）
 - 孤兒 tool-call/result/reasoning 配對清理
 - nudge 決策（閾值門 + 增長門（隨窗口縮放）+ baseline 重置 + T2/T3 **質量觸發**：可回收摘要 tokens ≥ 1.5×nudgeGrowthTokens；計數路徑默認關閉，對齊 acp-kernel #379「block COUNT is not a need signal」）
-- ACP system prompt 經 `Hook.ContextFn` 貢獻（對齊 DSH `ctx.systemPrompt.section`）
+- billion system prompt 經 `Hook.ContextFn` 貢獻（對齊 DSH `ctx.systemPrompt.section`）
 - 穩定消息 ID（宿主下發的 `event-<seq>`，不含視圖 index／內容 hash）
 - 超窗交給宿主滑窗（不再訂閱 `agent/request-error`，不做有損緊急壓縮）
 - state JSON 文件持久化
@@ -137,9 +137,9 @@ plugins:
 
 「留待後續」六項全部落地（對照上游算法實現，非逐行移植）：
 
-- **absorb 即時工具結果吸收**：`absorb` 第五工具（`DSC_ACP_ABSORB=1` 啓用）——
+- **absorb 即時工具結果吸收**：`absorb` 第五工具（`DSC_BILLION_ABSORB=1` 啓用）——
     
-  達標大工具結果每輪追加 `[ACP absorb]` 強制提示；模型蒸餾後消息對在下一輪
+  達標大工具結果每輪追加 `[billion absorb]` 強制提示；模型蒸餾後消息對在下一輪
     
   pre-step 隱藏，摘要成為唯一持久記錄（對齊 absorb.ts 全流程：候選判定/
     
@@ -188,7 +188,7 @@ plugins:
   
 Images——此前會破壞 provider 端 tool-call 協議）。
 
-仍未引入（有意）：cache-report（acp_cache 工具，屬流式宿主記賬面）、wire
+仍未引入（有意）：cache-report（billion_cache 工具，屬流式宿主記賬面）、wire
   
 codec / transform-channel / filter（dsc 無對應配置面）、語義向量檢索（無嵌入
   

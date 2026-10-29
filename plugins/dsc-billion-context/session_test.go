@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	bcacp "dsc-billion-context/acp"
+	billion "dsc-billion-context/billion"
 	bcadapter "dsc-billion-context/adapter"
 	dsc "dsc-sdk"
 )
@@ -42,7 +42,7 @@ func TestHandlePreStepAdoptsEventSession(t *testing.T) {
 	dir := t.TempDir()
 	bc := &BillionContext{
 		store:  bcadapter.NewStateStore(dir),
-		config: bcacp.DefaultConfig(200000),
+		config: billion.DefaultConfig(200000),
 	}
 
 	payload := `{"session":"sess-A","messages_json":"[{\"role\":\"user\",\"content\":\"hi\"}]","token_count":10}`
@@ -80,24 +80,24 @@ func TestCCREndToEnd(t *testing.T) {
 	dsc.SetWorkspaceRoot(dir)
 	t.Cleanup(func() { dsc.SetWorkspaceRoot(oldRoot) })
 
-	bc := &BillionContext{config: bcacp.DefaultConfig(200_000)}
+	bc := &BillionContext{config: billion.DefaultConfig(200_000)}
 	bc.config.CCR.Enabled = true
 	bc.config.CCR.MinToolTokens = 100
 	bc.config.CCR.InlineLimitTokens = 200
 
 	body := strings.Repeat("build output line\n", 400)
-	msg := bcacp.CoreMessage{
-		ID: "t1", Role: bcacp.RoleTool, ToolName: "shell", Text: body,
-		ContentType: bcacp.ContentTypeToolResult, ToolCallID: "call-t1",
+	msg := billion.CoreMessage{
+		ID: "t1", Role: billion.RoleTool, ToolName: "shell", Text: body,
+		ContentType: billion.ContentTypeToolResult, ToolCallID: "call-t1",
 	}
-	state := bcacp.CreateInitialState()
-	out, offloads := bcacp.ApplyCCR([]bcacp.CoreMessage{msg}, state, bc.config)
+	state := billion.CreateInitialState()
+	out, offloads := billion.ApplyCCR([]billion.CoreMessage{msg}, state, bc.config)
 	if len(offloads) != 1 {
 		t.Fatalf("应产生 1 条卸载，实际 %d", len(offloads))
 	}
 	// 落盘：正文进附件库
 	persisted := bc.persistCCROffloads(out, offloads)
-	if bcacp.IsCCRPlaceholder(persisted[0].Text) == false {
+	if billion.IsCCRPlaceholder(persisted[0].Text) == false {
 		t.Fatalf("落盘成功后应保留占位符: %q", persisted[0].Text[:40])
 	}
 	// 附件库里的文件应存在且内容一致
@@ -113,10 +113,10 @@ func TestCCREndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retrieve: %v", err)
 	}
-	if !strings.Contains(got, "acp-retrieved/") {
+	if !strings.Contains(got, "billion-retrieved/") {
 		t.Fatalf("超限时应返回导出指针: %s", got)
 	}
-	exportPath := filepath.Join(dir, "acp-retrieved", offloads[0].Entry.Shasum+".txt")
+	exportPath := filepath.Join(dir, "billion-retrieved", offloads[0].Entry.Shasum+".txt")
 	data, err := os.ReadFile(exportPath)
 	if err != nil {
 		t.Fatalf("导出文件应存在: %v", err)
@@ -143,16 +143,16 @@ func TestCCRPersistFailureRestoresBody(t *testing.T) {
 	}
 	t.Setenv("DSC_ATTACHMENT_DIR", blocker)
 
-	bc := &BillionContext{config: bcacp.DefaultConfig(200_000)}
+	bc := &BillionContext{config: billion.DefaultConfig(200_000)}
 	body := strings.Repeat("z", 4000)
-	msg := bcacp.CoreMessage{
-		ID: "t1", Role: bcacp.RoleTool, ToolName: "shell", Text: body,
-		ContentType: bcacp.ContentTypeToolResult, ToolCallID: "call-t1",
+	msg := billion.CoreMessage{
+		ID: "t1", Role: billion.RoleTool, ToolName: "shell", Text: body,
+		ContentType: billion.ContentTypeToolResult, ToolCallID: "call-t1",
 	}
-	state := bcacp.CreateInitialState()
+	state := billion.CreateInitialState()
 	bc.config.CCR.Enabled = true
 	bc.config.CCR.MinToolTokens = 100
-	out, offloads := bcacp.ApplyCCR([]bcacp.CoreMessage{msg}, state, bc.config)
+	out, offloads := billion.ApplyCCR([]billion.CoreMessage{msg}, state, bc.config)
 	if len(offloads) != 1 {
 		t.Fatal("应产生卸载")
 	}
@@ -167,7 +167,7 @@ func TestCCRPersistFailureRestoresBody(t *testing.T) {
 func TestRunCommandRendersStatus(t *testing.T) {
 	// 窗口取 DSC 的真实 1M 口径（1024 底）：1048576 必须显示成 1.0M，
 	// 而不是按 1000 折算出来的 1.05M。
-	bc := &BillionContext{config: bcacp.DefaultConfig(1_048_576)}
+	bc := &BillionContext{config: billion.DefaultConfig(1_048_576)}
 
 	out, err := bc.runCommand(context.Background(), "context", "")
 	if err != nil {
@@ -177,10 +177,10 @@ func TestRunCommandRendersStatus(t *testing.T) {
 		t.Fatalf("无状态时应说明原因，实际：%q", out)
 	}
 
-	state := bcacp.CreateInitialState()
-	state.Blocks = []bcacp.CompressionBlock{
-		{BlockID: "b0", Tier: bcacp.Tier1, Active: true, CompressedTokens: 40_000},
-		{BlockID: "b1", Tier: bcacp.Tier2, Active: true, CompressedTokens: 70_000},
+	state := billion.CreateInitialState()
+	state.Blocks = []billion.CompressionBlock{
+		{BlockID: "b0", Tier: billion.Tier1, Active: true, CompressedTokens: 40_000},
+		{BlockID: "b1", Tier: billion.Tier2, Active: true, CompressedTokens: 70_000},
 	}
 	state.Stats.TokensCompressed = 110_000
 	state.Stats.CompressionCount = 2
@@ -195,7 +195,7 @@ func TestRunCommandRendersStatus(t *testing.T) {
 
 	out, err = bc.runCommand(context.Background(), "context", "")
 	if err != nil {
-		t.Fatalf("runCommand(acp): %v", err)
+		t.Fatalf("runCommand(billion): %v", err)
 	}
 	for _, want := range []string{"420K / 1.0M", "41%", "T1=1 T2=1 T3=0", "107K", "确定性压缩: 3 次",
 		"已卸载可回取: 4 条", "回取: 2 次（导出 1 · 落空 0）"} {
@@ -213,7 +213,7 @@ func TestRunCommandRendersStatus(t *testing.T) {
 	if _, err := bc.runCommand(context.Background(), "nope", ""); err == nil {
 		t.Fatal("未知命令应返回错误")
 	}
-	if _, err := bc.runCommand(context.Background(), "acp", ""); err == nil {
+	if _, err := bc.runCommand(context.Background(), "billion", ""); err == nil {
 		t.Fatal("已移除的别名不应再被当作有效命令")
 	}
 }
