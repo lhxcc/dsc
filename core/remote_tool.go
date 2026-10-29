@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"dsc/proto"
@@ -23,6 +24,13 @@ type RemoteTool struct {
 	schema       json.RawMessage
 	client       proto.ToolServiceClient
 	capabilities []string
+
+	// hidden 由插件声明：注册了但不进模型可见目录（见 HiddenTool）。
+	hidden bool
+	// approvalHint 由插件声明：非空表示该工具需要用户审批，内容是给用户看的风险说明。
+	// 它是回退值——具体理由问插件（ApprovalReason RPC），因为同一工具不同参数的风险
+	// 不一样（连一个 URL vs 在本机拉起一条命令）。
+	approvalHint string
 }
 
 // HasCapability 报告该工具是否声明了指定能力标签（源自插件工具声明的 proto.Tool.capabilities。
@@ -34,6 +42,54 @@ func (r *RemoteTool) HasCapability(cap string) bool {
 		}
 	}
 	return false
+}
+
+// remoteToolFromProto 把插件的工具声明转成宿主工具。
+//
+// **唯一的构造点**：以前 ListTools 的两条路径（启动期 listStagedTools 与运行期
+// syncPluginTools）各自手写一遍字段赋值，结果一加 hidden / approval_hint 就只改了
+// 其中一处——插件声明了，宿主当没听见。跨层字段保真只能靠一处赋值来保证。
+func remoteToolFromProto(client proto.ToolServiceClient, t *proto.Tool) *RemoteTool {
+	return &RemoteTool{
+		name:         t.GetName(),
+		description:  t.GetDescription(),
+		schema:       json.RawMessage(t.GetParametersJson()),
+		client:       client,
+		capabilities: t.GetCapabilities(),
+		hidden:       t.GetHidden(),
+		approvalHint: t.GetApprovalHint(),
+	}
+}
+
+// IsHidden 实现 HiddenTool：插件声明不曝光的工具不进模型目录。
+//
+// 隐藏不等于不可用——它仍在注册表里，后台任务/子代理/按名调用照常；只是不随请求
+// 发给模型。判定每分钟都可能变（插件下次 ListTools 说了算，宿主 ~800ms 同步一次），
+// 所以这里每次都读当前值，不做缓存。
+func (r *RemoteTool) IsHidden() bool { return r.hidden }
+
+// approvalReason 返回本次调用需要审批的理由（空串 = 不需要）。
+//
+// 先问插件（ApprovalReason RPC）：理由里能带参数（连哪个地址、跑哪条命令）；插件未
+// 实现该 RPC（旧插件 / 只给了静态说明）时退回 approval_hint。RPC 失败不能变成「静默
+// 放行」——审批门是安全边界，拿不到理由就按 hint 算，hint 也空才放行。
+func (r *RemoteTool) approvalReason(ctx context.Context, argumentsJSON string) string {
+	if strings.TrimSpace(r.approvalHint) == "" {
+		return "" // 没声明需要审批
+	}
+	if r.client == nil {
+		return r.approvalHint
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := r.client.ApprovalReason(callCtx, &proto.ToolApprovalRequest{
+		ToolName:      r.name,
+		ArgumentsJson: argumentsJSON,
+	})
+	if err != nil || resp.GetReason() == "" {
+		return r.approvalHint
+	}
+	return resp.GetReason()
 }
 
 func (r *RemoteTool) Name() string {

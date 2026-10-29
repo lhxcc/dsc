@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -209,6 +208,13 @@ type Manager struct {
 	// 让零值 Manager（测试里常见）也能直接用。
 	mcpExpose     *mcpExposure
 	mcpExposeOnce sync.Once
+
+	// mcpServerCount 已连接 MCP 服务器的数量（原子，供工具的 IsHidden 判定）。
+	//
+	// 为什么单独计数而不是读 m.mcpClients：工具的可见性判定发生在目录装配里，那是最热
+	// 的路径之一，且装配期间不该去拿 m.mu（有调用方就持着它）。三个写入点各自维护这个
+	// 计数（登记 / 单个断开 / 全部断开），读侧永远只做一次原子读。
+	mcpServerCount atomic.Int32
 }
 
 type ManagerConfig struct {
@@ -2188,13 +2194,7 @@ func listStagedTools(toolClient proto.ToolServiceClient) ([]ToolDefinition, []st
 	var defs []ToolDefinition
 	var names []string
 	for _, t := range listResp.Tools {
-		defs = append(defs, &RemoteTool{
-			name:         t.Name,
-			description:  t.Description,
-			schema:       json.RawMessage(t.ParametersJson),
-			client:       toolClient,
-			capabilities: t.Capabilities,
-		})
+		defs = append(defs, remoteToolFromProto(toolClient, t))
 		names = append(names, t.Name)
 	}
 	return defs, names, nil

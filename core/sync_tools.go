@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"dsc/proto"
@@ -41,13 +40,7 @@ func (m *Manager) syncPluginTools() {
 		defs := make([]ToolDefinition, 0, len(resp.Tools))
 		names := make([]string, 0, len(resp.Tools))
 		for _, t := range resp.Tools {
-			defs = append(defs, &RemoteTool{
-				name:         t.Name,
-				description:  t.Description,
-				schema:       json.RawMessage(t.ParametersJson),
-				client:       client,
-				capabilities: t.Capabilities,
-			})
+			defs = append(defs, remoteToolFromProto(client, t))
 			names = append(names, t.Name)
 		}
 		m.applyPluginTools(name, defs, names)

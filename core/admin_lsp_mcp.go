@@ -272,6 +272,7 @@ func (m *Manager) DisconnectMCPServer(serverName string) (int, error) {
 		return 0, fmt.Errorf("MCP server %q is not connected", serverName)
 	}
 	delete(m.mcpClients, serverName)
+	m.mcpServerCount.Add(-1)
 	m.mu.Unlock()
 
 	// 先取数量再断开：Disconnect 会清空工具表，之后读就是 0（管理 API 的
@@ -409,6 +410,9 @@ func (m *Manager) RegisterMCPClient(serverName string, client *MCPClient) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureMCPClients()
+	if _, existed := m.mcpClients[serverName]; !existed {
+		m.mcpServerCount.Add(1)
+	}
 	m.mcpClients[serverName] = client
 }
 

@@ -293,11 +293,20 @@ func (m *Manager) toolApprovalGate() WaterfallListener {
 		if !ok {
 			return next(ev)
 		}
-		ar, ok := tool.(ApprovalRequester)
-		if !ok {
+		// 两条入口，同一个审批门：
+		//   - 进程内工具实现 ApprovalRequester（同步取理由）；
+		//   - 插件工具（RemoteTool）由插件声明，理由经 ApprovalReason RPC 按本次参数取。
+		// 后者是插件化的前提之一：没有它，插件提供的工具根本没法要求审批，
+		// 「在本机拉起一条命令」这类动作就只能裸奔。
+		var reason string
+		switch t := tool.(type) {
+		case ApprovalRequester:
+			reason = t.ApprovalReason(inv.ArgumentsJSON)
+		case *RemoteTool:
+			reason = t.approvalReason(ev.Context, inv.ArgumentsJSON)
+		default:
 			return next(ev)
 		}
-		reason := ar.ApprovalReason(inv.ArgumentsJSON)
 		if strings.TrimSpace(reason) == "" {
 			return next(ev)
 		}

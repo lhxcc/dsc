@@ -405,6 +405,22 @@ func (t *mcpToolAdapter) Name() string                      { return t.name }
 func (t *mcpToolAdapter) Description() string               { return t.description }
 func (t *mcpToolAdapter) ParametersSchema() json.RawMessage { return t.schema }
 
+// IsHidden 实现 HiddenTool：MCP 工具注册后默认**不进**模型目录，要 mcp_load 明确
+// 加载才出现（一台服务器可能有几百个工具，全塞进目录每个请求都要付钱）。关掉总闸时
+// 连已加载的也一起藏——off 的语义是「这个话题现在不占我任何预算」。
+//
+// 隐藏不等于不可用：它仍在注册表里，后台任务、子代理、按名调用照常工作。
+func (t *mcpToolAdapter) IsHidden() bool {
+	if t.client == nil || t.client.manager == nil {
+		return false // 未绑定宿主（单测直连）时不做曝光裁剪
+	}
+	m := t.client.manager
+	if !m.MCPToolsEnabled() {
+		return true
+	}
+	return !m.mcpToolLoaded(t.name)
+}
+
 func (t *mcpToolAdapter) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	if t.client == nil {
 		return "", fmt.Errorf("MCP tool %q: client not bound (server disconnected?)", t.name)

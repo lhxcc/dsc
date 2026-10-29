@@ -1040,6 +1040,7 @@ const (
 	ToolService_ListContext_FullMethodName     = "/dsc.ToolService/ListContext"
 	ToolService_SetInterconnect_FullMethodName = "/dsc.ToolService/SetInterconnect"
 	ToolService_GetActivity_FullMethodName     = "/dsc.ToolService/GetActivity"
+	ToolService_ApprovalReason_FullMethodName  = "/dsc.ToolService/ApprovalReason"
 )
 
 // ToolServiceClient is the client API for ToolService service.
@@ -1064,6 +1065,14 @@ type ToolServiceClient interface {
 	// 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
 	// 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
 	GetActivity(ctx context.Context, in *GetActivityRequest, opts ...grpc.CallOption) (*GetActivityResponse, error)
+	// ApprovalReason 询问「这一次调用为什么需要审批」。
+	//
+	// 为什么是 RPC 而不是在 ListTools 里给一句固定说明：审批理由依赖参数（连哪个
+	// endpoint、在本机拉起哪条命令），固定说明只能说到「这工具危险」；而它只在审批
+	// 路径上调用——用户要点头的时候——不在热路径。
+	// 只要工具声明了 approval_hint（或实现了 ApprovalFn），宿主就会先问这里；旧插件
+	// 未实现时返回 Unimplemented，宿主回退到 approval_hint。
+	ApprovalReason(ctx context.Context, in *ToolApprovalRequest, opts ...grpc.CallOption) (*ToolApprovalResponse, error)
 }
 
 type toolServiceClient struct {
@@ -1124,6 +1133,16 @@ func (c *toolServiceClient) GetActivity(ctx context.Context, in *GetActivityRequ
 	return out, nil
 }
 
+func (c *toolServiceClient) ApprovalReason(ctx context.Context, in *ToolApprovalRequest, opts ...grpc.CallOption) (*ToolApprovalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ToolApprovalResponse)
+	err := c.cc.Invoke(ctx, ToolService_ApprovalReason_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ToolServiceServer is the server API for ToolService service.
 // All implementations must embed UnimplementedToolServiceServer
 // for forward compatibility.
@@ -1146,6 +1165,14 @@ type ToolServiceServer interface {
 	// 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
 	// 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
 	GetActivity(context.Context, *GetActivityRequest) (*GetActivityResponse, error)
+	// ApprovalReason 询问「这一次调用为什么需要审批」。
+	//
+	// 为什么是 RPC 而不是在 ListTools 里给一句固定说明：审批理由依赖参数（连哪个
+	// endpoint、在本机拉起哪条命令），固定说明只能说到「这工具危险」；而它只在审批
+	// 路径上调用——用户要点头的时候——不在热路径。
+	// 只要工具声明了 approval_hint（或实现了 ApprovalFn），宿主就会先问这里；旧插件
+	// 未实现时返回 Unimplemented，宿主回退到 approval_hint。
+	ApprovalReason(context.Context, *ToolApprovalRequest) (*ToolApprovalResponse, error)
 	mustEmbedUnimplementedToolServiceServer()
 }
 
@@ -1170,6 +1197,9 @@ func (UnimplementedToolServiceServer) SetInterconnect(context.Context, *Intercon
 }
 func (UnimplementedToolServiceServer) GetActivity(context.Context, *GetActivityRequest) (*GetActivityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetActivity not implemented")
+}
+func (UnimplementedToolServiceServer) ApprovalReason(context.Context, *ToolApprovalRequest) (*ToolApprovalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApprovalReason not implemented")
 }
 func (UnimplementedToolServiceServer) mustEmbedUnimplementedToolServiceServer() {}
 func (UnimplementedToolServiceServer) testEmbeddedByValue()                     {}
@@ -1282,6 +1312,24 @@ func _ToolService_GetActivity_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ToolService_ApprovalReason_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ToolApprovalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ToolServiceServer).ApprovalReason(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ToolService_ApprovalReason_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ToolServiceServer).ApprovalReason(ctx, req.(*ToolApprovalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ToolService_ServiceDesc is the grpc.ServiceDesc for ToolService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1308,6 +1356,10 @@ var ToolService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetActivity",
 			Handler:    _ToolService_GetActivity_Handler,
+		},
+		{
+			MethodName: "ApprovalReason",
+			Handler:    _ToolService_ApprovalReason_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

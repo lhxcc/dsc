@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"dsc/proto"
 )
 
 // 宿主内置的 MCP 管理工具族：把「连接一个 MCP 服务器」「看清它有哪些工具」
@@ -48,11 +46,6 @@ const (
 	mcpListMaxLimit     = 200
 	mcpListDescRunes    = 110
 )
-
-// isMCPToolName 判断工具名是否来自 MCP 服务器。
-func isMCPToolName(name string) bool {
-	return strings.HasPrefix(name, mcpToolNamePrefix)
-}
 
 // mcpServerOf 从公开工具名里取出服务器名（mcp__<server>__<raw>）。
 func mcpServerOf(publicName string) string {
@@ -146,73 +139,35 @@ func (m *Manager) forgetMCPTools(serverName string) {
 	}
 }
 
-// filterMCPCatalog 按开关与曝光集裁剪模型可见目录（AllToolsProto 的唯一出口）。
+// mcpManagementVisible 报告运行期管理工具是否该进模型目录。
 //
-// 开关（config.yaml 的 mcp.enabled，由 /mcp on|off 写回）是**总闸**：
-//   - 关闭（缺省）：所有 MCP 相关工具都不出现——连 mcp_connect 与运行期管理工具一起，
-//     目录成本恰为 0。日常会话根本不用 MCP，没有理由为「可能用到」常態付费。
-//   - 打开但没有服务器：只剩 mcp_connect（把「没有」变成「有」的入口）。
-//   - 打开且有服务器：再加 list/load/unload/disconnect，以及被 mcp_load 加载过的
-//     mcp__* 工具（未加载的仍然不出现）。
+// 规则只有一条：开关打开、且确实有服务器连着。关着时它们全是噪音（而且这正是「默认
+// 不占任何目录预算」的实现方式）；开着但一台服务器都没有时，只剩 mcp_connect 这一个
+// 「把没有变成有」的入口有意义。
 //
-// 粒度是「每个请求的 tools 数组」：隐藏不等于不可调用——未加载的工具仍注册在宿主、
-// 仍可被后台任务/子代理执行，只是不随请求发给模型。
-func (m *Manager) filterMCPCatalog(tools []*proto.Tool) []*proto.Tool {
-	e := m.ensureMCPExposure()
-	e.mu.RLock()
-	enabled := e.enabled
-	loaded := make(map[string]bool, len(e.load))
-	for name := range e.load {
-		loaded[name] = true
+// 判定放在工具自己身上（IsHidden），装配点不再需要认识 MCP 的名字——以前是
+// filterMCPCatalog 按前缀在唯一的装配点里挑，每加一个子系统就要加一段特例。
+func (m *Manager) mcpManagementVisible(entry bool) bool {
+	if !m.MCPToolsEnabled() {
+		return false
 	}
-	e.mu.RUnlock()
-
-	if !enabled {
-		out := make([]*proto.Tool, 0, len(tools))
-		for _, t := range tools {
-			if isMCPToolName(t.GetName()) || isMCPManagementTool(t.GetName()) {
-				continue
-			}
-			out = append(out, t)
-		}
-		return out
-	}
-
-	hasMCP := false
-	for _, t := range tools {
-		if isMCPToolName(t.GetName()) {
-			hasMCP = true
-			break
-		}
-	}
-	out := make([]*proto.Tool, 0, len(tools))
-	for _, t := range tools {
-		name := t.GetName()
-		switch {
-		case name == mcpConnectToolName:
-			// 开关已开：入口保留
-		case isMCPToolName(name):
-			if !loaded[name] {
-				continue
-			}
-		case isMCPManagementTool(name):
-			if !hasMCP {
-				continue
-			}
-		}
-		out = append(out, t)
-	}
-	return out
+	return entry || m.mcpServerCount.Load() > 0
 }
 
-// isMCPManagementTool 判断是否为运行期管理工具。
-func isMCPManagementTool(name string) bool {
-	switch name {
-	case mcpConnectToolName, mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName:
-		return true
-	}
-	return false
-}
+// IsHidden 实现 HiddenTool：关闭时连入口一起藏（成本恰为 0）。
+func (t *mcpConnectTool) IsHidden() bool { return !t.m.mcpManagementVisible(true) }
+
+// IsHidden 实现 HiddenTool：没有服务器时「列出/加载/卸载/断开」都是空操作，藏起来。
+func (t *mcpListTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
+
+// IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpLoadTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
+
+// IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpUnloadTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
+
+// IsHidden 实现 HiddenTool（同 mcpListTool）。
+func (t *mcpDisconnectTool) IsHidden() bool { return !t.m.mcpManagementVisible(false) }
 
 // MCPToolsEnabled 报告 MCP 注入开关的状态。
 func (m *Manager) MCPToolsEnabled() bool {

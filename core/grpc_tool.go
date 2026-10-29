@@ -58,34 +58,28 @@ func (s *ToolGRPCServer) ListTools(ctx context.Context, req *proto.ListToolsRequ
 // run_code 的 SDK 注入复用。run_code 属 PTC presentation transport，不在普通业务
 // 工具目录中（对齐 DSH：run_code 名被保留、仅由 presentation 层暴露）。
 func (m *Manager) AllToolsProto() []*proto.Tool {
-	openaiTools := m.GetToolRegistry().ToOpenAITools()
-	out := make([]*proto.Tool, 0, len(openaiTools))
-	for _, t := range openaiTools {
-		fn, ok := t["function"].(map[string]interface{})
-		if !ok {
+	// 目录内容由**工具自己**决定：注册表返回的就是「现在该发给模型的那批」，
+	// 自报隐藏的已经排除（HiddenTool，见 tool_registry.go）。装配点因此保持通用：
+	// 它不认识任何子系统的名字、前缀或开关，也就不需要为新增的子系统再加特例。
+	visible := m.GetToolRegistry().VisibleTools()
+	out := make([]*proto.Tool, 0, len(visible))
+	for _, t := range visible {
+		if t.Name() == runCodeToolName {
 			continue
 		}
-		name, _ := fn["name"].(string)
-		if name == runCodeToolName {
-			continue
-		}
-		desc, _ := fn["description"].(string)
-		paramsJSON, _ := json.Marshal(fn["parameters"])
+		// schema 走一次 map 往返：与历史实现保持字节一致（json.Marshal 对 map 键排序），
+		// 免得工具目录的字节序在升级时变一次、白白让前缀缓存失效一轮。
+		var params map[string]interface{}
+		_ = json.Unmarshal(t.ParametersSchema(), &params)
+		paramsJSON, _ := json.Marshal(params)
 		out = append(out, &proto.Tool{
-			Name:           name,
-			Description:    desc,
+			Name:           t.Name(),
+			Description:    t.Description(),
 			ParametersJson: string(paramsJSON),
 		})
 	}
-	// 稳定排序：工具目录顺序必须确定。底层 ToOpenAITools 遍历共享 map，迭代序随机；
-	// 若直接把该顺序交给模型（ListTools→agent tools、subagent LLM、run_code SDK、
-	// PTC 描述内嵌清单），请求前缀随进程随机漂移、命中前缀缓存失效。此处统一按名升序，
-	// 与 agent 端对工具目录的排序算法一致（顺序不影响功能，但必须确定）。
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	// MCP 工具按「已加载」曝光（见 core/mcp_tools.go）。过滤放在这里，是因为它供
-	// 三类消费者共用：主 agent 的 tools 数组、子代理的 tools 数组、run_code 的 SDK
-	// 清单。放到任何单一消费者旁边都只能照顾到一路。
-	return m.filterMCPCatalog(out)
+	// VisibleTools 已按名升序；这里不再重排（两类消费者共用同一个顺序）。
+	return out
 }
 
 // isPTC 当前是否为 PTC 呈现模式（短读锁）。
