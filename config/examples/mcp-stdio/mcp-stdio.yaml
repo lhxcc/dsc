@@ -1,0 +1,34 @@
+# MCP 配置示例：stdio 传输（把服务器作为本机子进程）
+#
+# 用法：
+#   dsc -patch config/examples/mcp-stdio/mcp-stdio.yaml
+#
+# 宿主在启动时拉起这个命令，经它的 stdin/stdout 讲 JSON-RPC，发现的工具注册为
+# mcp__<server_name>__<rawName>。凡是以「本地命令」形式发布的 MCP 服务器都适用
+# （node / python / uvx / 自带二进制），不需要先把它跑起来，也不占端口。
+#
+# 与 HTTP 传输的区别：
+#   - 进程随宿主生命周期：断开或退出时回收（Windows 由 Job Object 兜底，POSIX 由
+#     Close 关 stdin 再等 3 秒后 kill）。
+#   - 子进程**不继承**宿主整份环境：只有 PATH/HOME/TEMP 等基线，另加下面 env 里显式
+#     写的项。服务器需要的 token 必须自己在这里写——这是一个明确的授权动作。
+#   - 启动失败会写日志并跳过该条（不影响宿主其它功能）。
+#
+# 建议直接指向解释器/二进制，而不是 npx / uvx 这类**启动器**：被 kill 的是启动器本身，
+# POSIX 上它拉起的真实服务器可能变成孤儿进程。用 npx 只适合一次性试用。
+- name: mcp-files
+  type: dsc
+  # enabled 必须显式写 true：普通 bool，省略即 false，整条会被跳过（日志里有告警）。
+  enabled: true
+  config:
+    mcp:
+      server_name: files          # 工具名前缀：mcp__files__*
+      transport: stdio
+      command: npx                # 走 PATH 解析；也可写绝对路径（推荐）
+      args:
+        - -y
+        - "@modelcontextprotocol/server-filesystem"
+        - O:/workspace            # 换成要暴露给该服务器的真实目录
+      # cwd: O:/workspace         # 服务器按相对路径找资源时才需要
+      # env:                      # 只有这里写明的变量才会进子进程
+      #   SOME_TOKEN: ""

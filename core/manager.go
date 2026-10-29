@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -215,6 +214,17 @@ type Manager struct {
 	// 让零值 Manager（测试里常见）也能直接用。
 	mcpExpose     *mcpExposure
 	mcpExposeOnce sync.Once
+
+	// mcpServerCount 已连接 MCP 服务器的数量（原子，供工具的 IsHidden 判定）。
+	//
+	// 为什么单独计数而不是读 m.mcpClients：工具的可见性判定发生在目录装配里，那是最热
+	// 的路径之一，且装配期间不该去拿 m.mu（有调用方就持着它）。三个写入点各自维护这个
+	// 计数（登记 / 单个断开 / 全部断开），读侧永远只做一次原子读。
+	mcpServerCount atomic.Int32
+
+	// scopeLedger 授权账本（见 core/authorization.go）：范围级审批粒度下的用户决定。
+	scopeLedger     *scopeLedger
+	scopeLedgerOnce sync.Once
 }
 
 type ManagerConfig struct {
@@ -1231,6 +1241,15 @@ func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	m.stopCronLocked() // 先停调度，避免新任务触发时插件已退出
 
+	// MCP stdio 服务器是本机子进程，必须显式关：Windows 上 EnableProcessJob 的 Job
+	// Object 会在宿主退出时兜底杀掉，但 Linux/macOS 没有这层保障——不关就会留下孤儿
+	// node/python 进程。先摘表再关，避免并发 connect 又把它们塞回去。
+	mcpToClose := make([]*MCPClient, 0, len(m.mcpClients))
+	for name, client := range m.mcpClients {
+		mcpToClose = append(mcpToClose, client)
+		delete(m.mcpClients, name)
+	}
+
 	// 收集所有插件 client 用于后续等待退出
 	type clientInfo struct {
 		name   string
@@ -1247,15 +1266,11 @@ func (m *Manager) Shutdown() {
 		clients = append(clients, clientInfo{name: name, client: client})
 	}
 
-	// LSP / MCP 客户端是 admin API 拉起的外部子进程，不登记在 m.clients；
-	// 一并收集后停止，避免宿主退出后残留。
+	// LSP 客户端是 admin API 拉起的外部子进程，不登记在 m.clients，一并收集后停止，
+	// 避免宿主退出后残留。
 	lspClients := make([]*LSPClient, 0, len(m.lspClients))
 	for _, c := range m.lspClients {
 		lspClients = append(lspClients, c)
-	}
-	mcpClients := make([]*MCPClient, 0, len(m.mcpClients))
-	for _, c := range m.mcpClients {
-		mcpClients = append(mcpClients, c)
 	}
 
 	m.clients = make(map[string]*plugin.Client)
@@ -1301,8 +1316,9 @@ func (m *Manager) Shutdown() {
 	for _, c := range lspClients {
 		_ = c.Stop()
 	}
-	for _, c := range mcpClients {
-		c.Disconnect()
+	// 关 MCP 子进程（在释放 m.mu 之后：Close 要等进程退出，不该占着锁）。
+	for _, client := range mcpToClose {
+		client.Disconnect() // 注销工具 + 关闭传输（stdio 关 stdin 并回收子进程）
 	}
 
 	// 等待所有插件子进程确实退出：go-plugin 的 client.Kill() 会阻塞等待进程退出，
@@ -1849,6 +1865,10 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 
 	// 保存显式声明的压缩后端插件名（供 registerDscCoreLocked 匹配检测）
 	m.compactionBackend = cfg.Compaction
+	// 预授予的权限范围：配置里写明的，启动即生效（人已经做过这个决定）。
+	if cfg.Authorization != nil {
+		m.SeedScopes(cfg.Authorization.GrantedScopes)
+	}
 
 	// 版本感知解析：各插件目录内若存在「<目录基名>-v<版本><ext>」的更高版本二进制，
 	// 启动即直接加载最高版本，避免先起基线进程再由 watcher 换新（Windows 下运行中的
@@ -2293,13 +2313,7 @@ func listStagedTools(toolClient proto.ToolServiceClient) ([]ToolDefinition, []st
 	var defs []ToolDefinition
 	var names []string
 	for _, t := range listResp.Tools {
-		defs = append(defs, &RemoteTool{
-			name:         t.Name,
-			description:  t.Description,
-			schema:       json.RawMessage(t.ParametersJson),
-			client:       toolClient,
-			capabilities: t.Capabilities,
-		})
+		defs = append(defs, remoteToolFromProto(toolClient, t))
 		names = append(names, t.Name)
 	}
 	return defs, names, nil

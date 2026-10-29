@@ -19,6 +19,15 @@ default_llm: llm-anthropic
 # 启用多个则必须在这里点名——否则启动会失败并提示点名。
 compaction: dsc-system
 
+# 权限范围预授予（可选）。范围是**能力的权限属性**，不是工具名：
+#   process.spawn  在本机拉起子进程（MCP stdio 服务器、浏览器、computer-use）
+#   net.egress     对外发网络请求
+#   fs.write       写文件（沙箱按路径策略强制）
+# 写在这里的范围启动即视为已授权，不再逐次弹审批；不写则按 DSC_APPROVAL_GRANULARITY
+# 的粒度处理（tool=每次都问 / scope=问一次即记住）。默认什么都不预授予。
+#authorization:
+#  granted_scopes: [process.spawn, net.egress]
+
 # 恢复历史注入（/settings history 写回）：-1 禁止（不注入从存档恢复的历史）、
 # 0 未定义（未设置，按默认处理 = 不限制）、N>0 只注入恢复历史中最近 N 条。
 # 它只影响「从存档恢复的历史」：同一会话内已经发生的轮次始终完整保留。

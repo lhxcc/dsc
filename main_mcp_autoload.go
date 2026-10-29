@@ -3,10 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	"dsc/core"
+
 	"github.com/hashicorp/go-hclog"
 )
 
@@ -27,11 +26,15 @@ import (
 //     # transport: stdio
 //     # command: mcp-server-memory
 //     # args: ["--port", "3000"]
-//     # env: {MEMORY_DB: "/tmp/memory.db"}   # 可选
-//     # workdir: /path/to/server             # 可选
+//     # env: {MEMORY_DB: "/tmp/memory.db"}   # 可选：只追加在白名单环境之上
+//     # cwd: /path/to/server                 # 可选
 //
-// 每个条目的 config.mcp 字段含 server_name（必填）与 endpoint（HTTP）或
-// transport: stdio + command + args/env（stdio）。
+// 每个条目的 config.mcp 字段含 server_name（必填），以及二者之一：
+//   - endpoint：streamable HTTP 地址；
+//   - transport: stdio + command + args（+ 可选 env / cwd）：本机拉起子进程。
+//
+// 两种传输与 mcp_connect 工具共用同一份解析与同一个连接实现（core.MCPSpecFromMap /
+// Manager.ConnectMCPServerSpec）——配置与工具各写一份，迟早会在字段上分叉。
 func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.Logger) {
 	if cfg == nil || len(cfg.Plugins) == 0 {
 		return
@@ -52,89 +55,33 @@ func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.
 				"plugin", entry.Name)
 			continue
 		}
-		serverName, _ := mcpCfg["server_name"].(string)
-		if serverName == "" {
+		// 工具入参与配置条目共用一份解析（core.MCPSpecFromMap）：支持两种传输，
+		// 且不会出现「配置认这个字段、工具认那个字段」的分叉。
+		spec, err := core.MCPSpecFromMap(mcpCfg)
+		if err != nil {
+			logger.Error("patch MCP config invalid, skipping",
+				"plugin", entry.Name, "error", err)
+			continue
+		}
+		if spec.ServerName == "" {
 			logger.Warn("patch MCP config missing server_name, skipping", "plugin", entry.Name)
 			continue
 		}
-		endpoint, _ := mcpCfg["endpoint"].(string)
-		transport, _ := mcpCfg["transport"].(string)
-
-		var (
-			client *core.MCPClient
-			err    error
-		)
-		if strings.EqualFold(transport, "stdio") {
-			command, _ := mcpCfg["command"].(string)
-			if command == "" {
-				logger.Warn("patch MCP stdio config missing command, skipping",
-					"plugin", entry.Name, "server_name", serverName)
-				continue
-			}
-			workDir, _ := mcpCfg["workdir"].(string)
-			client, err = core.NewMCPStdioClient(mgr, serverName, command,
-				mcpStringList(mcpCfg["args"]), mcpEnvList(mcpCfg["env"]), workDir)
-		} else {
-			if endpoint == "" {
-				logger.Warn("patch MCP config missing endpoint (HTTP transport), skipping",
-					"plugin", entry.Name, "server_name", serverName)
-				continue
-			}
-			client, err = core.NewMCPClient(mgr, serverName, endpoint)
+		if _, err := spec.TransportKind(); err != nil {
+			logger.Error("patch MCP config incomplete, skipping",
+				"plugin", entry.Name, "server_name", spec.ServerName, "error", err)
+			continue
 		}
+		// 经与 admin API / mcp_connect 相同的实现连接（唯一实现，避免三条入口各写一份）
+		count, err := mgr.ConnectMCPServerSpec(context.Background(), spec)
 		if err != nil {
 			logger.Error("patch MCP connect failed",
-				"plugin", entry.Name, "server_name", serverName, "error", err)
+				"plugin", entry.Name, "server_name", spec.ServerName,
+				"transport", spec.Transport, "error", err)
 			continue
 		}
-		if err := client.Connect(context.Background()); err != nil {
-			logger.Error("patch MCP connect failed",
-				"plugin", entry.Name, "server_name", serverName,
-				"endpoint", endpoint, "transport", transport, "error", err)
-			continue
-		}
-		// 注册到 Manager.mcpClients（与 admin API /mcp/connect 同款路径）
-		mgr.RegisterMCPClient(serverName, client)
 		logger.Info("patch MCP connected",
-			"plugin", entry.Name, "server_name", serverName,
-			"endpoint", endpoint, "transport", transport,
-			"tools", fmt.Sprintf("%d", client.ToolCount()))
-	}
-}
-
-// mcpStringList 把配置里的数组转成字符串列表（非字符串项忽略）。
-func mcpStringList(v any) []string {
-	arr, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(arr))
-	for _, item := range arr {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// mcpEnvList 把配置里的 env 转成 KEY=VALUE 列表：支持 map（按键升序，确定性）
-// 或字符串数组两种写法。
-func mcpEnvList(v any) []string {
-	switch e := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(e))
-		for k := range e {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		out := make([]string, 0, len(keys))
-		for _, k := range keys {
-			out = append(out, k+"="+fmt.Sprint(e[k]))
-		}
-		return out
-	case []any:
-		return mcpStringList(e)
-	default:
-		return nil
+			"plugin", entry.Name, "server_name", spec.ServerName,
+			"transport", spec.Transport, "tools", fmt.Sprintf("%d", count))
 	}
 }

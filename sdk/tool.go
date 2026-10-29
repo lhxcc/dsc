@@ -47,6 +47,27 @@ type Tool struct {
 	// 宿主据此按能力而非插件名做前置门控：声明 CapabilityRequiresNeverApproval 的工具
 	// 在审批策略非 never 时会于执行前被拒绝（避免逐工具弹窗授权）。
 	Capabilities []string
+	// Hidden 为 true 时工具注册了但**不进模型可见目录**。
+	//
+	// 用途是「存在但此刻不该占目录预算」：目录每个请求都要发，一台提供几百个工具的
+	// 插件全量上目录等于替每个请求付费。隐藏的工具仍可按名调用（后台任务、子代理），
+	// 只是模型看不到它的说明。
+	//
+	// 这个判定**归工具自己**：宿主不再按名字前缀猜谁能出现，因此插件可以随时改主意
+	// （下一次 ListTools 生效，宿主 ~800ms 内同步）。
+	Hidden bool
+	// Scopes 本工具可能触碰的权限范围（声明式，如 process.spawn / net.egress /
+	// fs.write）。非空即表示需要审批——审批是**能力的权限属性**，不是一段文案。
+	//
+	// 宿主按范围维护授权账本，审批粒度由策略决定（工具级每次问 / 范围级问一次记住），
+	// 工具侧两种粒度都不用改代码。具体到「这一次」的说明走 ApprovalFn。
+	//
+	// 只声明宿主能真正执行或验证的范围：无法执行的范围只是自我声明。
+	Scopes []string
+	// ApprovalFn 可选：按本次调用参数给出审批理由（空串 = 本次不需要审批）。
+	// 典型用法：「连一个 URL」与「在本机拉起一条命令」风险不同，理由应当说得出来。
+	// 它只在审批路径上被调用，不在每个请求的热路径上。
+	ApprovalFn func(ctx context.Context, args json.RawMessage) string
 }
 
 // CapabilityRequiresNeverApproval 声明式能力标签：本工具要求前置审批策略为 never。
@@ -170,6 +191,8 @@ func (s *toolServiceServer) ListTools(ctx context.Context, req *proto.ListToolsR
 			Description:    t.Description,
 			ParametersJson: string(t.Schema),
 			Capabilities:   t.Capabilities,
+			Hidden:         t.Hidden,
+			Scopes:         t.Scopes,
 		})
 	}
 	return &proto.ListToolsResponse{Tools: tools}, nil
@@ -177,6 +200,25 @@ func (s *toolServiceServer) ListTools(ctx context.Context, req *proto.ListToolsR
 
 // ListContext 贡献 system prompt 片段：优先用动态 ContextFn（每调用求值），
 // 否则拼接各工具的静态 Context（旧宿主可忽略）。
+// ApprovalReason 实现 ToolService.ApprovalReason：把「这一次为什么需要审批」交给
+// 工具自己的 ApprovalFn；没有 ApprovalFn 时回空串，宿主按声明的 scopes 合成说明。
+//
+// 未声明审批的工具一律回空串（不需要审批），宿主据此放行——这条路径只在用户即将被
+// 问「要不要批准」时走一次，所以多一跳 RPC 是划算的：理由里能带上具体参数（连哪个
+// 地址、跑哪条命令），比一句「该工具危险」有用得多。
+func (s *toolServiceServer) ApprovalReason(ctx context.Context, req *proto.ToolApprovalRequest) (*proto.ToolApprovalResponse, error) {
+	for _, t := range s.sdk.snapshotTools() {
+		if t.Name != req.GetToolName() {
+			continue
+		}
+		if t.ApprovalFn != nil {
+			return &proto.ToolApprovalResponse{Reason: t.ApprovalFn(ctx, json.RawMessage(req.GetArgumentsJson()))}, nil
+		}
+		return &proto.ToolApprovalResponse{}, nil
+	}
+	return &proto.ToolApprovalResponse{}, nil
+}
+
 func (s *toolServiceServer) ListContext(ctx context.Context, req *proto.ListContextRequest) (*proto.ListContextResponse, error) {
 	var b strings.Builder
 	for _, t := range s.sdk.snapshotTools() {

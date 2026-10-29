@@ -260,6 +260,21 @@ func TestMCPDisconnectForgetsExposure(t *testing.T) {
 	}
 }
 
+// isMCPToolName / isMCPManagementTool 只用于测试断言。
+//
+// 生产代码已经不再按名字判断可见性——每个工具自己声明 IsHidden（HiddenTool），这正是
+// 把「曝光策略」从唯一的目录装配点搬回工具提供方的地方。测试仍需要这两个谓词，是为了
+// 断言「关闭状态下目录里不该出现任何 MCP 相关工具」而不必逐个枚举管理工具名。
+func isMCPToolName(name string) bool { return strings.HasPrefix(name, mcpToolNamePrefix) }
+
+func isMCPManagementTool(name string) bool {
+	switch name {
+	case mcpConnectToolName, mcpListToolName, mcpLoadToolName, mcpUnloadToolName, mcpDisconnectToolName:
+		return true
+	}
+	return false
+}
+
 // toolNamesOf 把目录转成集合。
 func toolNamesOf(tools []*proto.Tool) map[string]bool {
 	out := make(map[string]bool, len(tools))

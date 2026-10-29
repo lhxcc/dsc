@@ -209,3 +209,82 @@ func TestMCPConnectRequiresEnable(t *testing.T) {
 		t.Fatal("启用后 connect 应执行")
 	}
 }
+
+// TestMCPConnectBuildArgsByTargetShape 目标形态决定传输：http(s):// 走 endpoint，
+// 其余按 stdio 命令 + args。这条只验参数构造（纯函数），真实 stdio 链路在 core 的
+// helper 进程用例里覆盖——测试不依赖任何外部命令。
+func TestMCPConnectBuildArgsByTargetShape(t *testing.T) {
+	build := mcpAdminSubs["connect"].build
+
+	cases := []struct {
+		name string
+		argv []string
+		want map[string]any
+	}{
+		{
+			name: "HTTP endpoint",
+			argv: []string{"srv", "http://127.0.0.1:8765/mcp"},
+			want: map[string]any{"server_name": "srv", "endpoint": "http://127.0.0.1:8765/mcp"},
+		},
+		{
+			name: "stdio 命令无参数",
+			argv: []string{"fs", "node"},
+			want: map[string]any{"server_name": "fs", "transport": "stdio", "command": "node"},
+		},
+		{
+			name: "stdio 命令带参数",
+			argv: []string{"fs", "node", "server.mjs", "mcp"},
+			want: map[string]any{
+				"server_name": "fs", "transport": "stdio", "command": "node",
+				"args": []string{"server.mjs", "mcp"},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := build(c.argv, nil)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			if len(got) != len(c.want) {
+				t.Fatalf("args = %#v, want %#v", got, c.want)
+			}
+			for k, want := range c.want {
+				switch wv := want.(type) {
+				case []string:
+					gv, ok := got[k].([]string)
+					if !ok || strings.Join(gv, "\x00") != strings.Join(wv, "\x00") {
+						t.Fatalf("%s = %#v, want %#v", k, got[k], wv)
+					}
+				default:
+					if got[k] != want {
+						t.Fatalf("%s = %#v, want %#v", k, got[k], want)
+					}
+				}
+			}
+		})
+	}
+
+	// HTTP 后面多给参数是错的（那是 stdio 的 args），必须明确报错而不是静默丢弃
+	if _, err := build([]string{"srv", "http://x/mcp", "extra"}, nil); err == nil {
+		t.Fatal("HTTP 带多余参数应报错")
+	}
+	// 缺目标
+	if _, err := build([]string{"srv"}, nil); err == nil {
+		t.Fatal("缺 endpoint/command 应报错")
+	}
+}
+
+// TestMCPArgsDoubleDashStopsOptionParsing stdio 命令的参数常带 - 前缀
+// （/mcp connect fs node server.mjs --root .）：`--` 之后必须全部按位置参数走，
+// 不能被当成未知选项拒掉。
+func TestMCPArgsDoubleDashStopsOptionParsing(t *testing.T) {
+	pos, _, err := parseMCPArgs([]string{"fs", "node", "--", "server.mjs", "--root", "."})
+	if err != nil {
+		t.Fatalf("-- 之后不应报未知选项: %v", err)
+	}
+	want := []string{"fs", "node", "server.mjs", "--root", "."}
+	if strings.Join(pos, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("pos = %#v, want %#v", pos, want)
+	}
+}

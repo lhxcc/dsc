@@ -48,6 +48,9 @@ func (*lctxMockClient) SetInterconnect(context.Context, *proto.InterconnectReque
 func (*lctxMockClient) GetActivity(context.Context, *proto.GetActivityRequest, ...grpc.CallOption) (*proto.GetActivityResponse, error) {
 	return &proto.GetActivityResponse{}, nil
 }
+func (*lctxMockClient) ApprovalReason(context.Context, *proto.ToolApprovalRequest, ...grpc.CallOption) (*proto.ToolApprovalResponse, error) {
+	return &proto.ToolApprovalResponse{}, nil
+}
 
 // TestListContextStableOrder 校验 ListContext 按插件名稳定排序拼接上下文片段：
 // map 遍历顺序随机，但输出必须按名确定，使 system prompt 前缀稳定、命中前缀缓存。

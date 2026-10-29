@@ -10,6 +10,16 @@ import (
 	"time"
 )
 
+// TestMain 兼任 LSP 测试服务器：同一个测试二进制带 DSC_LSP_HELPER=1 启动时进入
+// helper 模式（省掉额外编译产物，测的也正是真实子进程管道），其余情况正常跑测试。
+func TestMain(m *testing.M) {
+	if os.Getenv("DSC_LSP_HELPER") == "1" {
+		runLSPHelper()
+		return
+	}
+	os.Exit(m.Run())
+}
+
 // runLSPHelper 最小 LSP 服务器（stdio，Content-Length 分帧）：
 //   - initialize → 返回 caps
 //   - initialized/didOpen/didChange → 推送一条 publishDiagnostics

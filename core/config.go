@@ -48,6 +48,12 @@ type Config struct {
 	// ContextWindow 上下文窗口大小（token 数）；0 表示未配置，
 	// 由宿主探测 LLAMACPP 的 /v1/models 獲取 n_ctx，仍失敗則用默認 128K×1024
 	ContextWindow int `json:"context_window" yaml:"context_window"`
+	// Authorization 权限范围的预授予（见 core/authorization.go）。
+	//
+	// 用途：把「这个部署允许起进程 / 允许对外发请求」写进配置，启动即生效，不必每次
+	// 会话重新点头。空 = 什么都不预授予（默认，最严）。
+	Authorization *AuthorizationConfig `json:"authorization" yaml:"authorization"`
+
 	// Persona "你是一個…助手" 身份句（預設可配，同 DSH 的 deployment persona）；空則用 DeepSeek 官方默認
 	Persona string `json:"persona" yaml:"persona"`
 	// PlanSection plan 模式激活时注入 system prompt 的部署方引导文案（同 DSH plan-mode 的 section）；
@@ -165,4 +171,12 @@ func UpdateMode(mode string, configPath string) error {
 		cfg.Mode = mode
 	}
 	return SaveConfig(configPath, cfg)
+}
+
+// AuthorizationConfig 权限范围的预授予。
+//
+// 只写**范围**名（process.spawn / net.egress / fs.write），不写工具名：范围是能力的
+// 权限属性，写工具名等于把「允许什么」绑死在实现细节上。
+type AuthorizationConfig struct {
+	GrantedScopes []string `json:"granted_scopes" yaml:"granted_scopes"`
 }

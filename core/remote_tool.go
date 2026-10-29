@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"dsc/proto"
@@ -23,6 +24,13 @@ type RemoteTool struct {
 	schema       json.RawMessage
 	client       proto.ToolServiceClient
 	capabilities []string
+
+	// hidden 由插件声明：注册了但不进模型可见目录（见 HiddenTool）。
+	hidden bool
+	// scopes 由插件声明：本工具可能触碰的权限范围（见 core/authorization.go）。
+	// 非空即表示需要审批——审批是能力的权限属性，不是一段文案；具体到这一次的说明
+	// 由 ApprovalReason RPC 给（同一工具不同参数，风险不同）。
+	scopes []string
 }
 
 // HasCapability 报告该工具是否声明了指定能力标签（源自插件工具声明的 proto.Tool.capabilities。
@@ -40,6 +48,58 @@ func (r *RemoteTool) HasCapability(cap string) bool {
 // 带参数的能力 token（如 writes-path:<argName>）需经本方法枚举才能解析。
 func (r *RemoteTool) Capabilities() []string {
 	return r.capabilities
+}
+
+// remoteToolFromProto 把插件的工具声明转成宿主工具。
+//
+// **唯一的构造点**：以前 ListTools 的两条路径（启动期 listStagedTools 与运行期
+// syncPluginTools）各自手写一遍字段赋值，结果一加 hidden / scopes 就只改了其中
+// 一处——插件声明了，宿主当没听见。跨层字段保真只能靠一处赋值来保证。
+func remoteToolFromProto(client proto.ToolServiceClient, t *proto.Tool) *RemoteTool {
+	return &RemoteTool{
+		name:         t.GetName(),
+		description:  t.GetDescription(),
+		schema:       json.RawMessage(t.GetParametersJson()),
+		client:       client,
+		capabilities: t.GetCapabilities(),
+		hidden:       t.GetHidden(),
+		scopes:       t.GetScopes(),
+	}
+}
+
+// IsHidden 实现 HiddenTool：插件声明不曝光的工具不进模型目录。
+//
+// 隐藏不等于不可用——它仍在注册表里，后台任务/子代理/按名调用照常；只是不随请求
+// 发给模型。判定每分钟都可能变（插件下次 ListTools 说了算，宿主 ~800ms 同步一次），
+// 所以这里每次都读当前值，不做缓存。
+func (r *RemoteTool) IsHidden() bool { return r.hidden }
+
+// Scopes 实现 ScopeDeclarer：插件声明的权限范围。
+func (r *RemoteTool) Scopes() []string { return r.scopes }
+
+// approvalReason 返回本次调用需要审批的理由（空串 = 不需要）。
+//
+// 要不要审批看 scopes（静态声明），具体说明问插件（ApprovalReason RPC，按本次参数）。
+// 插件未实现该 RPC 时退回一句按范围拼出来的说明——**不能因为问不到就放行**：审批门是
+// 安全边界，说不清理由时仍要问，只有「没声明任何范围」才算不需要审批。
+func (r *RemoteTool) approvalReason(ctx context.Context, argumentsJSON string) string {
+	if len(r.scopes) == 0 {
+		return ""
+	}
+	fallback := "touches " + strings.Join(r.scopes, ", ")
+	if r.client == nil {
+		return fallback
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := r.client.ApprovalReason(callCtx, &proto.ToolApprovalRequest{
+		ToolName:      r.name,
+		ArgumentsJson: argumentsJSON,
+	})
+	if err != nil || resp.GetReason() == "" {
+		return fallback
+	}
+	return resp.GetReason()
 }
 
 func (r *RemoteTool) Name() string {

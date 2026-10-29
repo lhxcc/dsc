@@ -169,7 +169,7 @@ func (c *LSPClient) readLoop(r io.Reader) {
 		if len(msg.ID) == 0 || string(msg.ID) == "null" {
 			continue
 		}
-		id, ok := mcpParseID(msg.ID) // 复用 JSON-RPC id 解析（整数/浮点兼容）
+		id, ok := parseJSONRPCID(msg.ID) // 整数/浮点兼容：LSP 服务端回显的 id 可能是任一形态
 		if !ok {
 			continue
 		}
@@ -327,6 +327,22 @@ func lspWaitDiagnostics(ctx context.Context, ch chan struct{}, timeout time.Dura
 	case <-timer.C:
 	case <-ctx.Done():
 	}
+}
+
+// parseJSONRPCID 解析 JSON-RPC 响应 id（兼容整数与浮点表示）。
+//
+// LSP 服务端回显的 id 可能是 3 或 3.0；两者都要认，否则响应会因「认不出 id」被丢弃、
+// 调用方一直等到超时。
+func parseJSONRPCID(raw json.RawMessage) (int64, bool) {
+	var i int64
+	if err := json.Unmarshal(raw, &i); err == nil {
+		return i, true
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err == nil {
+		return int64(f), true
+	}
+	return 0, false
 }
 
 // lspFileURI 把文件系统路径转成 file:// URI（统一正斜杆；Windows 盘符前补 "/"）。

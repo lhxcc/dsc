@@ -62,6 +62,14 @@ service ToolService {
   // 的是空句柄——所以宿主只能反过来**轮询**。返回 0 表示从未上报过活动。
   // 旧插件未实现时返回 Unimplemented，宿主退回固定时间预算。
   rpc GetActivity(GetActivityRequest) returns (GetActivityResponse);
+  // ApprovalReason 询问「这一次调用为什么需要审批」。
+  //
+  // 为什么是 RPC 而不是在 ListTools 里给一句固定说明：审批理由依赖参数（连哪个
+  // endpoint、在本机拉起哪条命令），固定说明只能说到「这工具危险」；而它只在审批
+  // 路径上调用——用户要点头的时候——不在热路径。
+  // 只要工具声明了 approval_hint（或实现了 ApprovalFn），宿主就会先问这里；旧插件
+  // 未实现时返回 Unimplemented，宿主回退到 approval_hint。
+  rpc ApprovalReason(ToolApprovalRequest) returns (ToolApprovalResponse);
 }
 
 message GetActivityRequest {
@@ -176,6 +184,33 @@ message Tool {
   string parameters_json = 3; // JSON Schema 字符串
   // 声明式能力标签；'requires-never-approval' 表示本工具要求前置审批策略为 never
   repeated string capabilities = 4;
+  // hidden 为 true 时工具仍然注册、仍可被后台任务/子代理按名调用，但不进模型可见
+  // 的工具目录（目录每个请求都要发，隐藏即省成本）。**曝光策略归工具提供方**：
+  // 宿主不再按名字前缀判断谁能出现。
+  bool hidden = 5;
+  // 6 曾是 approval_hint（自由文案）。审批是**能力的权限属性**，不是工具的文案：
+  // 改成按范围声明，见 scopes。留空号避免与旧消息混淆。
+  reserved 6;
+
+  // scopes 本工具可能触碰的权限范围（声明式，如 process.spawn / net.egress /
+  // fs.write）。宿主按范围维护授权账本，审批粒度由策略决定：
+  //   - 工具级（默认）：每次调用都问，最严；
+  //   - 范围级：同一范围问过一次即记住，后续调用不再问。
+  // 空 = 不触碰任何需授权范围，不进入审批。
+  //
+  // 只应声明宿主**能真正执行或验证**的范围：无法执行的范围只是自我声明，
+  // 与一句「这工具危险」等价，不构成安全边界。
+  repeated string scopes = 7;
+}
+
+message ToolApprovalRequest {
+  string tool_name = 1;
+  string arguments_json = 2;
+}
+
+message ToolApprovalResponse {
+  // reason 为空表示本次调用不需要审批（工具可按参数自行判定）。
+  string reason = 1;
 }
 
 message ChatResponse {

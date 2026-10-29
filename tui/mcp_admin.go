@@ -56,13 +56,27 @@ var mcpAdminSubs = map[string]mcpAdminSub{
 		},
 	},
 	"connect": {
-		usage: "connect <name> <endpoint>",
+		usage: "connect <name> <endpoint|command> [args...]",
 		tool:  "mcp_connect",
 		build: func(pos []string, _ map[string]string) (map[string]any, error) {
 			if len(pos) < 2 {
-				return nil, fmt.Errorf("需要 <name> <endpoint>")
+				return nil, fmt.Errorf("需要 <name> <endpoint 或 command>")
 			}
-			return map[string]any{"server_name": pos[0], "endpoint": pos[1]}, nil
+			name, target := pos[0], pos[1]
+			// 目标形态自己就说明了传输：http(s):// 是 streamable HTTP，其余当作要拉起的
+			// 命令（余下 token 即 args）。不另设 --stdio 旗标——多一个开关就多一种写错的
+			// 方式，而且两种写法不可能同时成立。
+			if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+				if len(pos) > 2 {
+					return nil, fmt.Errorf("HTTP 传输只接一个 endpoint，多余参数：%v（stdio 才接 args）", pos[2:])
+				}
+				return map[string]any{"server_name": name, "endpoint": target}, nil
+			}
+			args := map[string]any{"server_name": name, "transport": "stdio", "command": target}
+			if len(pos) > 2 {
+				args["args"] = pos[2:]
+			}
+			return args, nil
 		},
 	},
 	"disconnect": {
@@ -142,6 +156,11 @@ func parseMCPArgs(argv []string) (pos []string, opts map[string]string, err erro
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
 		switch {
+		case a == "--":
+			// 之后的 token 一律按位置参数：stdio 的命令参数常带 - 前缀
+			//（/mcp connect fs node server.mjs --root .），不能被当成未知选项。
+			pos = append(pos, argv[i+1:]...)
+			return pos, opts, nil
 		case a == "--server" || a == "-s":
 			if i+1 >= len(argv) {
 				return nil, nil, fmt.Errorf("--server 需要一个值")
@@ -233,7 +252,7 @@ func mcpStatusText(st core.MCPStatus) string {
 		b.WriteString("注入：已关闭（模型看不到任何 MCP 工具，MCP 目录成本为 0）/mcp on 开启\n")
 	}
 	if len(st.Servers) == 0 {
-		b.WriteString("服务器：未连接（/mcp connect <name> <endpoint>）")
+		b.WriteString("服务器：未连接（/mcp connect <name> <endpoint 或 command>）")
 		if len(st.Loaded) > 0 {
 			fmt.Fprintf(&b, "\n已加载：%d 个（服务器已断开，加载记录仍在）", len(st.Loaded))
 		}
@@ -241,7 +260,7 @@ func mcpStatusText(st core.MCPStatus) string {
 	}
 	b.WriteString("服务器：\n")
 	for _, srv := range st.Servers {
-		fmt.Fprintf(&b, "  %s  %s  %d 个工具", srv.Name, srv.Endpoint, srv.Tools)
+		fmt.Fprintf(&b, "  %s  [%s] %s  %d 个工具", srv.Name, srv.Transport, srv.Target, srv.Tools)
 		if srv.Loaded > 0 {
 			fmt.Fprintf(&b, "（已加载 %d）", srv.Loaded)
 		}
