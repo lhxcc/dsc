@@ -1,8 +1,8 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -78,8 +78,9 @@ func (a *ReactLoopAgent) hostTools() []*proto.Tool {
 			Name: toolAskUserQuestion,
 			Description: "Ask the user a concise question when you need confirmation, a choice, or missing information to continue. " +
 				"Pass a non-empty questions array; each question needs a stable id and text, and may carry a short header, options (label with optional description), and multi_select. " +
-				"To recommend an option, put it first and append \"(Recommended)\" to its label.",
-			ParametersJson: `{"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string"},"question":{"type":"string"},"header":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"multi_select":{"type":"boolean"}},"required":["id","question"]}}},"required":["questions"],"additionalProperties":false}`,
+				"To recommend an option, put it first and append \"(Recommended)\" to its label. " +
+				toolPlainTextNote,
+			ParametersJson: `{"type":"object","properties":{"questions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string"},"question":{"type":"string","description":"Plain text, shown to the user exactly as written. For a line break write \\n (one backslash + n) inside the JSON string."},"header":{"type":"string","description":"Short plain-text title, one line."},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"multi_select":{"type":"boolean"}},"required":["id","question"]}}},"required":["questions"],"additionalProperties":false}`,
 		},
 		{
 			Name: toolTodoWrite,
@@ -99,6 +100,19 @@ func parallelInProgressNote(allow bool) string {
 	}
 	return "At most one task may be in_progress at a time."
 }
+
+// toolPlainTextNote 交代「这些文本怎么排版」——用户看到的就是字符本身，不会被渲染。
+//
+// 为什么要专门写：模型并不知道这层字符串会怎么显示。它把换行写成多转义一层的
+// `\\n`，解码后就是「反斜杠 + n」两个字符，卡片上原样显示 `\n\n`、两段挤成一行
+// （实测 8 次问人里有 1 次如此）。这类问题不该靠下游猜着展开——自动展开会把
+// `C:\temp\new` 这类路径、以及正文里讲正则 `\n` 的句子改坏——所以把规则写进
+// 工具描述：按 JSON 标准只转义一层，剩下的交给模型自己写对。
+const toolPlainTextNote = "Formatting of the text fields: everything is shown to the user verbatim as plain text — " +
+	"markdown is not rendered, so `backticks`, **stars** and # headings appear literally. " +
+	"Line breaks are ordinary JSON escapes: one backslash followed by n (\\n in the JSON you emit) ends a line, and two in a row gives a blank line between paragraphs. " +
+	"Escape it exactly once: a doubled backslash (a literal backslash + n inside the string value) reaches the user as those two characters instead of a line break, and nothing unescapes it afterwards. " +
+	"Keep the question to a few short paragraphs; option labels should be one line each."
 
 // executeLocalTool 执行宿主托管的工具。第二个返回值表示是否需要在
 // 本步骤后结束物理轮次（对齐 DSH concludeTurn：complete/blocked 后停止）。
