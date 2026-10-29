@@ -77,6 +77,10 @@ type StartSpec struct {
 type Read struct {
 	Text     string
 	Snapshot JobSnapshot
+	// Streaming 该任务的输出是**增量可读**的（生产方提供了 ReadOutput），
+	// 还是**只在落定时一次性可读**（final-output）。调用方据此决定「等首块输出」
+	// 值不值得等：增量任务随时可能有新内容，final-output 任务在结束前永远是空的。
+	Streaming bool
 	// ReadCount 该任务终态输出被读取的次数（1 = 第一次读到终态）。
 	// 最终输出任务读起来是幂等的，模型却不知道自己已经读过——同一个任务被连读
 	// 两三次、每次都拿到同样一段输出，界面看起来就像"重复渲染"。这个计数让
@@ -369,7 +373,7 @@ func (r *Registry) ListAll() []JobSnapshot {
 // 最终输出任务在终止后幂等返回终态输出（运行中为空）。终止读取标记 reported。
 func (r *Registry) readLocked(j *Job) Read {
 	if j.readOutput != nil {
-		return Read{Text: j.readOutput(), Snapshot: j.snapshot}
+		return Read{Text: j.readOutput(), Snapshot: j.snapshot, Streaming: true}
 	}
 	if j.snapshot.Status != StatusRunning && j.snapshot.Status != StatusStopping {
 		j.snapshot.Reported = true

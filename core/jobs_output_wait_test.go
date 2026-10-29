@@ -206,3 +206,43 @@ func TestJobOutputWaitStopsOnCancel(t *testing.T) {
 		t.Fatalf("取消后应返回当前快照，得到 %q", out)
 	}
 }
+
+// TestJobOutputDoesNotWaitLongForFinalOutput 后台命令这类 final-output 任务：
+// 运行期没有可读输出，等满 60s 也只是赌它马上结束。上限压到 3s，并明说「别轮询」。
+//
+// 现场（用户实测）：起一个长驻服务后调 job_output，干等 60s 仍是一行 (no output yet)；
+// 而模型随手再跑一条 curl/grep 立刻就有结果——因为那条命令的输出是它自己的 stdout，
+// 与后台任务无关。
+func TestJobOutputDoesNotWaitLongForFinalOutput(t *testing.T) {
+	t.Setenv("DSC_JOB_OUTPUT_WAIT_SECS", "60")
+	m := NewManager(&ManagerConfig{})
+
+	done := make(chan jobs.JobOutcome, 1)
+	id, err := m.jobs.Start(jobs.StartSpec{
+		Kind:  "shell",
+		Label: "long server",
+		Start: func() (jobs.JobHooks, error) {
+			return jobs.JobHooks{Done: done}, nil // ReadOutput=nil：落定前无可读输出
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { done <- jobs.JobOutcome{Status: jobs.StatusCompleted} }()
+
+	start := time.Now()
+	out, err := jobOutputOf(t, m, id)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("job_output: %v", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("final-output 任务不该按 60s 预算等待，实际等了 %v", elapsed)
+	}
+	if !strings.Contains(out, "(no output yet)") || !strings.Contains(out, "[status: running]") {
+		t.Fatalf("应如实回报运行中且无输出，得到 %q", out)
+	}
+	if !strings.Contains(out, "only when it finishes") {
+		t.Fatalf("应说明这类任务只在结束时才有输出（避免模型反复轮询），得到 %q", out)
+	}
+}

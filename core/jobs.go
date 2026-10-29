@@ -114,6 +114,14 @@ const outputWaitTimeout = 60 * time.Second
 // 是 500 次内存读，代价可以忽略，换来的是两条路径（final / stream）行为一致。
 const outputWaitPoll = 120 * time.Millisecond
 
+// finalOutputWait final-output 任务（绝大多数后台命令）的默认等待上限。
+//
+// 这类任务的输出**只在落定时**才可读，运行期永远是空的：等它等于赌「它就快结束了」。
+// 任务结束时宿主会主动送完成通知，所以赌错的代价就是白占一首歌的时间——实测用户
+// 起一个长驻服务后，`job_output` 干等满 60s 仍只有一行 (no output yet)。
+// 留 3s 只为接住「刚转后台就收尾」的短命令；真要阻塞等结果请显式 wait:true。
+const finalOutputWait = 3 * time.Second
+
 // jobWaitCap 生效的 wait 上限。DSC_JOB_WAIT_MAX_SECS 可覆盖：
 // 设为 0（或负数）即彻底禁止阻塞式等待——此时 wait:true 会被直接拒绝并提示
 // 「完成会通知你」，适合完全不允许工具调用占死模型的场景。
@@ -171,7 +179,7 @@ func (t *jobTool) Name() string { return t.name }
 func (t *jobTool) Description() string {
 	switch t.name {
 	case "job_output":
-		return "Read a background job's output and status. If the job has produced no output yet, this call waits up to 60s for the first output (or for the job to finish) before answering — so one call usually returns the real result instead of '(no output yet)'. Do not poll or sleep: a finished job also sends you a completion notice. Only use wait:true when you cannot take another step without the settled result; it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
+		return "Read a background job's output and status. Background commands expose their output only when they finish, so a still-running job answers '(no output yet)' — that is not bad luck, and polling will not change it: a completion notice reaches you automatically when the job ends. This call waits a few seconds first (to catch jobs that are about to finish), then reports the current state. Do not poll or sleep; if you need a live signal, run a separate short command (e.g. a curl/health check) instead of re-reading the job. Only use wait:true when you cannot take another step without the settled result: it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
@@ -246,6 +254,11 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 		rd = t.awaitFirstOutput(ctx, p.JobID, caller, rd)
 	}
 	out := renderJobOutput(rd)
+	if rd.Text == "" && jobRunning(rd.Snapshot.Status) && !rd.Streaming {
+		// 这类任务运行期没有可读输出：说清楚「别轮询」，否则模型会反复读空串。
+		out += "\n[note: this job exposes output only when it finishes; it is still running. " +
+			"Stop polling — a completion notice will reach you. Use wait:true only if you truly cannot proceed without the result.]"
+	}
 	if waitDropped {
 		out += "\n[note: blocking wait is disabled on this host; returned the current state instead. You will be notified when the job finishes.]"
 	}
@@ -267,6 +280,11 @@ func jobRunning(status jobs.JobStatus) bool {
 // 内容（流式任务本来就还没产生，最终输出任务在落定后仍可幂等读）。
 func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last jobs.Read) jobs.Read {
 	budget := jobOutputWait()
+	// final-output 任务：运行期没有可读输出，长等只是赌它马上结束。
+	// 催它快点没用，等满 60s 也一样是空——上限压到 finalOutputWait。
+	if !last.Streaming && budget > finalOutputWait {
+		budget = finalOutputWait
+	}
 	if budget <= 0 {
 		return last
 	}
