@@ -1,4 +1,4 @@
-// Package acp 是 acp-kernel 的 Go 原生重实现（对齐 MIT 协议的 acp-kernel TypeScript 核心算法）。
+// Package billion 是 acp-kernel 的 Go 原生重实现（对齐 MIT 协议的 acp-kernel TypeScript 核心算法）。
 //
 // 设计原则（对齐 acp-kernel DESIGN.md）：
 //   - 纯函数式核心：零 I/O、零状态存储，state 显式传入传出（像 zip(data)→data）
@@ -11,7 +11,7 @@
 //   - Go 而非 TypeScript（无 tiktoken 依赖，用字节/CJK 启发式 token 估算）
 //   - 不引入 absorb / filter / wire codec / transform-channel（高级特性留后续）
 //   - state 持久化由 adapter 层负责，核心不感知存储
-package acp
+package billion
 
 // MessageRole 消息角色（对齐 OpenAI/Anthropic 通用语义）。
 type MessageRole string
@@ -33,7 +33,7 @@ const (
 	ContentTypeReasoning  MessageContentType = "reasoning"
 )
 
-// CoreMessage acp 核心消息格式（对齐 acp-kernel CoreMessage）。
+// CoreMessage billion 核心消息格式（对齐 acp-kernel CoreMessage）。
 // adapter 层负责把 DSC proto.Message 翻译为此格式。
 type CoreMessage struct {
 	ID          string             `json:"id"`
@@ -149,7 +149,7 @@ type AbsorbRecord struct {
 	CreatedAt       int64  `json:"createdAt"`
 }
 
-// CompressionState acp 核心状态（显式传入传出，对齐 zip(data)→data 模型）。
+// CompressionState billion 核心状态（显式传入传出，对齐 zip(data)→data 模型）。
 // adapter 层负责持久化（JSON 文件 / session 事件）。
 // StateSchema 是 state 文件的当前格式版本。
 //
@@ -217,13 +217,13 @@ type Config struct {
 	PreserveRecentMessages int `json:"preserveRecentMessages"`
 	// TerminalEscapeAfter 连续近满无解轮数达到该值时发出逃逸信号（默认 3，0 禁用）
 	TerminalEscapeAfter int `json:"terminalEscapeAfter"`
-	// Absorb 即时工具结果吸收配置（默认关闭，DSC_ACP_ABSORB=1 开启）
+	// Absorb 即时工具结果吸收配置（默认关闭，DSC_BILLION_ABSORB=1 开启）
 	Absorb AbsorbConfig `json:"absorb"`
 	// Crush 工具结果的确定性压缩（absorb 两段式的第一段，默认关闭）。
 	// 只在 Absorb.Enabled 时生效：没有第二段兜底时压一半没有意义。
 	Crush CrushConfig `json:"crush"`
 	// CCR 内容缓存回取：大工具结果按内容 hash 存一次，线上只留占位符，
-	// 模型用 acp_retrieve 取回（默认关闭）。文本复用 dsc-txt:// 附件库，
+	// 模型用 billion_retrieve 取回（默认关闭）。文本复用 dsc-txt:// 附件库，
 	// 图像只记 dsc-img:// ref——不另建存储层。
 	CCR CCRConfig `json:"ccr"`
 }
@@ -282,7 +282,7 @@ func DefaultConfig(modelContextLimit int) Config {
 			Enabled:           false,
 			MinToolTokens:     2000,
 			InlineLimitTokens: 4000,
-			ToolName:          "acp_retrieve",
+			ToolName:          "billion_retrieve",
 			MaxEntries:        200,
 		},
 	}

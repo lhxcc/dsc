@@ -1,4 +1,4 @@
-// Package adapter 把 DSC 的 proto.Message 与 acp CoreMessage 互转。
+// Package adapter 把 DSC 的 proto.Message 与 billion CoreMessage 互转。
 // 同时负责 state 持久化（JSON 文件存储）。
 package adapter
 
@@ -9,12 +9,12 @@ import (
 	"strings"
 	"sync"
 
-	bcacp "dsc-billion-context/acp"
+	billion "dsc-billion-context/billion"
 	dsc "dsc-sdk"
 	"dsc/proto"
 )
 
-// ToCoreMessages 把 DSC proto.Message 列表转为 acp CoreMessage 列表。
+// ToCoreMessages 把 DSC proto.Message 列表转为 billion CoreMessage 列表。
 // ID 由调用方提供（通常为消息在 session 中的 seq 或 hash）。
 //
 // 转换规则：
@@ -22,40 +22,40 @@ import (
 //   - contentType 由 role + 是否有 ToolCalls 推断
 //   - text 取 Content 字段
 //   - toolName / toolCallId 取自 ToolCallId / 第一个 ToolCall.Name
-func ToCoreMessages(protoMsgs []*proto.Message, idProvider func(idx int, msg *proto.Message) string) []bcacp.CoreMessage {
+func ToCoreMessages(protoMsgs []*proto.Message, idProvider func(idx int, msg *proto.Message) string) []billion.CoreMessage {
 	if idProvider == nil {
 		idProvider = defaultIDProvider
 	}
-	out := make([]bcacp.CoreMessage, 0, len(protoMsgs))
+	out := make([]billion.CoreMessage, 0, len(protoMsgs))
 	for i, pm := range protoMsgs {
-		cm := bcacp.CoreMessage{
+		cm := billion.CoreMessage{
 			ID:   idProvider(i, pm),
-			Role: bcacp.MessageRole(pm.Role),
+			Role: billion.MessageRole(pm.Role),
 			Text: pm.Content,
 		}
 		// 推断 contentType
 		switch pm.Role {
 		case "tool":
-			cm.ContentType = bcacp.ContentTypeToolResult
+			cm.ContentType = billion.ContentTypeToolResult
 			cm.ToolCallID = pm.ToolCallId
 		case "assistant":
 			if len(pm.ToolCalls) > 0 {
-				cm.ContentType = bcacp.ContentTypeToolCall
+				cm.ContentType = billion.ContentTypeToolCall
 				cm.ToolName = pm.ToolCalls[0].Name
 				cm.ToolCallID = pm.ToolCalls[0].Id
 			} else {
-				cm.ContentType = bcacp.ContentTypeText
+				cm.ContentType = billion.ContentTypeText
 			}
 		case "system":
-			cm.ContentType = bcacp.ContentTypeText
+			cm.ContentType = billion.ContentTypeText
 		default: // user
-			cm.ContentType = bcacp.ContentTypeText
+			cm.ContentType = billion.ContentTypeText
 		}
 		// 工具调用与图像引用保真透传（改写往返不丢结构化字段）——
 		// ArgumentsJson 必须一起带：丢了以后模型看到自己的历史全是「调过某工具、
 		// 参数未知」，既无法判断自己做过什么，也无法复用上一次的命令。
 		for _, tc := range pm.ToolCalls {
-			cm.ToolCalls = append(cm.ToolCalls, bcacp.CoreToolCall{
+			cm.ToolCalls = append(cm.ToolCalls, billion.CoreToolCall{
 				ID:        tc.Id,
 				Name:      tc.Name,
 				Arguments: tc.ArgumentsJson,
@@ -69,9 +69,9 @@ func ToCoreMessages(protoMsgs []*proto.Message, idProvider func(idx int, msg *pr
 	return out
 }
 
-// FromCoreMessages 把 acp CoreMessage 列表转回 DSC proto.Message。
+// FromCoreMessages 把 billion CoreMessage 列表转回 DSC proto.Message。
 // 用于把改写后的消息列表发回给 LLM。
-func FromCoreMessages(coreMsgs []bcacp.CoreMessage) []*proto.Message {
+func FromCoreMessages(coreMsgs []billion.CoreMessage) []*proto.Message {
 	out := make([]*proto.Message, 0, len(coreMsgs))
 	for _, cm := range coreMsgs {
 		pm := &proto.Message{
@@ -121,30 +121,30 @@ const PluginName = "dsc-billion-context"
 
 // StateFileSuffix 是压缩状态文件的命名：<会话 id>.<插件名>.json。
 //
-// 用插件名而不是某个跨模块共享的固定后缀（如 ".acp.json"）：插件是**可分离**的，
+// 用插件名而不是某个跨模块共享的固定后缀（如 ".dsc-billion-context.json"）：插件是**可分离**的，
 // 宿主核心不该知道某个插件的落盘细节——删掉本插件后，core 里不该残留任何只为它
 // 服务的常量或清理代码。文件名自带插件名，同目录多个插件互不冲突、人工也看得懂。
 const StateFileSuffix = "." + PluginName + ".json"
 
-// StateStore 负责 acp state 的持久化（JSON 文件）。
+// StateStore 负责 billion state 的持久化（JSON 文件）。
 // 每个 session 一个 state 文件，路径为 dir/<sessionID>.<插件名>.json，目录由调用方
 // 传 dsc.SessionDir()（与会话日志同目录，靠文件名区分）。
 type StateStore struct {
 	mu    sync.Mutex
 	dir   string
-	cache map[string]*bcacp.CompressionState // sessionID → state
+	cache map[string]*billion.CompressionState // sessionID → state
 }
 
 // NewStateStore 创建状态存储。dir 为存储目录（ExecDir/sessions，与宿主会话同目录）。
 func NewStateStore(dir string) *StateStore {
 	return &StateStore{
 		dir:   dir,
-		cache: map[string]*bcacp.CompressionState{},
+		cache: map[string]*billion.CompressionState{},
 	}
 }
 
 // Load 加载（或创建）指定 session 的 state。
-func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
+func (s *StateStore) Load(sessionID string) (*billion.CompressionState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if st, ok := s.cache[sessionID]; ok {
@@ -157,22 +157,22 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			st := bcacp.CreateInitialState()
+			st := billion.CreateInitialState()
 			s.cache[sessionID] = st
 			return st, nil
 		}
-		return nil, fmt.Errorf("load acp state: %w", err)
+		return nil, fmt.Errorf("load billion state: %w", err)
 	}
-	var st bcacp.CompressionState
+	var st billion.CompressionState
 	if err := json.Unmarshal(data, &st); err != nil {
 		// 损坏的 state 文件：重建（避免阻塞会话）
-		st = *bcacp.CreateInitialState()
-	} else if st.Schema != bcacp.StateSchema {
+		st = *billion.CreateInitialState()
+	} else if st.Schema != billion.StateSchema {
 		// 格式版本不符：不解读、不迁移，整个丢弃。压缩记录由会话事件日志重建
 		// （compress 调用自带范围与摘要，重放即可复原），旧格式不保留兼容分支。
 		fmt.Fprintf(os.Stderr, "[billion-context] state schema %d != %d: discarded, will rebuild from the session log\n",
-			st.Schema, bcacp.StateSchema)
-		st = *bcacp.CreateInitialState()
+			st.Schema, billion.StateSchema)
+		st = *billion.CreateInitialState()
 	} else {
 		// map 写成 null（手工编辑、半截写入）时补初始化：写回 nil map 会 panic。
 		if st.MessageRefs.ByRaw == nil {
@@ -194,21 +194,21 @@ func (s *StateStore) Load(sessionID string) (*bcacp.CompressionState, error) {
 // 原子写：先写同目录临时文件并 fsync，再 rename 覆盖目标。直接 WriteFile 在进程崩溃
 // 或断电时可能留下半截 JSON——下次 Load 解析失败虽然会重建，但压缩记录全丢，
 // 上下文随即重新膨胀（压缩是"只增不减"的收益，丢一次等于全部白做）。
-func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error {
+func (s *StateStore) Save(sessionID string, state *billion.CompressionState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cache[sessionID] = state
 	if err := os.MkdirAll(s.dir, 0755); err != nil {
-		return fmt.Errorf("create acp state dir: %w", err)
+		return fmt.Errorf("create billion state dir: %w", err)
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal acp state: %w", err)
+		return fmt.Errorf("marshal billion state: %w", err)
 	}
 
 	tmp, err := os.CreateTemp(s.dir, ".state-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temp acp state: %w", err)
+		return fmt.Errorf("create temp billion state: %w", err)
 	}
 	tmpName := tmp.Name()
 	committed := false
@@ -220,14 +220,14 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write temp acp state: %w", err)
+		return fmt.Errorf("write temp billion state: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("sync temp acp state: %w", err)
+		return fmt.Errorf("sync temp billion state: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp acp state: %w", err)
+		return fmt.Errorf("close temp billion state: %w", err)
 	}
 	dst, err := s.path(sessionID)
 	if err != nil {
@@ -235,7 +235,7 @@ func (s *StateStore) Save(sessionID string, state *bcacp.CompressionState) error
 	}
 	// os.Rename 在 Windows 上等价于 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，可覆盖目标
 	if err := os.Rename(tmpName, dst); err != nil {
-		return fmt.Errorf("commit acp state: %w", err)
+		return fmt.Errorf("commit billion state: %w", err)
 	}
 	committed = true
 	return nil

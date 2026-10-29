@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"strings"
@@ -43,7 +43,7 @@ func TestCCROffloadsLargeResultsOnly(t *testing.T) {
 		t.Fatalf("条目 token 数应达门槛，实际 %d", got)
 	}
 	// 占位符必须给出可用的 ref 与取回指引
-	if !strings.Contains(out[0].Text, off[0].Entry.Ref) || !strings.Contains(out[0].Text, "acp_retrieve") {
+	if !strings.Contains(out[0].Text, off[0].Entry.Ref) || !strings.Contains(out[0].Text, "billion_retrieve") {
 		t.Fatalf("占位符应带 ref 与取回工具名: %s", out[0].Text)
 	}
 }
@@ -56,11 +56,11 @@ func TestCCRPlaceholderDeterministic(t *testing.T) {
 
 	e1 := CCREntry{Ref: "c00003", Shasum: "abc", Kind: CCRKindText, Tool: "shell", Tokens: 1000, Bytes: 4000, Preview: "npm run build"}
 	e2 := e1
-	if BuildCCRPlaceholder(e1, "acp_retrieve") != BuildCCRPlaceholder(e2, "acp_retrieve") {
+	if BuildCCRPlaceholder(e1, "billion_retrieve") != BuildCCRPlaceholder(e2, "billion_retrieve") {
 		t.Fatal("同一条目必须产出同一占位符")
 	}
 	// 与内容无关：body 变了但条目相同，占位符不变（说明没有把原文掺进去）
-	if BuildCCRPlaceholder(e1, "acp_retrieve") != BuildCCRPlaceholder(e2, "acp_retrieve") {
+	if BuildCCRPlaceholder(e1, "billion_retrieve") != BuildCCRPlaceholder(e2, "billion_retrieve") {
 		t.Fatal("占位符不应依赖原文")
 	}
 

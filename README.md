@@ -271,7 +271,7 @@ TUI 輸入框按 `@` 會彈出當前工作區的文件候選篩選列表（對�
 ### DSC 通用插件
 
 - `dsc-notify`（通知音效插件：**通用 dsc 類型**，純後台程序性驅動、不暴露模型工具——經 Hook.OnEvent 訂閲宿主通用 agent 回合事件，成功（`agent/status` idle）播 success、失敗（`agent/error`）播 error，無需模型調用；內置音效 success/error/warning/info 與自定義 `.mp3/.wav`）
-- `dsc-billion-context`（高級上下文管理插件：**通用 dsc 類型**，以 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 算法接管 DSC 默認的 compaction-basic 壓縮機制。Go 原生重實現 acp-kernel 核心（獨立重寫非移植），經 SDK 通用事件鈎子接管：`Hook.OnEvent` 攔截 `agent/pre-step` 改寫消息列表、`Hook.ContextFn` 貢獻 ACP system prompt（對齊 DSH `ctx.systemPrompt.section`）。**模型驅動壓縮**——模型決定何時壓、壓什麼範圍，插件編排其他一切。3 層 LSM-tree：T1 標準壓縮（消息範圍→摘要）、T2 蒸餾（T1 塊→T2）、T3 凝結（T2 塊→T3）。4 個模型可見工具：`compress`（壓縮消息範圍為摘要塊、用 `bN` 塊引用觸發蒸餾）、`decompress`（恢復壓縮塊內容）、`search_context`（在壓縮塊摘要中搜索關鍵詞）、`acp_status`（查看上下文使用率與可壓縮範圍）。前綴緩存穩定：summary 原位嵌入（不堆到頭部）、不注入 `<acp>` 標籤到消息文本、nudge 作為尾部 user 消息。state 持久化：每 session 一個 JSON 文件。config.yaml `compaction: dsc-billion-context` 顯式選為後端；提供 `compaction` 能力。詳見 `plugins/dsc-billion-context/README.md`）
+- `dsc-billion-context`（高級上下文管理插件：**通用 dsc 類型**，以 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 算法接管 DSC 默認的 compaction-basic 壓縮機制。Go 原生重實現 acp-kernel 核心（獨立重寫非移植），經 SDK 通用事件鈎子接管：`Hook.OnEvent` 攔截 `agent/pre-step` 改寫消息列表、`Hook.ContextFn` 貢獻 billion-context system prompt（對齊 DSH `ctx.systemPrompt.section`）。**模型驅動壓縮**——模型決定何時壓、壓什麼範圍，插件編排其他一切。3 層 LSM-tree：T1 標準壓縮（消息範圍→摘要）、T2 蒸餾（T1 塊→T2）、T3 凝結（T2 塊→T3）。4 個模型可見工具：`compress`（壓縮消息範圍為摘要塊、用 `bN` 塊引用觸發蒸餾）、`decompress`（恢復壓縮塊內容）、`search_context`（在壓縮塊摘要中搜索關鍵詞）、`billion_status`（查看上下文使用率與可壓縮範圍）。前綴緩存穩定：summary 原位嵌入（不堆到頭部）、不注入 `<billion>` 標籤到消息文本、nudge 作為尾部 user 消息。state 持久化：每 session 一個 JSON 文件。config.yaml `compaction: dsc-billion-context` 顯式選為後端；提供 `compaction` 能力。詳見 `plugins/dsc-billion-context/README.md`）
 
 ## 目錄結構
 

@@ -3,7 +3,7 @@ package adapter
 import (
 	"testing"
 
-	bcacp "dsc-billion-context/acp"
+	billion "dsc-billion-context/billion"
 	"dsc/proto"
 )
 
@@ -166,9 +166,9 @@ func TestLoadDiscardsStateWithUnknownSchema(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStateStore(dir)
 
-	old := bcacp.CreateInitialState()
-	old.Schema = bcacp.StateSchema - 1
-	old.Blocks = []bcacp.CompressionBlock{{
+	old := billion.CreateInitialState()
+	old.Schema = billion.StateSchema - 1
+	old.Blocks = []billion.CompressionBlock{{
 		BlockID:             "b0",
 		Active:              true,
 		StartRef:            "m00001",
@@ -188,7 +188,7 @@ func TestLoadDiscardsStateWithUnknownSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.Schema != bcacp.StateSchema {
+	if got.Schema != billion.StateSchema {
 		t.Fatalf("应返回当前版本的空状态，实际 schema = %d", got.Schema)
 	}
 	if len(got.Blocks) != 0 || len(got.MessageRefs.ByRaw) != 0 {

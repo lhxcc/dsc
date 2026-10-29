@@ -1,4 +1,4 @@
-package acp
+package billion
 
 // CCR：内容缓存回取（对齐 acp-kernel src/ccr.ts + content-store.ts）。
 //
@@ -6,7 +6,7 @@ package acp
 // 某个精确的报错行或完整 JSON 时只能重跑工具。
 //
 // CCR 的做法：工具结果到达时就按内容 hash 存一次，线上只留一个**确定性的占位符**
-// （带种类、大小、命令预览、ref），模型用 acp_retrieve 把原文取回来。
+// （带种类、大小、命令预览、ref），模型用 billion_retrieve 把原文取回来。
 //
 // ## 与 DSC 现有机制的关系（这是本实现与内核最大的不同）
 //
@@ -40,7 +40,7 @@ type CCRConfig struct {
 	// InlineLimitTokens 回取时单次内联上限（默认 4000）：超过就导出成文件给指针，
 	// 避免"取回"把上下文又撑爆——这是 CCR 的边界，不是越取越好。
 	InlineLimitTokens int `json:"inlineLimitTokens"`
-	// ToolName 模型可见的回取工具名（默认 acp_retrieve）。
+	// ToolName 模型可见的回取工具名（默认 billion_retrieve）。
 	ToolName string `json:"toolName"`
 	// MaxEntries 每会话最多保留条目数（默认 200，超出后最旧的先淘汰）。
 	MaxEntries int `json:"maxEntries"`
@@ -58,7 +58,7 @@ const (
 
 // CCREntry 一条已卸载内容。字段顺序即序列化顺序，便于人工比对。
 type CCREntry struct {
-	Ref string `json:"ref"` // 短 ref（c00001），模型在 acp_retrieve 里引用它
+	Ref string `json:"ref"` // 短 ref（c00001），模型在 billion_retrieve 里引用它
 	// Shasum 内容的 SHA-256（十六进制）——内容寻址，相同字节只存一份。
 	Shasum string  `json:"sha"`
 	Kind   CCRKind `json:"kind"`
@@ -80,8 +80,8 @@ const PreviewMaxRunes = 80
 
 // ccrPlaceholderOpen/Close 占位符标记。两者成对出现，用于识别"这条已经是占位符"。
 const (
-	ccrPlaceholderOpen  = "📦 [acp-stored "
-	ccrPlaceholderClose = "\n   → acp_retrieve("
+	ccrPlaceholderOpen  = "📦 [billion-stored "
+	ccrPlaceholderClose = "\n   → billion_retrieve("
 )
 
 // CCRRefFor 生成短 ref。编号来自 state.NextCCRID，单调递增、永不复用
@@ -104,7 +104,7 @@ func CCRKindOf(msg CoreMessage) CCRKind {
 //
 // 门控（顺序即优先级，任何一步不满足都不动）：
 //  1. 开关打开
-//  2. 是工具结果、且不是 ACP 自己的工具（compress/absorb/acp_retrieve 的结果
+//  2. 是工具结果、且不是 billion 自己的工具（compress/absorb/billion_retrieve 的结果
 //     本来就不该被再卸载一层）
 //  3. 不是已经卸载过的占位符（幂等）
 //  4. 规模达 MinToolTokens
@@ -116,7 +116,7 @@ func ShouldOffload(msg CoreMessage, config Config) bool {
 	if msg.ContentType != ContentTypeToolResult {
 		return false
 	}
-	if isACPManagedTool(msg.ToolName, config.Absorb) {
+	if isBillionManagedTool(msg.ToolName, config.Absorb) {
 		return false
 	}
 	if IsCCRPlaceholder(msg.Text) {
@@ -145,7 +145,7 @@ func IsCCRPlaceholder(text string) bool {
 // 每轮看到的都是这串字节，前缀缓存才不会失效（随机数、时间戳、行号都会打破它）。
 func BuildCCRPlaceholder(entry CCREntry, toolName string) string {
 	if toolName == "" {
-		toolName = "acp_retrieve"
+		toolName = "billion_retrieve"
 	}
 	var b strings.Builder
 	b.WriteString(ccrPlaceholderOpen)
@@ -269,7 +269,7 @@ func PlanRetrieval(entry CCREntry, config Config, fullText string) CCRRetrieval 
 // CCRPointerText 生成"超限已导出"的模型可见文案。
 func CCRPointerText(entry CCREntry, exportPath string, inlineTokens int) string {
 	return fmt.Sprintf(
-		"[acp-retrieved %s 已导出到工作区文件: %s（%d tok，超过单次内联上限 %d）]\n"+
+		"[billion-retrieved %s 已导出到工作区文件: %s（%d tok，超过单次内联上限 %d）]\n"+
 			"请用你的文件读取工具分页读取该文件（offset/limit），避免一次性塞满上下文。",
 		entry.Ref, exportPath, entry.Tokens, inlineTokens)
 }
@@ -309,7 +309,7 @@ func FindCCREntry(entries []CCREntry, ref string) (CCREntry, bool) {
 // CCREffects 由 ProcessTurn 产出、交由插件侧执行的副作用。
 //
 // 内核的约定是"kernel 不做 IO，只产出 host effects"；DSC 照此办理：
-// acp 只算出「这条消息该卸载、ref 是 c00007、字节是这些」，真正写附件库、
+// billion 只算出「这条消息该卸载、ref 是 c00007、字节是这些」，真正写附件库、
 // 写状态文件的是 main.go。
 type CCREffects struct {
 	// Offloads 需要落盘并替换为占位符的消息

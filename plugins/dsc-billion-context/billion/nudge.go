@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"fmt"
@@ -195,7 +195,7 @@ func DecideNudge(messages []CoreMessage, state *CompressionState, config Config,
 		decision.Tier = &tier
 		decision.TierTargetBlocks = t2Blocks
 		decision.ShouldInject = true
-		// 不暴露使用率百分比（对齐 ACP 设计：模型不应知道总上下文大小，
+		// 不暴露使用率百分比（对齐 billion 设计：模型不应知道总上下文大小，
 		// 避免模型"认为还很健康就懒得压缩"）
 		decision.Reason = fmt.Sprintf("T3 condense: %d tier-2 blocks (%d tokens of summaries, threshold %d)",
 			t2Count, t2Mass, massThreshold)
@@ -221,7 +221,7 @@ func DecideNudge(messages []CoreMessage, state *CompressionState, config Config,
 		return decision
 	}
 	// 全部条件满足：注入 nudge
-	// 不暴露使用率百分比——只告诉模型有可压缩内容（对齐 ACP 设计）
+	// 不暴露使用率百分比——只告诉模型有可压缩内容（对齐 billion 设计）
 	decision.ShouldInject = true
 	decision.Reason = fmt.Sprintf("%d compressible ranges detected", len(recommended))
 	return decision
@@ -270,7 +270,7 @@ func ComputeCompressibleRanges(messages []CoreMessage, state *CompressionState, 
 		// 跳过 system 消息（v3 system prompt surface node 0 + billion-context
 		// 已渲染的 summary 消息均为 system role）——对齐 DSH "node 0 is never
 		// inside a compaction range" 与 billion-context 自身的 summary 不可再压缩语义。
-		// 此前仅跳过 isRenderedSummary（ID 形如 acp_summary_bN），漏过了 v3 新增的
+		// 此前仅跳过 isRenderedSummary（ID 形如 billion_summary_bN），漏过了 v3 新增的
 		// system prompt（surface node 0 派生、ID 非 summary 前缀），导致 nudge 可能
 		// 把 system prompt 纳入可压缩范围、模型调用 compress 时丢失基础指令。
 		if msg.Role == RoleSystem {
@@ -340,7 +340,7 @@ func FormatNudgeText(d NudgeDecision) string {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[ACP Nudge: %s]\n", d.Reason))
+	sb.WriteString(fmt.Sprintf("[billion nudge: %s]\n", d.Reason))
 
 	// 蒸馏提示（T2/T3）：列出待蒸馏的目标块
 	if d.Tier != nil && len(d.TierTargetBlocks) > 0 {

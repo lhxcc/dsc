@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	bcacp "dsc-billion-context/acp"
+	billion "dsc-billion-context/billion"
 	bcadapter "dsc-billion-context/adapter"
 
 	dsc "dsc-sdk"
@@ -20,7 +20,7 @@ func TestEmptyPreStepPayloadDoesNothing(t *testing.T) {
 	dir := t.TempDir()
 	bc := &BillionContext{
 		store:  bcadapter.NewStateStore(dir),
-		config: bcacp.DefaultConfig(1_000_000),
+		config: billion.DefaultConfig(1_000_000),
 	}
 
 	out, err := bc.handlePreStep(context.Background(), `{"session":"s-empty","token_count":900000,"projected_tokens":900000}`)

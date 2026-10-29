@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"encoding/json"
@@ -62,8 +62,8 @@ func TestCrushJSONFoldIsStructural(t *testing.T) {
 	if err := json.Unmarshal([]byte(eval.Text), &v); err != nil {
 		t.Fatalf("压缩结果必须仍是合法 JSON: %v\n%s", err, eval.Text)
 	}
-	if v["__acp_crush"] != "rows" {
-		t.Fatalf("应带 __acp_crush 信封: %v", v["__acp_crush"])
+	if v["__billion_crush"] != "rows" {
+		t.Fatalf("应带 __billion_crush 信封: %v", v["__billion_crush"])
 	}
 	// 相同行必须被折叠成一条带计数的信封（60 行 => 1 条 count=60）
 	out := eval.Text

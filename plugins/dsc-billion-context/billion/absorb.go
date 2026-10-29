@@ -1,4 +1,4 @@
-package acp
+package billion
 
 import (
 	"encoding/json"
@@ -15,14 +15,14 @@ import (
 // （正交设计）。
 
 // AbsorbPromptMarker 吸收提示标记（识别已提示/已吸收）。
-const AbsorbPromptMarker = "[ACP absorb]"
+const AbsorbPromptMarker = "[billion absorb]"
 
-// ACPTeamTools ACP 管理的工具名集合（其结果不可吸收）。
-var ACPManagedTools = map[string]bool{
+// BillionTeamTools billion 管理的工具名集合（其结果不可吸收）。
+var BillionManagedTools = map[string]bool{
 	"compress":       true,
 	"decompress":     true,
 	"search_context": true,
-	"acp_status":     true,
+	"billion_status":     true,
 	"absorb":         true,
 }
 
@@ -78,25 +78,25 @@ func matchToolPattern(toolName, pattern string) bool {
 	return toolName == pattern
 }
 
-// isACPManagedTool 报告工具是否 ACP 管理或吸收工具自身。
-func isACPManagedTool(toolName string, cfg AbsorbConfig) bool {
+// isBillionManagedTool 报告工具是否 billion 管理或吸收工具自身。
+func isBillionManagedTool(toolName string, cfg AbsorbConfig) bool {
 	if toolName == "" {
 		return false
 	}
 	if toolName == cfg.ToolName {
 		return true
 	}
-	return ACPManagedTools[toolName]
+	return BillionManagedTools[toolName]
 }
 
 // IsAbsorbCandidate 报告工具结果消息是否在吸收提示范围内：
-// 非 ACP 管理、未排除、未受保护的工具的 tool-result。
+// 非 billion 管理、未排除、未受保护的工具的 tool-result。
 func IsAbsorbCandidate(msg CoreMessage, config Config) bool {
 	if msg.ContentType != ContentTypeToolResult || msg.ToolCallID == "" {
 		return false
 	}
 	cfg := config.Absorb
-	if isACPManagedTool(msg.ToolName, cfg) {
+	if isBillionManagedTool(msg.ToolName, cfg) {
 		return false
 	}
 	for _, t := range config.ProtectedTools {
@@ -261,8 +261,8 @@ func ApplyAbsorb(ref, summary, absorbCallID string, messages []CoreMessage, stat
 	if target.ContentType != ContentTypeToolResult {
 		return AbsorbOutcome{State: state, ResultText: "absorb failed: ref " + ref + " is a " + string(target.ContentType) + ", not a tool result."}
 	}
-	if isACPManagedTool(target.ToolName, cfg) {
-		return AbsorbOutcome{State: state, ResultText: "absorb failed: " + target.ToolName + " is an ACP-managed tool result — it is not absorbable."}
+	if isBillionManagedTool(target.ToolName, cfg) {
+		return AbsorbOutcome{State: state, ResultText: "absorb failed: " + target.ToolName + " is an billion-managed tool result — it is not absorbable."}
 	}
 	for _, t := range config.ProtectedTools {
 		if matchToolPattern(target.ToolName, t) {
