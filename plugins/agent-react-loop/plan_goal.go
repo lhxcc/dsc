@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	dsc "dsc-sdk"
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -145,9 +145,6 @@ func (a *ReactLoopAgent) execExitPlanMode(ctx context.Context, tc *proto.ToolCal
 	if !inPlanMode {
 		return &proto.ExecuteToolResponse{Error: "exit_plan_mode is only available in plan mode"}, false
 	}
-	// 计划正文是人读的散文：模型把换行写成字面量 `\n` 时，评审卡片会显示成一整行。
-	// 先归一化再校验——否则「# 标题\n\n…」这种被转义的正文会让标题行判定连带失效。
-	args.Plan = normalizeModelText(args.Plan)
 	if !regexp.MustCompile(`^#\s+\S`).MatchString(strings.TrimSpace(args.Plan)) {
 		return &proto.ExecuteToolResponse{Error: "exit_plan_mode requires a non-empty markdown plan starting with a # heading"}, false
 	}
@@ -230,90 +227,6 @@ func mapAskError(code, message string) string {
 	}
 }
 
-// normalizeModelText 展开模型「过度转义」的换行与制表符。
-//
-// 模型偶尔把换行写成 JSON 里的 `\\n`（本该是 `\n`），解码后落成**反斜杠 + n 两个
-// 字符**，于是提问卡片上原样显示 `\n\n`、段落挤成一行——用户看到的是转义残渣。
-//
-// 为什么敢展开：这段文本是**给人读的散文**，里面本来就不该出现字面量 `\n`。但仍要防
-// 反例——Windows 路径与正则里 `\n`、`\t` 是常客（`C:\temp\new`、`\node`）。判据两条：
-//   - 整段已经含真换行 → 模型会写换行，剩下的反斜杠按有意处理，一字不动；
-//   - 只要有一处 `\n`/`\t` 后面紧跟 ASCII 字母/数字/下划线（路径与标识符的形状），
-//     整段按「原文反斜杠」处理，不展开。
-//
-// 也就是只在「每一处都像换行」时才动手：后面是空行、标点、CJK 或结尾。英语散文
-// `line1\nline2` 会被判成后者（后继是字母），继续显示字面量——这是刻意选的方向：
-// 宁可少展开一次，也不要把用户正要照抄的路径改坏。
-func normalizeModelText(s string) string {
-	if s == "" || strings.ContainsAny(s, "\r\n") {
-		return s
-	}
-	expand := false
-	for i := 0; i < len(s); i++ {
-		if s[i] != '\\' || i+1 >= len(s) {
-			continue
-		}
-		switch s[i+1] {
-		case 'n', 't':
-			if !looksLikeLineBreak(s, i+2) {
-				return s
-			}
-			expand = true
-		case 'r':
-			// `\r\n` 的另一半，交给下面的替换处理；单独 `\r` 不是我们关心的形态
-		default:
-			continue
-		}
-		i++
-	}
-	if !expand {
-		return s
-	}
-	// `\r\n` 先换，免得只吃掉一半留下孤立 CR。
-	return strings.NewReplacer(`\r\n`, "\n", `\n`, "\n", `\t`, "\t").Replace(s)
-}
-
-// looksLikeLineBreak 判断 s[i:] 之后的位置像不像「换行后的续行开头」。
-//
-// 路径与标识符的续字是 ASCII 字母/数字/下划线；换行后的续行更常见的是空白、标点、
-// CJK 或直接结束。
-func looksLikeLineBreak(s string, i int) bool {
-	if i >= len(s) {
-		return true
-	}
-	c := s[i]
-	if c >= 0x80 { // 非 ASCII（CJK 等）按续行处理
-		return true
-	}
-	switch {
-	case c == ' ' || c == '\t':
-		return true
-	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_':
-		return false
-	}
-	return true
-}
-
-// normalizeQuestion 把模型给的人类可读文案归一化（提问、页眉、补充说明、选项）。
-//
-// 只碰这些字段：它们是给**人**读的散文；工具参数里的反斜杠（路径、正则、脚本）
-// 一律不动——那里不该替模型猜语义。
-func normalizeQuestion(q *proto.AskQuestion) {
-	if q == nil {
-		return
-	}
-	q.Question = normalizeModelText(q.Question)
-	q.Header = normalizeModelText(q.Header)
-	q.Detail = normalizeModelText(q.Detail)
-	for _, o := range q.Options {
-		if o == nil {
-			continue
-		}
-		o.Label = normalizeModelText(o.Label)
-		o.Description = normalizeModelText(o.Description)
-	}
-}
-
 // execAskUserQuestion 向用户提出简明问题并等待回答（对齐 DSH tool-ask-user）：
 // 参数 questions[] 原样经 UserQuestionsService 交给宿主 UI，回答以规范紧凑 JSON
 // {answers:[{id,selected,custom?}]} 返回（custom 为空时省略；selected 可含零至多个标签，
@@ -327,9 +240,6 @@ func (a *ReactLoopAgent) execAskUserQuestion(ctx context.Context, tc *proto.Tool
 	}
 	if len(args.Questions) == 0 {
 		return &proto.ExecuteToolResponse{Error: "ask_user_question requires a non-empty questions array"}, false
-	}
-	for _, q := range args.Questions {
-		normalizeQuestion(q)
 	}
 	client := a.ensureUserQuestionsClient()
 	if client == nil {
