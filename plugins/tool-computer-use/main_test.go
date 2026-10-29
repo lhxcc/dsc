@@ -16,6 +16,18 @@ import (
 // 纯函数单测（无 X11 依赖）
 // ---------------------------------------------------------------------------
 
+// requireInputBackend 跳过需要真实输入/截图后端的用例。
+//
+// robotgo 是 cgo 依赖：无 C 工具链的机器上 rb* 是「明确报错」的替身（rb_nocgo.go），
+// 这些用例在那里没有意义（它们要的是真实屏幕/鼠标/键盘）。纯逻辑用例不调用它，
+// 因此在同样的环境里照常跑——这正是把后端拆成两个构建变体的目的。
+func requireInputBackend(t *testing.T) {
+	t.Helper()
+	if !inputBackendReady {
+		t.Skip("跳过：本构建未启用 CGO（无 C 工具链），真实输入/截图后端不可用")
+	}
+}
+
 func TestClampInt(t *testing.T) {
 	cases := []struct{ v, lo, hi, want int }{
 		{5, 0, 10, 5},
@@ -195,6 +207,7 @@ func requireDisplay(t *testing.T) {
 }
 
 func TestXScreenSizeAndCapture(t *testing.T) {
+	requireInputBackend(t)
 	requireDisplay(t)
 	w, h := rbScreenSize()
 	if w <= 0 || h <= 0 {
@@ -220,6 +233,7 @@ func TestXScreenSizeAndCapture(t *testing.T) {
 }
 
 func TestXRegionCaptureAndScale(t *testing.T) {
+	requireInputBackend(t)
 	requireDisplay(t)
 	w, _ := rbScreenSize()
 	big := 640
@@ -240,6 +254,7 @@ func TestXRegionCaptureAndScale(t *testing.T) {
 }
 
 func TestXMouseMoveReadback(t *testing.T) {
+	requireInputBackend(t)
 	requireDisplay(t)
 	rbMoveMouse(100, 100)
 	x, y := rbMousePos()
@@ -254,6 +269,7 @@ func TestXMouseMoveReadback(t *testing.T) {
 }
 
 func TestXKeyTapNoError(t *testing.T) {
+	requireInputBackend(t)
 	requireDisplay(t)
 	if err := rbKeyTap("enter"); err != nil {
 		t.Fatalf("KeyTap enter 失败: %v", err)
@@ -264,6 +280,7 @@ func TestXKeyTapNoError(t *testing.T) {
 }
 
 func TestXScreenHandlerEnvelope(t *testing.T) {
+	requireInputBackend(t)
 	requireDisplay(t)
 	args := json.RawMessage(`{"show_grid": true}`)
 	out, err := screenHandler(context.Background(), args)

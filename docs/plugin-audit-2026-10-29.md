@@ -95,12 +95,23 @@ core」，例外表也写着「当前为空」——守卫在说谎。
 - `TestPluginsDoNotImportCore` 的例外表**清空**——现在全部插件确实只依赖 SDK，守卫那句
   「全部插件均已脱离 core」才成立。
 
-## 五、留给以后的一件事（本次未动）
+## 五、`tool-computer-use` 在无 C 工具链机器上不再阻塞测试套件
 
-1. `tool-computer-use` 在本机测试需要 C 工具链（`zig`/`gcc`/`clang` 之一）：CI 或无工具链
-   机器上它会红，而 `builder` 会正常构建（本机走 `E:\winkit\share\zig-...\zig.exe cc`）。
-   要不要在测试里检测工具链并 `t.Skip`，由部署策略定。
+robotgo 是 cgo 依赖，没有 C 工具链时整个包编译不过——连 `clampInt`、`normalizeKey`、
+截图编码这些**根本不碰 robotgo** 的纯逻辑用例也一起跑不了。这属于「一个环境缺陷拖死整份
+测试报告」，会让真正的回归淹没在噪音里。
 
-   顺带记录一次**构建偶发**：同一台机器同一命令，一次 zig 编译失败（`所有编译器均失败`）、
-   立刻重试即成功（`zig.exe cc 编译成功`）。不是代码问题，像是 zig 缓存/并发锁；若再遇到
-   同样的红，先重试一次再怀疑代码。
+改法：把 `rb*` 薄封装拆成两个构建变体（调用点保持不变，签名必须一致，漂移会立刻编译失败）：
+
+- `rb_cgo.go`（`//go:build cgo`）：真实 robotgo，`inputBackendReady = true`；
+- `rb_nocgo.go`（`//go:build !cgo`）：同名同型的替身，每次输入/截图返回一条能读懂的错误
+  （`computer_use 不可用：本二进制构建时未启用 CGO…`），启动时向 stderr 说明一次
+  （`DSC_COMPUTER_USE_SILENT_NOCGO` 可静音），`inputBackendReady = false`；
+- 5 个真实输入/截图用例加 `requireInputBackend(t)` → 无 cgo 时 `t.Skip`；9 个纯逻辑用例照跑。
+
+结果：无 cgo 环境下 `go test` = 9 PASS + 5 SKIP + ok；**发布包不受影响**——builder 走 cgo
+构建（工具链自动探测），打进 dist 的仍是真实后端。
+
+**另外记录一次构建偶发**：同一台机器同一命令，一次 zig 编译失败（`所有编译器均失败`）、
+立刻重试即成功（`zig.exe cc 编译成功`）。不是代码问题，像是 zig 缓存/并发锁；再遇到同样的
+红，先重试一次再怀疑代码。

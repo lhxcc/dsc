@@ -15,6 +15,10 @@
 //
 // Linux 构建依赖：gcc 与 X11 开发头文件（libx11-dev / libxtst-dev / libxi-dev）、
 // libXtst 链接库；运行期需要可用 DISPLAY（X11，Wayland 下能力受限）。
+//
+// 无 C 工具链时（`CGO_ENABLED=0`）：包照常编译，但输入/截图后端是「明确报错」的替身
+// （rb_nocgo.go）——纯逻辑单测仍可跑，工具调用会返回「本构建未启用 CGO」。发布包一律
+// 走 cgo 构建（builder 自动探测工具链），不受此影响。
 package main
 
 import (
@@ -28,29 +32,12 @@ import (
 	"strings"
 
 	dsc "dsc-sdk"
-	"github.com/go-vgo/robotgo"
 )
 
-// robotgo 薄封装：var 间接层便于单测注入替身（不触达真实 X11）。
-var (
-	rbCapture     = robotgo.Capture
-	rbScreenSize  = robotgo.GetScreenSize
-	rbSysScale    = robotgo.SysScale
-	rbDisplaysNum = robotgo.DisplaysNum
-	rbMousePos    = robotgo.GetMousePos
-	rbMoveClick   = robotgo.MoveClick
-	rbClick       = robotgo.Click
-	rbMoveMouse   = robotgo.MoveMouse
-	rbMoveSmooth  = robotgo.MoveMouseSmooth
-	rbScrollDir   = robotgo.ScrollDir
-	rbTypeStr     = robotgo.TypeStr
-	rbKeyTap      = robotgo.KeyTap
-	rbMouseDown   = robotgo.MouseDown
-	rbMouseUp     = robotgo.MouseUp
-	rbWriteAll    = robotgo.WriteAll
-	rbReadAll     = robotgo.ReadAll
-	rbMilliSleep  = robotgo.MilliSleep
-)
+// 输入/截图后端（rb* 薄封装）在 rb_cgo.go（真实 robotgo）与 rb_nocgo.go（无 C 工具链
+// 时的明确报错替身）两个构建变体里各定义一份：robotgo 是 cgo 依赖，没有 C 工具链时
+// 整个包会编译不过，连不碰真实输入的单元测试都跑不起来。两个变体必须提供同名同型
+// 的 rb*，且导出 inputBackendReady 供测试与启动期判断。
 
 // dragPressDelayMS 拖拽按下后与移动前的停顿（让目标应用吃住按下态）。
 const dragPressDelayMS = 120
