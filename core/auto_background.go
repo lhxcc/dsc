@@ -176,8 +176,9 @@ func (m *Manager) runWithGrace(ctx context.Context, toolName string, argsJSON js
 		m.logger.Info("auto background: moved to job", "tool", toolName, "job", jobID, "reason", reason)
 		result = fmt.Sprintf(
 			"Command still running (%s); moved to background (job_id: %s, status: %s). "+
-				"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill if needed.",
-			reason, jobID, snap.Status, jobID)
+				"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill (job_id: %s). "+
+				"Don't kill it through the shell (taskkill/kill): that leaves this job record stuck at running.",
+			reason, jobID, snap.Status, jobID, jobID)
 		return result, "", true, nil
 	}
 }

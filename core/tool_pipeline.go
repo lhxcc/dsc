@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -442,7 +443,10 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 	if err != nil {
 		return "", "", err
 	}
-	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
+	// 两个提示都带 job_id：只写 job_kill 而不给参数，模型会去试外部手段终止进程
+	// （taskkill/kill 之类），而外部终止不会更新本任务记录——它一直挂在 running。
+	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop it with job_kill (job_id: %s).",
+		toolName, jobID, jobID)
 	return result, "", nil
 }
 
@@ -465,12 +469,37 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 	// （"rpc error: code = Canceled desc = context canceled"），输出也随之丢失——
 	// 而 `run_in_background` 的语义正是「脱离本轮继续跑」。这里复制归属信息
 	//（会话、审批策略）到独立 ctx，生命周期交给 job 注册表（job_kill/进程退出）。
-	jobCtx := detachJobContext(ctx)
+	// job_kill 必须真的能停：Cancel 之前只往一个没人读的 channel 里塞了 reason，
+	// 工具照旧跑到底（模型于是改用 taskkill 之类的外部手段，而外部手段杀了进程之后
+	// 本任务记录还挂在 running）。改成派生可取消 ctx——Cancel 一按，gRPC 调用被取消，
+	// 插件的 Handler 收到 ctx 取消去杀子进程，流水线随之落定。
+	jobCtx, cancelJob := context.WithCancel(detachJobContext(ctx))
+	var (
+		killMu     sync.Mutex
+		killReason string
+		killed     bool
+	)
 
 	// 观察通道：能流式上报的工具（插件把自己的输出登记进 GetActivity）在这里被探测出
 	// 尾部输出与最近活动时间，job_output 于是在任务落定前也能回答「它在说什么」。
 	// 探测不到就是 nil——任务退回原来的 final-output 行为。
 	tailFn, activityFn := m.jobProbes(toolName, ToolCallIDFromContext(ctx))
+	// 缓存最近一次读到的尾部：任务被 job_kill 终止时工具结果通常是空的（ctx 取消），
+	// 但用户/模型已经看到过前面那些输出——落定后不该退化成 (no output yet)。
+	var (
+		lastMu   sync.Mutex
+		lastTail string
+	)
+	if tailFn != nil {
+		probe := tailFn
+		tailFn = func() (string, int64) {
+			text, total := probe()
+			lastMu.Lock()
+			lastTail = text
+			lastMu.Unlock()
+			return text, total
+		}
+	}
 
 	jobID, err := m.jobs.Start(jobs.StartSpec{
 		Kind:  toolName,
@@ -478,22 +507,42 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 		Owner: caller,
 		Start: func() (jobs.JobHooks, error) {
 			doneCh := make(chan jobs.JobOutcome, 1)
-			cancelCh := make(chan string, 1)
 
 			go func() {
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
 				result, view, err := m.executeBackgroundPipeline(jobCtx, toolName, argsJSON)
 				sink.set(view, err)
 				status, detail := settleBackgroundOutcome(result, err)
+				// 经 job_kill 终止的，落定状态记 killed 而不是 failed——「被取消」和
+				// 「自己出错」在事后排查里是两件事，混成 context canceled 会误导。
+				killMu.Lock()
+				wasKilled, reason := killed, killReason
+				killMu.Unlock()
+				if wasKilled {
+					status, detail = jobs.StatusKilled, "killed by caller"
+					if reason != "" {
+						detail += ": " + reason
+					}
+					// 保住「杀之前已经打印出来的那一段」：结束态的 Text 为空时用它兜底，
+					// 否则模型看到的是 (no output yet)，前面看到的 tick 全没了。
+					if result == "" {
+						lastMu.Lock()
+						result = lastTail
+						lastMu.Unlock()
+					}
+				}
 				doneCh <- jobs.JobOutcome{Status: status, Detail: detail, Output: result}
 			}()
 
 			return jobs.JobHooks{
 				Cancel: func(reason string) {
-					select {
-					case cancelCh <- reason:
-					default:
+					killMu.Lock()
+					killed = true
+					if reason != "" {
+						killReason = reason
 					}
+					killMu.Unlock()
+					cancelJob()
 				},
 				Done: doneCh,
 				// 最终输出仍以 Done.Output 为权威；TailOutput 只服务「任务还没结束」的观察。

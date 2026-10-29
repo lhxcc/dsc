@@ -272,6 +272,9 @@ func (r *Registry) Start(spec StartSpec) (string, error) {
 			j.output = outcome.Output
 		case StatusKilled:
 			j.snapshot.Status = StatusKilled
+			// 被终止的任务也可能携带「终止前已产生的输出」（生产方从尾部快照兜底），
+			// 与 completed 一样保存下来——否则事后读取只剩 (no output yet)。
+			j.output = outcome.Output
 		case StatusFailed:
 			j.snapshot.Status = StatusFailed
 		default:
