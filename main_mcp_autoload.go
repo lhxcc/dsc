@@ -26,8 +26,12 @@ import (
 //     # command: mcp-server-memory
 //     # args: ["--port", "3000"]
 //
-// 每个条目的 config.mcp 字段含 server_name（必填）与 endpoint（HTTP）或
-// transport: stdio + command + args（stdio，当前仅支持 HTTP，stdio 留待后续）。
+// 每个条目的 config.mcp 字段含 server_name（必填），以及二者之一：
+//   - endpoint：streamable HTTP 地址；
+//   - transport: stdio + command + args（+ 可选 env / cwd）：本机拉起子进程。
+//
+// 两种传输与 mcp_connect 工具共用同一份解析与同一个连接实现（core.MCPSpecFromMap /
+// Manager.ConnectMCPServerSpec）——配置与工具各写一份，迟早会在字段上分叉。
 func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.Logger) {
 	if cfg == nil || len(cfg.Plugins) == 0 {
 		return
@@ -48,41 +52,33 @@ func autoConnectMCPFromConfig(mgr *core.Manager, cfg *core.Config, logger hclog.
 				"plugin", entry.Name)
 			continue
 		}
-		serverName, _ := mcpCfg["server_name"].(string)
-		if serverName == "" {
+		// 工具入参与配置条目共用一份解析（core.MCPSpecFromMap）：支持两种传输，
+		// 且不会出现「配置认这个字段、工具认那个字段」的分叉。
+		spec, err := core.MCPSpecFromMap(mcpCfg)
+		if err != nil {
+			logger.Error("patch MCP config invalid, skipping",
+				"plugin", entry.Name, "error", err)
+			continue
+		}
+		if spec.ServerName == "" {
 			logger.Warn("patch MCP config missing server_name, skipping", "plugin", entry.Name)
 			continue
 		}
-		endpoint, _ := mcpCfg["endpoint"].(string)
-		transport, _ := mcpCfg["transport"].(string)
-		if transport == "stdio" {
-			// stdio 传输需要进程管理（spawn 子进程 + JSON-RPC over stdin/stdout）
-			// 当前 MCPClient 仅支持 HTTP/SSE，stdio 留待后续扩展
-			logger.Warn("patch MCP stdio transport not yet supported, skipping",
-				"plugin", entry.Name, "server_name", serverName)
+		if _, err := spec.TransportKind(); err != nil {
+			logger.Error("patch MCP config incomplete, skipping",
+				"plugin", entry.Name, "server_name", spec.ServerName, "error", err)
 			continue
 		}
-		if endpoint == "" {
-			logger.Warn("patch MCP config missing endpoint (HTTP transport), skipping",
-				"plugin", entry.Name, "server_name", serverName)
-			continue
-		}
-		// 经 admin API 的同一 Manager 路径连接（复用 ensureMCPClients + NewMCPClient + Connect）
-		client, err := core.NewMCPClient(mgr, serverName, endpoint)
+		// 经与 admin API / mcp_connect 相同的实现连接（唯一实现，避免三条入口各写一份）
+		count, err := mgr.ConnectMCPServerSpec(context.Background(), spec)
 		if err != nil {
 			logger.Error("patch MCP connect failed",
-				"plugin", entry.Name, "server_name", serverName, "error", err)
+				"plugin", entry.Name, "server_name", spec.ServerName,
+				"transport", spec.Transport, "error", err)
 			continue
 		}
-		if err := client.Connect(context.Background()); err != nil {
-			logger.Error("patch MCP connect failed",
-				"plugin", entry.Name, "server_name", serverName, "endpoint", endpoint, "error", err)
-			continue
-		}
-		// 注册到 Manager.mcpClients（与 admin API /mcp/connect 同款路径）
-		mgr.RegisterMCPClient(serverName, client)
 		logger.Info("patch MCP connected",
-			"plugin", entry.Name, "server_name", serverName,
-			"endpoint", endpoint, "tools", fmt.Sprintf("%d", client.ToolCount()))
+			"plugin", entry.Name, "server_name", spec.ServerName,
+			"transport", spec.Transport, "tools", fmt.Sprintf("%d", count))
 	}
 }

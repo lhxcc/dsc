@@ -241,7 +241,7 @@ func mcpStatusText(st core.MCPStatus) string {
 	}
 	b.WriteString("服务器：\n")
 	for _, srv := range st.Servers {
-		fmt.Fprintf(&b, "  %s  %s  %d 个工具", srv.Name, srv.Endpoint, srv.Tools)
+		fmt.Fprintf(&b, "  %s  [%s] %s  %d 个工具", srv.Name, srv.Transport, srv.Target, srv.Tools)
 		if srv.Loaded > 0 {
 			fmt.Fprintf(&b, "（已加载 %d）", srv.Loaded)
 		}

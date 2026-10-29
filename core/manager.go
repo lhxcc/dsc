@@ -1225,6 +1225,15 @@ func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	m.stopCronLocked() // 先停调度，避免新任务触发时插件已退出
 
+	// MCP stdio 服务器是本机子进程，必须显式关：Windows 上 EnableProcessJob 的 Job
+	// Object 会在宿主退出时兜底杀掉，但 Linux/macOS 没有这层保障——不关就会留下孤儿
+	// node/python 进程。先摘表再关，避免并发 connect 又把它们塞回去。
+	mcpToClose := make([]*MCPClient, 0, len(m.mcpClients))
+	for name, client := range m.mcpClients {
+		mcpToClose = append(mcpToClose, client)
+		delete(m.mcpClients, name)
+	}
+
 	// 收集所有插件 client 用于后续等待退出
 	type clientInfo struct {
 		name   string
@@ -1256,6 +1265,11 @@ func (m *Manager) Shutdown() {
 	m.pendingEntries = make(map[string]PluginEntry)
 	m.resolvedDeps = make(map[string][]ResolvedDep)
 	m.mu.Unlock()
+
+	// 关 MCP 子进程（在释放 m.mu 之后：Close 要等进程退出，不该占着锁）。
+	for _, client := range mcpToClose {
+		client.Disconnect() // 注销工具 + 关闭传输（stdio 关 stdin 并回收子进程）
+	}
 
 	// 等待所有插件子进程确实退出：go-plugin 的 client.Kill() 会阻塞等待进程退出，
 	// 但某些插件可能有自己的清理逻辑导致 Kill 在退出后进程未完全终止。

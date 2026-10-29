@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"dsc/libs/vodka"
 )
@@ -197,34 +198,40 @@ func (m *Manager) ensureMCPClients() {
 }
 
 func (m *Manager) handleMCPConnect(c *vodka.Context) error {
-	var req struct {
-		ServerName string `json:"server_name"` // [A-Za-z0-9_-]{1,32}
-		Endpoint   string `json:"endpoint"`    // MCP 服务器 HTTP URL
-	}
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+	// 请求体与 mcp_connect 工具同形：http 用 endpoint，stdio 用 command/args/env/cwd。
+	// 解码成 map 再走同一份解析，避免管理 API 只认 endpoint 而工具认 command。
+	var raw map[string]any
+	if err := json.NewDecoder(c.Request.Body).Decode(&raw); err != nil {
 		return vodka.NewHTTPError(http.StatusBadRequest, "invalid JSON: "+err.Error())
 	}
-	if req.ServerName == "" || req.Endpoint == "" {
-		return vodka.NewHTTPError(http.StatusBadRequest, "server_name and endpoint are required")
+	spec, err := MCPSpecFromMap(raw)
+	if err != nil {
+		return vodka.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
-	if !isMCPServerNameValid(req.ServerName) {
+	if spec.ServerName == "" {
+		return vodka.NewHTTPError(http.StatusBadRequest, "server_name is required")
+	}
+	if !isMCPServerNameValid(spec.ServerName) {
 		return vodka.NewHTTPError(http.StatusBadRequest, "invalid server_name: use [A-Za-z0-9_-] only, max 32 chars")
+	}
+	if _, err := spec.TransportKind(); err != nil {
+		return vodka.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
 	m.mu.Lock()
 	m.ensureMCPClients()
-	_, exists := m.mcpClients[req.ServerName]
+	_, exists := m.mcpClients[spec.ServerName]
 	m.mu.Unlock()
 	if exists {
-		return vodka.NewHTTPError(http.StatusConflict, fmt.Sprintf("MCP server %q already connected", req.ServerName))
+		return vodka.NewHTTPError(http.StatusConflict, fmt.Sprintf("MCP server %q already connected", spec.ServerName))
 	}
 
-	toolCount, err := m.ConnectMCPServer(context.Background(), req.ServerName, req.Endpoint)
+	toolCount, err := m.ConnectMCPServerSpec(context.Background(), spec)
 	if err != nil {
 		return vodka.NewHTTPError(http.StatusBadGateway, err.Error())
 	}
 
-	return c.JSON(map[string]any{"ok": true, "server_name": req.ServerName, "tools_discovered": toolCount})
+	return c.JSON(map[string]any{"ok": true, "server_name": spec.ServerName, "tools_discovered": toolCount})
 }
 
 func (m *Manager) handleMCPDisconnect(c *vodka.Context) error {
@@ -293,7 +300,8 @@ func (m *Manager) handleMCPList(c *vodka.Context) error {
 		}
 		servers = append(servers, map[string]any{
 			"server_name": name,
-			"endpoint":    client.endpoint,
+			"endpoint":    client.Describe(),
+			"transport":   client.TransportKind(),
 			"tool_count":  len(client.tools),
 			"tools":       tools,
 		})
@@ -314,18 +322,83 @@ func (m *Manager) handleMCPList(c *vodka.Context) error {
 // 这是「连接」的唯一实现：管理 API（/mcp/connect）、启动时的配置自动连接、
 // 以及模型侧的 mcp_connect 工具都走它。三条入口各写一份会分叉——比如某一条
 // 忘了把客户端登记进 mcpClients，断开时就会留下一批无人管的工具注册。
-func (m *Manager) ConnectMCPServer(ctx context.Context, serverName, endpoint string) (int, error) {
-	if !isMCPServerNameValid(serverName) {
-		return 0, fmt.Errorf("invalid MCP server name %q: use [A-Za-z0-9_-] only, max 32 chars", serverName)
+// MCPConnectSpec 描述一次连接请求：HTTP 用 Endpoint，stdio 用 Command/Args/Env/CWD。
+//
+// Transport 留空按 Endpoint 非空判为 http（兼容只传 endpoint 的旧调用）。
+type MCPConnectSpec struct {
+	ServerName string
+	Transport  string // "http" | "stdio"（空 = 按字段推断）
+	Endpoint   string
+	Command    string
+	Args       []string
+	Env        map[string]string
+	CWD        string
+}
+
+// transport 归一化传输类型：空值按「有 endpoint 就是 http，有 command 就是 stdio」推断。
+// TransportKind 归一化传输类型（供配置解析、管理 API 与工具共用）。
+func (s MCPConnectSpec) TransportKind() (string, error) {
+	switch t := strings.ToLower(strings.TrimSpace(s.Transport)); t {
+	case "", "http", "streamable-http", "streamable_http":
+		if strings.TrimSpace(s.Endpoint) != "" {
+			return "http", nil
+		}
+		if strings.TrimSpace(s.Command) != "" {
+			return "stdio", nil
+		}
+		return "", fmt.Errorf("either endpoint (http) or command (stdio) is required")
+	case "stdio":
+		if strings.TrimSpace(s.Command) == "" {
+			return "", fmt.Errorf("stdio transport requires command")
+		}
+		return "stdio", nil
+	default:
+		return "", fmt.Errorf("unsupported MCP transport %q: use http or stdio", s.Transport)
 	}
-	client, err := NewMCPClient(m, serverName, endpoint)
+}
+
+// ConnectMCPServer 连接一个 HTTP(streamable) MCP 服务器（兼容旧签名）。
+func (m *Manager) ConnectMCPServer(ctx context.Context, serverName, endpoint string) (int, error) {
+	return m.ConnectMCPServerSpec(ctx, MCPConnectSpec{ServerName: serverName, Endpoint: endpoint})
+}
+
+// ConnectMCPServerSpec 连接一个 MCP 服务器（HTTP 或 stdio）、发现其工具并登记到
+// Manager。返回发现的工具数。
+//
+// 这是「连接」的唯一实现：管理 API（/mcp/connect）、启动时的配置自动连接、以及模型侧
+// 的 mcp_connect 工具都走它。三条入口各写一份会分叉——比如某一条忘了把客户端登记进
+// mcpClients，断开时就会留下一批无人管的工具注册。
+func (m *Manager) ConnectMCPServerSpec(ctx context.Context, spec MCPConnectSpec) (int, error) {
+	if !isMCPServerNameValid(spec.ServerName) {
+		return 0, fmt.Errorf("invalid MCP server name %q: use [A-Za-z0-9_-] only, max 32 chars", spec.ServerName)
+	}
+	kind, err := spec.TransportKind()
+	if err != nil {
+		return 0, err
+	}
+	var client *MCPClient
+	switch kind {
+	case "http":
+		client, err = NewMCPClient(m, spec.ServerName, strings.TrimSpace(spec.Endpoint))
+	case "stdio":
+		client, err = NewMCPStdioClient(m, spec.ServerName, MCPStdioSpec{
+			Command: strings.TrimSpace(spec.Command),
+			Args:    spec.Args,
+			Env:     spec.Env,
+			CWD:     strings.TrimSpace(spec.CWD),
+		}, m.logger)
+	}
 	if err != nil {
 		return 0, err
 	}
 	if err := client.Connect(ctx); err != nil {
+		// 连不上就别把子进程/客户端留在原地：stdio 已经拉起了进程，不关会变成孤儿。
+		client.Disconnect()
 		return 0, fmt.Errorf("MCP connect failed: %w", err)
 	}
-	m.RegisterMCPClient(serverName, client)
+	m.RegisterMCPClient(spec.ServerName, client)
+	m.logger.Info("mcp server connected", "server", spec.ServerName, "transport", kind,
+		"target", client.Describe(), "tools", client.ToolCount())
 	return client.ToolCount(), nil
 }
 

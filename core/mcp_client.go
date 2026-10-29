@@ -1,16 +1,14 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"sync"
-	"time"
+
+	"github.com/hashicorp/go-hclog"
 )
 
 // MCP 客户端（对齐 DSH/Cordis 的 mcp-client 插件）。
@@ -27,25 +25,20 @@ import (
 // 后续按需扩展。
 
 // MCPClient 连接一个外部 MCP 服务器，发现并注册其工具。
+//
+// 传输是可替换的（见 mcp_transport.go）：streamable HTTP 或 stdio 子进程。协议流程
+// （initialize → initialized → tools/list → tools/call）与传输无关，全在这里；会话
+// 状态（HTTP 的 Mcp-Session-Id、stdio 的子进程）归各自的 transport 管。
 type MCPClient struct {
 	mu         sync.Mutex
 	serverName string
-	endpoint   string
-	httpClient *http.Client
-	tools      map[string]*MCPTool // rawName → tool
+	tools      map[string]*MCPTool
 	manager    *Manager
 
-	// sessionID 是 initialize 响应头 Mcp-Session-Id 带回的会话标识。
-	//
-	// streamable HTTP 传输把「一次连接」建模成服务端会话：initialize 的响应用
-	// `Mcp-Session-Id` 头下发标识，**之后每个请求都必须原样回带**，否则服务端直接
-	// 400（"Bad Request: Mcp-Session-Id header is required"）。此前这里完全没保存
-	// 这个头，于是 initialize 成功、紧接着的 tools/list 就 400——连接看起来「连不上」，
-	// 实际是第二次请求被拒，一个工具也注册不上。
-	sessionID string
-	// protocolVersion 是 initialize 协商出的版本，后续请求按规范放在
-	// MCP-Protocol-Version 头里（缺失时部分服务端直接拒绝）。
-	protocolVersion string
+	// transport 实际通道；logger 用于 stdio 的 stderr 与进程事件。
+	transport mcpTransport
+	logger    hclog.Logger
+
 	// nextID 下一次请求的 JSON-RPC id（单调递增的小整数）。
 	//
 	// 不能用 time.Now().UnixNano()：那串值约 1.79e18，超过 IEEE-754 的安全整数
@@ -68,18 +61,48 @@ type MCPTool struct {
 	serverName string
 }
 
-// NewMCPClient 创建 MCP 客户端。serverName 仅允许 [A-Za-z0-9_-]，最长 32 字符。
-// endpoint 为 MCP 服务器的 HTTP URL（如 http://localhost:3000/mcp）。
+// NewMCPClient 创建 MCP 客户端（streamable HTTP）。serverName 仅允许
+// [A-Za-z0-9_-]，最长 32 字符。endpoint 为 MCP 服务器的 HTTP URL
+// （如 http://localhost:3000/mcp）。
 func NewMCPClient(mgr *Manager, serverName, endpoint string) (*MCPClient, error) {
+	c, err := newMCPClient(mgr, serverName, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.transport = newHTTPTransport(endpoint)
+	return c, nil
+}
+
+// NewMCPStdioClient 创建 MCP 客户端（stdio：把服务器作为子进程跑）。
+//
+// 与 HTTP 版的差别只在 transport；协议流程完全相同。子进程的环境**不是**整份继承
+// 宿主环境，而是白名单基线 + 调用方显式给的 env（见 mcpStdioEnv）——MCP 服务器是
+// 第三方代码，不该顺手拿到宿主的 API key。
+func NewMCPStdioClient(mgr *Manager, serverName string, spec MCPStdioSpec, logger hclog.Logger) (*MCPClient, error) {
+	c, err := newMCPClient(mgr, serverName, logger)
+	if err != nil {
+		return nil, err
+	}
+	tr, terr := newStdioTransport(spec, logger)
+	if terr != nil {
+		return nil, terr
+	}
+	c.transport = tr
+	return c, nil
+}
+
+func newMCPClient(mgr *Manager, serverName string, logger hclog.Logger) (*MCPClient, error) {
 	if !isMCPServerNameValid(serverName) {
 		return nil, fmt.Errorf("invalid MCP server name %q: use [A-Za-z0-9_-] only, max 32 chars", serverName)
 	}
+	if logger == nil {
+		logger = hclog.NewNullLogger()
+	}
 	return &MCPClient{
 		serverName: serverName,
-		endpoint:   endpoint,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
 		tools:      make(map[string]*MCPTool),
 		manager:    mgr,
+		logger:     logger,
 	}, nil
 }
 
@@ -94,10 +117,14 @@ func (c *MCPClient) nextRequestID() int64 {
 // Connect 连接 MCP 服务器并发现工具。重复调用即重新握手（工具会被重复注册，
 // 注册表按名字覆盖，幂等）。
 func (c *MCPClient) Connect(ctx context.Context) error {
-	// 清空上一次的会话：重连必须拿新会话，旧 id 在新连接上一定 404
-	c.mu.Lock()
-	c.sessionID = ""
-	c.mu.Unlock()
+	// 重置传输状态：HTTP 重连必须拿新会话（旧 id 在新连接上一定 404）；stdio 若子进程
+	// 已退出则重启一个。
+	if c.transport == nil {
+		return fmt.Errorf("MCP client %q has no transport", c.serverName)
+	}
+	if err := c.transport.Reset(c.logger); err != nil {
+		return fmt.Errorf("MCP transport reset failed: %w", err)
+	}
 
 	// MCP 协议：发送 initialize 请求
 	initReq := map[string]any{
@@ -124,9 +151,9 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("MCP initialize: no result in response")
 	}
 	if v, ok := result["protocolVersion"].(string); ok && v != "" {
-		c.mu.Lock()
-		c.protocolVersion = v
-		c.mu.Unlock()
+		if ht, ok := c.transport.(*httpTransport); ok {
+			ht.setProtocolVersion(v) // stdio 没有 header，不需要记
+		}
 	}
 
 	// 发送 initialized 通知
@@ -264,13 +291,36 @@ func (c *MCPClient) CallTool(ctx context.Context, rawName string, args json.RawM
 // Disconnect 断开连接并注销所有工具。
 func (c *MCPClient) Disconnect() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.manager != nil {
 		for _, t := range c.tools {
 			c.manager.toolRegistry.Unregister(t.publicName)
 		}
 	}
 	c.tools = make(map[string]*MCPTool)
+	tr := c.transport
+	c.mu.Unlock()
+
+	// 传输关闭放在锁外：stdio 的 Close 要等子进程退出（最多 stdioShutdownGrace），
+	// 期间不该挡住别人读工具表。
+	if tr != nil {
+		tr.Close() // stdio：关 stdin 回收子进程；http：无操作
+	}
+}
+
+// TransportKind 返回传输类型（http / stdio）。
+func (c *MCPClient) TransportKind() string {
+	if c.transport == nil {
+		return ""
+	}
+	return c.transport.Kind()
+}
+
+// Describe 返回一行传输描述（HTTP 是 URL，stdio 是命令行）。
+func (c *MCPClient) Describe() string {
+	if c.transport == nil {
+		return ""
+	}
+	return c.transport.Describe()
 }
 
 // ServerName 返回 MCP 服务器名。
@@ -289,106 +339,15 @@ func (c *MCPClient) Tools() []*MCPTool {
 	return out
 }
 
-// doJSON 发送 JSON-RPC 请求并解析响应。
+// doJSON 发送一次 JSON-RPC 往返，具体通道由 transport 决定（HTTP / stdio）。
 //
-// HTTP 头设置兼容新旧两种 MCP HTTP 传输：
-//   - 旧版 JSON-RPC over HTTP（Content-Type: application/json）
-//   - 新版 streamable-http（MCP 规范 2025-03-26+，要求 Accept 同时含
-//     application/json 和 text/event-stream）
-//
-// 新版服务器经 Accept 头检测客户端能力——缺 text/event-stream 会返回
-// HTTP 406 "Not Acceptable"。设上两个类型后，旧版服务器忽略 Accept、
-// 新版服务器选择其中一种响应（简单请求通常返回 application/json）。
-// errMCPSessionExpired 表示服务端不再认识当前会话（streamable HTTP 的 404）。
-// 调用方据此重新 initialize，而不是把「会话过期」当成工具调用失败。
-var errMCPSessionExpired = fmt.Errorf("mcp: session expired")
-
+// 会话过期只可能来自 HTTP（404）；stdio 的「会话过期」表现为子进程退出，由 transport
+// 直接报错。
 func (c *MCPClient) doJSON(ctx context.Context, req map[string]any) (map[string]any, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
+	if c.transport == nil {
+		return nil, fmt.Errorf("MCP client %q has no transport", c.serverName)
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	// MCP streamable-http 传输要求客户端声明接受 application/json 与
-	// text/event-stream 两种响应格式（MCP 规范 2025-03-26 §2.1）。
-	// 旧版 JSON-RPC 服务器忽略 Accept 头，不受影响。
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-
-	c.mu.Lock()
-	sid, ver := c.sessionID, c.protocolVersion
-	c.mu.Unlock()
-	if sid != "" {
-		httpReq.Header.Set("Mcp-Session-Id", sid)
-	}
-	if ver != "" {
-		httpReq.Header.Set("MCP-Protocol-Version", ver)
-	}
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// 服务端可能在任意响应上重新下发会话标识（initialize 一定有），有就更新。
-	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" && newSID != sid {
-		c.mu.Lock()
-		c.sessionID = newSID
-		c.mu.Unlock()
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	switch {
-	case resp.StatusCode == http.StatusOK:
-		// 正常响应，按内容类型解析（JSON 或 SSE）
-	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusNoContent:
-		// 通知（如 notifications/initialized）按规范回 202/204 且无正文
-		return map[string]any{}, nil
-	case resp.StatusCode == http.StatusNotFound && sid != "":
-		// 会话已失效：交给调用方重新 initialize
-		return nil, errMCPSessionExpired
-	default:
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-
-	// streamable-http 服务器可能以 text/event-stream（SSE）响应：
-	// 每行 "data: <json>\n\n" 格式。
-	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
-		return ParseSSEResponse(respBody)
-	}
-
-	var result map[string]any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("invalid JSON response: %w", err)
-	}
-	return result, nil
-}
-
-// ParseSSEResponse 从 SSE 响应体提取首个 data: 行的 JSON 负载。
-// MCP streamable-http 传输的 SSE 格式：每行 "data: <json>\n\n"，
-// 客户端取首个事件 data 字段解析为 JSON-RPC 响应。
-func ParseSSEResponse(body []byte) (map[string]any, error) {
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data: ") {
-			jsonData := strings.TrimPrefix(line, "data: ")
-			var result map[string]any
-			if err := json.Unmarshal([]byte(jsonData), &result); err != nil {
-				return nil, fmt.Errorf("invalid SSE data JSON: %w", err)
-			}
-			return result, nil
-		}
-	}
-	return nil, fmt.Errorf("no data: line found in SSE response")
+	return c.transport.RoundTrip(ctx, req)
 }
 
 // mcpPublicName 生成模型可见的工具名：mcp__<serverName>__<rawName>

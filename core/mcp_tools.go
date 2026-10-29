@@ -263,10 +263,11 @@ type MCPStatus struct {
 
 // MCPServerStatus 一台已连接服务器的概要。
 type MCPServerStatus struct {
-	Name     string
-	Endpoint string
-	Tools    int
-	Loaded   int
+	Name      string
+	Transport string // http / stdio
+	Target    string // HTTP 是 URL，stdio 是命令行
+	Tools     int
+	Loaded    int
 }
 
 // MCPStatus 取当前状态快照。
@@ -277,7 +278,7 @@ func (m *Manager) MCPStatus() MCPStatus {
 		loaded[name] = true
 	}
 	for _, view := range m.mcpServers() {
-		srv := MCPServerStatus{Name: view.name, Endpoint: view.endpoint, Tools: len(view.tools)}
+		srv := MCPServerStatus{Name: view.name, Transport: view.transport, Target: view.describe, Tools: len(view.tools)}
 		for _, tool := range view.tools {
 			if loaded[tool.publicName] {
 				srv.Loaded++
@@ -295,9 +296,10 @@ func (m *Manager) MCPStatus() MCPStatus {
 
 // mcpServerView 一台已连接服务器的只读视图（工具指针在发现后不再变化，可直接共享）。
 type mcpServerView struct {
-	name     string
-	endpoint string
-	tools    []*MCPTool
+	name      string
+	transport string // http / stdio
+	describe  string // URL 或命令行
+	tools     []*MCPTool
 }
 
 // mcpServers 返回已连接服务器的快照（按名字排序，输出稳定）。
@@ -306,7 +308,7 @@ func (m *Manager) mcpServers() []mcpServerView {
 	m.ensureMCPClients()
 	views := make([]mcpServerView, 0, len(m.mcpClients))
 	for name, client := range m.mcpClients {
-		views = append(views, mcpServerView{name: name, endpoint: client.endpoint, tools: client.Tools()})
+		views = append(views, mcpServerView{name: name, transport: client.TransportKind(), describe: client.Describe(), tools: client.Tools()})
 	}
 	m.mu.Unlock()
 	sort.Slice(views, func(i, j int) bool { return views[i].name < views[j].name })
@@ -348,75 +350,146 @@ func mcpToolCost(t *MCPTool) int {
 // mcp_connect
 // ============================================================
 
+// MCPSpecFromMap 把 {server_name, transport, endpoint, command, args, env, cwd} 形状的
+// map 解析成连接规格。
+//
+// 工具入参（模型的 JSON）与配置条目（config.yaml 的 config.mcp）共用这一份解析：
+// 两处各写一遍必然分叉——一处认 args 数组、另一处只认字符串，用户配了却不生效，
+// 而这种错只在「配了没用」时才暴露。
+func MCPSpecFromMap(raw map[string]any) (MCPConnectSpec, error) {
+	spec := MCPConnectSpec{}
+	str := func(key string) string {
+		v, _ := raw[key].(string)
+		return strings.TrimSpace(v)
+	}
+	spec.ServerName = str("server_name")
+	spec.Transport = str("transport")
+	spec.Endpoint = str("endpoint")
+	spec.Command = str("command")
+	spec.CWD = str("cwd")
+
+	if v, ok := raw["args"]; ok {
+		items, ok := v.([]any)
+		if !ok {
+			return spec, fmt.Errorf("args must be an array of strings")
+		}
+		for _, item := range items {
+			arg, ok := item.(string)
+			if !ok {
+				return spec, fmt.Errorf("args must be an array of strings")
+			}
+			spec.Args = append(spec.Args, arg)
+		}
+	}
+	if v, ok := raw["env"]; ok {
+		envMap, ok := v.(map[string]any)
+		if !ok {
+			return spec, fmt.Errorf("env must be an object of string values")
+		}
+		spec.Env = make(map[string]string, len(envMap))
+		for k, val := range envMap {
+			sv, ok := val.(string)
+			if !ok {
+				return spec, fmt.Errorf("env[%s] must be a string", k)
+			}
+			spec.Env[k] = sv
+		}
+	}
+	return spec, nil
+}
+
 type mcpConnectTool struct{ m *Manager }
 
 func (t *mcpConnectTool) Name() string { return mcpConnectToolName }
 
 func (t *mcpConnectTool) Description() string {
-	return "Connect to an external MCP server over streamable HTTP and register its tools (endpoint like http://127.0.0.1:8765/mcp). " +
+	return "Connect to an external MCP server and register its tools. Two transports: " +
+		"http — a streamable-HTTP URL (endpoint); stdio — spawn a local command (command + args) and speak JSON-RPC over its stdin/stdout. " +
+		"Use stdio for servers that are meant to be launched (npx/node/python/uvx/binary), and http for one already listening. " +
 		"Use when the user asks to use an MCP server that is not connected yet. This is a host capability: do NOT start another `dsc` process to connect to MCP — that process has its own tool table and this session can never see it. " +
-		"stdio transport is not supported; start the server with an HTTP endpoint first (e.g. `rea mcp --http --port 8765`). " +
+		"A stdio server only inherits a small environment baseline (PATH/HOME/TEMP and similar); put any token it needs into env explicitly. " +
 		"Registered tools stay hidden from your tool list to keep it small — use mcp_list to see them, then mcp_load for the ones you need, and mcp_unload/mcp_disconnect when done. Requires approval."
 }
 
 func (t *mcpConnectTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{
 "server_name":{"type":"string","description":"Short name for this server, [A-Za-z0-9_-] only, max 32 chars. Becomes the tool name prefix: mcp__<server_name>__<tool>."},
-"endpoint":{"type":"string","description":"MCP streamable-HTTP URL, e.g. http://127.0.0.1:8765/mcp."}
+"transport":{"type":"string","enum":["http","stdio"],"description":"http = streamable HTTP to a running endpoint; stdio = launch command and talk over its stdin/stdout. Inferred from endpoint/command when omitted."},
+"endpoint":{"type":"string","description":"http only: MCP streamable-HTTP URL, e.g. http://127.0.0.1:8765/mcp."},
+"command":{"type":"string","description":"stdio only: executable to launch, e.g. node, python, npx, or an absolute path. Resolved via PATH."},
+"args":{"type":"array","items":{"type":"string"},"description":"stdio only: arguments passed to command, e.g. [\"path/to/server.mjs\", \"mcp\"]."},
+"env":{"type":"object","additionalProperties":{"type":"string"},"description":"stdio only: extra environment variables for the server process. Only a small baseline is inherited (PATH/HOME/TEMP/...); anything else the server needs - including tokens - must be listed here."},
+"cwd":{"type":"string","description":"stdio only: working directory for the server process (defaults to the host's)."}
 },
-"required":["server_name","endpoint"],"additionalProperties":false}`)
+"required":["server_name"],"additionalProperties":false}`)
 }
 
 // ApprovalReason 实现 ApprovalRequester：连接外部服务器等于把该服务器提供的任意
 // 工具接进当前会话（执行权限等同本机用户），属能力扩张，须经用户审批。
+// stdio 还额外意味着**在本机拉起一个进程**，这一点必须在审批文案里说清楚。
 func (t *mcpConnectTool) ApprovalReason(argumentsJSON string) string {
-	var in struct {
-		ServerName string `json:"server_name"`
-		Endpoint   string `json:"endpoint"`
-	}
-	_ = json.Unmarshal([]byte(argumentsJSON), &in)
-	if in.Endpoint == "" {
+	var raw map[string]any
+	_ = json.Unmarshal([]byte(argumentsJSON), &raw)
+	spec, _ := MCPSpecFromMap(raw)
+
+	kind, err := spec.TransportKind()
+	if err != nil {
 		return "Connects an external MCP server and makes its tools available to this session."
 	}
+	if kind == "stdio" {
+		cmd := strings.Join(append([]string{spec.Command}, spec.Args...), " ")
+		return fmt.Sprintf("Spawns `%s` as a local process for MCP server %q; its tools will run with your local privileges once loaded.",
+			cmd, spec.ServerName)
+	}
 	return fmt.Sprintf("Connects MCP server %q at %s; its tools will run with your local privileges once loaded.",
-		in.ServerName, in.Endpoint)
+		spec.ServerName, spec.Endpoint)
 }
 
 func (t *mcpConnectTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var in struct {
-		ServerName string `json:"server_name"`
-		Endpoint   string `json:"endpoint"`
-	}
-	if err := json.Unmarshal(args, &in); err != nil {
+	var raw map[string]any
+	if err := json.Unmarshal(args, &raw); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	name := strings.TrimSpace(in.ServerName)
-	endpoint := strings.TrimSpace(in.Endpoint)
-	if name == "" || endpoint == "" {
-		return "", fmt.Errorf("server_name and endpoint are required")
+	spec, err := MCPSpecFromMap(raw)
+	if err != nil {
+		return "", err
 	}
-	if !isMCPServerNameValid(name) {
-		return "", fmt.Errorf("invalid server_name %q: use [A-Za-z0-9_-] only, max 32 chars", name)
+	if spec.ServerName == "" {
+		return "", fmt.Errorf("server_name is required")
 	}
-	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
-		return "", fmt.Errorf("endpoint must be an http(s) URL (streamable HTTP), got %q", endpoint)
+	if !isMCPServerNameValid(spec.ServerName) {
+		return "", fmt.Errorf("invalid server_name %q: use [A-Za-z0-9_-] only, max 32 chars", spec.ServerName)
+	}
+	kind, err := spec.TransportKind()
+	if err != nil {
+		return "", err
+	}
+	if kind == "http" && !strings.HasPrefix(spec.Endpoint, "http://") && !strings.HasPrefix(spec.Endpoint, "https://") {
+		return "", fmt.Errorf("endpoint must be an http(s) URL (streamable HTTP), got %q", spec.Endpoint)
 	}
 
 	// 幂等：重复连接是模型常见动作（上一轮连过、或它不确定），报「已连接」并指向
 	// mcp_list 比抛冲突好用。
-	if existing := t.m.GetMCPClient(name); existing != nil {
-		return fmt.Sprintf("MCP server %q is already connected (%d tools). Its tools are hidden from your tool list by default: "+
-			"call mcp_list to see the names, then mcp_load for the ones you need.", name, existing.ToolCount()), nil
+	if existing := t.m.GetMCPClient(spec.ServerName); existing != nil {
+		return fmt.Sprintf("MCP server %q is already connected (%d tools, %s). Its tools are hidden from your tool list by default: "+
+			"call mcp_list to see the names, then mcp_load for the ones you need.",
+			spec.ServerName, existing.ToolCount(), existing.Describe()), nil
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
 	defer cancel()
-	count, err := t.m.ConnectMCPServer(cctx, name, endpoint)
+	spec.Transport = kind
+	count, err := t.m.ConnectMCPServerSpec(cctx, spec)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Connected MCP server %q: %d tools registered (prefix mcp__%s__); MCP tools are now enabled for this session. "+
-		"Registered is not visible: call mcp_list to see the names and mcp_load for the ones you need.", name, count, name), nil
+	how := spec.Endpoint
+	if kind == "stdio" {
+		how = "stdio: " + strings.Join(append([]string{spec.Command}, spec.Args...), " ")
+	}
+	return fmt.Sprintf("Connected MCP server %q (%s): %d tools registered (prefix mcp__%s__); MCP tools are now enabled for this session. "+
+		"Registered is not visible: call mcp_list to see the names and mcp_load for the ones you need.",
+		spec.ServerName, how, count, spec.ServerName), nil
 }
 
 // ============================================================
@@ -458,7 +531,7 @@ func (t *mcpListTool) Execute(_ context.Context, args json.RawMessage) (string, 
 
 	servers := t.m.mcpServers()
 	if len(servers) == 0 {
-		return "No MCP server is connected. Use mcp_connect with the server's streamable-HTTP endpoint (e.g. http://127.0.0.1:8765/mcp) to connect one.", nil
+		return "No MCP server is connected. Use mcp_connect with either a streamable-HTTP endpoint (e.g. http://127.0.0.1:8765/mcp) or a stdio command (command + args, for servers you launch locally) to connect one.", nil
 	}
 
 	terms := strings.Fields(strings.ToLower(in.Query))
