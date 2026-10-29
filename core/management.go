@@ -69,7 +69,7 @@ func (m *Manager) ManagementOperations() []ManagementOperation {
 			Group:        group,
 			Name:         managementOpName(group, name),
 			Tool:         name,
-			Summary:      firstLine(tool.Description()),
+			Summary:      managementSummary(tool.Description()),
 			Schema:       tool.ParametersSchema(),
 			ModelVisible: visible,
 		})
@@ -94,11 +94,19 @@ func managementOpName(group, toolName string) string {
 	return toolName
 }
 
-// firstLine 取描述的第一行（说明可能很长，管理面只展示一句）。
-func firstLine(s string) string {
+// managementSummary 取描述的第一行并截断到一句（管理面是给人看的，不是工具手册）。
+//
+// 工具描述往往是给模型的长段落（MCP 那个就有两百多字），原样塞进目录会让面板与
+// /mcp 帮助整体垮掉；完整说明仍在工具描述里，呈现层需要时可以另取。
+func managementSummary(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}
-	return strings.TrimSpace(s)
+	const maxRunes = 80
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= maxRunes {
+		return string(r)
+	}
+	return strings.TrimSpace(string(r[:maxRunes])) + "…"
 }

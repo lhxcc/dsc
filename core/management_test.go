@@ -97,3 +97,23 @@ func TestManagementOperationsAreDeclaredNotNamed(t *testing.T) {
 		}
 	}
 }
+
+// TestManagementSummaryIsOneShortLine 管理面的说明是一句，不是工具手册。
+//
+// MCP 的 connect 描述有两百多字（给模型看的），原样塞进目录会让面板与 /mcp 帮助垮掉。
+func TestManagementSummaryIsOneShortLine(t *testing.T) {
+	if got := managementSummary("First line.\nSecond line."); got != "First line." {
+		t.Fatalf("应只取第一行，got %q", got)
+	}
+	long := strings.Repeat("字", 200)
+	got := managementSummary(long)
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("超长说明应截断并加省略号，got %q", got)
+	}
+	if n := len([]rune(got)); n > 81 {
+		t.Fatalf("截断后仍是 %d 个字符", n)
+	}
+	if got := managementSummary("  "); got != "" {
+		t.Fatalf("空白说明应为空，got %q", got)
+	}
+}
