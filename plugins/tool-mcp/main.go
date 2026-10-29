@@ -32,8 +32,8 @@ func main() {
 		// 命令声明：补全菜单由宿主动态汇总，卸载插件即消失。
 		Commands: []dsc.Command{{
 			Name:    "mcp",
-			Summary: "MCP 服务器与工具（status / on / off / list / connect / load / unload / disconnect）",
-			Usage:   "/mcp [status|on|off|list|connect|load|unload|disconnect]",
+			Summary: "MCP 服务器与工具（status / on / off / list / connect / load / unload / disconnect / resources / prompts）",
+			Usage:   "/mcp [status|on|off|list|connect|load|unload|disconnect|resources|read|prompts|prompt]",
 		}},
 	})
 	// 动态工具集：管理操作 + 已连接服务器的工具（每次 ListTools/ExecuteTool 求值）。
@@ -124,6 +124,42 @@ func (a *app) runCommand(_ context.Context, name, args string) (string, error) {
 			payload["server_name"] = rest[0]
 		}
 		return a.execDisconnect(payload)
+	case "resources":
+		payload := map[string]any{"limit": 200}
+		if len(rest) > 0 {
+			payload["server"] = rest[0]
+		}
+		return a.execListResources(payload)
+	case "read":
+		if len(rest) == 0 {
+			return "", fmt.Errorf("用法：/mcp read <uri> [server]")
+		}
+		payload := map[string]any{"uri": rest[0]}
+		if len(rest) > 1 {
+			payload["server"] = rest[1]
+		}
+		return a.execReadResource(context.Background(), payload)
+	case "prompts":
+		payload := map[string]any{"limit": 200}
+		if len(rest) > 0 {
+			payload["server"] = rest[0]
+		}
+		return a.execListPrompts(payload)
+	case "prompt":
+		if len(rest) == 0 {
+			return "", fmt.Errorf("用法：/mcp prompt <name> [key=value ...]")
+		}
+		payload := map[string]any{"name": rest[0]}
+		args := map[string]any{}
+		for _, kv := range rest[1:] {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				args[k] = v
+			}
+		}
+		if len(args) > 0 {
+			payload["arguments"] = args
+		}
+		return a.execGetPrompt(context.Background(), payload)
 	}
 	return "", fmt.Errorf("unknown /mcp subcommand %q（%s）", sub, mcpUsage)
 }
@@ -154,7 +190,8 @@ func (a *app) execConnectFields(rest []string) (string, error) {
 }
 
 const mcpUsage = "status | on | off | list [server] | connect <name> <endpoint|command> [args...] | " +
-	"load <tool...> | unload [tool...] | disconnect [server]"
+	"load <tool...> | unload [tool...] | disconnect [server] | " +
+	"resources [server] | read <uri> [server] | prompts [server] | prompt <name> [key=value ...]"
 
 // marshalArgs 把工具入参解码成 map（工具与命令两条入口共用）。
 func marshalArgs(args json.RawMessage) (map[string]any, error) {

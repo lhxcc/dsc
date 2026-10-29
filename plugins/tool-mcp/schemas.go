@@ -64,3 +64,65 @@ const disconnectSchema = `{
   },
   "additionalProperties": false
 }`
+
+// ---- 资源（resources）：只读内容，不是动作 ----
+
+const listResourcesDescription = "List the resources (documents, datasets, files) that connected MCP servers expose. " +
+	"Resources are content, not actions: read one with mcp_read_resource. " +
+	"Only servers that advertise the resources capability have any."
+
+const listResourcesSchema = `{
+  "type": "object",
+  "properties": {
+    "server": {"type": "string", "description": "Only list this server's resources (default: all servers that expose them)."},
+    "limit": {"type": "integer", "description": "Maximum entries to print (default 40, max 200).", "minimum": 1, "maximum": 200}
+  },
+  "additionalProperties": false
+}`
+
+const readResourceDescription = "Read one resource by URI (resources/read). " +
+	"Text comes back verbatim; binary resources are reported as omitted with their type and size. " +
+	"When several servers expose the same URI you must pass server=."
+
+const readResourceSchema = `{
+  "type": "object",
+  "properties": {
+    "uri": {"type": "string", "description": "Resource URI exactly as mcp_list_resources printed it."},
+    "server": {"type": "string", "description": "Which server to read from. Omit when only one server exposes that URI."}
+  },
+  "required": ["uri"],
+  "additionalProperties": false
+}`
+
+// ---- 提示词（prompts）：服务器提供的模板，取回后由调用方决定怎么用 ----
+
+const listPromptsDescription = "List the prompt templates connected MCP servers expose, with their arguments. " +
+	"Render one with mcp_get_prompt. Only servers that advertise the prompts capability have any."
+
+const listPromptsSchema = `{
+  "type": "object",
+  "properties": {
+    "server": {"type": "string", "description": "Only list this server's prompts (default: all servers that expose them)."},
+    "limit": {"type": "integer", "description": "Maximum entries to print (default 40, max 200).", "minimum": 1, "maximum": 200}
+  },
+  "additionalProperties": false
+}`
+
+const getPromptDescription = "Render one prompt template (prompts/get) into plain text: description plus each message " +
+	"prefixed with its role. Non-text content is reported as omitted rather than dropped silently."
+
+const getPromptSchema = `{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "description": "Prompt name exactly as mcp_list_prompts printed it."},
+    "server": {"type": "string", "description": "Which server to ask. Omit when only one server exposes that prompt."},
+    "arguments": {
+      "type": "object",
+      "additionalProperties": {"type": "string"},
+      "description": "Template arguments as name → value strings."
+    }
+  },
+  "required": ["name"],
+  "additionalProperties": false
+}`
+

@@ -1,6 +1,6 @@
 ---
 name: mcp-connect
-description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP 或 stdio 本機子進程）：運行期用 mcp_connect/mcp_list/mcp_load 接上並按需加載工具、或用 overlay 配置持久化；驗證 mcp__<server>__* 是否可用，並排查「連不上／看不到工具」的常見原因。
+description: 用 DSC 連接外部 MCP 伺服器（streamable HTTP 或 stdio 本機子進程）：運行期用 mcp_connect/mcp_list/mcp_load 接上並按需加載工具、讀取伺服器的 resources 與 prompts、或用 overlay 配置持久化；驗證 mcp__<server>__* 是否可用，並排查「連不上／看不到工具」的常見原因。
 ---
 
 # mcp-connect — 用 DSC 連接 MCP 伺服器
@@ -82,6 +82,24 @@ mcp_unload(tools=["mcp__srv__list_units"])
 卸載只是把工具移出目錄，**連接還在**——再 `mcp_load` 即可回來，不用重連。
 任務結束（或不再需要那批工具）就卸載，別讓它一直佔著每個請求的目錄成本。
 
+### 4. 伺服器還可能有 resources / prompts（這兩類不是工具）
+
+MCP 除了工具，還有兩種只讀能力，DSC 各給兩個訪問器：
+
+| 工具 | 作用 |
+|---|---|
+| `mcp_list_resources` / `mcp_read_resource(uri=…)` | 伺服器暴露的內容（文檔、資料集、檔案）。讀回來是文字；二進位只回一句「已省略 + 型別 + 大小」 |
+| `mcp_list_prompts` / `mcp_get_prompt(name=…, arguments={…})` | 伺服器的提示詞模板。取回來是渲染好的文字（每段帶 `[role]` 前綴） |
+
+三條要點：
+
+- 這四個工具**只在伺服器聲明該能力時才存在**。只有 tools 的伺服器（大多數）目錄裡完全沒有它們，
+  所以工具清單裡找不到並不代表壞了。
+- 它們**不需要 `mcp_load`**：不像幾百個伺服器工具那樣要挑，能力在就直接可用。
+- 多台伺服器有同名資源／提示詞時必須傳 `server=`（不傳就報歧義並列出候選）——猜錯就是讀錯內容。
+
+先列再讀：`uri` / `name` 要照列表原樣抄（伺服器自訂 scheme，例如 `file:///…`、`mem://…`）。
+
 ## 使用者側的等價操作（斜杆命令）
 
 使用者在終端裡可以自己做同樣的事，與你的工具共用一份宿主實現——所以他說「我自己連好了」
@@ -96,6 +114,9 @@ mcp_unload(tools=["mcp__srv__list_units"])
 | `/mcp disconnect [server]` | 斷開並註銷工具（不帶參數=全部；stdio 同時回收子進程） |
 | `/mcp load <tool...>` / `--server <name>` | 加載進模型目錄 |
 | `/mcp unload [tool...]` / `--server <name>` | 卸載（不帶參數=全部） |
+| `/mcp resources [server]` | 列出資源（`uri`、描述、MIME） |
+| `/mcp read <uri> [server]` | 讀一份資源（二進位只回省略說明） |
+| `/mcp prompts [server]` / `/mcp prompt <name> [k=v …]` | 列出／渲染提示詞模板 |
 
 ## 路線 B：寫進配置（需要每次啟動都連時用）
 
@@ -147,6 +168,8 @@ dsc -patch <絕對路徑>/mcp-srv.yaml
 | `mcp_list` 說沒有伺服器 | 還沒連，或連的是另一個 DSC 進程 | 用 `mcp_connect` 在本會話連（不要 shell 起新 dsc） |
 | 連上了，但工具清單裡看不到那批工具 | 正常：預設不曝光 | `mcp_load` 你要用的那幾個 |
 | `mcp_load` 說名字找不到 | 名字記錯／沒加 `mcp__<server>__` 前綴 | 先 `mcp_list` 拿準確名字（裸名唯一時也可用） |
+| `mcp_list_resources` / `mcp_list_prompts` 報「no connected server exposes …」 | 那台伺服器沒有聲明該能力（多數只有 tools） | 正常；用它的工具即可，別去找不存在的資源 |
+| `mcp_read_resource` 說 URI 不存在／歧義 | 抄錯 `uri`，或同 URI 出現在多台伺服器 | 先 `mcp_list_resources` 照抄；歧義時補 `server=` |
 | HTTP 400 `Mcp-Session-Id header is required` | 客戶端沒回帶 initialize 下發的會話 id（舊版 bug，已修） | 升級 DSC |
 | HTTP 400 `Parse error: Invalid JSON-RPC message` | 請求 id 超過 JS 安全整數 2^53（舊版用 UnixNano，已修） | 升級 DSC |
 | HTTP 404 `Session not found` | 伺服器重啟過，會話失效 | DSC 會自動重新握手一次；持續出現則重連 |

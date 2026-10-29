@@ -35,6 +35,18 @@ func (a *app) currentTools() []dsc.Tool {
 	}
 	sort.Strings(names)
 
+	hasResources, hasPrompts := false, false
+	for _, server := range names {
+		caps := a.clients[server].client.Capabilities()
+		hasResources = hasResources || caps.Resources
+		hasPrompts = hasPrompts || caps.Prompts
+	}
+	// 资源/提示词是**按能力**出现的插件自有工具，不是服务器工具：一台只有 tools 的
+	// 服务器（绝大多数）根本不注册它们，目录成本为 0。它们也不走 mcp_load 那一套——
+	// 「几百个工具里挑几个」的曝光策略对这两三条访问器没有意义，能力在就摆出来。
+	tools = append(tools, a.resourceToolsLocked(enabled, hasResources)...)
+	tools = append(tools, a.promptToolsLocked(enabled, hasPrompts)...)
+
 	for _, server := range names {
 		conn := a.clients[server]
 		for _, t := range conn.client.Tools() {
@@ -158,6 +170,80 @@ func (a *app) managementToolsLocked(enabled, hasServers bool) []dsc.Tool {
 	}
 }
 
+// resourceToolsLocked 资源访问器：只在**有服务器声明了 resources 能力**时出现。
+//
+// 资源是内容（可读的文档/数据），不是动作；模型只能通过这两个工具读它。它们不参与
+// mcp_load 那套曝光策略——一台服务器通常只有几条到几十条资源，而「先加载才能用」
+// 会让模型在需要时才去猜插件支持什么，得不偿失。
+func (a *app) resourceToolsLocked(enabled, has bool) []dsc.Tool {
+	if !has {
+		return nil
+	}
+	return []dsc.Tool{
+		{
+			Name:        "mcp_list_resources",
+			Description: listResourcesDescription,
+			Schema:      json.RawMessage(listResourcesSchema),
+			Hidden:      !enabled,
+			Handler: func(_ context.Context, args json.RawMessage) (string, error) {
+				payload, err := marshalArgs(args)
+				if err != nil {
+					return "", err
+				}
+				return a.execListResources(payload)
+			},
+		},
+		{
+			Name:        "mcp_read_resource",
+			Description: readResourceDescription,
+			Schema:      json.RawMessage(readResourceSchema),
+			Hidden:      !enabled,
+			Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
+				payload, err := marshalArgs(args)
+				if err != nil {
+					return "", err
+				}
+				return a.execReadResource(ctx, payload)
+			},
+		},
+	}
+}
+
+// promptToolsLocked 提示词访问器：只在有服务器声明了 prompts 能力时出现。
+func (a *app) promptToolsLocked(enabled, has bool) []dsc.Tool {
+	if !has {
+		return nil
+	}
+	return []dsc.Tool{
+		{
+			Name:        "mcp_list_prompts",
+			Description: listPromptsDescription,
+			Schema:      json.RawMessage(listPromptsSchema),
+			Hidden:      !enabled,
+			Handler: func(_ context.Context, args json.RawMessage) (string, error) {
+				payload, err := marshalArgs(args)
+				if err != nil {
+					return "", err
+				}
+				return a.execListPrompts(payload)
+			},
+		},
+		{
+			Name:        "mcp_get_prompt",
+			Description: getPromptDescription,
+			Schema:      json.RawMessage(getPromptSchema),
+			Hidden:      !enabled,
+			Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
+				payload, err := marshalArgs(args)
+				if err != nil {
+					return "", err
+				}
+				return a.execGetPrompt(ctx, payload)
+			},
+		},
+	}
+}
+
 // execConnect 实现 mcp_connect。
 func (a *app) execConnect(payload map[string]any) (string, error) {
 	spec, err := specFromPayload(payload)
@@ -183,9 +269,16 @@ func (a *app) execConnect(payload map[string]any) (string, error) {
 	if strings.EqualFold(spec.Transport, "stdio") {
 		how = "stdio: " + strings.Join(append([]string{spec.Command}, spec.Args...), " ")
 	}
-	return fmt.Sprintf("Connected MCP server %q (%s): %d tools registered (prefix mcp__%s__). "+
+	extra := ""
+	if n := a.resourceCount(spec.Name); n > 0 {
+		extra += fmt.Sprintf(", %d resources (mcp_list_resources / mcp_read_resource)", n)
+	}
+	if n := a.promptCount(spec.Name); n > 0 {
+		extra += fmt.Sprintf(", %d prompts (mcp_list_prompts / mcp_get_prompt)", n)
+	}
+	return fmt.Sprintf("Connected MCP server %q (%s): %d tools registered (prefix mcp__%s__)%s. "+
 		"Registered is not visible: mcp_list shows the names, mcp_load makes the ones you need callable.",
-		spec.Name, how, a.toolCount(spec.Name), spec.Name), nil
+		spec.Name, how, a.toolCount(spec.Name), spec.Name, extra), nil
 }
 
 // specFromPayload 把工具入参（或配置块）解析成 serverSpec。
@@ -271,6 +364,25 @@ func connectApprovalDetail(args json.RawMessage) string {
 		spec.Name, spec.Endpoint)
 }
 
+// resourceCount / promptCount 某台服务器已发现的资源、提示词数。
+func (a *app) resourceCount(server string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c, ok := a.clients[server]; ok {
+		return c.client.ResourceCount()
+	}
+	return 0
+}
+
+func (a *app) promptCount(server string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c, ok := a.clients[server]; ok {
+		return c.client.PromptCount()
+	}
+	return 0
+}
+
 // toolCount 某台服务器已发现的工具数。
 func (a *app) toolCount(server string) int {
 	a.mu.Lock()
@@ -340,6 +452,272 @@ func (a *app) execList(payload map[string]any) (string, error) {
 		shown++
 	}
 	return b.String(), nil
+}
+
+// serversSupporting 返回声明了某能力的已连接服务器（按名排序）。
+func (a *app) serversSupporting(capability string) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make([]string, 0, len(a.clients))
+	for name, conn := range a.clients {
+		caps := conn.client.Capabilities()
+		if (capability == "resources" && caps.Resources) || (capability == "prompts" && caps.Prompts) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// pickServers 解析入参里的 server：空 = 全部支持该能力的服务器。
+//
+// 三种错法要分清（提示不一样）：没连过 / 连了但这台不支持该能力 / 名字写错。
+func (a *app) pickServers(want, capability string) ([]string, error) {
+	supported := a.serversSupporting(capability)
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return supported, nil
+	}
+	a.mu.Lock()
+	_, connected := a.clients[want]
+	a.mu.Unlock()
+	if !connected {
+		return nil, fmt.Errorf("MCP server %q is not connected", want)
+	}
+	for _, name := range supported {
+		if name == want {
+			return []string{want}, nil
+		}
+	}
+	return nil, fmt.Errorf("MCP server %q does not expose %s", want, capability)
+}
+
+// execListResources 实现 mcp_list_resources。
+func (a *app) execListResources(payload map[string]any) (string, error) {
+	want, _ := payload["server"].(string)
+	limit := listDefault
+	if v, ok := payload["limit"].(float64); ok && int(v) > 0 {
+		limit = int(v)
+	}
+	if limit > listMax {
+		limit = listMax
+	}
+
+	servers, err := a.pickServers(want, "resources")
+	if err != nil {
+		return "", err
+	}
+	if len(servers) == 0 {
+		return "No connected MCP server exposes resources.", nil
+	}
+
+	type row struct{ server, uri, name, mime, desc string }
+	var rows []row
+	a.mu.Lock()
+	for _, server := range servers {
+		for _, r := range a.clients[server].client.Resources() {
+			rows = append(rows, row{server: server, uri: r.URI, name: r.Name, mime: r.MimeType, desc: r.Description})
+		}
+	}
+	a.mu.Unlock()
+
+	if len(rows) == 0 {
+		return fmt.Sprintf("Connected server(s) %s declare resources but list none.", strings.Join(servers, ", ")), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d resource(s) from %d server(s); showing up to %d. Read one with mcp_read_resource(uri=...).\n",
+		len(rows), len(servers), limit)
+	shown := 0
+	for _, r := range rows {
+		if shown >= limit {
+			fmt.Fprintf(&b, "… %d more (raise limit or pass server=)\n", len(rows)-shown)
+			break
+		}
+		fmt.Fprintf(&b, "  [%s] %s", r.server, r.uri)
+		if r.name != "" && r.name != r.uri {
+			fmt.Fprintf(&b, " — %s", r.name)
+		}
+		if r.mime != "" {
+			fmt.Fprintf(&b, " (%s)", r.mime)
+		}
+		if r.desc != "" {
+			fmt.Fprintf(&b, ": %s", firstLine(r.desc))
+		}
+		b.WriteString("\n")
+		shown++
+	}
+	return b.String(), nil
+}
+
+// execReadResource 实现 mcp_read_resource。
+func (a *app) execReadResource(ctx context.Context, payload map[string]any) (string, error) {
+	uri := strings.TrimSpace(stringField(payload, "uri"))
+	if uri == "" {
+		return "", fmt.Errorf("uri is required")
+	}
+	want := strings.TrimSpace(stringField(payload, "server"))
+	servers, err := a.pickServers(want, "resources")
+	if err != nil {
+		return "", err
+	}
+
+	// 没点名服务器就按 URI 找：唯一命中才读，多个命中列出来让人挑——猜错就是读错内容。
+	if want == "" {
+		var hits []string
+		a.mu.Lock()
+		for _, server := range servers {
+			for _, r := range a.clients[server].client.Resources() {
+				if r.URI == uri {
+					hits = append(hits, server)
+					break
+				}
+			}
+		}
+		a.mu.Unlock()
+		switch len(hits) {
+		case 0:
+			return "", fmt.Errorf("no connected server exposes resource %q (call mcp_list_resources for exact URIs)", uri)
+		case 1:
+			want = hits[0]
+		default:
+			return "", fmt.Errorf("resource %q exists on several servers (%s); pass server= to pick one", uri, strings.Join(hits, ", "))
+		}
+	}
+
+	a.mu.Lock()
+	conn, ok := a.clients[want]
+	a.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("MCP server %q is not connected", want)
+	}
+	return conn.client.ReadResource(ctx, uri)
+}
+
+// execListPrompts 实现 mcp_list_prompts。
+func (a *app) execListPrompts(payload map[string]any) (string, error) {
+	want, _ := payload["server"].(string)
+	limit := listDefault
+	if v, ok := payload["limit"].(float64); ok && int(v) > 0 {
+		limit = int(v)
+	}
+	if limit > listMax {
+		limit = listMax
+	}
+
+	servers, err := a.pickServers(want, "prompts")
+	if err != nil {
+		return "", err
+	}
+	if len(servers) == 0 {
+		return "No connected MCP server exposes prompts.", nil
+	}
+
+	type row struct {
+		server, name, desc string
+		args               []string
+	}
+	var rows []row
+	a.mu.Lock()
+	for _, server := range servers {
+		for _, p := range a.clients[server].client.Prompts() {
+			args := make([]string, 0, len(p.Arguments))
+			for _, arg := range p.Arguments {
+				label := arg.Name
+				if arg.Required {
+					label += "*"
+				}
+				args = append(args, label)
+			}
+			rows = append(rows, row{server: server, name: p.Name, desc: p.Description, args: args})
+		}
+	}
+	a.mu.Unlock()
+
+	if len(rows) == 0 {
+		return fmt.Sprintf("Connected server(s) %s declare prompts but list none.", strings.Join(servers, ", ")), nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d prompt(s) from %d server(s); showing up to %d. Render one with mcp_get_prompt(name=...).\n",
+		len(rows), len(servers), limit)
+	fmt.Fprintf(&b, "Arguments marked * are required.\n")
+	shown := 0
+	for _, r := range rows {
+		if shown >= limit {
+			fmt.Fprintf(&b, "… %d more (raise limit or pass server=)\n", len(rows)-shown)
+			break
+		}
+		fmt.Fprintf(&b, "  [%s] %s", r.server, r.name)
+		if len(r.args) > 0 {
+			fmt.Fprintf(&b, " (%s)", strings.Join(r.args, ", "))
+		}
+		if r.desc != "" {
+			fmt.Fprintf(&b, " — %s", firstLine(r.desc))
+		}
+		b.WriteString("\n")
+		shown++
+	}
+	return b.String(), nil
+}
+
+// execGetPrompt 实现 mcp_get_prompt。
+func (a *app) execGetPrompt(ctx context.Context, payload map[string]any) (string, error) {
+	name := strings.TrimSpace(stringField(payload, "name"))
+	if name == "" {
+		return "", fmt.Errorf("name is required")
+	}
+	want := strings.TrimSpace(stringField(payload, "server"))
+	servers, err := a.pickServers(want, "prompts")
+	if err != nil {
+		return "", err
+	}
+
+	if want == "" {
+		var hits []string
+		a.mu.Lock()
+		for _, server := range servers {
+			for _, p := range a.clients[server].client.Prompts() {
+				if p.Name == name {
+					hits = append(hits, server)
+					break
+				}
+			}
+		}
+		a.mu.Unlock()
+		switch len(hits) {
+		case 0:
+			return "", fmt.Errorf("no connected server exposes prompt %q (call mcp_list_prompts)", name)
+		case 1:
+			want = hits[0]
+		default:
+			return "", fmt.Errorf("prompt %q exists on several servers (%s); pass server= to pick one", name, strings.Join(hits, ", "))
+		}
+	}
+
+	args := map[string]string{}
+	if raw, ok := payload["arguments"].(map[string]any); ok {
+		for k, v := range raw {
+			if s, ok := v.(string); ok {
+				args[k] = s
+			} else {
+				args[k] = fmt.Sprint(v)
+			}
+		}
+	}
+	a.mu.Lock()
+	conn, ok := a.clients[want]
+	a.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("MCP server %q is not connected", want)
+	}
+	return conn.client.GetPrompt(ctx, name, args)
+}
+
+// stringField 取字符串入参（缺失/类型不符一律空串）。
+func stringField(payload map[string]any, key string) string {
+	v, _ := payload[key].(string)
+	return v
 }
 
 // resolveTools 解析工具名：完整公开名优先，其次唯一的裸名（模型常把名字记短）。
@@ -513,7 +891,15 @@ func (a *app) statusText() string {
 	sort.Strings(names)
 	for _, name := range names {
 		conn := a.clients[name]
-		fmt.Fprintf(&b, "  %s  [%s] %s  %d 个工具\n", name, conn.client.Kind(), describe(conn), conn.client.ToolCount())
+		fmt.Fprintf(&b, "  %s  [%s] %s  %d 个工具", name, conn.client.Kind(), describe(conn), conn.client.ToolCount())
+		// 资源/提示词只在服务器真的有的时候才提，免得每行都挂两个 0。
+		if n := conn.client.ResourceCount(); n > 0 {
+			fmt.Fprintf(&b, "、%d 个资源", n)
+		}
+		if n := conn.client.PromptCount(); n > 0 {
+			fmt.Fprintf(&b, "、%d 个提示词", n)
+		}
+		b.WriteString("\n")
 	}
 	if len(a.loaded) > 0 {
 		fmt.Fprintf(&b, "已加载：%d 个（每个请求都带，约 %d tokens）", len(a.loaded), a.loadedCostLocked())
