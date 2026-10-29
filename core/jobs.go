@@ -96,6 +96,24 @@ const (
 	maxWaitTimeout     = 60 * time.Second
 )
 
+// outputWaitTimeout 没有任何输出时，job_output 先等多久再回报 (no output yet)。
+//
+// 为什么要有这段等待：后台任务的结果只在**落定后**才可读（final-output 模式），
+// 所以「刚转后台就立刻读」必然拿到空串。模型拿到一行「(no output yet)」什么也做不了
+// ——它要么立刻再读一次（空转烧 token），要么以为任务没起来。等一小会儿，绝大多数
+// 命令都能在预算内跑完并把真结果交出去；真等不到再如实说没输出。
+//
+// 上限与 maxWaitTimeout 同源：这仍是一次同步工具调用，不能无限占着模型。
+// DSC_JOB_OUTPUT_WAIT_SECS 可覆盖（0 = 不等，立刻回报；负数视同 0）。
+const outputWaitTimeout = 60 * time.Second
+
+// outputWaitPoll 等待首块输出时的轮询间隔。
+//
+// 为什么轮询而不是事件：注册表只为「落定」提供了广播通道（settled），没有为
+// 「追加了输出」提供；流式任务（ReadOutput）更没有。120ms 的轮询对 60s 预算来说
+// 是 500 次内存读，代价可以忽略，换来的是两条路径（final / stream）行为一致。
+const outputWaitPoll = 120 * time.Millisecond
+
 // jobWaitCap 生效的 wait 上限。DSC_JOB_WAIT_MAX_SECS 可覆盖：
 // 设为 0（或负数）即彻底禁止阻塞式等待——此时 wait:true 会被直接拒绝并提示
 // 「完成会通知你」，适合完全不允许工具调用占死模型的场景。
@@ -114,6 +132,35 @@ func jobWaitCap() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// jobOutputWait 生效的「等首块输出」预算；0 表示不等（立刻回报）。
+//
+// 两个闸门都尊重：显式的 DSC_JOB_OUTPUT_WAIT_SECS，以及宿主级的 DSC_JOB_WAIT_MAX_SECS
+// ——部署方既然禁掉了阻塞式等待，这里也不该偷偷阻塞一分钟。
+func jobOutputWait() time.Duration {
+	cap := jobWaitCap()
+	if cap == 0 {
+		return 0 // 宿主明确禁止阻塞式等待
+	}
+	budget := outputWaitTimeout
+	if cap < budget {
+		budget = cap
+	}
+	if v := strings.TrimSpace(os.Getenv("DSC_JOB_OUTPUT_WAIT_SECS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return budget // 写坏了按默认走，别把「等」悄悄变成「不等」
+		}
+		if n <= 0 {
+			return 0
+		}
+		budget = time.Duration(n) * time.Second
+		if budget > cap {
+			budget = cap
+		}
+	}
+	return budget
+}
+
 type jobTool struct {
 	m    *Manager
 	name string
@@ -124,7 +171,7 @@ func (t *jobTool) Name() string { return t.name }
 func (t *jobTool) Description() string {
 	switch t.name {
 	case "job_output":
-		return "Read a background job's output and status. NON-BLOCKING by default — do not poll or sleep: when the job finishes, a completion notice is delivered to you automatically, so you can keep working meanwhile. Only use wait:true when you genuinely cannot take another step without the result; it is synchronous and blocks you (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
+		return "Read a background job's output and status. If the job has produced no output yet, this call waits up to 60s for the first output (or for the job to finish) before answering — so one call usually returns the real result instead of '(no output yet)'. Do not poll or sleep: a finished job also sends you a completion notice. Only use wait:true when you cannot take another step without the settled result; it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
@@ -193,11 +240,57 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 	if err != nil {
 		return "", fmt.Errorf("job_output: %w", err)
 	}
+	// 还没有任何输出、任务也还在跑：先等一小会儿再回报，别把「刚转后台，来不及出东西」
+	// 当成「这个任务没有输出」。等到了就立刻返回（不等满预算），等不到才如实说没有。
+	if !p.Wait && rd.Text == "" && jobRunning(rd.Snapshot.Status) {
+		rd = t.awaitFirstOutput(ctx, p.JobID, caller, rd)
+	}
 	out := renderJobOutput(rd)
 	if waitDropped {
 		out += "\n[note: blocking wait is disabled on this host; returned the current state instead. You will be notified when the job finishes.]"
 	}
 	return out, nil
+}
+
+// jobRunning 任务是否仍在跑（running / stopping 都算）。
+func jobRunning(status jobs.JobStatus) bool {
+	return status == jobs.StatusRunning || status == jobs.StatusStopping
+}
+
+// awaitFirstOutput 等「第一块输出」或任务落定，最多 jobOutputWait()；超时返回最后一次读到的快照。
+//
+// 退出条件刻意有三条：拿到输出（立刻走）、任务落定（读完就可能拿到最终输出）、
+// ctx 取消（用户中断 / 回合结束，不能把人卡在这里）。
+//
+// 轮询读流式任务会消费增量——那正是我们想要的：谁先读到就归谁，返回的就是这次的
+// 第一块输出；没读到的部分留给下一次 job_output。超时那次读到的空结果不会丢任何
+// 内容（流式任务本来就还没产生，最终输出任务在落定后仍可幂等读）。
+func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last jobs.Read) jobs.Read {
+	budget := jobOutputWait()
+	if budget <= 0 {
+		return last
+	}
+	deadline := time.Now().Add(budget)
+	ticker := time.NewTicker(outputWaitPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return last
+		case <-ticker.C:
+		}
+		rd, err := t.m.jobs.Read(id, caller)
+		if err != nil {
+			return last // 任务被剔掉/权限变化：退回上一次的结果，不把错误伪装成空输出
+		}
+		last = rd
+		if rd.Text != "" || !jobRunning(rd.Snapshot.Status) {
+			return rd
+		}
+		if !time.Now().Before(deadline) {
+			return rd
+		}
+	}
 }
 
 // renderJobOutput 渲染 job_output 结果（对齐 DSH：输出 + [status: ...] 结尾；
