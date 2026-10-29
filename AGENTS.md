@@ -351,3 +351,19 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
 
 - 若改动较为局部、不影响 README 概述，可标注「README 无需变更」以便复核。
 
+
+### 15. 工具结果必须是合法 UTF-8，还原归工具自己（不是宿主）
+
+- proto 的 `string` 字段强制合法 UTF-8：非法字节会让**整个**工具结果 marshal 失败（模型
+  只收到一句 "grpc: error while marshaling"，输出全丢）。SDK 因此兜底 `sanitizeUTF8`
+  （非法字节 → U+FFFD），但那是**止损**，不是还原。
+- **还原必须在工具侧做**，因为只有工具知道自己的输出来自哪里：外部进程在中文 Windows
+  上按系统码页（OEM/ANSI 936）输出，并且会与我们的 UTF-8 混在同一份结果里——`python3`
+  打印中文（GBK）+ 内建 `echo` 打印中文（UTF-8），或 stdout 与 stderr 直接拼在一起。
+- 解码要**两级**：先整段按系统码页严格解码（单一编码一次成功）；整段失败再**逐行**重试，
+  合法行原样保留、非法行单独解码。只做整段解码会把混编码输出整片退化成 U+FFFD（现场：
+  `合并: v7 线程` 显示成 `�ϲ�: v7 �߳�`）。参考
+  `plugins/tool-filesystem/encoding.go` 的 `ensureUTF8` / `decodeMixedLines`。
+- 流式上报（`dsc.AppendOutput`）的尾部同样要先还原：宿主只把它原样交给 UI，不会替任何
+  工具猜码页。
+- **不要把「猜码页」当默认行为**：解不出就老实给 U+FFFD——猜出一段假文本比乱码更难发现。

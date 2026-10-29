@@ -22,6 +22,13 @@ import (
 // ensureUTF8 把可能含非法 UTF-8 的命令输出净化为合法 UTF-8 字符串：
 // 已合法则原样返回（零开销快速路径）；Windows 上先按系统码页尽力还原；
 // 仍失败才以 U+FFFD 逐字节替换。
+//
+// 「尽力还原」分两级：先整段解一次（单一编码——绝大多数原生命令，一次成功），
+// 失败再**逐行**重试。整段失败几乎只发生在混编码时：同一条命令里既有外部程序按
+// 系统码页（GBK）输出的行，又有本解释器/内建命令按 UTF-8 输出的行（stdout 与
+// stderr 还会被拼在一起）。严格解码要求整段合法，一行不合就全段放弃 —— 中文于是
+// 整片退化成 U+FFFD（现场：`python3 - <<PY` 打印 GBK 中文 + 我们回写的 UTF-8 行，
+// 结果 `合并: v7 线程` 显示成 `�ϲ�: v7 �߳�`）。
 func ensureUTF8(s string) string {
 	if utf8.ValidString(s) {
 		return s
@@ -30,6 +37,41 @@ func ensureUTF8(s string) string {
 		if dec, ok := decodeSystemCodePage(s); ok && utf8.ValidString(dec) {
 			return dec
 		}
+		if dec, ok := decodeMixedLines(s); ok {
+			return dec
+		}
 	}
 	return strings.ToValidUTF8(s, string(utf8.RuneError))
+}
+
+// decodeMixedLines 逐行解码混合编码输出：合法 UTF-8 行原样保留，非法行按系统码页
+// 严格解码（解不出则局部 U+FFFD）。返回 changed=false 表示整段没有可取之处，
+// 由调用方统一兜底。
+//
+// 按行切的理由：命令行程序的输出以行为单位产生，一行通常来自同一个写入方，
+// 因此「同一行内部混编码」比「同一段里混编码」罕见得多。
+func decodeMixedLines(s string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(s))
+	changed := false
+	rest := s
+	for len(rest) > 0 {
+		line := rest
+		if i := strings.IndexByte(rest, '\n'); i >= 0 {
+			line, rest = rest[:i+1], rest[i+1:]
+		} else {
+			rest = ""
+		}
+		if utf8.ValidString(line) {
+			b.WriteString(line)
+			continue
+		}
+		changed = true
+		if dec, ok := decodeSystemCodePage(line); ok && utf8.ValidString(dec) {
+			b.WriteString(dec)
+			continue
+		}
+		b.WriteString(strings.ToValidUTF8(line, string(utf8.RuneError)))
+	}
+	return b.String(), changed
 }

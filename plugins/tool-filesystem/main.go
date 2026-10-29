@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"dsc-sdk"
 
@@ -121,6 +122,12 @@ func (a *activityWriter) bind(ctx context.Context) {
 	}
 	a.onWrite = func(p []byte) {
 		dsc.TouchActivity(ctx)
+		// 尾部快照同样要给人看：外部程序按系统码页（GBK）写出、我们按 UTF-8 收，
+		// 未还原的字节到了宿主只会变成 U+FFFD。这里按块尽力还原（完整输出在落定时
+		// 还会用整段/逐行两级解码再净化一次，块边界切开的字符只影响这一眼的观感）。
+		if !utf8.Valid(p) {
+			p = []byte(ensureUTF8(string(p)))
+		}
 		dsc.AppendOutput(ctx, p)
 	}
 }
