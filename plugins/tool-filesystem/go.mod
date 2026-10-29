@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	dsc-sdk v0.0.0
+	github.com/axgle/mahonia v0.0.0-20180208002826-3358181d7394
 	mvdan.cc/sh/v3 v3.14.1
 )
 

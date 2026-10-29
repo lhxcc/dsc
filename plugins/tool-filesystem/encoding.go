@@ -49,6 +49,37 @@ func ensureUTF8(s string) string {
 	return strings.ToValidUTF8(s, string(utf8.RuneError))
 }
 
+// decodeCandidate 一种候选解码方式：码页号走平台原生解码（仅 Windows），字符集名
+// 走 mahonia（全平台）。两者可并存——Windows 上钉死 950 时，原生解码是第一选择、
+// mahonia 的 big5 是后端备份。
+type decodeCandidate struct {
+	cp      uint32 // 非 0：交给解码器按码页处理（0 = 系统 ANSI，1 = 系统 OEM）
+	charset string // 非空：mahonia 字符集名
+}
+
+// decodeOne 用单个候选严格解码；解不出合法文本返回 false。
+func decodeOne(c decodeCandidate, s string) (string, bool) {
+	if c.cp != 0 {
+		if dec, ok := decodeWindowCodePage(c.cp, s); ok {
+			return dec, true
+		}
+	}
+	if c.charset != "" {
+		return decodeByCharset(c.charset, s)
+	}
+	return "", false
+}
+
+// decodeSystemCodePage 按候选（系统码页 / 显式覆盖）逐个严格解码。
+func decodeSystemCodePage(s string) (string, bool) {
+	for _, c := range decodeCandidates() {
+		if dec, ok := decodeOne(c, s); ok {
+			return dec, true
+		}
+	}
+	return "", false
+}
+
 // decodeMixedLines 逐行解码混合编码输出：合法 UTF-8 行原样保留，非法行按系统码页
 // 严格解码（解不出则局部 U+FFFD）。返回 changed=false 表示整段没有可取之处，
 // 由调用方统一兜底。
