@@ -259,15 +259,29 @@ func runStdinLoop(agent core.Agent, ctx context.Context) int {
 // 首轮跑 -input 传入的文本；随后若 stdin 为重定向输入（管道/文件），
 // 则继续逐行驱动多轮，直到 EOF。始终不进入 TUI 事件循环，故 ADMIN API / DEBUGGER
 // 端点可在进程存活期间持续观察。
-func runInputMode(agent core.Agent, ctx context.Context, input string) int {
+//
+// singleShot（-headless）下跑完首轮即退出：headless 的契约是「单发、不留后台」，
+// 而 stdin 多轮循环会**无限等下一个输入**——CI/管道里 stdin 常常是一个开着不关的
+// 句柄（并非 EOF），于是任务早就跑完了，进程却永远不退出。这类挂起没有任何输出，
+// 看起来和「模型卡住」一模一样。
+func runInputMode(agent core.Agent, ctx context.Context, input string, singleShot bool) int {
 	if code := runOneTurn(agent, ctx, input); code != 0 {
 		return code
 	}
-	if !stdinIsRedirected() {
-		// 终端手动单轮：跑完 -input 即退出，维持原来的便利行为
+	if !shouldReadStdin(singleShot, stdinIsRedirected()) {
+		// -headless 单发，或终端手动单轮：跑完 -input 即退出
 		return 0
 	}
 	return runStdinLoop(agent, ctx)
+}
+
+// shouldReadStdin 决定 -input 首轮之后是否继续按行读 stdin 驱动多轮。
+//
+// -headless 是「单发、不留后台」契约（见 help），永远不读——headless 场景的 stdin
+// 常常是一个开着不关的管道句柄（不是 EOF），读下去就永远等不到输入，任务早已跑完
+// 而进程不退出，看上去和模型卡死一模一样。其余情况仍按 stdin 是否被重定向判断。
+func shouldReadStdin(singleShot, stdinRedirected bool) bool {
+	return !singleShot && stdinRedirected
 }
 
 // ptcEnvEnabled 是否由环境变量 DSC_PTC 显式开启 PTC 呈现（判定与 agent 侧 ptcEnabled 一致）。
@@ -1003,7 +1017,7 @@ func main() {
 	if inputText != "" {
 		// -input：一次性模式，不显示 TUI，完成后自然退出
 		logger.Info("running in input mode", "input", inputText)
-		exitCode = runInputMode(agent, ctx, inputText)
+		exitCode = runInputMode(agent, ctx, inputText, headless)
 		logger.Info("input mode finished", "exitCode", exitCode)
 
 		// 回合完成音效宽限：notify 等程序性通知插件在 agent 回合完成时异步播放完成音效
