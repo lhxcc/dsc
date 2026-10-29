@@ -100,7 +100,7 @@ func TestRemoteToolCarriesHiddenAndApprovalHint(t *testing.T) {
 		Description:    "d",
 		ParametersJson: `{"type":"object"}`,
 		Hidden:         true,
-		ApprovalHint:   "spawns a local process",
+		Scopes:         []string{ScopeProcessSpawn},
 	}}}
 	defs, _, err := listStagedTools(stub)
 	if err != nil {
@@ -113,8 +113,8 @@ func TestRemoteToolCarriesHiddenAndApprovalHint(t *testing.T) {
 	if !rt.IsHidden() {
 		t.Fatal("hidden 字段在聚合层丢失")
 	}
-	if got := rt.approvalReason(context.Background(), `{}`); got != "spawns a local process" {
-		t.Fatalf("approval_hint 在聚合层丢失：%q", got)
+	if got := rt.approvalReason(context.Background(), `{}`); !strings.Contains(got, ScopeProcessSpawn) {
+		t.Fatalf("scopes 在聚合层丢失：%q", got)
 	}
 }
 
@@ -122,9 +122,9 @@ func TestRemoteToolCarriesHiddenAndApprovalHint(t *testing.T) {
 func TestApprovalReasonComesFromPlugin(t *testing.T) {
 	stub := &approvalStub{
 		reason: "Spawns `node server.mjs` as a local process",
-		tools:  []*proto.Tool{{Name: "spawn_tool", ParametersJson: `{}`, ApprovalHint: "spawns a process"}},
+		tools:  []*proto.Tool{{Name: "spawn_tool", ParametersJson: `{}`, Scopes: []string{ScopeProcessSpawn}}},
 	}
-	rt := &RemoteTool{name: "spawn_tool", client: stub, approvalHint: "spawns a process"}
+	rt := &RemoteTool{name: "spawn_tool", client: stub, scopes: []string{ScopeProcessSpawn}}
 	args := `{"command":"node","args":["server.mjs"]}`
 	if got := rt.approvalReason(context.Background(), args); !strings.Contains(got, "node server.mjs") {
 		t.Fatalf("应使用插件给的具体理由，got %q", got)
@@ -138,9 +138,9 @@ func TestApprovalReasonComesFromPlugin(t *testing.T) {
 // 但绝不能因为「问不到」就变成放行：审批门是安全边界。
 func TestApprovalReasonFallsBackToHint(t *testing.T) {
 	stub := &approvalStub{reasonErr: errors.New("unimplemented")}
-	rt := &RemoteTool{name: "spawn_tool", client: stub, approvalHint: "spawns a process"}
-	if got := rt.approvalReason(context.Background(), `{}`); got != "spawns a process" {
-		t.Fatalf("应回退到 approval_hint，got %q", got)
+	rt := &RemoteTool{name: "spawn_tool", client: stub, scopes: []string{ScopeProcessSpawn}}
+	if got := rt.approvalReason(context.Background(), `{}`); !strings.Contains(got, ScopeProcessSpawn) {
+		t.Fatalf("插件给不出理由时应按范围合成说明，got %q", got)
 	}
 
 	// 没声明审批的工具：不问、也不要理由
@@ -155,11 +155,11 @@ func TestApprovalReasonFallsBackToHint(t *testing.T) {
 func TestApprovalGateCoversRemoteTools(t *testing.T) {
 	m := newRouterManager()
 	rt := &RemoteTool{
-		name:         "spawn_tool",
-		description:  "d",
-		schema:       json.RawMessage(`{}`),
-		client:       &approvalStub{reason: "spawns a local process"},
-		approvalHint: "spawns a local process",
+		name:        "spawn_tool",
+		description: "d",
+		schema:      json.RawMessage(`{}`),
+		client:      &approvalStub{reason: "spawns a local process"},
+		scopes:      []string{ScopeProcessSpawn},
 	}
 	if err := m.toolRegistry.Register(rt); err != nil {
 		t.Fatalf("register: %v", err)

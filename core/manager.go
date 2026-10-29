@@ -215,6 +215,10 @@ type Manager struct {
 	// 的路径之一，且装配期间不该去拿 m.mu（有调用方就持着它）。三个写入点各自维护这个
 	// 计数（登记 / 单个断开 / 全部断开），读侧永远只做一次原子读。
 	mcpServerCount atomic.Int32
+
+	// scopeLedger 授权账本（见 core/authorization.go）：范围级审批粒度下的用户决定。
+	scopeLedger     *scopeLedger
+	scopeLedgerOnce sync.Once
 }
 
 type ManagerConfig struct {
@@ -1794,6 +1798,10 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 
 	// 保存显式声明的压缩后端插件名（供 registerDscCoreLocked 匹配检测）
 	m.compactionBackend = cfg.Compaction
+	// 预授予的权限范围：配置里写明的，启动即生效（人已经做过这个决定）。
+	if cfg.Authorization != nil {
+		m.SeedScopes(cfg.Authorization.GrantedScopes)
+	}
 
 	// 版本感知解析：各插件目录内若存在「<目录基名>-v<版本><ext>」的更高版本二进制，
 	// 启动即直接加载最高版本，避免先起基线进程再由 watcher 换新（Windows 下运行中的

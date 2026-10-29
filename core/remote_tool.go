@@ -27,10 +27,10 @@ type RemoteTool struct {
 
 	// hidden 由插件声明：注册了但不进模型可见目录（见 HiddenTool）。
 	hidden bool
-	// approvalHint 由插件声明：非空表示该工具需要用户审批，内容是给用户看的风险说明。
-	// 它是回退值——具体理由问插件（ApprovalReason RPC），因为同一工具不同参数的风险
-	// 不一样（连一个 URL vs 在本机拉起一条命令）。
-	approvalHint string
+	// scopes 由插件声明：本工具可能触碰的权限范围（见 core/authorization.go）。
+	// 非空即表示需要审批——审批是能力的权限属性，不是一段文案；具体到这一次的说明
+	// 由 ApprovalReason RPC 给（同一工具不同参数，风险不同）。
+	scopes []string
 }
 
 // HasCapability 报告该工具是否声明了指定能力标签（源自插件工具声明的 proto.Tool.capabilities。
@@ -57,7 +57,7 @@ func remoteToolFromProto(client proto.ToolServiceClient, t *proto.Tool) *RemoteT
 		client:       client,
 		capabilities: t.GetCapabilities(),
 		hidden:       t.GetHidden(),
-		approvalHint: t.GetApprovalHint(),
+		scopes:       t.GetScopes(),
 	}
 }
 
@@ -68,17 +68,21 @@ func remoteToolFromProto(client proto.ToolServiceClient, t *proto.Tool) *RemoteT
 // 所以这里每次都读当前值，不做缓存。
 func (r *RemoteTool) IsHidden() bool { return r.hidden }
 
+// Scopes 实现 ScopeDeclarer：插件声明的权限范围。
+func (r *RemoteTool) Scopes() []string { return r.scopes }
+
 // approvalReason 返回本次调用需要审批的理由（空串 = 不需要）。
 //
-// 先问插件（ApprovalReason RPC）：理由里能带参数（连哪个地址、跑哪条命令）；插件未
-// 实现该 RPC（旧插件 / 只给了静态说明）时退回 approval_hint。RPC 失败不能变成「静默
-// 放行」——审批门是安全边界，拿不到理由就按 hint 算，hint 也空才放行。
+// 要不要审批看 scopes（静态声明），具体说明问插件（ApprovalReason RPC，按本次参数）。
+// 插件未实现该 RPC 时退回一句按范围拼出来的说明——**不能因为问不到就放行**：审批门是
+// 安全边界，说不清理由时仍要问，只有「没声明任何范围」才算不需要审批。
 func (r *RemoteTool) approvalReason(ctx context.Context, argumentsJSON string) string {
-	if strings.TrimSpace(r.approvalHint) == "" {
-		return "" // 没声明需要审批
+	if len(r.scopes) == 0 {
+		return ""
 	}
+	fallback := "touches " + strings.Join(r.scopes, ", ")
 	if r.client == nil {
-		return r.approvalHint
+		return fallback
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -87,7 +91,7 @@ func (r *RemoteTool) approvalReason(ctx context.Context, argumentsJSON string) s
 		ArgumentsJson: argumentsJSON,
 	})
 	if err != nil || resp.GetReason() == "" {
-		return r.approvalHint
+		return fallback
 	}
 	return resp.GetReason()
 }

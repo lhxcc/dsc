@@ -301,13 +301,25 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
     请求发给模型（目录每个请求都要付成本）。
   - 判定每次现读、不缓存：提供方改主意后下一次 `ListTools` 就生效（宿主约 800ms 同步）。
 
-- **要不要审批，也由工具自己说**（`proto.Tool.approval_hint` + `ToolService.ApprovalReason`）。
-  进程内工具实现 `ApprovalRequester`；插件工具由声明驱动，理由经 RPC 按**本次参数**取
-  （`RemoteTool.approvalReason`），插件未实现该 RPC 时回退到 `approval_hint`。
-  - **不能因为「问不到理由」就放行**：审批门是安全边界，RPC 失败按 hint 算，hint 也空
-    才放行。
-  - 这条是插件化的前提：没有它，插件提供的工具无法要求审批，「在本机拉起一条命令」这类
-    动作只能裸奔。
+- **审批是能力的权限属性，不是工具的文案**（`proto.Tool.scopes` + `ScopeDeclarer` +
+  `ToolService.ApprovalReason`）：
+  - **范围**（静态，工具声明）：本工具**可能**触碰什么（`process.spawn` / `net.egress` /
+    `fs.write`）。非空即需要审批；空 = 不进入审批。
+  - **粒度**（策略，人配置：`DSC_APPROVAL_GRANULARITY=tool|scope`）：工具级每次问、不记账；
+    范围级问一次即记账，同一范围的多把工具共享这次授权。**粒度与范围正交**，工具侧两种
+    粒度下都不用改代码。
+  - **理由**（动态，按本次参数）：`ApprovalReason` RPC；插件未实现时按声明的范围合成说明。
+  - **不能因为「问不到理由」就放行**：RPC 失败按范围合成说明，只有「没声明任何范围」才算
+    不需要审批。
+  - **只声明宿主能真正执行或验证的范围**：无法执行的范围只是自我声明，与一句「这工具
+    危险」等价，却披着声明式的外衣。
+  - **`never` 与预授予是两件事**：`never` 表示「不要问，需要点头的就拒」；配置里
+    `authorization.granted_scopes` 的预授予是人已经做过的决定，`never` 下照常放行。
+    两者混为一谈就是「问不到就放行」这种漏洞的来源。
+
+- **岗位是「有名字的坑位」，编制由岗位性质决定**：`ResolveCompactionRole` 的「唯一」是
+  那个岗位的性质（压缩只能有一个写者），**不是岗位概念的通则**。管理这类能力天然多提供方
+  （编制 N）；呈现层若抢同一端口/路径，则那个岗位编制 1。新增岗位时先声明编制，再谈解析。
 
 - **跨层字段只有一个赋值点**：`remoteToolFromProto`。`listStagedTools`（启动期）与
   `syncPluginTools`（运行期）曾经各拼一遍 `RemoteTool`，加字段时只改一处 → 插件声明了、

@@ -299,16 +299,35 @@ func (m *Manager) toolApprovalGate() WaterfallListener {
 		// 后者是插件化的前提之一：没有它，插件提供的工具根本没法要求审批，
 		// 「在本机拉起一条命令」这类动作就只能裸奔。
 		var reason string
+		var scopes []string
 		switch t := tool.(type) {
 		case ApprovalRequester:
 			reason = t.ApprovalReason(inv.ArgumentsJSON)
+			if sd, ok := tool.(ScopeDeclarer); ok {
+				scopes = sd.Scopes()
+			}
 		case *RemoteTool:
 			reason = t.approvalReason(ev.Context, inv.ArgumentsJSON)
+			scopes = t.Scopes()
 		default:
 			return next(ev)
 		}
 		if strings.TrimSpace(reason) == "" {
 			return next(ev)
+		}
+
+		// 粒度是策略，不是工具的属性：
+		//   工具级（默认）——每次都问，理由按本次参数；
+		//   范围级——这些范围都授权过就不再问；有未授权的才问，问过即记账。
+		// 两种粒度共用同一个理由、同一个账本，工具侧一行都不用改。
+		missing := scopes
+		perScope := m.ApprovalGranularity() == GranularityPerScope && len(scopes) > 0
+		if perScope {
+			missing = m.missingScopes(scopes)
+			if len(missing) == 0 {
+				return next(ev)
+			}
+			reason += "（本次需要授权范围：" + strings.Join(missing, ", ") + "）"
 		}
 		// 用户在前端手打命令即授权：不再问一次（审计事件照旧记）。
 		if HasUserGrant(ev.Context) {
@@ -321,6 +340,12 @@ func (m *Manager) toolApprovalGate() WaterfallListener {
 		outcome := m.askApproval(ev.Context, inv, fmt.Sprintf("Approve running tool %q?", inv.ToolName), inv.ToolName, reason)
 		switch outcome {
 		case "allowed-once":
+			if perScope {
+				// 「同意一次」在范围级语义下是「同意这类动作」，记账后同类调用不再打断。
+				// 工具级不记账：那个粒度下每一次都要人点头，记账等于悄悄放行。
+				m.GrantScopes(missing)
+				m.markScopesAsked(missing)
+			}
 			return next(ev)
 		case "rejected":
 			return fmt.Errorf("the user rejected tool %q", inv.ToolName)

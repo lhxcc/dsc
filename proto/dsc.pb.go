@@ -1072,10 +1072,15 @@ type Tool struct {
 	// 的工具目录（目录每个请求都要发，隐藏即省成本）。**曝光策略归工具提供方**：
 	// 宿主不再按名字前缀判断谁能出现。
 	Hidden bool `protobuf:"varint,5,opt,name=hidden,proto3" json:"hidden,omitempty"`
-	// approval_hint 非空表示该工具需要用户审批，内容是给用户看的一句风险说明。
-	// 只是回退值——宿主优先调 ApprovalReason 拿本次调用的具体理由（同一工具不同参数
-	// 风险不同，例如「连一个 URL」与「在本机拉起一条命令」）。
-	ApprovalHint  string `protobuf:"bytes,6,opt,name=approval_hint,json=approvalHint,proto3" json:"approval_hint,omitempty"`
+	// scopes 本工具可能触碰的权限范围（声明式，如 process.spawn / net.egress /
+	// fs.write）。宿主按范围维护授权账本，审批粒度由策略决定：
+	//   - 工具级（默认）：每次调用都问，最严；
+	//   - 范围级：同一范围问过一次即记住，后续调用不再问。
+	// 空 = 不触碰任何需授权范围，不进入审批。
+	//
+	// 只应声明宿主**能真正执行或验证**的范围：无法执行的范围只是自我声明，
+	// 与一句「这工具危险」等价，不构成安全边界。
+	Scopes        []string `protobuf:"bytes,7,rep,name=scopes,proto3" json:"scopes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1145,11 +1150,11 @@ func (x *Tool) GetHidden() bool {
 	return false
 }
 
-func (x *Tool) GetApprovalHint() string {
+func (x *Tool) GetScopes() []string {
 	if x != nil {
-		return x.ApprovalHint
+		return x.Scopes
 	}
-	return ""
+	return nil
 }
 
 type ToolApprovalRequest struct {
@@ -3920,14 +3925,14 @@ const file_proto_dsc_proto_rawDesc = "" +
 	"\n" +
 	"tool_calls\x18\x04 \x03(\v2\r.dsc.ToolCallR\ttoolCalls\x12\x16\n" +
 	"\x06images\x18\x05 \x03(\tR\x06images\x12\x0e\n" +
-	"\x02id\x18\x06 \x01(\tR\x02id\"\xc6\x01\n" +
+	"\x02id\x18\x06 \x01(\tR\x02id\"\xbf\x01\n" +
 	"\x04Tool\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12'\n" +
 	"\x0fparameters_json\x18\x03 \x01(\tR\x0eparametersJson\x12\"\n" +
 	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x16\n" +
-	"\x06hidden\x18\x05 \x01(\bR\x06hidden\x12#\n" +
-	"\rapproval_hint\x18\x06 \x01(\tR\fapprovalHint\"Y\n" +
+	"\x06hidden\x18\x05 \x01(\bR\x06hidden\x12\x16\n" +
+	"\x06scopes\x18\a \x03(\tR\x06scopesJ\x04\b\x06\x10\a\"Y\n" +
 	"\x13ToolApprovalRequest\x12\x1b\n" +
 	"\ttool_name\x18\x01 \x01(\tR\btoolName\x12%\n" +
 	"\x0earguments_json\x18\x02 \x01(\tR\rargumentsJson\".\n" +

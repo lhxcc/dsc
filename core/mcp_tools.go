@@ -154,6 +154,15 @@ func (m *Manager) mcpManagementVisible(entry bool) bool {
 	return entry || m.mcpServerCount.Load() > 0
 }
 
+// Scopes 实现 ScopeDeclarer：连接/拉起 MCP 服务器会触碰两个范围。
+//
+// 一律两个都声明（即使这次只给 endpoint）：声明是「这个工具**可能**做什么」，不是
+// 「这次做了什么」——后者由 ApprovalReason 按参数说清。少声明就等于给了一条绕过
+// 范围授权的路（先连 HTTP，再借同一个工具改成 stdio）。
+func (t *mcpConnectTool) Scopes() []string {
+	return []string{ScopeProcessSpawn, ScopeNetEgress}
+}
+
 // IsHidden 实现 HiddenTool：关闭时连入口一起藏（成本恰为 0）。
 func (t *mcpConnectTool) IsHidden() bool { return !t.m.mcpManagementVisible(true) }
 

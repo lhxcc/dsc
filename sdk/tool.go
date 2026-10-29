@@ -54,9 +54,14 @@ type Tool struct {
 	// 这个判定**归工具自己**：宿主不再按名字前缀猜谁能出现，因此插件可以随时改主意
 	// （下一次 ListTools 生效，宿主 ~800ms 内同步）。
 	Hidden bool
-	// ApprovalHint 非空表示本工具需要用户审批，内容是给用户看的一句风险说明。
-	// 它是回退值：宿主会先调 ApprovalReason 问「这一次」的具体理由（见 ApprovalFn）。
-	ApprovalHint string
+	// Scopes 本工具可能触碰的权限范围（声明式，如 process.spawn / net.egress /
+	// fs.write）。非空即表示需要审批——审批是**能力的权限属性**，不是一段文案。
+	//
+	// 宿主按范围维护授权账本，审批粒度由策略决定（工具级每次问 / 范围级问一次记住），
+	// 工具侧两种粒度都不用改代码。具体到「这一次」的说明走 ApprovalFn。
+	//
+	// 只声明宿主能真正执行或验证的范围：无法执行的范围只是自我声明。
+	Scopes []string
 	// ApprovalFn 可选：按本次调用参数给出审批理由（空串 = 本次不需要审批）。
 	// 典型用法：「连一个 URL」与「在本机拉起一条命令」风险不同，理由应当说得出来。
 	// 它只在审批路径上被调用，不在每个请求的热路径上。
@@ -176,7 +181,7 @@ func (s *toolServiceServer) ListTools(ctx context.Context, req *proto.ListToolsR
 			ParametersJson: string(t.Schema),
 			Capabilities:   t.Capabilities,
 			Hidden:         t.Hidden,
-			ApprovalHint:   t.ApprovalHint,
+			Scopes:         t.Scopes,
 		})
 	}
 	return &proto.ListToolsResponse{Tools: tools}, nil
@@ -185,7 +190,7 @@ func (s *toolServiceServer) ListTools(ctx context.Context, req *proto.ListToolsR
 // ListContext 贡献 system prompt 片段：优先用动态 ContextFn（每调用求值），
 // 否则拼接各工具的静态 Context（旧宿主可忽略）。
 // ApprovalReason 实现 ToolService.ApprovalReason：把「这一次为什么需要审批」交给
-// 工具自己的 ApprovalFn；没有 ApprovalFn 时回退到静态 ApprovalHint。
+// 工具自己的 ApprovalFn；没有 ApprovalFn 时回空串，宿主按声明的 scopes 合成说明。
 //
 // 未声明审批的工具一律回空串（不需要审批），宿主据此放行——这条路径只在用户即将被
 // 问「要不要批准」时走一次，所以多一跳 RPC 是划算的：理由里能带上具体参数（连哪个
@@ -198,7 +203,7 @@ func (s *toolServiceServer) ApprovalReason(ctx context.Context, req *proto.ToolA
 		if t.ApprovalFn != nil {
 			return &proto.ToolApprovalResponse{Reason: t.ApprovalFn(ctx, json.RawMessage(req.GetArgumentsJson()))}, nil
 		}
-		return &proto.ToolApprovalResponse{Reason: t.ApprovalHint}, nil
+		return &proto.ToolApprovalResponse{}, nil
 	}
 	return &proto.ToolApprovalResponse{}, nil
 }
