@@ -210,6 +210,13 @@ DSC 的命令解析使用内置 POSIX shell 实现（mvdan/sh），所有路径�
 
 ### 10.5 分層：core ← sdk ← plugins（插件不得 import core）
 
+**临时例外（MCP 搬迁期）**：`core` 目前 `import dsc-sdk/mcp`，因为 MCP 客户端已经搬进
+SDK、而宿主还留着薄封装（命名/注册/曝光）。这条边**必须随 MCP 搬成插件一起删掉**。
+维持它的前提是 `sdk/mcp` 只依赖标准库——一旦它 import SDK 根（根里 re-export 了 core 的
+类型），`core → sdk/mcp → sdk → core` 就成了包级循环。`sdk/mcp` 因此自带
+`proc_windows.go`（隐藏控制台）而不是调 `dsc.ConfigureChildProcessAttrs`。
+
+
 插件一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`：
 
 - **为什么**：core 是宿主内核（事件总线、会话、计量、协议实现），会持续重构；sdk 是插件的稳定面（类型别名 + 薄转发）。更要紧的是**同一件事不能有第二份实现机会**——DSC 曾让宿主 `core.TokenMeter`（实测口径）成为无人调用的死代码，agent 插件自己用裸估算决定裁剪/压缩，口径一偏（纯 ASCII 高估 4~5 倍），1M 窗口里服务端实测 332K 的会话被判每轮超窗并反复裁剪。

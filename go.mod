@@ -6,6 +6,7 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.1.0
 	charm.land/lipgloss/v2 v2.0.6
+	dsc-sdk v0.0.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/casbin/casbin v1.9.1
 	github.com/charmbracelet/x/ansi v0.11.9
@@ -19,7 +20,7 @@ require (
 	github.com/hashicorp/go-plugin v1.8.0
 	github.com/hashicorp/go-version v1.9.0
 	github.com/mattn/go-colorable v0.1.14
-	github.com/mattn/go-isatty v0.0.20
+	github.com/mattn/go-isatty v0.0.24
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/smartystreets/goconvey v1.8.1
@@ -29,6 +30,7 @@ require (
 	github.com/wippyai/go-lua v1.5.17
 	github.com/yuin/goldmark v1.8.5
 	github.com/zeebo/blake3 v0.2.4
+	golang.org/x/image v0.44.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.40.0
 	golang.org/x/time v0.15.0
@@ -73,7 +75,6 @@ require (
 	github.com/xo/terminfo v1.0.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa // indirect
-	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	google.golang.org/appengine v1.6.5 // indirect
@@ -104,3 +105,8 @@ replace github.com/valyala/fasttemplate => ./libs/fasttemplate
 replace github.com/valyala/bytebufferpool => ./libs/bytebufferpool
 
 replace github.com/wippyai/go-lua => ./libs/go-lua
+
+// sdk/mcp 是纯 MCP 客户端（只依赖标准库），宿主与插件共用同一份实现。
+// 这是**过渡性**依赖：core 目前还留着 MCP 的薄封装（命名 / 注册 / 曝光），
+// 等 MCP 整体搬成插件后 core 不再引用 dsc-sdk，这行随之删除（分层仍是 core ← sdk ← plugins）。
+replace dsc-sdk => ./sdk

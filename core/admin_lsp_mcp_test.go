@@ -83,11 +83,17 @@ func TestMCPMockServerConnect(t *testing.T) {
 	if len(client.tools) != 2 {
 		t.Fatalf("expected 2 tools, got %d", len(client.tools))
 	}
-	if _, ok := client.tools["search"]; !ok {
-		t.Fatal("tool 'search' not found")
+	// tools 按**公开名**索引（注册表键一致）：模型看到的名字必须带服务器前缀，
+	// 否则两台服务器各有一个 search 时会互相覆盖。服务器原名在 rawName 里。
+	entry, ok := client.tools["mcp__mockserver__search"]
+	if !ok {
+		t.Fatalf("tool 'mcp__mockserver__search' not found（现有 %v）", client.tools)
 	}
-	if client.tools["search"].publicName != "mcp__mockserver__search" {
-		t.Errorf("publicName = %q", client.tools["search"].publicName)
+	if entry.rawName != "search" {
+		t.Errorf("rawName = %q, want search", entry.rawName)
+	}
+	if entry.publicName != "mcp__mockserver__search" {
+		t.Errorf("publicName = %q", entry.publicName)
 	}
 	result, err := client.CallTool(context.Background(), "search", json.RawMessage(`{}`))
 	if err != nil {

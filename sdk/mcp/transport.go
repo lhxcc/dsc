@@ -1,4 +1,4 @@
-package core
+package mcp
 
 import (
 	"bufio"
@@ -14,9 +14,19 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/hashicorp/go-hclog"
 )
+
+// Logger 最小的日志接口：*hclog.Logger 直接满足，SDK 因此不必依赖具体日志实现。
+// 默认静默；调用方传自己的 logger 即可看到 stdio 的 stderr 与进程事件。
+type Logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+}
+
+type nopLogger struct{}
+
+func (nopLogger) Debug(string, ...any) {}
+func (nopLogger) Info(string, ...any)  {}
 
 // MCP 传输层：一次 JSON-RPC 往返背后的实际通道。
 //
@@ -30,11 +40,11 @@ import (
 // 会话过期重连、工具注册、错误包装都在客户端；把「怎么把一行 JSON 送过去再取回一行」
 // 隔开之后，两种传输各自的怪癖（HTTP 的 header 与 SSE、stdio 的管道与进程退出）不会
 // 渗进协议逻辑。
-type mcpTransport interface {
+type Transport interface {
 	// RoundTrip 发送一个 JSON-RPC 消息并返回响应；无 id 的通知返回空 map。
 	RoundTrip(ctx context.Context, req map[string]any) (map[string]any, error)
 	// Reset 丢弃会话状态并准备下一次握手（HTTP 清会话 id；stdio 在子进程已退出时重启）。
-	Reset(logger hclog.Logger) error
+	Reset(logger Logger) error
 	// Close 释放通道（HTTP 无操作；stdio 关 stdin 并回收子进程）。
 	Close()
 	// Kind 传输类型标识：http / stdio。
@@ -47,9 +57,9 @@ type mcpTransport interface {
 // streamable HTTP
 // ============================================================
 
-// errMCPSessionExpired 表示服务端不再认识当前会话（streamable HTTP 的 404）。
+// ErrSessionExpired 表示服务端不再认识当前会话（streamable HTTP 的 404）。
 // 调用方据此重新 initialize，而不是把「会话过期」当成工具调用失败。
-var errMCPSessionExpired = fmt.Errorf("mcp: session expired")
+var ErrSessionExpired = fmt.Errorf("mcp: session expired")
 
 type httpTransport struct {
 	endpoint   string
@@ -72,7 +82,7 @@ func (t *httpTransport) Describe() string { return t.endpoint }
 func (t *httpTransport) Close()           {}
 
 // Reset 清掉会话：重连必须拿新会话，旧 id 在新连接上一定 404。
-func (t *httpTransport) Reset(_ hclog.Logger) error {
+func (t *httpTransport) Reset(_ Logger) error {
 	t.mu.Lock()
 	t.sessionID = ""
 	t.mu.Unlock()
@@ -138,7 +148,7 @@ func (t *httpTransport) RoundTrip(ctx context.Context, req map[string]any) (map[
 		return map[string]any{}, nil
 	case resp.StatusCode == http.StatusNotFound && sid != "":
 		// 会话已失效：交给调用方重新 initialize
-		return nil, errMCPSessionExpired
+		return nil, ErrSessionExpired
 	default:
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
@@ -188,11 +198,11 @@ func ParseSSEResponse(body []byte) (map[string]any, error) {
 // stdio（子进程）
 // ============================================================
 
-// MCPStdioSpec 是启动一个 stdio MCP 服务器所需的全部信息。
+// StdioSpec 是启动一个 stdio MCP 服务器所需的全部信息。
 //
-// Command/Args 是命令行，Env 只会追加到**白名单基线**上（见 mcpStdioEnv）——
+// Command/Args 是命令行，Env 只会追加到**白名单基线**上（见 stdioEnv）——
 // MCP 服务器是第三方代码，不能把宿主的整份环境（含各家 API key）灌给它。
-type MCPStdioSpec struct {
+type StdioSpec struct {
 	Command string
 	Args    []string
 	Env     map[string]string
@@ -202,12 +212,12 @@ type MCPStdioSpec struct {
 // stdioShutdownGrace 关 stdin 之后等子进程自行退出的时间，超时才 Kill。
 const stdioShutdownGrace = 3 * time.Second
 
-// mcpStdioBaseEnv 传给 MCP 子进程的环境变量白名单（大小写不敏感匹配）。
+// stdioBaseEnv 传给 MCP 子进程的环境变量白名单（大小写不敏感匹配）。
 //
 // 只给「能启动进程、能找到自己的运行时」所必需的那些：PATH 及其 Windows 扩展、
 // 系统根、家目录、临时目录。**不给**任何 DSC_* / *_API_KEY —— 需要密钥的服务器
 // 应由用户在配置里显式写进 env（那是明确的授权动作，不是隐式继承）。
-var mcpStdioBaseEnv = []string{
+var stdioBaseEnv = []string{
 	"PATH", "PATHEXT", "SystemRoot", "SYSTEMDRIVE", "COMSPEC", "WINDIR",
 	"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
 	"TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -217,13 +227,13 @@ var mcpStdioBaseEnv = []string{
 	"JAVA_HOME", "GOROOT", "GOPATH", "CARGO_HOME", "RUSTUP_HOME",
 }
 
-// mcpStdioEnv 组装子进程环境：白名单基线 + 调用方显式给的 env（后者覆盖前者）。
+// stdioEnv 组装子进程环境：白名单基线 + 调用方显式给的 env（后者覆盖前者）。
 //
 // 排序输出：同一份配置在不同机器上环境块字节一致，便于比对与排查（也避免
 // Windows 上「环境块顺序不同 → 进程行为不同」这种难查的差异）。
-func mcpStdioEnv(extra map[string]string) []string {
+func stdioEnv(extra map[string]string) []string {
 	env := map[string]string{}
-	for _, key := range mcpStdioBaseEnv {
+	for _, key := range stdioBaseEnv {
 		if v, ok := os.LookupEnv(key); ok {
 			env[strings.ToUpper(key)] = key + "=" + v
 		}
@@ -243,8 +253,8 @@ func mcpStdioEnv(extra map[string]string) []string {
 }
 
 type stdioTransport struct {
-	spec   MCPStdioSpec
-	logger hclog.Logger
+	spec   StdioSpec
+	logger Logger
 
 	// mu 串行化往返，并保护下面这些字段的快照（stdin/lines/done/cmd）。
 	// **进程退出路径不取它**：等待 goroutine 若为拿锁而阻塞，会让正在等待响应的
@@ -260,12 +270,12 @@ type stdioTransport struct {
 	doneErr error
 }
 
-func newStdioTransport(spec MCPStdioSpec, logger hclog.Logger) (*stdioTransport, error) {
+func newStdioTransport(spec StdioSpec, logger Logger) (*stdioTransport, error) {
 	if strings.TrimSpace(spec.Command) == "" {
 		return nil, fmt.Errorf("stdio MCP server needs a command")
 	}
 	if logger == nil {
-		logger = hclog.NewNullLogger()
+		logger = nopLogger{}
 	}
 	t := &stdioTransport{
 		spec:   spec,
@@ -286,10 +296,10 @@ func newStdioTransport(spec MCPStdioSpec, logger hclog.Logger) (*stdioTransport,
 func (t *stdioTransport) start() error {
 	cmd := exec.Command(t.spec.Command, t.spec.Args...)
 	// Windows：隐藏子进程控制台窗口（否则每拉一个 MCP 服务器都弹一个黑框）。
-	// 与 lsp / lua 的 spawn 站点同一防护网（proc_attr_regression_test 会检查）。
-	ConfigureChildProcessAttrs(cmd)
+	// 本包自带实现（proc_windows.go），不依赖 SDK 根——否则 core 反向依赖会成环。
+	configureChildProcessAttrs(cmd)
 	cmd.Dir = t.spec.CWD
-	cmd.Env = mcpStdioEnv(t.spec.Env)
+	cmd.Env = stdioEnv(t.spec.Env)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -372,7 +382,7 @@ func (t *stdioTransport) describeCmd() string {
 
 // Reset：stdio 没有「会话」，只有「进程」。进程还活着就什么都不做；已经退出就重启
 // 一个（对齐 HTTP 侧 404 重连的语义：下一次调用前恢复可用状态）。
-func (t *stdioTransport) Reset(_ hclog.Logger) error {
+func (t *stdioTransport) Reset(_ Logger) error {
 	select {
 	case <-t.done:
 	default:
@@ -473,7 +483,7 @@ func (t *stdioTransport) RoundTrip(ctx context.Context, req map[string]any) (map
 				}
 				continue
 			}
-			if mid, ok := msg["id"]; ok && mcpIDEqual(mid, wantID) {
+			if mid, ok := msg["id"]; ok && idEqual(mid, wantID) {
 				return msg, nil
 			}
 			// 迟到/无关响应：丢弃
@@ -510,8 +520,8 @@ func (t *stdioTransport) replyMethodNotFound(stdin io.Writer, id any, msg map[st
 	_, _ = stdin.Write(append(payload, '\n'))
 }
 
-// mcpIDEqual 比较 JSON-RPC id。我们发的是整数，服务端回 JSON 数字（解析成 float64），
+// idEqual 比较 JSON-RPC id。我们发的是整数，服务端回 JSON 数字（解析成 float64），
 // 也可能是字符串（少数实现），所以统一按文本比较。
-func mcpIDEqual(a, b any) bool {
+func idEqual(a, b any) bool {
 	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }

@@ -423,10 +423,3 @@ func (m *Manager) GetMCPClient(serverName string) *MCPClient {
 	m.ensureMCPClients()
 	return m.mcpClients[serverName]
 }
-
-// ToolCount 返回 MCP 客户端已发现的工具数量（供日志输出）。
-func (c *MCPClient) ToolCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.tools)
-}
