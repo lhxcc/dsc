@@ -366,4 +366,10 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
   `plugins/tool-filesystem/encoding.go` 的 `ensureUTF8` / `decodeMixedLines`。
 - 流式上报（`dsc.AppendOutput`）的尾部同样要先还原：宿主只把它原样交给 UI，不会替任何
   工具猜码页。
+- **码页取自系统，不写死**：`CP_OEMCP` / `CP_ACP` 交给 Windows 解析，zh-CN 得到 936、
+  zh-TW 得到 950（Big5）、ja-JP 得到 932，不需要判断「这是不是简体系统」。需要确定性时
+  用 `DSC_OUTPUT_CODEPAGE` 显式钉死（如 `950`、`65001`），此时不再试探。
+- **已知边界（别当它能猜对）**：GBK 与 Big5 都是双字节且区间重叠，交叉解码会**成功但给出
+  错字**（GBK `合并` 按 Big5 解出 `磁甜`），而不是 U+FFFD。单凭字节无法判断码页——这正是
+  需要 `DSC_OUTPUT_CODEPAGE` 的原因。
 - **不要把「猜码页」当默认行为**：解不出就老实给 U+FFFD——猜出一段假文本比乱码更难发现。

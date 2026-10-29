@@ -6,6 +6,11 @@ package main
 // 中文 Windows 上 `tree` 命中 C:\Windows\tree.com，其输出为系统 OEM 码页（GBK）
 // 编码，原样进入工具结果即触发 marshal 失败。
 //
+// 码页不是写死的常量：解码时传 CP_OEMCP / CP_ACP 给 Windows，由系统换成本机实际
+// 码页（zh-CN 936、zh-TW 950/Big5、ja-JP 932……），可用 DSC_OUTPUT_CODEPAGE 钉死。
+// 注意双字节码页交叉解码会「成功但错字」（GBK 的「合并」按 Big5 解出「磁甜」），
+// 单凭字节无法判断码页——所以只做严格解码 + 显式覆盖，绝不按内容猜。
+//
 // 净化分两层：
 //  1. Windows 上先尝试按系统 OEM/ANSI 码页严格解码（MB_ERR_INVALID_CHARS，
 //     解不出合法文本即放弃）——中文 Windows 的控制台工具输出因此可还原为正确
