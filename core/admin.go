@@ -114,11 +114,11 @@ func (m *Manager) adminEngine() *vodka.Vodka {
 	lsp.Use(adminAuth)
 	m.registerLSPAdminRoutes(lsp)
 
-	// MCP 管理（认证与 /plugins 一致）——盘活 core/mcp_client.go 死模块，
-	// 对齐 DSH packages/mcp/mcp-client 的能力暴露面。
-	mcp := e.Group("/mcp")
-	mcp.Use(adminAuth)
-	m.registerMCPAdminRoutes(mcp)
+	// 通用管理操作端点（认证与 /plugins 一致）：任何声明了管理面的插件都经这里暴露，
+	// 宿主不认识具体名字（见 core/admin_operations.go）。
+	ops := e.Group("/operations")
+	ops.Use(adminAuth)
+	m.registerOperationAdminRoutes(ops)
 
 	return e
 }

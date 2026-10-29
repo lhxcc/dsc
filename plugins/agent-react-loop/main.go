@@ -396,13 +396,16 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		}, ctx.Err()
 	}
 
-	// 正常模式沿用 maxIterations（默認 0 = 不設限）；單輪模式（-input）下僅執行一輪，方便測試後自然退出
+	// 迭代上限只来自显式预算（DSC_MAX_ITERATIONS）；默认 0 = 不设限。
+	//
+	// 这里曾在单轮模式（-input / -headless）下把上限硬设成 1，本意是「自动化跑完一轮
+	// 就能自然退出」，实际含义却是**只发一次 LLM 请求**：模型一旦调用工具，这一轮就在
+	// 工具结果之后结束，再没有第二次请求去用结果作答。表现为 `dsc -input` 永远只打印
+	// 工具卡片、没有答案，多步流程（如 MCP connect→list→load→call）根本无法验证。
+	//
+	// 「单轮」该约束的是**不自动续行**（goal 轮、待办追问、注入续行、截断续写都按
+	// singleTurn 关掉了），而不是不许多步；循环在模型不再调用工具时自然收尾。
 	maxIterations := a.maxIterations
-	if a.singleTurn {
-		maxIterations = 1
-	}
-	executedTools := false    // 記錄本輪是否執行了工具（單輪模式下視為正常完成）
-	executedToolsErr := false // 記錄本輪執行的工具是否出現錯誤（單輪模式下據此判定退出碼）
 	stepNo := 0
 	// 回合闭合不变量（对齐 DSH：turn/end 总以某 reason 闭合 turn/start，step 同理）：
 	// 正常收尾路径（completed/goal-concluded/max-iterations/单轮成败）自行闭合并
@@ -854,9 +857,6 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			default:
 			}
 
-			// 标记本轮执行了工具（单轮模式下据此判定为正常完成）
-			executedTools = true
-
 			// 模型请求的工具调用记入会话（log-only，与下方 tool/result 配对）
 			sess.Append(session.ToolCallEvent, &session.ToolCallData{
 				Turn: turnNo, Step: stepNo, CallID: tc.Id, Name: tc.Name, Arguments: tc.ArgumentsJson,
@@ -879,10 +879,6 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 					Error:   reason,
 				}, &session.SurfaceOp{Op: session.SurfaceAppend})
 				a.logger.Info("truncated tool call skipped", "turn", turnNo, "step", stepNo, "tool", tc.Name, "argsLen", len(tc.ArgumentsJson))
-				// 單輪模式下，截断导致的工具未执行視為失敗退出（影響退出碼）
-				if a.singleTurn {
-					executedToolsErr = true
-				}
 				if emit != nil {
 					emit(&dsc.RunStreamResponse{Output: fmt.Sprintf("\n[工具结果: %s 错误] %s\n", tc.Name, reason), Status: "tool", ToolName: tc.Name, ToolResult: reason, Error: reason, Usage: a.usageSnapshot()})
 				}
@@ -952,10 +948,6 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 					Content: fmt.Sprintf("Tool error: %s", toolResp.Error),
 					Error:   toolResp.Error,
 				}, &session.SurfaceOp{Op: session.SurfaceAppend})
-				// 單輪模式下，工具報錯要視為失敗退出（影響退出碼）
-				if a.singleTurn {
-					executedToolsErr = true
-				}
 				// 把工具結果輸出到流，供 TUI 渲染 REX 式结果卡片
 				if emit != nil {
 					emit(&dsc.RunStreamResponse{Output: fmt.Sprintf("\n[工具结果: %s 错误] %s\n", tc.Name, toolResp.Error), Status: "tool", ToolName: tc.Name, ToolResult: toolResp.Error, Error: toolResp.Error, Usage: a.usageSnapshot()})
@@ -999,9 +991,10 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		// 下一次 LLM 请求会带着过时的工具列表，模型看不到新加载的工具。
 		// 刷新 availableTools 确保模型在下一轮看到最新工具集。
 		//
-		// MCP 的 load/unload/connect 同理：那三个工具改的是宿主侧「哪些 MCP 工具对模型
-		// 可见」，宿主下一次 ListTools 给的目录已经不同（见 core/mcp_tools.go）。不刷新
-		// 的话，模型刚 mcp_load 完就调不了那两个工具——它会以为加载失败，然后重复加载。
+		// MCP 的 load/unload/connect 同理：那几个工具改的是「哪些 MCP 工具对模型可见」，
+		// 归属在 tool-mcp 插件（宿主只按插件上报的 hidden 决定曝光），宿主下一次 ListTools
+		// 给的目录已经不同。不刷新的话，模型刚 mcp_load 完就调不了刚加载的工具——它会
+		// 以为加载失败，然后重复加载。
 		for _, tc := range toolCalls {
 			if isToolCatalogChangingCall(tc.Name) {
 				if refreshed, err := toolClient.ListTools(ctx, &proto.ListToolsRequest{}); err == nil {
@@ -1034,39 +1027,11 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 			return &dsc.AgentResult{Output: content, Status: "success"}, nil
 		}
 	}
-	// 超过最大迭代次数：轮次以 max-iterations 关闭（不再持久化独立消息数组，session 即历史）
-	// 单轮模式按实际结果闭合轮次（先前无论成败一律标 max-iterations，导出记录难以如实判读）；
-	// 多轮模式循环耗尽才标 max-iterations。
-	turnReason := "max-iterations"
-	if a.singleTurn && executedTools {
-		turnReason = "completed"
-		if executedToolsErr {
-			turnReason = "error"
-		}
-	}
-	sess.Append(session.TurnEnd, &session.TurnData{Turn: turnNo, Reason: turnReason}, nil)
+	// 超过最大迭代次数：轮次以 max-iterations 关闭（不再持久化独立消息数组，session 即历史）。
+	// 预算耗尽一律是「没做完」，与模式无关——以前单轮模式会在这里按「已执行过工具」判成功，
+	// 那只是给「单轮=单步」的缺陷兜面子（输出一句占位文案、退出码 0），真正的答案并没有产生。
+	sess.Append(session.TurnEnd, &session.TurnData{Turn: turnNo, Reason: "max-iterations"}, nil)
 	turnOpen = false
-	// 單輪模式（-input）下，工具已在本輪執行完畢，視為正常完成（而非“達迭代上限”錯誤），
-	// 這樣一次工具調用測試成功後程序能以退出碼 0 自然結束；若工具報錯則以退出碼 1 結束
-	if a.singleTurn && executedTools {
-		if executedToolsErr {
-			// 工具執行出錯：發 error 幀，使 -input 以退出碼 1 結束，測試方能據此判斷失敗
-			if emit != nil {
-				emit(&dsc.RunStreamResponse{Output: "Single turn completed with tool errors", Status: "error"})
-			}
-			return &dsc.AgentResult{
-				Output: "Single turn completed with tool errors",
-				Status: "error",
-			}, nil
-		}
-		if emit != nil {
-			emit(&dsc.RunStreamResponse{Status: "success"})
-		}
-		return &dsc.AgentResult{
-			Output: "Single turn completed with tools executed",
-			Status: "success",
-		}, nil
-	}
 	if emit != nil {
 		// Error 字段必須帶上，否則 TUI 只按 Status 判斷、看不到任何提示，造成「莫名停止」
 		emit(&dsc.RunStreamResponse{Output: "Max iterations reached", Status: "error", Error: "达到最大轮次上限，自动停止"})

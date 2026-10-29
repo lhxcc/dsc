@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const (
@@ -26,7 +27,42 @@ func printColored(color, msg string) {
 func printInfo(msg string)    { printColored(colorBlue, msg) }
 func printSuccess(msg string) { printColored(colorGreen, msg) }
 func printWarning(msg string) { printColored(colorYellow, msg) }
-func printError(msg string)   { printColored(colorRed, msg) }
+
+// warnIfBuilderStale 报告「二进制比源码旧」——build 清单（publicPlugins 等）写在源码里，
+// 跑旧二进制等于用旧清单打包，且慢一步发现就会是「构建成功但缺插件」。
+func warnIfBuilderStale(exePath, scriptDir string) {
+	exeInfo, err := os.Stat(exePath)
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(scriptDir)
+	if err != nil {
+		return
+	}
+	var newest time.Time
+	newestName := ""
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+			newestName = name
+		}
+	}
+	if newest.After(exeInfo.ModTime()) {
+		printWarning(fmt.Sprintf(
+			"  ！%s 比 %s 新：正在运行的是**旧版 builder**，发布清单可能不是源码里的那份。\n"+
+				"    先重新编译：go build -o builder.exe ./builder\n",
+			newestName, filepath.Base(exePath)))
+	}
+}
+func printError(msg string) { printColored(colorRed, msg) }
 
 // platform 定义目标平台
 type platform struct {
@@ -64,6 +100,7 @@ var publicPlugins = []string{
 	"tool-lisp-eval",
 	"tool-pdf",
 	"tool-memory-service",
+	"tool-mcp",
 	"dsc-notify",
 	"tool-lua-host",
 	"tool-sql-host",
@@ -129,6 +166,12 @@ func main() {
 		fmt.Printf("切换目录失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 自检：builder.exe 是编译产物，改了 builder.go 却忘了重编，跑出来的就是**上一份**
+	// 清单——曾经因此打出一个少了插件的发布包，日志里连该插件的名字都没出现过，
+	// 看起来像是「构建成功」。这里在开工前先把这件事说出来（不中止：旧清单多数时候
+	// 仍可用，但人必须知道自己在跑哪一版）。
+	warnIfBuilderStale(exePath, scriptDir)
 
 	// 处理帮助命令
 	if len(os.Args) >= 2 {

@@ -1080,7 +1080,14 @@ type Tool struct {
 	//
 	// 只应声明宿主**能真正执行或验证**的范围：无法执行的范围只是自我声明，
 	// 与一句「这工具危险」等价，不构成安全边界。
-	Scopes        []string `protobuf:"bytes,7,rep,name=scopes,proto3" json:"scopes,omitempty"`
+	Scopes []string `protobuf:"bytes,7,rep,name=scopes,proto3" json:"scopes,omitempty"`
+	// management 非空表示本工具是一条**管理操作**，值是它所属的管理能力名（如 "mcp"）。
+	//
+	// 管理是能力，端点/命令是呈现：宿主把同一组操作交给任何呈现层（TUI、admin REST、
+	// 未来的 WEB）统一渲染，而不是让每个插件各自带一面前端。操作本身仍是一个工具
+	// （可执行、可审批、可隐藏），只是多了「我属于哪个管理面」这一条归属。
+	// 空 = 普通工具，不是任何管理面的一部分。
+	Management    string `protobuf:"bytes,8,opt,name=management,proto3" json:"management,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1155,6 +1162,13 @@ func (x *Tool) GetScopes() []string {
 		return x.Scopes
 	}
 	return nil
+}
+
+func (x *Tool) GetManagement() string {
+	if x != nil {
+		return x.Management
+	}
+	return ""
 }
 
 type ToolApprovalRequest struct {
@@ -3925,14 +3939,17 @@ const file_proto_dsc_proto_rawDesc = "" +
 	"\n" +
 	"tool_calls\x18\x04 \x03(\v2\r.dsc.ToolCallR\ttoolCalls\x12\x16\n" +
 	"\x06images\x18\x05 \x03(\tR\x06images\x12\x0e\n" +
-	"\x02id\x18\x06 \x01(\tR\x02id\"\xbf\x01\n" +
+	"\x02id\x18\x06 \x01(\tR\x02id\"\xdf\x01\n" +
 	"\x04Tool\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
 	"\vdescription\x18\x02 \x01(\tR\vdescription\x12'\n" +
 	"\x0fparameters_json\x18\x03 \x01(\tR\x0eparametersJson\x12\"\n" +
 	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x16\n" +
 	"\x06hidden\x18\x05 \x01(\bR\x06hidden\x12\x16\n" +
-	"\x06scopes\x18\a \x03(\tR\x06scopesJ\x04\b\x06\x10\a\"Y\n" +
+	"\x06scopes\x18\a \x03(\tR\x06scopes\x12\x1e\n" +
+	"\n" +
+	"management\x18\b \x01(\tR\n" +
+	"managementJ\x04\b\x06\x10\a\"Y\n" +
 	"\x13ToolApprovalRequest\x12\x1b\n" +
 	"\ttool_name\x18\x01 \x01(\tR\btoolName\x12%\n" +
 	"\x0earguments_json\x18\x02 \x01(\tR\rargumentsJson\".\n" +

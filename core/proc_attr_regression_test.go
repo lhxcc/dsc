@@ -75,6 +75,9 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 		"ConfigureChildProcessAttrs", // core / sdk re-export 命名
 		"hideChildConsole",           // plugin/internal/cmdrunner、libs/sh/interp 命名
 		"setChildProcSysProcAttr",    // core windows 平台内部命名
+		// sdk/mcp 里拉 MCP 服务器子进程时的小写实现（该包刻意不依赖 SDK 根，
+		// 自带一份平台实现；见 sdk/mcp/proc_windows.go）。
+		"configureChildProcessAttrs",
 	}
 
 	// 派生点特征：构造 *exec.Cmd 的全部形态（直接与别名导入）。

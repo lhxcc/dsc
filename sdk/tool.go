@@ -64,6 +64,12 @@ type Tool struct {
 	//
 	// 只声明宿主能真正执行或验证的范围：无法执行的范围只是自我声明。
 	Scopes []string
+	// Management 非空表示本工具是一条**管理操作**，值是所属管理能力名（如 "mcp"）。
+	//
+	// 管理是能力，呈现是另一件事：宿主把同一组操作交给任何呈现层（TUI / admin REST /
+	// 未来的 WEB）统一渲染，而不是让每个插件各带一面前端。操作仍是一个工具（可执行、
+	// 可审批、可 Hidden），只是多了归属。空 = 普通工具。
+	Management string
 	// ApprovalFn 可选：按本次调用参数给出审批理由（空串 = 本次不需要审批）。
 	// 典型用法：「连一个 URL」与「在本机拉起一条命令」风险不同，理由应当说得出来。
 	// 它只在审批路径上被调用，不在每个请求的热路径上。
@@ -193,6 +199,7 @@ func (s *toolServiceServer) ListTools(ctx context.Context, req *proto.ListToolsR
 			Capabilities:   t.Capabilities,
 			Hidden:         t.Hidden,
 			Scopes:         t.Scopes,
+			Management:     t.Management,
 		})
 	}
 	return &proto.ListToolsResponse{Tools: tools}, nil

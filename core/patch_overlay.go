@@ -28,17 +28,13 @@ type PatchOverlay struct {
 //
 //   - insert:           # 显式 insert action（DSH 标准）
 //
-//   - name: mcp-memory
-//     type: dsc
-//     config:
-//     mcp:
-//     server_name: memory
-//     endpoint: http://localhost:3100/mcp
+//   - name: tool-mcp
+//     type: tool
+//     config: {mcp: {servers: [{name: memory, endpoint: "http://localhost:3100/mcp"}]}}
 //
-//   - name: mcp-memory  # 顶层条目（无 action，视为 insert）
-//     type: dsc
-//     config:
-//     mcp: {...}
+//   - name: tool-mcp     # 顶层条目（无 action，视为 insert）
+//     type: tool
+//     config: {mcp: {servers: [...]}}
 //
 // 两种形式可混用，解析为同一个 PatchOverlay.Entries 列表。
 // 顶层条目若 Name 已存在于 base Config，合并时替换其 Config（id-targeted override）。

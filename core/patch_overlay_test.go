@@ -147,20 +147,20 @@ func TestLoadPatchFilesEmpty(t *testing.T) {
 // 碰到的字段」。
 //
 // 这里曾经是逐字段列举拷贝：新加配置项只要忘了加一行，用 -patch 启动时就被静默抹掉。
-// mcp 开关与 history_shows 正是这样漏的——而 mcp 被抹掉意味着「用户明明开了 MCP，
-// 加了 -patch 启动又变成关闭」，症状是工具莫名消失，极难归因。
+// 结构体指针字段（如 authorization）与 history_shows 正是这样漏的——被抹掉意味着
+// 「用户明明在配置里授权了范围，加了 -patch 启动又变回未授权」，症状是审批莫名又弹出来。
 func TestApplyPatchOverlaysPreservesUnlistedFields(t *testing.T) {
 	base := &Config{
 		WorkspaceRoot: "/tmp/ws",
 		HistoryShows:  5,
-		MCP:           &MCPConfig{Enabled: true},
+		Authorization: &AuthorizationConfig{GrantedScopes: []string{"net.egress"}},
 		Plugins:       []PluginEntry{{Name: "a", Type: "tool", Enabled: true}},
 	}
 	overlays := []*PatchOverlay{{Entries: []PluginEntry{{Name: "b", Type: "tool"}}}}
 
 	merged := ApplyPatchOverlays(base, overlays)
-	if merged.MCP == nil || !merged.MCP.Enabled {
-		t.Fatalf("mcp 开关被 patch 合并抹掉了：%+v", merged.MCP)
+	if merged.Authorization == nil || len(merged.Authorization.GrantedScopes) != 1 {
+		t.Fatalf("授权范围被 patch 合并抹掉了：%+v", merged.Authorization)
 	}
 	if merged.HistoryShows != 5 {
 		t.Fatalf("history_shows 被抹掉了：%d", merged.HistoryShows)

@@ -260,15 +260,29 @@ func runStdinLoop(agent core.Agent, ctx context.Context) int {
 // 首轮跑 -input 传入的文本；随后若 stdin 为重定向输入（管道/文件），
 // 则继续逐行驱动多轮，直到 EOF。始终不进入 TUI 事件循环，故 ADMIN API / DEBUGGER
 // 端点可在进程存活期间持续观察。
-func runInputMode(agent core.Agent, ctx context.Context, input string) int {
+//
+// singleShot（-headless）下跑完首轮即退出：headless 的契约是「单发、不留后台」，
+// 而 stdin 多轮循环会**无限等下一个输入**——CI/管道里 stdin 常常是一个开着不关的
+// 句柄（并非 EOF），于是任务早就跑完了，进程却永远不退出。这类挂起没有任何输出，
+// 看起来和「模型卡住」一模一样。
+func runInputMode(agent core.Agent, ctx context.Context, input string, singleShot bool) int {
 	if code := runOneTurn(agent, ctx, input); code != 0 {
 		return code
 	}
-	if !stdinIsRedirected() {
-		// 终端手动单轮：跑完 -input 即退出，维持原来的便利行为
+	if !shouldReadStdin(singleShot, stdinIsRedirected()) {
+		// -headless 单发，或终端手动单轮：跑完 -input 即退出
 		return 0
 	}
 	return runStdinLoop(agent, ctx)
+}
+
+// shouldReadStdin 决定 -input 首轮之后是否继续按行读 stdin 驱动多轮。
+//
+// -headless 是「单发、不留后台」契约（见 help），永远不读——headless 场景的 stdin
+// 常常是一个开着不关的管道句柄（不是 EOF），读下去就永远等不到输入，任务早已跑完
+// 而进程不退出，看上去和模型卡死一模一样。其余情况仍按 stdin 是否被重定向判断。
+func shouldReadStdin(singleShot, stdinRedirected bool) bool {
+	return !singleShot && stdinRedirected
 }
 
 // ptcEnvEnabled 是否由环境变量 DSC_PTC 显式开启 PTC 呈现（判定与 agent 侧 ptcEnabled 一致）。
@@ -662,14 +676,8 @@ func main() {
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
 
-	// MCP 注入开关（config.yaml 的 mcp.enabled）：**缺省即未启用**。
-	// 关闭时 MCP 相关工具（含入口 mcp_connect）一个都不进模型目录，日常会话因此不付
-	// 任何目录成本；启用后按 mcp_load 逐个曝光。开关只由人经 /mcp on|off 改写（写回
-	// 本文件），模型侧没有关掉/打开它的工具——目录预算是部署决定，不是模型决定。
-	if mainCfg != nil && mainCfg.MCP != nil && mainCfg.MCP.Enabled {
-		mgr.SetMCPToolsEnabled(true)
-		logger.Info("MCP tools enabled from config", "config", core.ConfigPath)
-	}
+	// 「MCP 是否启用」不在这里：那是插件自己的状态（由插件写自己的状态文件）。
+	// 宿主不认识任何具体协议，插件不报工具，目录成本自然为 0。
 
 	// 外部脚本钩子（-hooks hooks.json）：严格 LUA 脚本（go-lua 进程内解释）或
 	// 原生可执行文件（直接 exec 不经 shell），在工具流水线 BeforeTool/AfterTool
@@ -953,11 +961,6 @@ func main() {
 	// 后台监听/调度仅在常规模式启用；-headless 精简无头模式不开端口、不起常驻轮询，
 	// 对齐 harness headless「进程只存活于单发、不留任何后台」的契约。
 	if !headless {
-		// -patch overlay 注入的 MCP 客户端配置：扫描 merged.Plugins 中含
-		// config.mcp 的条目，启动时自动连接（对齐 DSH cordis.yml 的 mcp-client
-		// 插件实例化）。每个条目的 config.mcp 字段含 server_name/endpoint 等。
-		autoConnectMCPFromConfig(mgr, merged, logger)
-
 		// 版本化二进制自动热重载（config.yaml hot_reload: true 时启用）：fsnotify + 周期扫描
 		if err := mgr.StartHotReloadWatcher(); err != nil {
 			logger.Warn("failed to start hot-reload watcher", "err", err)
@@ -1030,7 +1033,7 @@ func main() {
 	if inputText != "" {
 		// -input：一次性模式，不显示 TUI，完成后自然退出
 		logger.Info("running in input mode", "input", inputText)
-		exitCode = runInputMode(agent, ctx, inputText)
+		exitCode = runInputMode(agent, ctx, inputText, headless)
 		logger.Info("input mode finished", "exitCode", exitCode)
 
 		// 回合完成音效宽限：notify 等程序性通知插件在 agent 回合完成时异步播放完成音效

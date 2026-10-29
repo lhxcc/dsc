@@ -100,8 +100,7 @@ go run ./cmd/benchcmp --baseline <baseline.json> --current <report.json> \
 
 ## 呈現樣式示例（真實運行時輸出）
 
-以本地模型 `Agentic-Turbo-Coder`（llama.cpp 服務）經 `bench` 程序（`-input` 且 stdin
-重定向關單輪、`DSC_APPROVAL=never` 無人值守、未設交卷/每案例預算）跑一次完整
+以本地模型 `Agentic-Turbo-Coder`（llama.cpp 服務）經 `bench` 程序（`-headless` 單發、`DSC_APPROVAL=never` 無人值守、未設交卷/每案例預算）跑一次完整
 **16 用例**的真實結果為例：
 
 - `bench_report` 落盤的 `bench-out/report.json`（機器可讀，原始輸出；含**總耗時**
@@ -195,23 +194,23 @@ bench 產物根取自宿主注入的 `DSC_WORKSPACE_ROOT`（對齊沙箱：相�
 
 不經過 TUI 交互，一切由命令行一次性完成，適合腳本與 CI。
 
-> ⚠️ **避免「只跑 1 輪就退出」的關鍵**
-> 宿主對 `-headless`（或 `-input` 且 **stdin 未重定向**）會注入 `DSC_SINGLE_TURN=1`，
-> 把 agent 的 ReAct 循環強制為 **1 輪**——模型常剛調完 `bench_start` 就輸出收尾而退出，
-> 後面的用例全部沒跑（這正是曾遇到的現象）。
-> 完整跑完 agentic 循環的辦法：讓 **stdin 處於重定向狀態**（管道/文件），此時宿主
-> **不會**注入 `DSC_SINGLE_TURN`，循環不再設上限，模型可一路 `bench_next` 逐個完成。
-> 下面的示例正是用 `"" |` 把空行管道進 stdin 來關閉單輪模式（空行會被 `runStdinLoop`
-> 跳過，不會產生多餘回合）。
+> ℹ️ **單輪 ≠ 單步**（這條以前被寫反了，別再照舊做法繞）
+> 宿主對 `-headless`（或 `-input` 且 stdin 未重定向）注入 `DSC_SINGLE_TURN=1`，它約束的是
+> **不自動續行**（不開 goal 輪、不追待辦、不因截斷/注入自行再加一輪），**不是**「只發一次
+> 模型請求」。模型每調一次工具，都會帶著結果再請求下一步，所以 `bench_start` →
+> `bench_next` → … → `bench_report` 這種多步循環在一輪裡照樣跑完；模型不再調工具時這一輪
+> 自然收尾，進程退出。
+> 直接 `-headless -input "…"` 即可。過去用 `"" |` 給 stdin 灌空行來「關掉單輪上限」的做法
+> 是為了繞過「單輪 = 1 步」的缺陷，現在只會讓進程跑完之後繼續等下一行輸入、遲遲不退出。
 
 ```bash
 # PowerShell 示例：臨時工作區 + 審批自動拒絕 + 完整 agentic 循環
 $env:DSC_WORKSPACE_ROOT = "C:\Users\me\AppData\Local\Temp\dsc-bench-run-artifacts"
 $env:DSC_APPROVAL      = "never"
-"" | .\dsc.exe -input "加載 tool-agentic-bench 插件，逐項完成所有 bench 測試並彙總報告"
+.\dsc.exe -headless -input "加載 tool-agentic-bench 插件，逐項完成所有 bench 測試並彙總報告"
 ```
 
-> 若改用 `-headless` 或直接 `-input "…"`（不接管道），只會跑 1 輪即退出，無法完成整輪評測。
+> `-headless` 是單發契約：跑完這一輪即退出，且不讀 stdin（管道不關也不會掛住）。
 
 - 產物隨用例而定：各用例 `reply.txt` 與彙總 `report.json` 都在該臨時工作區內。
 - 大模型本地跑得慢不是問題：bench 本身不設固定短超時，判分為純端態判定，不受速度

@@ -95,21 +95,6 @@ type Config struct {
 	// 机制（能力声明驱动，不硬编码插件名）。
 	// 对齐 DSH：preset YAML 显式挂 compaction-basic 或其他后端。
 	Compaction string `json:"compaction" yaml:"compaction"`
-	// MCP MCP 工具的注入开关（`/mcp on|off` 写回这里）。
-	//
-	// **缺省（无 mcp 段）= 未启用**：MCP 相关工具一个都不进模型目录，日常会话不承担
-	// 任何目录成本。启用后 mcp_connect 与运行期管理工具（list/load/unload/disconnect）
-	// 才会注入，服务器上发现的 mcp__* 工具再按 mcp_load 逐个曝光。
-	//
-	// 为什么放在配置里而不是只留内存：这是人与模型之外的一个决定——「这个部署要不要
-	// 用 MCP」。重启后还得保持，否则每次启动都要重新打开。
-	MCP *MCPConfig `json:"mcp,omitempty" yaml:"mcp,omitempty"`
-}
-
-// MCPConfig config.yaml 的 mcp 段。
-type MCPConfig struct {
-	// Enabled 是否启用 MCP 注入。缺省（无 mcp 段）按 false 处理。
-	Enabled bool `json:"enabled" yaml:"enabled"`
 }
 
 type PluginEntry struct {
@@ -120,10 +105,9 @@ type PluginEntry struct {
 	Enabled bool `json:"enabled" yaml:"enabled" default:"true"`
 	// 可選：傳遞給插件子進程的額外環境變量（合併宿主環境，插件值優先）
 	Env map[string]string `json:"env" yaml:"env"`
-	// Config 插件配置（对齐 DSH cordis.yml 的 config 字段）：
-	// 供 -patch overlay 注入插件特定配置（如 MCP 客户端的 serverName/transport/
-	// command/args/env）。宿主按 type 分发：tool/dsc 类型的 Config["mcp"] 含
-	// MCP 客户端配置时，启动时自动连接。空则忽略。
+	// Config 插件配置（对齐 DSH cordis.yml 的 config 字段）：-patch overlay 注入的
+	// 插件专属配置，宿主原样以 JSON 交给插件（DSC_PLUGIN_CONFIG 环境变量），形状与
+	// 含义由插件自己解释。宿主不解析、不认识任何子系统的字段。空则忽略。
 	Config map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
 }
 

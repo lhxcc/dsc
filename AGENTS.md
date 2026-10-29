@@ -210,6 +210,12 @@ DSC 的命令解析使用内置 POSIX shell 实现（mvdan/sh），所有路径�
 
 ### 10.5 分層：core ← sdk ← plugins（插件不得 import core）
 
+**反向依赖已清除（MCP 插件化完成）**：`core` 不再 import 任何 `dsc-sdk` 包。`sdk/mcp`
+仍然只依赖标准库（自带 `proc_windows.go` 隐藏控制台而不调 `dsc.ConfigureChildProcessAttrs`）
+——这条约束要留着，否则将来谁把 SDK 根引进 `sdk/mcp`，又会把
+`core → sdk/mcp → sdk → core` 变成包级循环。
+
+
 插件一律 `import dsc "dsc-sdk"`，**不得** `import "dsc/core"`：
 
 - **为什么**：core 是宿主内核（事件总线、会话、计量、协议实现），会持续重构；sdk 是插件的稳定面（类型别名 + 薄转发）。更要紧的是**同一件事不能有第二份实现机会**——DSC 曾让宿主 `core.TokenMeter`（实测口径）成为无人调用的死代码，agent 插件自己用裸估算决定裁剪/压缩，口径一偏（纯 ASCII 高估 4~5 倍），1M 窗口里服务端实测 332K 的会话被判每轮超窗并反复裁剪。
@@ -296,7 +302,8 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
   （`AllToolsProto`）只做「取 VisibleTools → 转 proto」，**不得**再按工具名前缀/名字
   判断谁能出现。历史教训：MCP 的曝光规则（关闭、已加载、有没有服务器）曾以
   `filterMCPCatalog` 的形式住在这个唯一装配点里，靠 `mcp__` 前缀认人——每加一个「有
-  曝光策略」的提供方，就要在这里再加一段特例。
+  曝光策略」的提供方，就要在这里再加一段特例（MCP 现已整体搬成 `tool-mcp` 插件，
+  宿主连它的名字都不再认识）。
   - 隐藏 ≠ 不可用：隐藏的工具仍在注册表里，后台任务、子代理、按名调用照常；只是不随
     请求发给模型（目录每个请求都要付成本）。
   - 判定每次现读、不缓存：提供方改主意后下一次 `ListTools` 就生效（宿主约 800ms 同步）。
@@ -320,6 +327,17 @@ filepath 包在 Windows 上会把路径结果归一化为原生反斜杆（实�
 - **岗位是「有名字的坑位」，编制由岗位性质决定**：`ResolveCompactionRole` 的「唯一」是
   那个岗位的性质（压缩只能有一个写者），**不是岗位概念的通则**。管理这类能力天然多提供方
   （编制 N）；呈现层若抢同一端口/路径，则那个岗位编制 1。新增岗位时先声明编制，再谈解析。
+
+- **管理是能力，呈现是消费方**（`ManagementDeclarer` + `Manager.ManagementOperations` +
+  `proto.Tool.management`）：
+  - 操作声明**独立于工具表**：`mcp_load` 模型能用，`mcp on|off` 只给人用；混在工具表里
+    只能再补一个 `hidden_for_model`，而那个补丁迟早跑到装配点或审批门里去。
+  - 归属由工具自己说（`ManagementGroup() == "mcp"`），呈现层（TUI / admin REST / 未来的
+    WEB）统一从 `ManagementOperations()` 取清单——**不得**各自去扫工具表、也不得写死
+    "哪个子命令对应哪个工具名"（TUI 已改为按清单解析，`/mcp connect` 不再认识 `mcp_connect`）。
+  - 清单里包含当前对模型隐藏的操作（`ModelVisible=false`）：否则呈现层连「怎么打开它」
+    都显示不出来。
+  - 岗位语义：管理面编制 N（多提供方）；若多个呈现层抢同一个端口/路径，那个岗位编制 1。
 
 - **跨层字段只有一个赋值点**：`remoteToolFromProto`。`listStagedTools`（启动期）与
   `syncPluginTools`（运行期）曾经各拼一遍 `RemoteTool`，加字段时只改一处 → 插件声明了、
