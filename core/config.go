@@ -80,11 +80,13 @@ type Config struct {
 	// <基名>-v<版本><ext> 文件时，自动经 HotReload 换成新进程（默认关闭）。
 	HotReload bool `json:"hot_reload" yaml:"hot_reload"`
 	// Compaction 显式声明压缩后端（对齐 DSH preset 的 compaction group）：
-	//   ""             — 默认：agent 走内联 compactHistory（向后兼容）
-	//   后端插件名      — 使用该插件的压缩接管（插件需声明 Provides compaction 能力：
-	//                     基础压缩插件 基础压缩 / 上下文管理插件接管），
-	//                     宿主 registerDscCoreLocked 验证能力声明；接管经
-	//                     agent/pre-step 事件机制（后端主动压缩，agent 内联兜底）
+	//   ""             — 未点名：若恰好只有一个插件声明了 Provides compaction，宿主
+	//                    直接把它放上岗位（启用即生效）；多候选时启动失败并要求点名
+	//   后端插件名      — 该插件当值（插件需声明 Provides compaction 能力）
+	//
+	// 压缩是 agent 的强依赖：没有当值的压缩后端时 agent 不会被激活，宿主启动即失败
+	// 并说明缺什么——不存在「agent 自己压缩」的回退路径。接管经 agent/pre-step 事件
+	// 机制（能力声明驱动，不硬编码插件名）。
 	// 对齐 DSH：preset YAML 显式挂 compaction-basic 或其他后端。
 	Compaction string `json:"compaction" yaml:"compaction"`
 	// MCP MCP 工具的注入开关（`/mcp on|off` 写回这里）。

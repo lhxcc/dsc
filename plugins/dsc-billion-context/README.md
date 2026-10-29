@@ -54,13 +54,15 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
 4. agent 每輪 `buildSystemPrompt` 經 `ListContext` 拉取 ACP 指導（對齊 DSH `ctx.systemPrompt.section`）
 5. agent 發起 LLM 請求前，宿主 emit `agent/pre-step` 事件
 6. 插件收到事件，經 `acp.ProcessTurn` 跑 pipeline：
-   - 分配 `mNNNNN` ref 給每條消息（FNV-1a 內容 hash 生成穩定 ID）
+   - 分配 `mNNNNN` ref 給每條消息（以宿主下發的穩定消息 id 為鍵：`proto.Message.id`＝
+     surface 事件 seq；沒有 id 的消息不參與壓縮，絕不退回流位置或內容 hash）
    - 應用 prune（被壓縮塊覆蓋的消息替換為 summary，原位嵌入保持前綴穩定）
    - 清理孤兒 tool-call/result/reasoning 配對
    - 決策是否注入 nudge 提示（45% 閾值 + 隨窗口縮放的增長門 + T2/T3 蒸餾（質量優先））
 7. 返回改寫後的消息列表給宿主，宿主透傳給 LLM
 8. 模型調 `compress` 工具時，插件從緩存的 `lastMessages` 解析 `mNNNNN` 邊界執行壓縮
-9. 上下文溢出不由插件處置：超窗的裁決權歸宿主（收緊預算 + 滑窗 + 重試），插件不再在 `agent/request-error` 上做有損的緊急壓縮
+9. 上下文溢出不由插件處理：超窗的處置權在宿主（收緊預算 → 滑窗 → 重試，全程無損）。
+   本插件不再訂閱 `agent/request-error`——有損的緊急壓縮會把整段真實消息換成佔位摘要
 
 ## 前綴緩存穩定性
 
@@ -82,14 +84,18 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
 
 模型在 `compress` 調用中用 `bN` 形式作為 `startId`/`endId` 觸發蒸餾路徑。
 
-## 與 agent 內聯壓縮的關係
+## 與 agent 的關係
 
-agent-react-loop 的內聯 `compactHistory`（80% 閾值）作為**兜底安全網**保留：
+agent-react-loop **不實現壓縮**（它只做循環與調度），並以 metadata
+`requires/dsc/compaction` 聲明壓縮是強依賴：沒有當值後端時 agent 不會被激活，
+宿主啟動即失敗。因此本插件與其它壓縮後端不是「主路 + 兜底」的關係，而是
+**候選 + 崗位**的關係：
 
-- billion-context 在 45% 閾值主動 nudge 模型壓縮，使 80% 正常不被觸發
-- agent 經 `ListContext` 響應中的 `[DSC_COMPACTION_BACKEND_ACTIVE]` 標記檢測後端存在
-- 後端卸載後標記消失，agent 自動恢復內聯壓縮
-- 不依賴 env 或跨進程狀態同步——`ListContext` 每輪實時反映插件生命週期
+- 多個壓縮後端可同時啟用，但只有 `config.yaml` 的 `compaction:` 點名的那一個當值
+  （只啟用一個時可省略該行，唯一候選自動當值）；
+- 當值者的 `agent/pre-step` 改寫被採納，也只有它收到完整消息列表；
+- 卸載當值後端會被宿主拒絕（先啟用並點名另一個）；
+- 不依賴 env 或跨進程狀態同步——崗位在每次解析時實時反映插件生命週期。
 
 ## 配置
 
@@ -121,8 +127,8 @@ plugins:
 - 孤兒 tool-call/result/reasoning 配對清理
 - nudge 決策（閾值門 + 增長門（隨窗口縮放）+ baseline 重置 + T2/T3 **質量觸發**：可回收摘要 tokens ≥ 1.5×nudgeGrowthTokens；計數路徑默認關閉，對齊 acp-kernel #379「block COUNT is not a need signal」）
 - ACP system prompt 經 `Hook.ContextFn` 貢獻（對齊 DSH `ctx.systemPrompt.section`）
-- 穩定消息 ID（FNV-1a 內容 hash，不含視圖 index）
-- 超窗歸宿主滑窗（不再響應 `agent/request-error`）
+- 穩定消息 ID（宿主下發的 `event-<seq>`，不含視圖 index／內容 hash）
+- 超窗交給宿主滑窗（不再訂閱 `agent/request-error`，不做有損緊急壓縮）
 - state JSON 文件持久化
 - 4 個工具 handler
 - 18 個單元測試

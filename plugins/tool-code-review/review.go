@@ -18,11 +18,12 @@ import (
 	"sync"
 	"time"
 
-	"dsc/core/llmclient"
+	dsc "dsc-sdk"
+
 	"dsc/proto"
 )
 
-// chatStream 是流式响应的最小接口（*llmclient.Client 返回的流满足）。
+// chatStream 是流式响应的最小接口（*dsc.LLMClient 返回的流满足）。
 type chatStream interface {
 	Recv() (*proto.ChatStreamResponse, error)
 }
@@ -35,10 +36,10 @@ type chatClient interface {
 	ChatStream(ctx context.Context, messages []*proto.Message, maxTokens int32) (chatStream, error)
 }
 
-// llmAdapter 收敛 *llmclient.Client 的方法签名（返回最小流接口），
+// llmAdapter 收敛 *dsc.LLMClient 的方法签名（返回最小流接口），
 // 使单测可以注入假流而不必构造 gRPC 流。
 type llmAdapter struct {
-	c *llmclient.Client
+	c *dsc.LLMClient
 }
 
 func (a llmAdapter) ChatStream(ctx context.Context, messages []*proto.Message, maxTokens int32) (chatStream, error) {

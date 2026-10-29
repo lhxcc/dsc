@@ -534,3 +534,93 @@ func TestFindProviderLLMMultiFallbackWarns(t *testing.T) {
 		t.Errorf("未设 default_llm 时应按名升序取首个（llm-anthropic），got %q", provider)
 	}
 }
+
+// TestCompactionCapabilityResolvesToRoleHolder 压缩能力的 provider 解析必须与岗位解析
+// 给出同一个答案：多候选时按 config.yaml 的 compaction 点名，未点名且唯一候选时自动选它。
+//
+// 为什么单列这条：agent 现在声明 requires/dsc/compaction，如果这里按「多 provider 冲突
+// fail-loud」处理，同时启用两个压缩后端（合法的换后端配置）就会让 agent 永远 PENDING。
+func TestCompactionCapabilityResolvesToRoleHolder(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.coreMetadata["backend-a"] = &metadata.PluginInfo{
+		Type: "dsc", Name: "backend-a", Capabilities: map[string]string{"compaction": "true"},
+	}
+	m.coreMetadata["backend-b"] = &metadata.PluginInfo{
+		Type: "dsc", Name: "backend-b", Capabilities: map[string]string{"compaction": "true"},
+	}
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.toolHookClients["backend-b"] = &fakeHook{}
+	m.mu.Unlock()
+
+	// 1) 多候选未点名：配置歧义必须报错（不能静默取首个——两个后端改写会叠加）
+	m.mu.Lock()
+	provider, err := m.findProviderByCapabilityLocked("dsc", "compaction", "agent")
+	m.mu.Unlock()
+	if err == nil {
+		t.Fatalf("多候选未点名应报配置歧义，got provider=%q", provider)
+	}
+	if !strings.Contains(err.Error(), "multiple compaction candidates") {
+		t.Errorf("错误信息应说明多候选未点名，got %v", err)
+	}
+
+	// 2) 点名后解析到该插件
+	m.mu.Lock()
+	m.compactionBackend = "backend-b"
+	provider, err = m.findProviderByCapabilityLocked("dsc", "compaction", "agent")
+	m.mu.Unlock()
+	if err != nil || provider != "backend-b" {
+		t.Fatalf("点名后应解析到 backend-b，got %q err=%v", provider, err)
+	}
+
+	// 3) 未点名但只剩一个候选：自动当值（启用即生效）
+	m.mu.Lock()
+	m.compactionBackend = ""
+	delete(m.toolHookClients, "backend-b")
+	provider, err = m.findProviderByCapabilityLocked("dsc", "compaction", "agent")
+	m.mu.Unlock()
+	if err != nil || provider != "backend-a" {
+		t.Fatalf("唯一候选应自动当值，got %q err=%v", provider, err)
+	}
+
+	// 4) 一个候选都没有：不报错（留给 PENDING + 启动闸门解释），但要解析不出 provider
+	m.mu.Lock()
+	delete(m.toolHookClients, "backend-a")
+	provider, err = m.findProviderByCapabilityLocked("dsc", "compaction", "agent")
+	m.mu.Unlock()
+	if err != nil || provider != "" {
+		t.Fatalf("无候选时应返回空 provider 且不报错，got %q err=%v", provider, err)
+	}
+}
+
+// TestAgentDepsGatedByCompactionProvider agent 对压缩的依赖是**硬门**：没有当值后端时
+// agentDepsSatisfiedLocked 必须为 false（宿主据此让 agent 保持 PENDING，启动闸门再失败）。
+func TestAgentDepsGatedByCompactionProvider(t *testing.T) {
+	m, _ := hookManager()
+	agentInfo := &metadata.PluginInfo{
+		Type: "agent", Name: "agent",
+		Capabilities: map[string]string{"requires/dsc/compaction": "true"},
+	}
+	m.mu.Lock()
+	m.coreMetadata["agent"] = agentInfo
+	m.resolvedDeps["agent"] = m.resolveRequiredDeps(agentInfo, "agent")
+	satisfied := m.agentDepsSatisfiedLocked("agent")
+	m.mu.Unlock()
+	if satisfied {
+		t.Fatal("没有压缩 provider 时 agent 的依赖不应视为满足")
+	}
+
+	// 加载一个声明 compaction 的 provider 后重算 → 满足
+	m.mu.Lock()
+	m.coreMetadata["backend-a"] = &metadata.PluginInfo{
+		Type: "dsc", Name: "backend-a", Capabilities: map[string]string{"compaction": "true"},
+	}
+	m.toolHookClients["backend-a"] = &fakeHook{}
+	m.typeMap["backend-a"] = "dsc"
+	m.resolvedDeps["agent"] = m.resolveRequiredDeps(agentInfo, "agent")
+	satisfied = m.agentDepsSatisfiedLocked("agent")
+	m.mu.Unlock()
+	if !satisfied {
+		t.Fatal("加载了压缩 provider 后 agent 的依赖应视为满足")
+	}
+}

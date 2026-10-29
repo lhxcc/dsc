@@ -20,7 +20,12 @@ import (
 // 迁移是渐进的：下列插件仍持有 core 依赖（多为协议实现边界，需要先在 SDK 补齐转发面），
 // 登记在此以便只允许减少、不允许新增。补齐后把条目删掉即可。
 var pluginsStillOnCore = map[string]string{
-	// 当前为空：全部插件已改为只依赖 dsc-sdk。新增条目须写明具体理由与迁移计划。
+	// 当前为空：全部插件已改为只依赖 dsc-sdk。
+	//
+	// LUA/SQL 绑定层曾在册（需要 core/llmclient|toolclient|notify 的具体客户端类型）。
+	// 现在客户端类型以别名形式由 SDK 提供（sdk/clients.go 的 LLMClient / ToolClient /
+	// NotifyClient / AgentClient），绑定层只 import dsc-sdk，条目已删除。
+	// 新增条目须写明具体理由与迁移计划。
 }
 
 // TestPluginsDoNotImportCore 扫描 plugins/ 下所有 Go 源文件（含测试），禁止 import "dsc/core"。
@@ -53,7 +58,10 @@ func TestPluginsDoNotImportCore(t *testing.T) {
 		if readErr != nil {
 			return nil
 		}
-		if !strings.Contains(string(data), `"dsc/core"`) {
+		// 前缀匹配：`"dsc/core"` 与 `"dsc/core/llmclient"` 都是 core 依赖。
+		// 只匹配精确串会漏掉子包——这里曾经漏过（三个文件用着 core/llmclient，
+		// 守卫却报「全部插件已脱离 core」）。
+		if !strings.Contains(string(data), `"dsc/core`) {
 			return nil
 		}
 		rel, _ := filepath.Rel(repoRoot, path)

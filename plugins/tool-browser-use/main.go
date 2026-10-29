@@ -380,15 +380,10 @@ var (
 //     往往就能拿到登录态，比直接退回隔离会话好得多；
 //  3. 隔离 profile（无登录态）。
 func launchBrowserRod(sessionID string, userMode bool) (*launchResult, error) {
-	cands := browserCandidatesFn()
-	if len(cands) == 0 {
-		return nil, fmt.Errorf("找不到可用的浏览器（安装 Chrome/Edge，或用 DSC_BROWSER_BIN 指定）")
-	}
-	headed := browserHeaded()
-	offscreen := headed && browserOffscreen()
-
-	// 外部 CDP 端点（用户自己起的 Chrome）：不启动、不干预，UA/指纹由那边决定。
-	// mock 集成测试也走这条路径。
+	// 外部 CDP 端点（用户自己起的 Chrome/远端浏览器）：不启动、不干预，UA/指纹由那边
+	// 决定。**必须放在候选浏览器检查之前**：这条路径根本不启动本地浏览器，本机没有
+	// Chrome/Edge 也应可用（否则「指定了端点却报找不到浏览器」，mock 集成测试正是撞上
+	// 这一点——它不依赖本机安装任何浏览器）。
 	if u := strings.TrimSpace(os.Getenv("DSC_BROWSER_CDP_URL")); u != "" {
 		log.Printf("[BrowserSessionManager] session %s 连接外部 CDP：%s", sessionID, u)
 		return &launchResult{
@@ -398,6 +393,13 @@ func launchBrowserRod(sessionID string, userMode bool) (*launchResult, error) {
 			engine:   "外部浏览器（DSC_BROWSER_CDP_URL）",
 		}, nil
 	}
+
+	cands := browserCandidatesFn()
+	if len(cands) == 0 {
+		return nil, fmt.Errorf("找不到可用的浏览器（安装 Chrome/Edge，或用 DSC_BROWSER_BIN / DSC_BROWSER_CDP_URL 指定）")
+	}
+	headed := browserHeaded()
+	offscreen := headed && browserOffscreen()
 
 	if userMode {
 		var tried []string

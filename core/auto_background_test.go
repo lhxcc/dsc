@@ -40,7 +40,7 @@ func (t *graceTool) HasCapability(cap string) bool {
 	return false
 }
 
-// withGrace 临时改小前台宽限期，让测试不必真等 30 秒。
+// withGrace 临时改小前台宽限期，让测试不必真等默认的 60 秒。
 func withGrace(t *testing.T, d time.Duration) {
 	t.Helper()
 	old := autoBackgroundGrace
@@ -259,7 +259,7 @@ func (t *callIDProbeTool) seenID() string {
 // 这不是内部细节：插件侧的活跃上报（sdk.TouchActivity → GetActivity）以这个 id 为键，
 // 宿主的前台宽限期轮询的也是它。曾经 detachJobContext 只复制会话与审批策略，id 被丢成
 // 空串——插件于是把活动记在 ""（recordActivity 直接 return）→ 宿主永远读到 0 →
-// 任何有输出的长命令都会在固定预算（30s）后被判 "no output" 转后台。实测现场就是
+// 任何有输出的长命令都会在固定预算（默认 60s）后被判 "no output" 转后台。实测现场就是
 // 「几乎所有长命令都无谓转后台，然后模型又不得不反复查 job_output」。
 func TestBackgroundPipelinePreservesToolCallID(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})

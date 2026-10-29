@@ -565,7 +565,7 @@ func (bc *BillionContext) setSessionID(id string) {
 //
 // 为什么不能直接用 ev.TokenCount：它虽然已经是「消息 + 工具目录」的完整估算，
 // 但那是 agent 的 append-only 原始历史——压缩只改写发给模型的视图、不回写历史（agent
-// 侧「有后端时跳过内联 compactHistory」）。于是原始历史只增不减：一旦越过使用率阈值，
+// 只调度、不做压缩）。于是原始历史只增不减：一旦越过使用率阈值，
 // 压缩再怎么压都不会让它回落，插件便每一轮都提示「该压缩了」，模型只能每隔几步压
 // 一小段，而主界面显示的上下文始终很低。真正要装进窗口的是视图，`LastUsageTokens`
 // （上一轮 provider 报的 prompt tokens）才是它的真实大小，且随压缩回落。

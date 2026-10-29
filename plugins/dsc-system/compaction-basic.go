@@ -4,23 +4,25 @@
 // 同一协议，agent 与协议零改动）：
 //
 //   - agent/pre-step（waterfall 拦截）：收到本步消息列表（MessagesJSON）；
-//     估算用量超过阈值（默认窗口 80%，对齐 compaction-basic 压力语义；agent 经
-//     [DSC_COMPACTION_BACKEND_ACTIVE] 标记检测到后端即跳过内联压缩——接管靠
-//     能力声明驱动，与阈值无关）时保留尾部
-//     （RetainRatio / RetainTokensMin 取大），把未压缩前段经 LLM 生成摘要
-//     （interconnect 聚合 LLM；未互联或调用失败退化为截断式摘要），以
-//     {"messages": [...]} 返回改写后的消息列表。
+//     估算用量超过阈值（默认窗口 80%，对齐 compaction-basic 压力语义；接管靠
+//     能力声明驱动——谁声明 Provides compaction 且当值，谁收到完整消息列表，
+//     与阈值无关）时保留尾部（RetainRatio / RetainTokensMin 取大），把未压缩前段
+//     经 LLM 生成摘要（interconnect 聚合 LLM；未互联或调用失败退化为截断式摘要），
+//     以 {"messages": [...]} 返回改写后的消息列表。
 //
-// 超窗（provider 报 context_window_exceeded）不由本插件处置：宿主在发出前按窗口
-// 硬上限做确定性滑窗，provider 4xx 也不再要求后端做有损的紧急压缩。
+// 溢出（provider 4xx）不由本插件处理：超窗的处置权归宿主（滑窗，无损），本插件只在
+// pre-step 按压力改写。曾经的「request-error 紧急压缩」会跳过 LLM、用截断摘要把整段
+// 真实消息永久压掉，已随那次裁定删除。
 //
-// per-session 状态：pre-step 改写只作用于本次 LLM 请求（agent 内部历史不改写），
-// 逐 step 复用靠进程内 per-session 记录（内存 map）：记录已压缩前缀的指纹
-// （sha256），指纹吻合直接复用既有摘要、仅对新溢出段追加压缩；历史被改写
-// （指纹失配）则丢弃记录从头评估。对齐 DSH compaction-basic 的零文件 IO：
-// 压缩状态是运行时兜底的内部记账，持久化由宿主会话存储承担（DSH 侧为
-// session 日志事件）；插件重启即重新评估（指纹失配语义的自然延伸），
-// 文件落盘是加强版（dsc-billion-context，记忆形态）的领域。
+// per-session 状态：pre-step 改写只作用于**本次** LLM 请求（agent 内部历史不改写，
+// 会话日志一字不改）。逐 step 复用靠 per-session 记录：记已压缩前缀的指纹（sha256）+
+// 摘要 + 审计字段；指纹吻合直接复用摘要、只对新溢出段追加压缩，失配（历史被改写/
+// 回滚）则整套作废从头评估。
+//
+// 这张记录会落到插件自己的 <session>.dsc-system.json（见 compaction-state.go）：
+// 进程重启后指纹仍吻合即复用，不必为同一段前缀重新调用 LLM。它**不是**会话日志，
+// 也不参与历史派生——丢掉它只会让下次重压一次，绝不改变模型看到的历史（与 DSH 把
+// 压缩写成会话 surface 事件、遮蔽历史、不可逆的做法有本质区别）。
 //
 // 配置（DSC_ 前缀 env 白名单天然可见）：
 //   - DSC_COMPACTION_BASIC_CONTEXT_WINDOW  上下文窗口 token 数（默认 131072；0 = 驻留禁用）
@@ -44,11 +46,12 @@ import (
 
 	dsc "dsc-sdk"
 
-	"dsc/core/llmclient"
 	"dsc/proto"
 )
 
-// llmChat 聚合 LLM 的最小接口（*llmclient.Client 满足；单测以 fake 注入）。
+// llmChat 聚合 LLM 的最小接口（宿主 interconnect 的 *llmclient.Client 满足；单测以
+// fake 注入）。这里刻意只声明接口、不 import core 的 llmclient 子包：插件只依赖
+// dsc-sdk（AGENTS.md §10.5），少一个 core 子包就少一处随内核重构漂移的面。
 type llmChat interface {
 	Chat(ctx context.Context, messages []*proto.Message, maxTokens int32) (*proto.ChatResponse, error)
 }
@@ -56,15 +59,23 @@ type llmChat interface {
 // compactionRecord 一段已压缩前缀：[0, UpTo) 被替换为 Summary。
 // HeadHash 是前缀指纹——历史 append-only 增长时指纹稳定，复用摘要免重复压缩；
 // 历史被改写（指纹失配）则全部作废。记录连续覆盖 [0, last.UpTo)。
+//
+// 后四个字段只用于审计（对齐 DSH compaction/summary 里记 provider/model/usage 的意图：
+// 「这段摘要是什么时候、用哪个模型压的、压了多少」要能从落盘记录里直接回答），
+// 不参与任何判定。
 type compactionRecord struct {
-	UpTo     int    `json:"up_to"`           // 已压缩前缀长度（消息条数）
-	HeadHash string `json:"head_hash"`       // 前缀指纹（sha256 hex）
-	Summary  string `json:"summary"`         // 摘要内容
-	Shadowed int    `json:"shadowed_tokens"` // 被遮蔽内容的估算 token 数
-	ID       string `json:"compaction_id"`   // 稳定标识（时间戳，进程内唯一）
+	UpTo      int    `json:"up_to"`           // 已压缩前缀长度（消息条数）
+	HeadHash  string `json:"head_hash"`       // 前缀指纹（sha256 hex）
+	Summary   string `json:"summary"`         // 摘要内容
+	Shadowed  int    `json:"shadowed_tokens"` // 被遮蔽内容的估算 token 数
+	ID        string `json:"compaction_id"`   // 稳定标识（时间戳，进程内唯一）
+	Covered   int    `json:"covered_messages,omitempty"`
+	Model     string `json:"model,omitempty"`  // 写这条摘要的模型（DSC_MODEL）
+	Source    string `json:"source,omitempty"` // "llm" | "truncated"（LLM 不可用时的退化摘要）
+	CreatedMS int64  `json:"created_ms,omitempty"`
 }
 
-// compactionState per-session 压缩状态（进程内内存 map 项）。
+// compactionState per-session 压缩状态（进程内 map 项；磁盘副本见 compaction-state.go）。
 type compactionState struct {
 	Records []compactionRecord `json:"records"`
 }
@@ -82,6 +93,10 @@ type compactionBasicServer struct {
 	retainMin   int     // 保留尾部最少 token 数
 
 	states map[string]*compactionState // per-session 压缩记录（进程内，须持 mu）
+
+	// store 摘要缓存的落盘通道（nil = 纯内存：测试与未装配时走这条）。
+	// 由 main 装配注入 dsc.SessionDir()——测试因此不会污染用户的 sessions/。
+	store *compactionStore
 
 	// logWindowOnce 首次 pre-step 打印生效参数一次（启动期 stderr 尚未被宿主转发）。
 	logWindowOnce sync.Once
@@ -129,7 +144,7 @@ func newCompactionBasicServer() *compactionBasicServer {
 
 // attachLLM 缓存 interconnect 聚合 LLM 客户端（宿主挂载后回调注入）。
 // nil 不覆盖：未互联时保持 nil，摘要走截断式退化（对齐宿主引擎 nil-LLM 路径）。
-func (s *compactionBasicServer) attachLLM(c *llmclient.Client) {
+func (s *compactionBasicServer) attachLLM(c llmChat) {
 	if c == nil {
 		return
 	}
@@ -179,9 +194,17 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 	sess := s.sessionKey(ev.Session)
 	s.mu.Lock()
 	st := s.stateFor(sess)
-	// 指纹校验：历史被改写/回滚时丢弃记录从头评估
+	// 指纹校验：历史被改写/回滚时丢弃记录从头评估（重启后从磁盘读回的那份也走这一步）
 	records := validRecords(msgs, st.Records)
+	pruned := len(records) != len(st.Records)
+	if pruned {
+		st.Records = records
+	}
 	s.mu.Unlock()
+	if pruned {
+		// 作废的记录连同磁盘副本一起清掉：否则下次启动会把它读回来、再白算一遍指纹。
+		s.persistState(sess, records)
+	}
 
 	// 复用既有压缩后的用量评估：低于阈值则直接返回改写（或无记录时不改写）
 	rewritten := applyRecords(msgs, records)
@@ -237,8 +260,9 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		}
 	}
 	if retainIdx >= len(msgs) || retainIdx <= base {
-		// 可压缩段已被既有记录覆盖（或全部落在保留区）：尽力返回当前改写；
-		// 真正的超窗由宿主的滑窗兜底，这里无需再压。
+		// 可压缩段已被既有记录覆盖（或全部落在保留区）：尽力返回当前改写。
+		// 仍然超窗时由宿主滑窗兜住（provider 4xx → 收紧预算 → 重试），本插件不再
+		// 做有损的紧急压缩。
 		if len(records) > 0 {
 			return rewriteJSON(rewritten)
 		}
@@ -255,27 +279,45 @@ func (s *compactionBasicServer) handlePreStep(ctx context.Context, dataJSON stri
 		return "", nil
 	}
 
-	summary, id := s.summarize(ctx, msgs[base:retainIdx])
+	summary, id, source := s.summarize(ctx, msgs[base:retainIdx])
 	rec := compactionRecord{
-		UpTo:     retainIdx,
-		HeadHash: fingerprint(msgs[:retainIdx]),
-		Summary:  summary,
-		Shadowed: dsc.EstimateProtoMessagesTokens(msgs[base:retainIdx]),
-		ID:       id,
+		UpTo:      retainIdx,
+		HeadHash:  fingerprint(msgs[:retainIdx]),
+		Summary:   summary,
+		Shadowed:  dsc.EstimateProtoMessagesTokens(msgs[base:retainIdx]),
+		ID:        id,
+		Covered:   retainIdx - base,
+		Model:     dsc.EnvStr("DSC_MODEL", ""),
+		Source:    source,
+		CreatedMS: time.Now().UnixMilli(),
 	}
+	// 先更新内存、再落盘（顺序无关紧要，但快照必须在解锁后使用：此前这里在解锁后
+	// 直接读 st.Records，与同会话的其他 pre-step 存在数据竞争）。
 	s.mu.Lock()
 	st.Records = append(records, rec)
+	saved := append([]compactionRecord(nil), st.Records...)
 	s.mu.Unlock()
-	return rewriteJSON(applyRecords(msgs, st.Records))
+	// 落盘是尽力而为：写失败只影响「重启后要不要重压」，不影响本次请求。
+	s.persistState(sess, saved)
+	return rewriteJSON(applyRecords(msgs, saved))
 }
 
-// summarize 生成 [region] 的摘要。LLM 路径：聚合 LLM 生成（对齐宿主引擎提示词与
-// maxTokens=窗口/8、下限 512）；LLM 未互联或失败：退化为截断式摘要（对齐宿主引擎
-// nil-LLM 路径）。
+// persistState 把该会话的记录快照写到插件自己的状态文件（store 未装配时纯内存）。
+func (s *compactionBasicServer) persistState(sess string, records []compactionRecord) {
+	if s.store == nil {
+		return
+	}
+	s.store.Save(sess, records)
+}
+
+// summarize 生成 [region] 的摘要，返回（摘要, 记录 id, 来源）。
+// 来源只有两种：LLM 路径（"llm"）与退化截断（"truncated"，未互联或调用失败）——
+// 审计记录里必须能区分「这条摘要是模型写的」还是「只是一段截断」，否则事后无法判断
+// 某段历史为什么变得这么简略。
 //
 // 没有「紧急模式」这个参数了：超窗的处置权归宿主（滑窗），不再由本插件在
 // request-error 里做有损的紧急压缩——那会跳过 LLM、用截断摘要把整段真实消息永久埋掉。
-func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.Message) (string, string) {
+func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.Message) (string, string, string) {
 	id := fmt.Sprintf("compact-%d", time.Now().UnixMilli())
 	s.mu.Lock()
 	llm := s.llm
@@ -290,11 +332,11 @@ func (s *compactionBasicServer) summarize(ctx context.Context, region []*proto.M
 		s.compacting = false
 		s.mu.Unlock()
 		if err == nil && summary != "" {
-			return summary, id
+			return summary, id, "llm"
 		}
 		// LLM 失败：退化截断式（不把失败上抛——压缩尽力而为）
 	}
-	return truncateSummary(region), id
+	return truncateSummary(region), id, "truncated"
 }
 
 // llmSummary 构建压缩请求并调用聚合 LLM（提示词与宿主原引擎逐字一致）。
@@ -466,15 +508,19 @@ func rewriteJSON(msgs []*proto.Message) (string, error) {
 	return `{"messages": ` + string(b) + `}`, nil
 }
 
-// stateFor per-session 压缩记录（进程内 map，须持 s.mu；缺失即空状态）。
-// 基础兜底零文件 IO（对齐 DSH compaction-basic：持久化由宿主会话存储承担）；
-// 插件重启即重新评估——指纹失配语义的自然延伸，尽力而为。
+// stateFor per-session 压缩记录（须持 s.mu；缺失即从磁盘读一份，再退化为空状态）。
+//
+// 这里做一次读盘：每个会话只在首次 pre-step 发生一次，换来的是「重启后不必把同一段
+// 前缀重新摘要一遍」。store 未装配（测试）时纯内存，行为与从前一致。
 func (s *compactionBasicServer) stateFor(sessID string) *compactionState {
-	st, ok := s.states[sessID]
-	if !ok {
-		st = &compactionState{}
-		s.states[sessID] = st
+	if st, ok := s.states[sessID]; ok {
+		return st
 	}
+	st := &compactionState{}
+	if s.store != nil {
+		st.Records = s.store.Load(sessID)
+	}
+	s.states[sessID] = st
 	return st
 }
 

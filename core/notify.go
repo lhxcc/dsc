@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,53 +131,92 @@ const capPreStepTransform = "pre-step-transform"
 // 也只有它需要拿到完整消息列表。岗位在启动期就能定死（配置点名 + 已加载 + 声明了
 // compaction 能力），不必等广播之后再从多个结果里挑。
 //
+// 压缩是 agent 的**强依赖**（agent 元数据声明 requires/dsc/compaction）：没有当值的
+// 后端，agent 不会被激活，也就没有循环可跑。因此「空缺」不再是可接受的常态，而是
+// 启动期就会失败的状态——宿主 main 在加载完成后据此拒绝启动。
+//
 // 不做缓存的理由：插件热加载/卸载会改变答案，缓存得额外维护失效；解析本身只是查两张
 // 表，代价可以忽略。
 type CompactionRole struct {
-	// Holder 岗位持有者（空 = 岗位空缺：没人能改写请求面，agent 走内联压缩）。
+	// Holder 岗位持有者（空 = 空缺：没有任何插件能改写请求面，进程不允许运行）。
 	Holder string
 	// Configured config.yaml 的 compaction 字段（可能指向一个没加载的插件）。
 	Configured string
 	// Candidates 当前已加载、且声明了 compaction 能力的插件（按名字排序）。
 	Candidates []string
-	// Vacancy 岗位空缺的原因（空 = 有人当值）。空缺本身是正常形态（不用后端），
-	// 但「有候选人却没人当值」必须解释清楚缺的是哪个条件。
+	// AutoSelected 只有唯一候选、且配置没点名时，宿主直接把它放上岗位
+	// （对齐「启用即生效」：用户只启用一个后端就不必再写一行配置）。
+	AutoSelected bool
+	// Vacancy 岗位空缺的原因（空 = 有人当值）。空缺时宿主必须把原因说清楚：
+	// 缺的是「没启用插件」「点名的没加载」「点名的没声明能力」还是「多候选未点名」。
 	Vacancy string
 }
 
 // ResolveCompactionRole 解析压缩岗位（唯一入口：改名/换后端只需改这里）。
 //
-// 三个条件同时成立才算当值：配置点了名、插件已加载（且进程仍可用）、它确实声明了
-// Provides compaction。只认配置点名的那一个——同时启用两个后端时若都采纳，pre-step
-// 改写会层层叠加，与配置意图不符。
-//
-// 已标记不可用（进程退出/连接断开）的插件一律视为未加载：否则岗位会一直指向一个再也
-// 不会改写载荷的死插件，agent 也不会退回内联压缩。
+// 选择规则见 pickCompactionProviderLocked：配置点名且合格者当值；未点名时若只有一个
+// 候选，它自动当值；多候选且未点名则空缺（要求用户点名，避免两个后端都改写请求面）。
 func (m *Manager) ResolveCompactionRole() CompactionRole {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	role := CompactionRole{Configured: m.compactionBackend}
-	for name := range m.coreMetadata {
-		if m.toolHookClients[name] == nil || m.deadHookClients[name] || !m.declaresCompactionLocked(name) {
+	holder, candidates, reason := m.pickCompactionProviderLocked("")
+	return CompactionRole{
+		Holder:       holder,
+		Configured:   m.compactionBackend,
+		Candidates:   candidates,
+		AutoSelected: m.compactionBackend == "" && holder != "",
+		Vacancy:      reason,
+	}
+}
+
+// pickCompactionProviderLocked 选出压缩能力提供者（需持有锁）。providerType 为空表示
+// 不限类型（岗位解析用），非空时只在该类型的插件里找（能力依赖解析用）。
+//
+// 规则（唯一实现——依赖解析与岗位解析必须给出同一个答案，否则会出现「岗位有人、
+// agent 却因依赖未满足而 PENDING」这种自相矛盾的状态）：
+//  1. config.yaml 的 compaction 点名且该插件已加载并声明了 compaction → 它；
+//  2. 未点名、恰好一个候选 → 它（启用即生效）；
+//  3. 其余情况 → 空 + 原因（点名的没加载/没声明，或多候选未点名）。
+//
+// 多候选为什么不自动取首个：两个后端同时改写请求面会层层叠加，结果既不是 A 也不是 B。
+// 显式点名的角色与 LLM 的 default_llm 同构——多实现并存时由配置做唯一选择。
+//
+// 已标记不可用（进程退出/连接断开）的插件一律视为未加载：否则岗位会一直指向一个再也
+// 不会改写载荷的死插件，agent 也不会因岗位空缺而明确报错。
+func (m *Manager) pickCompactionProviderLocked(providerType string) (holder string, candidates []string, reason string) {
+	for name, info := range m.coreMetadata {
+		if info == nil || m.toolHookClients[name] == nil || m.deadHookClients[name] {
+			continue // 未加载/已不可用的不算候选
+		}
+		if providerType != "" && info.Type != providerType {
 			continue
 		}
-		role.Candidates = append(role.Candidates, name)
+		v, ok := info.Capabilities["compaction"]
+		if ok && v != "false" {
+			candidates = append(candidates, name)
+		}
 	}
-	sort.Strings(role.Candidates)
+	sort.Strings(candidates)
 
 	switch {
-	case role.Configured == "":
-		role.Vacancy = "no compaction backend configured (agent inline compaction is the only path)"
-	case m.toolHookClients[role.Configured] == nil:
-		role.Vacancy = fmt.Sprintf("configured backend %q is not loaded", role.Configured)
-	case m.deadHookClients[role.Configured]:
-		role.Vacancy = fmt.Sprintf("configured backend %q is unavailable (plugin process exited)", role.Configured)
-	case !m.declaresCompactionLocked(role.Configured):
-		role.Vacancy = fmt.Sprintf("configured backend %q does not declare Provides compaction", role.Configured)
+	case m.compactionBackend != "":
+		if m.toolHookClients[m.compactionBackend] == nil {
+			return "", candidates, fmt.Sprintf("configured backend %q is not loaded", m.compactionBackend)
+		}
+		if m.deadHookClients[m.compactionBackend] {
+			return "", candidates, fmt.Sprintf("configured backend %q is unavailable (plugin process exited)", m.compactionBackend)
+		}
+		if info := m.coreMetadata[m.compactionBackend]; info == nil || info.Capabilities["compaction"] == "" || info.Capabilities["compaction"] == "false" {
+			return "", candidates, fmt.Sprintf("configured backend %q does not declare Provides compaction", m.compactionBackend)
+		}
+		return m.compactionBackend, candidates, ""
+	case len(candidates) == 1:
+		return candidates[0], candidates, ""
+	case len(candidates) > 1:
+		return "", candidates, fmt.Sprintf("multiple compaction candidates (%s) but config.yaml has no `compaction:` to put one on duty", strings.Join(candidates, ", "))
 	default:
-		role.Holder = role.Configured
+		return "", nil, "no loaded plugin declares the compaction capability"
 	}
-	return role
 }
 
 // declaresCompactionLocked 报告某个已加载插件是否声明了 compaction 能力（需持有读锁）。
@@ -201,7 +241,7 @@ func (m *Manager) wantsPreStepMessages(name string) bool {
 	return ok && v != "false"
 }
 
-// compactionBackendName 返回岗位持有者（空 = 岗位空缺，走 agent 内联压缩）。
+// compactionBackendName 返回岗位持有者（空 = 岗位空缺，进程不允许运行）。
 func (m *Manager) compactionBackendName() string {
 	return m.ResolveCompactionRole().Holder
 }
@@ -209,30 +249,32 @@ func (m *Manager) compactionBackendName() string {
 // CompactionBackendState 返回配置指定的后端名与岗位是否真的有人当值。
 //
 // 给前端/诊断用：config.yaml 里写了 `compaction: X` 但插件没加载（plugins 列表里
-// 注释掉、enabled: false、二进制缺失）时，宿主会静默回落到 agent 内联压缩——
-// 用户看到的是"新压缩没生效"，却没有任何地方说明原因。
+// 注释掉、enabled: false、二进制缺失）时，岗位为空——没有回落路径，启动会失败并说明
+// 原因（见 main 的启动闸门）。
 func (m *Manager) CompactionBackendState() (configured string, active bool) {
 	role := m.ResolveCompactionRole()
 	return role.Configured, role.Holder != ""
 }
 
-// WarnIfCompactionBackendMissing 检查「配置了压缩后端但它没生效」，返回一句可展示的
-// 说明（一切正常时返回空串）。宿主在插件加载完成后调用一次，把静默降级变成日志里的
-// 一条明确告警。
-func (m *Manager) WarnIfCompactionBackendMissing() string {
+// CompactionRoleProblem 返回「岗位空缺」的一句话说明（一切正常时返回空串）。
+//
+// 宿主在插件加载完成后据此拒绝启动：压缩是 agent 的强依赖，空缺不是可选形态。
+// 把原因写清楚是本函数的全部职责——用户要能直接看出缺的是「没启用插件」「点名的
+// 没加载」还是「多候选未点名」。
+func (m *Manager) CompactionRoleProblem() string {
 	if m == nil {
 		return ""
 	}
 	role := m.ResolveCompactionRole()
-	if role.Configured == "" || role.Holder != "" {
+	if role.Holder != "" {
 		return ""
 	}
-	m.logger.Error("compaction backend configured but not active",
-		"backend", role.Configured, "reason", role.Vacancy,
+	m.logger.Error("compaction role is vacant",
+		"configured", role.Configured, "reason", role.Vacancy,
 		"candidates", role.Candidates,
-		"hint", "check config.yaml: the plugin must appear in the plugins list with enabled: true (and binary_path ending in .exe on Windows)")
-	return fmt.Sprintf("compaction backend %q is configured but not active: %s; falling back to agent inline compaction",
-		role.Configured, role.Vacancy)
+		"hint", "enable a plugin that declares Provides compaction in config.yaml (and set `compaction: <name>` when several are enabled)")
+	return fmt.Sprintf("no compaction backend on duty (%s); candidates=%v configured=%q",
+		role.Vacancy, role.Candidates, role.Configured)
 }
 
 // compactionBackendActive 报告岗位是否有人当值。

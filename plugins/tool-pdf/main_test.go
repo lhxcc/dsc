@@ -100,13 +100,31 @@ func TestHandleInfo(t *testing.T) {
 	t.Logf("output:\n%s", out)
 }
 
+// createdPDFPath 从 handleCreateText 的输出里取出实际落盘路径。
+//
+// 不能假设 out_path 就是真实路径：`/tmp` 是宿主的虚拟根，插件会把它映射到自己的
+// 临时目录（Windows 上尤其不同）。断言真实写出的那个路径，才既跨平台又测得到
+// 「文件确实被创建」。
+func createdPDFPath(t *testing.T, out string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "Created PDF:"); ok {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				return p
+			}
+		}
+	}
+	t.Fatalf("输出未报告 Created PDF 路径:\n%s", out)
+	return ""
+}
+
 // TestHandleCreateText 验证 pdf_create_text 工具。
 func TestHandleCreateText(t *testing.T) {
 	os.Setenv("DSC_WORKSPACE_ROOT", "/tmp")
 	defer os.Unsetenv("DSC_WORKSPACE_ROOT")
 
 	outPath := "/tmp/test_create_text.pdf"
-	defer os.Remove(outPath)
 
 	args, _ := json.Marshal(map[string]any{
 		"out_path":  outPath,
@@ -122,7 +140,12 @@ func TestHandleCreateText(t *testing.T) {
 	t.Logf("output:\n%s", out)
 
 	// 验证文件存在且非空
-	info, err := os.Stat(outPath)
+	// 真实落盘路径（虚拟根映射后的）由工具自己报告，用它做后续断言
+	realPath := createdPDFPath(t, out)
+	defer os.Remove(realPath)
+
+	// 验证文件存在且非空
+	info, err := os.Stat(realPath)
 	if err != nil {
 		t.Fatalf("output file not created: %v", err)
 	}
@@ -132,7 +155,7 @@ func TestHandleCreateText(t *testing.T) {
 
 	// 验证可被读回（用我们的 pdf_read_text 工具）
 	readArgs, _ := json.Marshal(map[string]any{
-		"file_path": outPath,
+		"file_path": realPath,
 	})
 	// 清空共享 PDF Context 缓存（防止读到旧文件）
 	sharedCtx.mu.Lock()
@@ -153,7 +176,6 @@ func TestHandleCreateTextMultiPage(t *testing.T) {
 	defer os.Unsetenv("DSC_WORKSPACE_ROOT")
 
 	outPath := "/tmp/test_create_multipage.pdf"
-	defer os.Remove(outPath)
 
 	// 生成 200 行文本，确保跨页（A4 @ 12pt 约可容纳 40 行）
 	var sb strings.Builder
@@ -173,7 +195,9 @@ func TestHandleCreateTextMultiPage(t *testing.T) {
 	t.Logf("output:\n%s", out)
 
 	// 验证文件存在
-	if _, err := os.Stat(outPath); err != nil {
+	realPath := createdPDFPath(t, out)
+	defer os.Remove(realPath)
+	if _, err := os.Stat(realPath); err != nil {
 		t.Fatalf("output file not created: %v", err)
 	}
 

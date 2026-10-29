@@ -178,10 +178,10 @@ type Manager struct {
 	// logFanout 宿主/插件日志扇出，供 ADMIN /logs SSE 消费；由 ManagerConfig 注入。
 	logFanout *LogFanout
 
-	// compactionBackend config.yaml 中显式声明的压缩后端插件名（对齐 DSH preset
-	// 的 compaction group）。registerDscCoreLocked 检测插件名匹配时验证其
-	// Provides compaction 能力声明；空串 = 默认（agent 走内联压缩，后端经
-	// pre-step 事件接管——压缩引擎已插件化，实现见声明 compaction 能力的插件）。
+	// compactionBackend config.yaml 中显式点名的压缩后端插件名（对齐 DSH preset
+	// 的 compaction group）。空串 = 未点名（唯一候选自动当值，多候选要求点名）。
+	// 谁当值统一由 ResolveCompactionRole 解析；agent 元数据声明 requires/dsc/compaction，
+	// 没有当值后端时不会被激活，宿主启动即失败。
 	compactionBackend string
 
 	// credentialStore 插件凭据存储（对齐 DSH packages/credentials/credentials）：
@@ -1464,10 +1464,9 @@ func (m *Manager) ListContext(ctx context.Context) (string, error) {
 			parts = append(parts, content)
 		}
 	}
-	// compaction 后端状态标记（对齐 DSH ctx.compaction Service 的运行时查询）：
-	// 只认 compaction 字段选定的那一个后端——「有任一插件声明该能力」不足以判定接管，
-	// 否则未被选中的同类插件（同时启用了多个压缩后端时）会让 agent 误判为有后端
-	// 而跳过内联压缩，实际却由另一个后端在跑。
+	// compaction 岗位状态标记（对齐 DSH ctx.compaction Service 的运行时查询）：
+	// 只认当值的那一个后端——「有任一插件声明该能力」不足以判定有人当值（多候选时
+	// 未点名就算空缺）。agent 侧只把这个标记当宿主内部诊断信息剔除，不据此改行为。
 	if m.compactionBackendActive() {
 		parts = append(parts, "[DSC_COMPACTION_BACKEND_ACTIVE]")
 	}
@@ -1490,6 +1489,13 @@ func (m *Manager) UnloadPlugin(name string) error {
 			return nil
 		}
 		return fmt.Errorf("core '%s' not found", name)
+	}
+
+	// 压缩岗位持有者不可卸载：agent 对压缩是强依赖（它自己不实现压缩），卸掉当值后端
+	// 等于把系统降级到一个不被允许运行的状态——之后每次请求都没有任何东西能改写请求面。
+	// 换后端要走「先启用另一个并点名，再卸旧的」这条路，不能靠卸到底。
+	if holder, _, _ := m.pickCompactionProviderLocked(""); holder != "" && holder == name {
+		return fmt.Errorf("cannot unload %q: it is the compaction role holder and the agent requires it; enable another compaction backend and set `compaction: <name>` first", name)
 	}
 
 	// 对称清理：执行已注册的 stopHook（tool 插件撤销其工具、agent 优雅关闭）；
@@ -1931,6 +1937,17 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 	// RegisterServices 中 Dial，远超 5 秒窗口即连不上 RPC。推迟到 provider 全部就绪后再
 	// 挂载并随即 RegisterServices，把 ConnInfo 发送到 agent Dial 的间隔压缩到毫秒级，彻底
 	// 避开超时窗口——与 PENDING 的「依赖就绪才激活」语义一致：agent 在 LLM 就绪前保持等待。
+	//
+	// provider 就绪后重算 agent 的能力依赖：agent 是最先拉起的（要先拿到 broker），
+	// 它加载时 provider 还没起，那一次解析出来的 ProviderName 必然为空。不重算的话，
+	// 下面的 primary LLM / 依赖判定读的都是过期结果（agent 会被无谓地置为 PENDING，
+	// 再靠 repairPendingLocked 补一次——那是兜底，不该是常态）。
+	if info, ok := m.coreMetadata[agentEntry.Name]; ok {
+		if deps := m.resolveRequiredDeps(info, agentEntry.Name); deps != nil {
+			m.resolvedDeps[agentEntry.Name] = deps
+		}
+	}
+
 	hasLLM := false
 	primaryLLM := ""
 	// 从 agent 的能力依赖解析结果中选 primary LLM
@@ -1942,6 +1959,9 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 			}
 		}
 	}
+	// 所有能力依赖（不止 LLM）都必须就绪才激活：压缩（requires/dsc/compaction）是
+	// agent 的强依赖——它自己不做压缩，没有当值后端时历史越过窗口就无人能救。
+	depsOK := m.agentDepsSatisfiedLocked(agentEntry.Name)
 	// 有工具插件加载时，才提供聚合 Tool 服务（能力依赖中 tool 类已反映在 m.toolServiceIDs）
 	attachTool := len(m.toolServiceIDs) > 0
 
@@ -1972,7 +1992,7 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 		m.logger.Warn("core notify service unavailable", "error", err)
 	}
 
-	if hasLLM {
+	if hasLLM && depsOK {
 		agent, ok := m.agents[agentEntry.Name]
 		if !ok {
 			return fmt.Errorf("agent %s not loaded", agentEntry.Name)
@@ -1984,9 +2004,15 @@ func (m *Manager) LoadFromConfig(cfg *Config) error {
 		m.transitionLocked(agentEntry.Name, StateActive, "")
 		m.logger.Info("agent activated declaratively", "name", agentEntry.Name, "llmID", llmID, "toolID", toolID)
 	} else {
-		m.markPendingLocked(agentEntry.Name, "agent", "dependent LLM not loaded")
+		// 依赖未齐（LLM 或压缩能力）时保持 PENDING：agent 不参与任何请求。少了压缩
+		// 后端时它一律不会被提升，宿主 main 在加载完成后拒绝启动并说明缺什么。
+		reason := "dependent LLM not loaded"
+		if hasLLM && !depsOK {
+			reason = "dependent capability provider not loaded (missing compaction backend?)"
+		}
+		m.markPendingLocked(agentEntry.Name, "agent", reason)
 		m.pendingEntries[agentEntry.Name] = *agentEntry // 记录待再激活的 agent 条目
-		m.logger.Warn("agent deferred to pending (missing LLM capability provider)", "name", agentEntry.Name)
+		m.logger.Warn("agent deferred to pending", "name", agentEntry.Name, "reason", reason)
 	}
 
 	// 聚合 LLM 已就绪：为启动期加载的 tool/dsc 插件补注入互通。
@@ -2406,19 +2432,17 @@ func (m *Manager) registerDscCoreLocked(name string, info *metadata.PluginInfo, 
 		}
 		// len(st.tools) == 0：插件不提供工具（如纯后台的通知类），不登记 tool provider。
 	}
-	// 压缩后端检测（对齐 DSH preset compaction group + 能力验证）：
-	// config.yaml 中 compaction 字段显式选择后端，宿主验证该
-	// 插件声明了 Provides: {"compaction": "true"} 能力。验证通过后仅记日志——
-	// 不再设环境变量（env 不能跨进程动态同步，导致动态加载/卸载与 agent env 快照
-	// 不同步）。后端接管经 agent/pre-step 事件机制：有后端时 pre-step 按后端自身阈值
-	// （默认 80%，对齐 compaction-basic）改写消息列表，agent 经
-	// [DSC_COMPACTION_BACKEND_ACTIVE] 标记检测到后端即跳过内联压缩（同为 80% 阈值）——
-	// 接管靠能力声明驱动、与阈值无关；后端卸载 → 标记消失 → 内联自动恢复为唯一路径。
+	// 压缩后端登记（对齐 DSH preset compaction group + 能力验证）：
+	// config.yaml 的 compaction 字段显式点名时，这里只做一次能力声明校验并留日志。
+	// 具体「谁当值」由 ResolveCompactionRole 统一定（点名优先，未点名时唯一候选自动
+	// 当值，多候选要求点名），不在这里各写一份。接管经 agent/pre-step 事件机制：
+	// 宿主把完整消息列表只发给岗位持有者（compactionBackendName），其余插件拿轻载荷。
+	// 不设环境变量——env 不能跨进程动态同步，动态加载/卸载会与 agent 的 env 快照脱节。
 	if m.compactionBackend != "" && m.compactionBackend == name {
 		if info != nil && len(info.Capabilities) > 0 {
 			if v, ok := info.Capabilities["compaction"]; ok && v != "false" {
 				m.logger.Info("compaction backend selected", "backend", name,
-					"mode", "pre-step event takeover, agent inline compaction skipped while backend active")
+					"mode", "pre-step event takeover")
 			} else {
 				m.logger.Error("compaction backend does not declare compaction capability (Provides compaction)",
 					"backend", name, "hint", "plugin must declare Provides: {\"compaction\": \"true\"} in SDK Config")

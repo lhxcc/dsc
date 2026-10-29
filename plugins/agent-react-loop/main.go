@@ -22,29 +22,12 @@ import (
 	"google.golang.org/grpc"
 )
 
-// 内联压缩配置——经 env 覆盖，与 dsc-system/compaction-basic 的同名 env
-// 对齐（DSC_COMPACTION_BASIC_*）。两处独立阈值是因为：内联压缩是 agent
-// 进程内的兜底（rule-driven），dsc-system 是宿主后端（model-driven）；
-// 后端加载时 agent 跳过内联（见 hasCompactionBackend 检测），故两套阈值
-// 实际不会同时生效，但仍允许各自独立调参以适配不同部署场景。
+// toolMetadataRPCTimeout ListContext / ListTools 等 tool-client 元数据 RPC 超时
+// （默认 3 秒，超时即跳过该次元数据刷新，不阻塞主循环）。
 //
-// 不抽共享常量到 dsc-sdk 是因为 agent-react-loop 是独立 module
-// （dsc-plugin-agent-react-loop），不能依赖 core——env 名字字符串相同
-// 即已表达对齐意图。
+// 压缩（阈值、保留比例、摘要提示词、请求预算）都不在这里：agent 不实现压缩，
+// 那些参数属于声明 Provides compaction 的压缩后端（各自读自己的 env）。
 var (
-	// compactionTriggerRatio 触发阈值比例（默认 0.80）。
-	// prompt tokens >= contextWindow * ratio 时启动压缩。
-	compactionTriggerRatio = dsc.EnvFloat("DSC_COMPACTION_BASIC_THRESHOLD", 0.80)
-	// compactionRetainRatio 保留尾部比例（默认 0.16，对齐 DSH retainRatio 0.16）。
-	compactionRetainRatio = dsc.EnvFloat("DSC_COMPACTION_BASIC_RETAIN_RATIO", 0.16)
-	// compactionRetainMinTokens 保留尾部最少 token 数（默认 1024）。
-	compactionRetainMinTokens = dsc.EnvInt("DSC_COMPACTION_BASIC_RETAIN_MIN", 1024)
-	// compactionInstructionOverheadTokens 压缩请求的指令与结构开销估算（默认 64）。
-	// 用于 compactHistory 计算 max_tokens = contextWindow - inputTokens - overhead
-	// 时的输入 token 估算加成。
-	compactionInstructionOverheadTokens = dsc.EnvInt("DSC_COMPACTION_BASIC_INSTRUCTION_OVERHEAD", 64)
-	// toolMetadataRPCTimeout ListContext / ListTools 等 tool-client 元数据 RPC 超时
-	// （默认 3 秒，超时即跳过该次元数据刷新，不阻塞主循环）。
 	toolMetadataRPCTimeout = 3 * time.Second
 )
 
@@ -135,17 +118,11 @@ type ReactLoopAgent struct {
 
 	// lastContextTokens 本步请求的上下文占用投影（core.TokenMeter 的 Project 结果）。
 	// 随 usage 帧（Usage.ContextTokens）上报给宿主：宿主侧计量实例据此对外发布，
-	// TUI 显示的就是这个数——与裁剪/压缩决策同源，不再另算一套。
+	// TUI 显示的就是这个数——与宿主的滑窗/压缩决策同源，不再另算一套。
 	lastContextTokens int
 
-	// trimNoticeSession / foldNoticeSession：裁剪与折叠提示已提示过的会话 id。
-	// 小窗口读越窗口的会话是常态（一个项目积累数月的会话），逐轮提示等于刷屏；
-	// 每个会话只说明一次，之后静默。会话 id 变化（切会话）即自然重置。
-	trimNoticeSession string
-	foldNoticeSession string
-
 	// meter 上下文占用的唯一计量（dsc.TokenMeter）：实测锚点 + 启发式增量。
-	// 裁剪/压缩/提示文案/单轮超窗判定全部读它，不得各自再用估算另算一遍。
+	// 「已用」上报与宿主决策读同一个口径，不得各自再用估算另算一遍。
 	meter *dsc.TokenMeter
 
 	// 記錄上次的工具名稱列表，用於檢測模式是否切換
@@ -160,11 +137,6 @@ type ReactLoopAgent struct {
 	// replace node 0）——system prompt 进入事件日志，对齐 DSH v3
 	// system/message surface node 0 设计。
 	sysPrompt string
-
-	// hasCompactionBackend 宿主是否有 compaction 后端插件接管（经 ListContext 标记检测）。
-	// 有后端时跳过内联 compactHistory（后端在 pre-step 以自身策略阈值接管）；
-	// 无后端时走内联压缩。每轮 buildSystemPrompt 时更新（ListContext 响应实时反映插件生命周期）。
-	hasCompactionBackend bool
 
 	// 單輪模式（-input 自動化測試入口使用）：代理循環僅執行一次，
 	// 完成一輪（含工具調用）後自然結束，方便測試後程序自動退出
@@ -503,217 +475,50 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 		iterPendingInjects := a.pendingInjects
 		a.sessMu.Unlock()
 
-		// 超窗裁剪（请求级兜底，不改会话日志）：内联压缩是把「整段历史」交给同一个模型
-		// 做摘要，只能处理「历史本身还塞得进窗口」的情形；1M 云端攒下 700K 历史再切回
-		// 128K 本地时，压缩请求自己就超限，整轮直接失败——既没压缩也没发请求。故先把
-		// 派生历史裁进窗口（丢弃最旧的完整轮次，允许接近上限但不允许超过），再走后面的
-		// 压缩判断。裁剪只作用于本次请求，surface/事件日志一字不改，切回大窗口时全量历史原样恢复。
+		// 请求历史由会话 surface 派生（system prompt 前置），**原样下发**。
 		//
-		// 「已用容量」只有一个来源：dsc.TokenMeter 的投影值（实测锚点 + 自锚点以来的
-		// 启发式增量，对齐 DSH tokenMeter 的 projectedTokens）。裁剪、压缩、提示文案、
-		// 单轮超窗判定全部读这同一个数——此前这里各算各的（一处看服务端值、一处看纯估算），
-		// 口径一偏就整盘错：纯 ASCII 高估 4~5 倍时，1M 窗口、服务端实测 332K 的会话
-		// 被判超窗，每轮都裁历史并打印提示。
+		// 这里不做任何窗口手术：裁剪、折叠、摘要化压缩都是「改写请求面」，属于压缩岗位
+		// （声明 Provides compaction 的后端）的职责；agent 只负责循环与调度。历史装不进
+		// 窗口时，由宿主在请求发出前统一量表面并按需滑窗（core/context_ceiling.go）；
+		// provider 报超窗时同样由宿主滑窗后重试（core/overflow_adjust.go）。
+		//
+		// 为什么不能让 agent 顺手裁一刀（与消息身份无关——身份早已是宿主下发的稳定 id，
+		// 裁掉头部不会再让压缩块指错消息）：
+		//
+		//  1. 职责：改写请求面是压缩后端的职责，窗口适配是宿主收口层的职责（它看得到
+		//     改写之后的表面）。agent 只调度，两边都不该由它代劳。
+		//  2. 观测点错位：这里拿到的是**改写前**的列表，可能几倍于窗口；真正上线的是
+		//     后端渲染后的视图或宿主滑窗后的视图。拿前者决定丢什么，等于在后端改写之前
+		//     替他扔材料——扔掉的正是它可能要用/要保留的那一段。
+		//  3. 压缩是增量的：dsc-system 按「已压前缀的 sha256 指纹」复用摘要，billion-context
+		//     的块覆盖与保留区也建立在它见过的历史上。喂它一份每步都被裁过的列表，前缀
+		//     每步变、指纹每次失配 → 每步重算压缩，视图与请求面在相邻两步之间摆动、
+		//     前缀缓存反复失效（早期实测 169K / 26.5K 交替，那时还叠加着按位置寻址的错位；
+		//     位置寻址已随稳定 id 消失，但「喂它残次历史就每步重算」这条至今成立）。
+		//
+		// 压缩能力是 agent 的强依赖（metadata 声明 requires/dsc/compaction）：没有当值的
+		// 压缩后端时宿主不会激活 agent（启动即失败并说明怎么补），因此这里不存在、
+		// 也不该有「没有后端时自己压」的分支。
+
 		// 会话检索工具只在「历史已经装不进窗口」时才出现在目录里：整个历史都在眼前时，
 		// 检索没有增量价值；而一旦滑窗开始裁历史，模型就失去了那部分内容的唯一入口。
 		availableTools = a.filterContextSearch(availableTools, dsc.EstimateProtoMessagesTokens(msgs))
 
+		// 「已用容量」只有一个来源：dsc.TokenMeter 的投影值（实测锚点 + 自锚点以来的
+		// 启发式增量，对齐 DSH tokenMeter 的 projectedTokens）。
 		meter := a.tokenMeter()
 		meter.UpdateContextWindow(a.contextWindow)
-		currentEstimate := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
-		projectedTokens := meter.Project(currentEstimate)
-		// 有压缩后端时**不做请求级裁剪**：这里拿到的是改写**前**的列表，裁它等于在
-		// 后端接手之前就替它丢了材料——而后端的状态（块覆盖、保留区）是按完整
-		// append-only 历史建立的，喂它一份被裁过的列表会让覆盖关系错位，渲染结果在
-		// 相邻两步之间摆动（实测 1M 窗口下 169K/26.5K 交替），前缀缓存每步失效。
-		//
-		// 「谁保证发出去的 ≤ 窗口」由宿主统一收口：pre-step 改写完成后、请求发出之前，
-		// 宿主量最终表面并按需裁剪（core/context_ceiling.go，超窗时先请后端紧急压缩，
-		// 压不下去才丢最旧的一段）。那里看到的是**真正要发的那一份**，且消息身份已是
-		// 宿主下发的稳定 id，裁剪不会让压缩块指错消息。
-		//
-		// 因此这里也不再做「单轮超窗」硬报错，那是拿**改写前**的规模去判**改写后**的
-		// 请求，有后端时必然误判。
-		var droppedMsgs int
-		if !a.hasCompactionBackend {
-			msgs, droppedMsgs = a.trimToWindow(msgs, availableTools, projectedTokens)
-		}
-		// 本步是否已动过历史（裁剪或折叠）。动了历史就跳过内联压缩：压缩按 surface
-		// node 索引取落点，与改写后的 msgs 不再一一对应，且它会在失败回退时把折叠
-		// 掉的内容重新装回去——等于白折。
-		historySlimmed := droppedMsgs > 0
-		if droppedMsgs > 0 {
-			// 不往 system 里追加「已省略 N 条」的说明：system 是缓存前缀，每次改写都会
-			// 让整段前缀缓存失效；而且小窗口读越窗口的会话是常态（一个项目积累数月的
-			// 会话），这句话会一直挂在每一轮里。
-			//
-			// 也**不往前端输出提示帧**：滑动窗口是这个产品的常态工作方式，不是需要用户
-			// 处理的异常。它是运行日志（-log 可见），只在一个会话第一次被裁时记一条，
-			// 免得每步刷满日志。
-			if a.trimNoticeSession != a.sess.ID() {
-				a.trimNoticeSession = a.sess.ID()
-				a.logger.Warn("context trimmed to fit the window",
-					"session", a.sess.ID(), "dropped", droppedMsgs,
-					"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
-			}
-		}
-		// 历史已裁到无可再裁，仍然超窗 → 折叠过长的单条消息（保留首尾）。
-		//
-		// 裁剪只能从「最旧的完整轮次」开始丢，遇到「这一轮本身就超窗」（一次巨大的工具
-		// 输出、一次长粘贴）时它无历史可裁——以前只能整轮失败。折叠一条消息（丢掉中间的
-		// 过程、保留头尾与结论）比让整轮一事无成要强；会话还能继续走下去。
-		// 有压缩后端时不做：后端改写后的载荷由它自己负责，这里折叠只会重复劳动，
-		// 而且折叠会改写正文（位置不变，但内容变了），白白牺牲前缀缓存。
-		if a.contextWindow > 0 && !a.hasCompactionBackend && !a.fitsWindow(msgs, availableTools) {
-			if folded, n := a.foldOversizeMessages(msgs, availableTools); n > 0 {
-				msgs = folded
-				historySlimmed = true
-				// 同样只提示一次，理由同上（常态事件不出声）。
-				if a.foldNoticeSession != a.sess.ID() {
-					a.foldNoticeSession = a.sess.ID()
-					a.logger.Warn("oversized messages folded (head and tail kept)",
-						"session", a.sess.ID(), "folded", n,
-						"window", a.contextWindow, "projected", a.projectedFit(msgs, availableTools))
-				}
-			}
-		}
 
-		// 展示/上报的「已用」必须是**真正要发出去的那份表面**（裁剪、折叠都做完之后）：
-		// 拿裁剪前的估算上报，等于向界面上报一个没有发出去的请求。
-		//
-		// 这在小窗口读超长会话（滑动窗口）时尤其要紧：历史每轮都被裁掉一大段，裁剪前
-		// 的估算可能几倍于窗口、而真正发出的是裁完的那一段。此前这里在裁剪前赋值，
-		// 界面上的占用与实际请求之间差着「被裁掉的那部分」。
+		// 展示/上报的「已用」= 真正要发出的那份表面（消息 + 工具目录）的投影。
+		// 宿主与 TUI 都读这个数，不另算一套。
 		sentSurface := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools)
 		a.usageMu.Lock()
 		a.lastContextTokens = meter.Project(sentSurface)
 		a.usageMu.Unlock()
 
-		// 到这里仍超窗口：没有任何自动解（裁剪与折叠都做了），明确报错而不是发出注定
-		// 被 provider 拒绝的请求。
-		// 有压缩后端时不做这个判定：这里量的是**改写前**的列表，而真正发出去的是后端
-		// 渲染后的视图（可能小一个数量级）。拿前者判后者会把一个完全装得下的请求判死，
-		// 正是「1M 窗口、历史 1.6M、后端已压到 170K 却整轮报单轮超窗」的成因。
-		if a.contextWindow > 0 && !a.hasCompactionBackend {
-			// 工具目录同样占窗口：只算消息会把「单轮超窗」判晚。
-			// 报错取两个口径的较严者——投影（实测为底数）与估算都可能偏，取大者才不会
-			// 出现「判定说装得下、provider 说超窗」。
-			est := a.projectedFit(msgs, availableTools)
-			if raw := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(availableTools); raw > est {
-				est = raw
-			}
-			if est > a.contextWindow {
-				err := fmt.Errorf("单轮内容超出上下文窗口（约 %d > %d tokens）：请拆分输入、减少一次性粘贴的内容，或改用更大窗口的模型", est, a.contextWindow)
-				if emit != nil {
-					emit(&dsc.RunStreamResponse{Status: "error", Error: err.Error()})
-				}
-				return nil, err
-			}
-		}
-
-		// 上下文自动压缩（对齐 DSH compaction-basic 的 pre-step 压力检查）：
-		// - 已用容量优先取上次请求服务端报告的 prompt token（精确）；首次请求（含重启
-		//   恢复历史会话）无该值，退回字符启发式估算（对齐 DSH tokenMeter 的
-		//   "字符数 + 结构开销" 回退），确保重启后第一发请求不会把整段历史直接灌给模型。
-		// - 超过阈值（默认 80% 窗口）时压缩最旧前缀，保留近期尾部（默认 16% 窗口）逐字，
-		//   而非把全部历史折叠成单一摘要。
-		// - 历史注入被显式设置（historyInjection != 0：负数=不注入、N=只带 N 条）时跳过
-		//   压缩：注入条数本身就是上下文的硬边界，压缩会与截断重复且其 surface 索引
-		//   基于全量历史，不再适用。0 = 未定义（默认不限制），此时才走内联压缩。
-		// - 若宿主有 compaction 后端插件，后端在 pre-step 事件中以自身策略阈值
-		//   接管压缩（能力声明驱动，接管与阈值无关；如 billion-context 的 45%
-		//   nudge 提醒 / dsc-system compaction-basic 的 80% 压力改写）。后端卸载后
-		//   内联压缩自动恢复为唯一压缩路径——不依赖 env 或动态状态同步，
-		//   避免了"动态加载/卸载与 env 快照不同步"的问题。两者作为双重安全网：
-		//   后端负责日常压缩（model-driven），内联压缩负责兜底（rule-driven）。
-		//   - 本步已做过超窗裁剪（droppedMsgs > 0）时跳过内联压缩，两个原因：
-		//     ① 裁剪后的 msgs 与 surface nodes 不再一一对应，压缩落点按 node 索引取
-		//        msgs 会错位；
-		//     ② 更重要——裁剪是非破坏性的（历史仍在会话里，切回大窗口模型可原样恢复），
-		//        而压缩会把它摘要化、永久改写会话。既然本次请求已在窗口内（≤90%），
-		//        没理由为省这点余量把「留给大窗口的那部分历史」销毁掉。
-		compacted := false
-		if !historySlimmed && a.contextWindow > 0 && a.historyInjection == 0 &&
-			float64(projectedTokens) >= float64(a.contextWindow)*compactionTriggerRatio && !a.hasCompactionBackend {
-			// 同样只记日志、不输出到前端：压缩是宿主自己的调度动作，用户不需要为它
-			// 处理任何事（真要观察可以用 -log）。
-			a.logger.Info("compacting history (inline)",
-				"session", a.sess.ID(), "projected_pct", projectedTokens*100/a.contextWindow,
-				"window", a.contextWindow)
-			// 计算保留尾部（compactionRetainRatio 比例，至少 compactionRetainMinTokens），
-			// 从末尾向前累积直至预算用尽；绝不压缩刚追加的当前用户消息（不可分尾部）。
-			nodes := sess.SurfaceNodes()
-			if len(nodes) >= 2 {
-				retainTokens := int(float64(a.contextWindow) * compactionRetainRatio)
-				if retainTokens < compactionRetainMinTokens {
-					retainTokens = compactionRetainMinTokens
-				}
-				// v3：system prompt 由 surface node 0 派生（不再由 sysPrompt 参数前置）。
-				// DeriveMessagesLimited 把 system 前置为 msgs[0]，其余 msgs[1..N-1]
-				// 与 surface nodes[1..N-1] 一一对应（node 0 system 已前置为 msgs[0]）。
-				// 故 msgs[j] 直接对应 surface node j，无需 offset 调整。
-				keep := len(nodes) // 首个被逐字保留的节点下标
-				acc := 0
-				for j := len(nodes) - 1; j >= 1; j-- {
-					acc += dsc.EstimateProtoMessageTokens(msgs[j])
-					if acc > retainTokens {
-						break
-					}
-					keep = j
-				}
-				if keep >= len(nodes) {
-					keep = len(nodes) - 1 // 连最近一条都超预算：压缩到至少保留最后一条
-				}
-				// v3 head 不变量：node 0（system/message）永不被压缩
-				// （对齐 DSH "compaction anchors at the first non-system node;
-				// node 0 is never inside a compaction range"）。
-				// 压缩范围从 nodes[1] 起到 nodes[keep-1]，跳过 system node。
-				if keep <= 1 {
-					keep = 2 // 至少保留最后 1 条 + system 不压缩 → keep 最小为 2
-				}
-				// 工具对边界：保留区不得以 tool 消息开头（否则请求历史出现孤立
-				// tool 消息）。无法吸附时不压缩，空间压力交给 request-error 兜底。
-				if snapped, ok := dsc.SnapRetainStart(msgs, keep, 1); ok {
-					keep = snapped
-				} else {
-					keep = 0
-				}
-				if keep >= 2 {
-					summary, err := a.compactHistory(ctx, llmClient, msgs, availableTools)
-					if err != nil {
-						if emit != nil {
-							emit(&dsc.RunStreamResponse{Status: "error", Error: err.Error()})
-						}
-						return nil, err
-					}
-					// 压缩落地（surface replace）：追加 CompactionSummary 事件遮蔽最旧前缀
-					// [1, keep-1]（跳过 node 0 system），尾部 [keep, len-1] 保持逐字。
-					// 原事件保留在日志（append-only 无损，可回放/恢复）。
-					sess.Append(session.CompactionSummary, &session.CompactionSummaryData{
-						Content: "以下是此前对话的压缩摘要，请基于它继续当前任务：\n" + summary,
-					}, &session.SurfaceOp{Op: session.SurfaceReplace, Start: nodes[1], End: nodes[keep-1]})
-					// 压缩改写了历史：旧锚点（实测值 + 采样时的消息估算）全部失效，清空后
-					// Project 退回纯估算，直到下一次服务端 usage 重新锚定。
-					a.usageMu.Lock()
-					a.lastPromptTokens = 0
-					a.usageMu.Unlock()
-					a.tokenMeter().Reset()
-					compacted = true
-				}
-			}
-		}
-		// 压缩后 surface 已重写，重新派生请求历史（注入计数快照一并刷新，避免已入
-		// 历史的注入在收尾时被误判为新注入而重复发送）
-		if compacted {
-			a.sessMu.Lock()
-			msgs = a.deriveMessages(sess)
-			iterPendingInjects = a.pendingInjects
-			a.sessMu.Unlock()
-			// 压缩后若注入计数把历史又拉回超窗（historyInjection>0 时压缩不被跳过，
-			// 但尾部逐字保留区仍可能很大），再裁一次兜底，保证发出去的一定在窗口内。
-			// 这里没有服务端值可用（刚压缩完，上一发的用量已不代表新列表），故只传估算。
-			msgs, _ = fitMessagesToWindow(msgs, a.contextWindow, dsc.EstimateProtoMessagesTokens(msgs)+dsc.EstimateProtoToolTokens(availableTools))
-		}
+		// 压缩（改写请求面）不在这里做：它由当值的压缩后端在 agent/pre-step 事件里完成，
+		// 宿主按能力（Provides compaction）找到唯一岗位持有者并把完整消息列表发给它。
+		// agent 只调度，不实现压缩——否则换后端时行为会分裂成两套。
 
 		// 稳定排序工具目录（按名称），消除无关的顺序差异导致请求前缀字节变化、
 		// 命中前缀缓存失效（对齐 REX 的 normalizeToolSchemas；顺序不影响功能）。
@@ -1331,12 +1136,8 @@ func (a *ReactLoopAgent) buildSystemPrompt(ctx context.Context, toolClient proto
 	if err == nil {
 		listContextContent := strings.TrimSpace(resp.GetContent())
 		if listContextContent != "" {
-			// 检测 compaction 后端标记（宿主 ListContext 追加 [DSC_COMPACTION_BACKEND_ACTIVE]）
-			// 有后端时跳过内联 compactHistory——后端在 pre-step 以自身策略阈值接管。
-			// 此检测每轮 buildSystemPrompt 执行，与插件生命周期同步：
-			// 后端加载 → 标记出现 → 跳过内联；后端卸载 → 标记消失 → 恢复内联。
-			a.hasCompactionBackend = strings.Contains(listContextContent, "[DSC_COMPACTION_BACKEND_ACTIVE]")
-			// 标记不进 system prompt（对模型不可见）
+			// 宿主在响应里追加 [DSC_COMPACTION_BACKEND_ACTIVE] 标记（它自己据此确认压缩
+			// 岗位有人当值）。标记是宿主内部诊断信息，不进 system prompt（对模型不可见）。
 			listContextContent = strings.ReplaceAll(listContextContent, "[DSC_COMPACTION_BACKEND_ACTIVE]", "")
 			listContextContent = strings.TrimSpace(listContextContent)
 			if listContextContent != "" {
@@ -1521,157 +1322,6 @@ func (a *ReactLoopAgent) approvalPolicyContext() string {
 	}
 }
 
-// compactSystemPrompt 上下文压缩指令：要求模型只输出精简摘要，不添加额外解释。
-// 对齐 DSH compaction-basic summarizer.ts 的 COMPACTION_INSTRUCTION（英文）。
-const compactSystemPrompt = "You are a conversation compactor. Condense the conversation history below into a concise but information-complete summary. " +
-	"Preserve the user's intent, executed tool calls and their results, and all key intermediate conclusions, so the conversation can continue without the original records. " +
-	"Output only the condensed summary, without any explanation, preamble, or closing remarks."
-
-// 用量估算统一走 core 公用启发式（dsc.EstimateProtoMessageTokens /
-// dsc.EstimateProtoMessagesTokens，对齐 DSH tokenMeter：CJK 感知
-// max(bytes/4, runes) + 角色开销 + 图像 + 工具参数），与压缩后端
-// （dsc-system compaction-basic）及宿主 pre-step 同一估算口径，
-// 不再各持一份私有字节/4 粗略实现。
-
-// oversizeTrimRatio 超窗裁剪的目标比例（默认 0.90）。裁到窗口内侧但仍在压缩触发线
-// （0.80）之上：这样「裁完立刻压缩」——能塞进窗口的那部分被摘要化（信息保留），只有
-// 确实塞不进的最旧部分被丢弃，而不是因为总量超窗就干脆不压缩。
-var oversizeTrimRatio = 0.90
-
-// oversizeTrimTriggerRatio 进入裁剪的门槛（占窗口比例，默认 0.95）。窗口内的历史交给
-// 内联压缩处理（留尾部逐字、旧前缀摘要化，比直接丢弃更保信息）；只有超过这条线
-// ——已无空间留给压缩请求自身的 system/user 包装与指令开销——才退化为裁剪。
-var oversizeTrimTriggerRatio = 0.95
-
-// oversizeTrimFallbackRatios 闭环裁剪时逐档收紧的目标比例。
-//
-// 为什么要多档：裁剪按**消息估算**算预算，而超窗判定读的是 TokenMeter 的投影值
-// （provider 实测锚点 + 增量）。两者口径不同——CJK/JSON 密集的会话里实测可能是估算的
-// 两三倍，一次裁到「估算预算」往往仍旧超窗（实测现象：裁掉六千多条历史之后，判定值
-// 仍是窗口的三倍多）。所以裁完要按同一个口径复核，不满足就继续收紧，直到装得进
-// 或者确实无历史可裁（那才是真正的单轮内容超窗）。
-var oversizeTrimFallbackRatios = []float64{oversizeTrimRatio, 0.60, 0.35, 0.15}
-
-// fitMessagesToWindow 把待发历史裁进上下文窗口：允许接近上限，但不允许超过。
-//
-// 存在理由：内联压缩是把「整段历史」交给同一个模型做摘要，因此它只能处理「历史本身还
-// 塞得进窗口」的情形。1M 云端攒下 700K 历史后切回 128K 本地，压缩请求自身就超限，
-// 整轮直接失败（`compact history failed: context length exceeded`）——既没压缩也没发出
-// 请求。压缩后端（billion-context）也只能一段一段救，救不动就放弃。
-//
-// 这里的兜底最小侵入：从最旧的**完整轮次**开始丢弃，直到估算落进 budget。丢弃只发生在
-// 本次请求的派生消息上，surface/事件日志一字不改——所以切回大窗口模型时全量历史原样
-// 回来（压缩是不可逆的，裁剪不是）。
-//
-// 返回裁剪后的消息与被丢弃的条数。边界：
-//   - 首条 system 永不丢（丢掉基础指令模型会乱答）
-//   - 起点必须落在 user 消息上：保证 tool_use 与 tool_result 配对不被切断，且 Anthropic
-//     要求首条非 system 消息是 user
-//   - 连最后一条 user 起的后缀都超窗（单轮本身超窗，如一次粘贴 200K tokens）时原样返回，
-//     由调用方报错——这种情况没有正确的自动解
-func fitMessagesToWindow(msgs []*proto.Message, window, effectiveTokens int) (out []*proto.Message, dropped int) {
-	return fitMessagesToWindowTo(msgs, window, effectiveTokens, 0, false)
-}
-
-// fitMessagesToWindowTo 与 fitMessagesToWindow 相同，但预算与「是否强制再裁」由调用方给：
-//   - budgetTokens <= 0 时用默认目标比例（oversizeTrimRatio）；
-//   - force=true 时跳过「估算显示已在窗口内」的早退——闭环收紧就是靠它反复裁。
-func fitMessagesToWindowTo(msgs []*proto.Message, window, effectiveTokens, budgetTokens int, force bool) (out []*proto.Message, dropped int) {
-	if window <= 0 || len(msgs) == 0 {
-		return msgs, 0
-	}
-	budget := budgetTokens
-	if budget <= 0 {
-		budget = int(float64(window) * oversizeTrimRatio)
-	}
-	if effectiveTokens <= 0 {
-		// 兜底只算消息：本函数看不到工具目录。调用方应传入「消息 + 工具目录」的
-		// 整体估算（dsc.EstimateProtoMessagesTokens + dsc.EstimateProtoToolTokens），
-		// 否则预算里会少算工具目录那一截。
-		effectiveTokens = dsc.EstimateProtoMessagesTokens(msgs)
-	}
-	// 用「已用容量」而不是「消息总估算」决定是否裁剪：前者含服务端上报值，最接近真实；
-	// 后者在图片、工具定义等未计入的部分之外还会因启发式口径漂移（见 dsc.EstimateTextTokens）。
-	if !force && effectiveTokens <= int(float64(window)*oversizeTrimTriggerRatio) {
-		return msgs, 0 // 窗口内（含稍超压缩线）：交给压缩路径，不在这里丢历史
-	}
-	head := 0
-	if msgs[0].Role == "system" {
-		head = 1
-	}
-	// 逐条 token 与后缀累计，避免对每个候选起点重算整段
-	toks := make([]int, len(msgs))
-	for i, m := range msgs {
-		toks[i] = dsc.EstimateProtoMessageTokens(m)
-	}
-	headTokens := 0
-	for _, t := range toks[:head] {
-		headTokens += t
-	}
-	suffix := make([]int, len(msgs)+1) // suffix[i] = toks[i:] 之和
-	for i := len(msgs) - 1; i >= 0; i-- {
-		suffix[i] = suffix[i+1] + toks[i]
-	}
-	// 最旧的「整段塞得进」的 user 边界即起点（越旧保留越多）
-	for i := head; i < len(msgs); i++ {
-		if msgs[i].Role != "user" {
-			continue
-		}
-		if headTokens+suffix[i] > budget {
-			continue
-		}
-		out = make([]*proto.Message, 0, head+len(msgs)-i)
-		out = append(out, msgs[:head]...)
-		out = append(out, msgs[i:]...)
-		return out, i - head
-	}
-	return msgs, 0
-}
-
-// compactHistory 當上下文已用容量超過 80% 時觸發：讓模型把派生歷史壓縮成摘要。
-// 返回摘要文本（不含 system 消息，避免把基礎指令與技能索引壓進摘要），
-// 由調用方決定落點（重建會話或 surface replace 遮蔽）。
-// max_tokens 設為窗口淨餘（contextWindow - 估算輸入）的真實值，保證壓縮結果能放入
-// 剩餘空間——基於字符估算而非上次請求的 usage，重啟恢復場景同樣成立。
-func (a *ReactLoopAgent) compactHistory(ctx context.Context, llmClient proto.LLMServiceClient, msgs []*proto.Message, tools []*proto.Tool) (string, error) {
-	if a.contextWindow <= 0 {
-		return "", nil
-	}
-	// 压缩请求本身也携带工具目录（下面 req.Tools = tools），预算必须一并计入，
-	// 否则 max_tokens 会被高估、摘要可能超出窗口被截断。
-	inputTokens := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools) + compactionInstructionOverheadTokens
-	remaining := a.contextWindow - inputTokens
-	if remaining < compactionRetainMinTokens {
-		remaining = compactionRetainMinTokens
-	}
-	// 壓縮請求：以 system 指令引導 + 派生歷史作為 user 內容
-	// （跳過歷史中的 system 消息，避免把基礎指令與技能索引壓進摘要）
-	reqMsgs := make([]*proto.Message, 0, len(msgs)+2)
-	reqMsgs = append(reqMsgs, &proto.Message{Role: "system", Content: compactSystemPrompt})
-	reqMsgs = append(reqMsgs, &proto.Message{Role: "user", Content: "以下是需要压缩的对话历史："})
-	for _, m := range msgs {
-		if m.Role == "system" {
-			continue
-		}
-		reqMsgs = append(reqMsgs, m)
-	}
-
-	req := &proto.ChatRequest{
-		Messages:  reqMsgs,
-		Tools:     tools,
-		MaxTokens: int32(remaining),
-	}
-	resp, err := llmClient.Chat(ctx, req)
-	if err != nil {
-		return "", fmt.Errorf("compact history failed: %w", err)
-	}
-	summary := strings.TrimSpace(resp.Content)
-	if summary == "" {
-		return "", fmt.Errorf("compact history returned empty summary")
-	}
-	return summary, nil
-}
-
 // SetUserQuestionsService 注入宿主挂载在 broker 上的 UserQuestionsService ID。
 // exit_plan_mode 评审等场景经 ensureUserQuestionsClient 惰性连接并调用。
 func (a *ReactLoopAgent) SetUserQuestionsService(ctx context.Context, serviceID uint32) error {
@@ -1747,13 +1397,11 @@ func (a *ReactLoopAgent) SwitchSession(ctx context.Context, sessionID string) er
 	a.turnCounter = sess.LastTurn()
 	a.sysPromptNeedsUpdate = true // 新会话的 plan/goal 状态不同，下次 Run 重建 system prompt
 	a.sessMu.Unlock()
-	// 用量与裁剪状态属于「上一个会话」：不清掉的话，从 1M 的大会话切到新会话时，
-	// 上一发的 prompt 用量会被当成本会话的已用容量，导致空会话被判定超窗而触发裁剪/压缩。
+	// 用量属于「上一个会话」：不清掉的话，从 1M 的大会话切到新会话时，上一发的
+	// prompt 用量会被当成本会话的已用容量，导致空会话被判定超窗而触发滑窗/压缩。
 	a.usageMu.Lock()
 	a.lastPromptTokens = 0
 	a.lastUsage = nil
-	a.trimNoticeSession = ""
-	a.foldNoticeSession = ""
 	a.usageMu.Unlock()
 	a.contextSearchSeen = false // 会话检索工具的可见性随会话重新裁定
 	a.tokenMeter().Reset()
@@ -2009,94 +1657,6 @@ func (a *ReactLoopAgent) tokenMeter() *dsc.TokenMeter {
 	return a.meter
 }
 
-// trimToWindow 把派生历史裁进窗口，返回裁剪后的消息与被丢弃的条数。
-//
-// 闭环：先按默认目标裁一次，再按**判定所用的同一口径**（投影值，含工具目录）复核，
-// 装不进就逐档收紧预算继续裁。
-//
-// 为什么不能只裁一次：裁剪按消息估算算预算，判定却读投影值（provider 实测锚点 +
-// 增量）。CJK/JSON 密集的会话里两者可能差两三倍，于是出现「估算已经裁进窗口、判定
-// 仍然超窗」——正是「省略六千多条历史之后还报 441195 / 131072」的成因。多档收紧让
-// 两边收敛到同一个数；真的无历史可裁时，才说明是单轮内容本身超窗。
-func (a *ReactLoopAgent) trimToWindow(msgs []*proto.Message, tools []*proto.Tool, projectedTokens int) ([]*proto.Message, int) {
-	if a.contextWindow <= 0 || len(msgs) == 0 {
-		return msgs, 0
-	}
-	out, dropped := fitMessagesToWindow(msgs, a.contextWindow, projectedTokens)
-	for _, ratio := range oversizeTrimFallbackRatios[1:] {
-		if a.fitsWindow(out, tools) {
-			break
-		}
-		more, d := fitMessagesToWindowTo(out, a.contextWindow, projectedTokens,
-			int(float64(a.contextWindow)*ratio), true)
-		if d <= 0 || len(more) == len(out) {
-			break // 无历史可再裁：剩下的就是这一轮内容本身
-		}
-		out, dropped = more, dropped+d
-	}
-	return out, dropped
-}
-
-// foldOversizeMessages 单条消息过长导致整轮超窗时的兜底：循环挑出最长的一条折叠
-// （保留首尾 + 标注原规模），直到投影值落进窗口或无可再折。
-//
-// 只折叠 user / tool 两类：assistant 消息里可能有 tool_calls 结构，截断会破坏调用与
-// 结果的对应关系。system 永不折叠（丢掉基础指令模型会乱答）。
-func (a *ReactLoopAgent) foldOversizeMessages(msgs []*proto.Message, tools []*proto.Tool) ([]*proto.Message, int) {
-	if a.contextWindow <= 0 || len(msgs) == 0 {
-		return msgs, 0
-	}
-	const maxPasses = 16
-	out := append([]*proto.Message(nil), msgs...)
-	folded := 0
-	for pass := 0; pass < maxPasses; pass++ {
-		if a.fitsWindow(out, tools) {
-			return out, folded
-		}
-		bestIdx, bestTokens := -1, 0
-		for i, m := range out {
-			if m.Role != "user" && m.Role != "tool" {
-				continue
-			}
-			if t := dsc.EstimateProtoMessageTokens(m); t > bestTokens {
-				bestIdx, bestTokens = i, t
-			}
-		}
-		// 太短的消息折了没意义（也说明超窗不来自消息正文，别再白折腾）
-		if bestIdx < 0 || bestTokens < 512 {
-			return out, folded
-		}
-		out[bestIdx] = foldMessage(out[bestIdx], bestTokens, a.contextWindow)
-		folded++
-	}
-	return out, folded
-}
-
-// foldMessage 把一条消息折叠为「首尾保留 + 中间标注」的形态。保留量按窗口比例给：
-// 窗口越大，能留的越多；窗口很小时宁可多折一点，也要把请求发出去。
-func foldMessage(m *proto.Message, tokens, window int) *proto.Message {
-	runes := []rune(m.Content)
-	head := window / 10
-	tail := window / 20
-	if head < 512 {
-		head = 512
-	}
-	if tail < 256 {
-		tail = 256
-	}
-	if len(runes) <= head+tail+64 {
-		return m
-	}
-	return &proto.Message{
-		Role: m.Role,
-		Content: string(runes[:head]) +
-			fmt.Sprintf("\n\n…（本条内容过长，已折叠：原约 %d tokens，保留首尾，中间过程省略）…\n\n", tokens) +
-			string(runes[len(runes)-tail:]),
-		ToolCallId: m.ToolCallId,
-		Images:     m.Images,
-	}
-}
-
 // contextSearchToolName 宿主内置的会话检索工具名（实现在 core/context_search_tool.go）。
 // agent 只决定「要不要把它放进目录」，搜索本身在宿主侧执行——数据（会话日志）归宿主。
 const contextSearchToolName = "context_search"
@@ -2156,14 +1716,6 @@ func dropToolByName(tools []*proto.Tool, name string) []*proto.Tool {
 	out := make([]*proto.Tool, 0, len(tools)-1)
 	out = append(out, tools[:idx]...)
 	return append(out, tools[idx+1:]...)
-}
-
-// projectedFit 报告把这份消息列表发出去的预计占用（投影口径，含工具目录）。
-//
-// 裁剪、压缩、超窗判定、界面显示全部读这一个数——口径一旦分叉就会出现「裁掉了
-// 六千条、判定却说还超窗三倍」这种自己打自己的结果。
-func (a *ReactLoopAgent) projectedFit(msgs []*proto.Message, tools []*proto.Tool) int {
-	return a.tokenMeter().Project(dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools))
 }
 
 // seedUsageFromHistory 从会话日志恢复上次成功请求的用量锚点（重启后首发请求没有
@@ -2275,9 +1827,36 @@ func newAgent() (*ReactLoopAgent, error) {
 	return agent, nil
 }
 
+// agentSDKConfig 是 agent 的声明式元数据：名字、类型、**能力依赖**。
+//
+// 依赖只在 metadata 里说「我需要什么」，不点名具体插件：
+//   - requires/llm/llm：一个提供 "llm" 能力的 LLM 插件（所有 LLM 插件默认提供）。
+//     宿主据此按能力解析 primary LLM provider。
+//   - requires/dsc/compaction：一个提供 "compaction" 能力的压缩插件。这是**强依赖**：
+//     agent 只负责循环与调度，不实现压缩（不裁剪、不折叠、不做摘要），请求面的改写
+//     全部由当值后端完成。没有它，历史一旦越过窗口就无人能救——所以依赖未满足时宿主
+//     让 agent 保持 PENDING，并在启动期明确失败，而不是让用户到某次请求报超窗才发现。
+//
+// 多候选（同时启用两个压缩后端）由宿主按 config.yaml 的 compaction 字段选一个当值，
+// 其余保留为候选——同域唯一 provider 语义在这里落实为「岗位唯一」。
+//
+// 抽成函数而不是写在 main 里：这是可测的契约（见 agent_deps_test.go），
+// 删掉一条依赖就等于允许 agent 在没有压缩能力的环境里裸奔。
+func agentSDKConfig() dsc.Config {
+	return dsc.Config{
+		Name:    "agent-react-loop",
+		Version: "1.2.0",
+		Type:    dsc.TypeAgent,
+		Requires: []dsc.CapabilityRequirement{
+			{Type: "llm", Capability: "llm"},
+			{Type: "dsc", Capability: "compaction"},
+		},
+	}
+}
+
 // main 以公共 SDK（dsc-sdk）声明式启动：SDK 复用宿主 dsc.AgentGRPCPlugin 提供
 // AgentService + 元数据，并经 AgentBroker 回调在 gRPC server 建立时注入宿主 broker
-// （重写自旧的 customAgentPlugin/agentGRPCServer 样板）。
+// （重写自旧的 customAgentGRPCServer 样板）。
 func main() {
 	agent, err := newAgent()
 	if err != nil {
@@ -2285,17 +1864,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	// agent 声明能力依赖：requires/llm/llm —— 依赖一个提供 "llm" 能力的 LLM 插件
-	// （所有 LLM 插件经 PluginInfo.Capabilities 默认提供 "llm" 能力）。宿主据此按
-	// 能力（而非插件名）解析 primary LLM provider，对齐 DSH/Cordis 的 provide + inject 模型。
-	sdk := dsc.New(dsc.Config{
-		Name:    "agent-react-loop",
-		Version: "1.1.0",
-		Type:    dsc.TypeAgent,
-		Requires: []dsc.CapabilityRequirement{
-			{Type: "llm", Capability: "llm"},
-		},
-	})
+	sdk := dsc.New(agentSDKConfig())
 	sdk.Agent(agent)
 	// 订阅宿主事件：把沙箱升级审批审计（approval/asked + approval/decided）写进当前会话日志。
 	sdk.Hook(dsc.Hook{OnEvent: agent.handleHostEvent})
@@ -2337,20 +1906,4 @@ func buildTodoNudgePrompt(todos []session.TodoItem) string {
 		"请逐项继续处理，直到清单清空再结束回复：完成的项、已失效或无需进行的项，"+
 		"都必须以 todo_write 更新（标记为 completed 或从清单中移除），不得保留无人处理的待办项；"+
 		"若某项暂时无法推进，请改为 in_progress 并说明阻塞原因。", len(pending), strings.Join(pending, "\n"))
-}
-
-// fitsWindow 报告这份消息列表是否装得进窗口：投影口径与估算口径**都要满足**。
-//
-// 两个口径都会偏：投影以 provider 实测为底数，在 CJK/JSON 密集的会话里可能高估两三倍
-// （于是「裁掉了六千条还判超窗」）；反过来，若锚点来自一次规模小得多的请求，投影又会
-// 低于真实估算（于是裁完发出去被 provider 拒）。所以这里取两者的较严者——宁可多裁一点，
-// 也不能把一个注定被拒的请求发出去。
-func (a *ReactLoopAgent) fitsWindow(msgs []*proto.Message, tools []*proto.Tool) bool {
-	if a.contextWindow <= 0 {
-		return true
-	}
-	if raw := dsc.EstimateProtoMessagesTokens(msgs) + dsc.EstimateProtoToolTokens(tools); raw > a.contextWindow {
-		return false
-	}
-	return a.projectedFit(msgs, tools) <= a.contextWindow
 }

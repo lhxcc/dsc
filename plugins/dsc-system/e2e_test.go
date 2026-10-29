@@ -12,6 +12,7 @@ import (
 
 	"dsc/proto"
 	"dsc/proto/metadata"
+
 	plugin "github.com/hashicorp/go-plugin"
 )
 
@@ -547,8 +548,8 @@ func TestSkillE2E(t *testing.T) {
 
 // TestCompactionBasicE2E 端到端验证基础压缩驻留（自宿主 core/compaction.go 迁入）：
 // spawn dsc-system exe，经 gRPC PluginHookService.OnEvent 走宿主 agent/pre-step /
-// agent/request-error 同款调用——溢出紧急压缩返回 {"retry": true}、重试的 pre-step
-// 返回 {"messages": [...]} 改写（LLM 未互联 → 截断式退化路径）、非溢出错误码忽略。
+// agent/request-error 同款调用——pre-step 返回 {"messages": [...]} 改写（LLM 未互联
+// → 截断式退化路径）、重放确定性一致；超窗不归本插件（一律不响应，处置权在宿主滑窗）。
 func TestCompactionBasicE2E(t *testing.T) {
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()

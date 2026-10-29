@@ -30,8 +30,9 @@ const CapabilityAutoBackground = "auto-background"
 //
 // 这不是「最多等多久」：只要有输出，预算就重新计时（活跃续命），命令可以一直在
 // 前台跑完；只有真的安静下来（编译中、阻塞在网络、卡在交互）才把控制权交回模型。
-// 30s 是「这么久没动静，基本不是它能自己好起来的事」的经验值。
-const defaultAutoBackgroundGrace = 30 * time.Second
+// 60s 是实测定下的经验值：30s 会把「安静的编译/安装/网络等待」误判成卡死，模型隔
+// 一步就去看 job，来回切反而更慢；而真正卡死的命令多等 30 秒的代价可以接受。
+const defaultAutoBackgroundGrace = 60 * time.Second
 
 // maxAutoBackgroundForeground 前台等待的硬上限：即便命令一直在输出，也不能让模型
 // 无限期被占住——到点同样转后台（任务继续跑，只是先把它交出去）。

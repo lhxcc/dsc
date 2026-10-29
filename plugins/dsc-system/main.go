@@ -18,8 +18,9 @@
 //     tool/post-execute 槽超长结果外置为文件 + replace 预览替换）
 //   - compaction-basic.go 基础上下文压缩（自宿主 core/compaction.go 迁入，对齐 DSH
 //     compaction-basic：agent/pre-step 压力驱动改写消息列表；LLM 摘要经 interconnect，
-//     未互联退化截断式；超窗由宿主滑窗兜底；
-//     config.yaml compaction: dsc-system 选其为本插件后端）
+//     未互联退化截断式；摘要记录落 <session>.dsc-system.json，重启即复用；
+//     溢出/超窗不归它管——处置权在宿主的滑窗。config.yaml compaction: dsc-system
+//     或「唯一候选自动当值」把它放上岗位）
 //   - image-offload.go 请求面图像预算卸载（自 agent-react-loop/image_offload.go
 //     抽取迁入，对齐 DSH RequestImageOffloadPolicy count 预算：agent/pre-step 槽
 //     把超预算最旧图像引用退役为占位文本，纯瞬态投影不改会话存储；
@@ -45,7 +46,10 @@ import (
 //
 //   - stage=projection：只做请求面投影（图像预算卸载），压缩不参与——此时列表已经
 //     是压缩改写后的视图，再压一次既无意义也会打乱引用；
-//   - stage=compaction（或缺省，旧宿主）：reminder 重置重复链 + 压缩结构改写；
+//   - stage=compaction（或缺省，旧宿主）：reminder 重置重复链 + 压缩结构改写。
+//
+// agent/request-error 不再订阅：超窗由宿主滑窗（无损）处理，插件侧做有损紧急压缩
+// 会把整段真实消息压成一句占位摘要。
 func handleDscSystemEvent(ctx context.Context, eventType, dataJSON string,
 	compaction *compactionBasicServer, offload *imageOffloadServer, reminder *reminderServer) (string, error) {
 	if eventType == string(dsc.EventAgentPreStep) && dsc.PreStepStageOf(dataJSON) == dsc.PreStepStageProjection {
@@ -69,12 +73,16 @@ func main() {
 		os.Exit(2)
 	}
 	compactionBasicServer := newCompactionBasicServer()
+	// 摘要缓存的落盘通道：与会话存档同目录（<id>.dsc-system.json），重启后指纹吻合
+	// 即复用、不必为同一段前缀重新调用 LLM。装配只在这里——测试构造的服务器不带
+	// store（纯内存），因此不会写进用户的 sessions/。
+	compactionBasicServer.store = newCompactionStore(dsc.SessionDir())
 	imageOffloadServer := newImageOffloadServer()
 
 	skillStore, skillInstalledDir := newSkillResident()
 	sdk := dsc.New(dsc.Config{
 		Name:    "dsc-system",
-		Version: "1.6.1",
+		Version: "1.7.0",
 		Type:    dsc.TypeDsc,
 		// 声明压缩后端能力：config.yaml 的 compaction: dsc-system 选中时，
 		// 宿主 registerDscCoreLocked 验证此声明并标记后端生效
@@ -95,7 +103,7 @@ func main() {
 	//   - reminder：agent/pre-step 的「新用户输入」重置重复链（对齐 DSH
 	//     repeat-tool-reminder 的 agent/pre-step reset hook——用户插话改变了
 	//     上下文，跨插话的重复不是循环）；恒返回空，不影响其他驻留的改写结果
-	//   - compaction-basic：agent/pre-step 结构改写（stage=compaction）
+	//   - compaction-basic：agent/pre-step 结构改写（stage=compaction）；超窗归宿主滑窗
 	//   - image-offload：pre-step 第二阶段的请求面投影（stage=projection），由宿主按
 	//     pre-step-transform 能力调用，作用在压缩改写后的视图上
 	//

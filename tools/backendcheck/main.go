@@ -65,8 +65,7 @@ func main() {
 	fmt.Printf("夹具: %d 条 / 估算 %d，窗口 %d\n\n", len(msgs), core.EstimateProtoMessagesTokens(msgs), *window)
 
 	var checked, warn, bad int
-	for _, name := range dirs {
-		exe := core.PJoin(*pluginsDir, name, name+".exe")
+	for _, exe := range dirs {
 		res := runOne(exe, string(msgsJSON), toolTokens, total, *window, stateDir)
 		fmt.Println(res.String())
 		switch res.kind {
@@ -86,6 +85,10 @@ func main() {
 	}
 }
 
+// pluginDirs 返回插件目录下所有可执行文件路径（<name>/<name>.exe 或 <name>/<name>）。
+//
+// Windows 的插件二进制带 .exe，Unix（darwin/linux/freebsd）不带——只认 .exe 会让
+// 契约检查在 Unix 上一个插件都扫不到，变成「跑完显示全部通过」的空检查。
 func pluginDirs(root string) ([]string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -97,8 +100,12 @@ func pluginDirs(root string) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if _, err := os.Stat(core.PJoin(root, name, name+".exe")); err == nil {
-			out = append(out, name)
+		for _, candidate := range []string{name + ".exe", name} {
+			p := core.PJoin(root, name, candidate)
+			if info, statErr := os.Stat(p); statErr == nil && !info.IsDir() {
+				out = append(out, p)
+				break
+			}
 		}
 	}
 	sort.Strings(out)
