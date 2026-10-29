@@ -487,15 +487,16 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 	// 缓存最近一次读到的尾部：任务被 job_kill 终止时工具结果通常是空的（ctx 取消），
 	// 但用户/模型已经看到过前面那些输出——落定后不该退化成 (no output yet)。
 	var (
-		lastMu   sync.Mutex
-		lastTail string
+		lastMu    sync.Mutex
+		lastTail  string
+		lastTotal int64
 	)
 	if tailFn != nil {
 		probe := tailFn
 		tailFn = func() (string, int64) {
 			text, total := probe()
 			lastMu.Lock()
-			lastTail = text
+			lastTail, lastTotal = text, total
 			lastMu.Unlock()
 			return text, total
 		}
@@ -525,10 +526,20 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 					}
 					// 保住「杀之前已经打印出来的那一段」：结束态的 Text 为空时用它兜底，
 					// 否则模型看到的是 (no output yet)，前面看到的 tick 全没了。
-					if result == "" {
-						lastMu.Lock()
-						result = lastTail
-						lastMu.Unlock()
+					//
+					// 兜底时必须**明说是终止前抓到的尾巴**：这段文本是唯一一次「终态却带着
+					// 输出」的情形，不标注的话模型会把它当成完整结果，甚至以为任务还在跑
+					// （正文里没有 running 行，但也没有「到此为止」的交代）。
+					lastMu.Lock()
+					tail, total := lastTail, lastTotal
+					lastMu.Unlock()
+					if result == "" && tail != "" {
+						if total > int64(len(tail)) {
+							result = fmt.Sprintf("[stopped when killed — showing the last %s of %s it had printed; there is no more]\n%s",
+								humanBytes(int64(len(tail))), humanBytes(total), tail)
+						} else {
+							result = "[stopped when killed — this is everything it printed]\n" + tail
+						}
 					}
 				}
 				doneCh <- jobs.JobOutcome{Status: status, Detail: detail, Output: result}

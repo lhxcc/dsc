@@ -16,6 +16,8 @@ type blockingTool struct {
 	started  chan struct{}
 	canceled chan struct{}
 	tail     string // 非空则实现 OutputTail（模拟能流式上报的 shell）
+	// reportedTotal > 0 时按它上报「已产生总字节数」，用于模拟只抓到尾部的情形。
+	reportedTotal int64
 
 	onceStart sync.Once
 	onceEnd   sync.Once
@@ -32,7 +34,11 @@ func (t *blockingTool) OutputTail(context.Context, string) (string, int64, bool)
 	if t.tail == "" {
 		return "", 0, false
 	}
-	return t.tail, int64(len(t.tail)), true
+	total := int64(len(t.tail))
+	if t.reportedTotal > 0 {
+		total = t.reportedTotal
+	}
+	return t.tail, total, true
 }
 
 func (t *blockingTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
@@ -158,5 +164,52 @@ func TestJobKillKeepsTailOutput(t *testing.T) {
 	}
 	if strings.Contains(out, "(no output yet)") {
 		t.Fatalf("不该退化成 (no output yet)：%q", out)
+	}
+	// 终态却带输出是唯一一种「看起来像还在跑」的形态：必须明说是终止前抓到的，
+	// 而且说明有没有被截断，否则模型会把它当成完整结果。
+	if !strings.Contains(out, "[stopped when killed — this is everything it printed]") {
+		t.Fatalf("终止输出应以「终止时抓到的全部」标注开头，实际 %q", out)
+	}
+	if strings.Contains(out, "running for") {
+		t.Fatalf("终止后不该再出现运行中摘要：%q", out)
+	}
+}
+
+// TestJobKillTailIsMarkedAsTruncated 只抓到尾部时（总量大于尾巴）要写清截断范围。
+func TestJobKillTailIsMarkedAsTruncated(t *testing.T) {
+	m := NewManager(&ManagerConfig{})
+	tool := &blockingTool{
+		started:       make(chan struct{}),
+		canceled:      make(chan struct{}),
+		tail:          "tick-7\ntick-8\n",
+		reportedTotal: 64 * 1024, // 实际打印过 64 KB，我们只留了最后几行
+	}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	callCtx := WithToolCallID(context.Background(), "call-kill-trunc")
+	msg, _, err := m.startBackgroundTool(callCtx, tool.Name(), json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatalf("start background: %v", err)
+	}
+	id := jobIDFromMessage(t, msg)
+	<-tool.started
+	if _, err := jobOutputOf(t, m, id); err != nil { // 让宿主缓存尾部
+		t.Fatalf("job_output: %v", err)
+	}
+	kill, _ := m.toolRegistry.Get("job_kill")
+	if _, err := kill.Execute(context.Background(), json.RawMessage(`{"job_id":"`+id+`"}`)); err != nil {
+		t.Fatalf("job_kill: %v", err)
+	}
+	waitJobStatus(t, m, id, jobs.StatusKilled)
+
+	out, err := jobOutputOf(t, m, id)
+	if err != nil {
+		t.Fatalf("job_output after kill: %v", err)
+	}
+	for _, want := range []string{"[stopped when killed — showing the last", "of 64.0 KB it had printed; there is no more]", "tick-7", "[status: killed]"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("缺 %q：%q", want, out)
+		}
 	}
 }
