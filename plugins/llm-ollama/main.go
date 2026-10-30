@@ -62,9 +62,10 @@ func toOllamaMessage(m dsc.Message) api.Message {
 	if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 		msg.ToolCalls = make([]api.ToolCall, len(m.ToolCalls))
 		for j, tc := range m.ToolCalls {
-			argsJSON, _ := json.Marshal(tc.Arguments)
+			// Ollama 的 api.ToolCallFunctionArguments 是 map，不能承载参数原文；一份解析失败的
+			// 调用在这里只能投影成空参数集（原文仍留在会话历史与工具结果里，模型看得到）。
 			var ollamaArgs api.ToolCallFunctionArguments
-			json.Unmarshal(argsJSON, &ollamaArgs)
+			json.Unmarshal([]byte(tc.ArgumentsJSON()), &ollamaArgs)
 			msg.ToolCalls[j] = api.ToolCall{
 				ID: tc.ID,
 				Function: api.ToolCallFunction{
@@ -155,14 +156,13 @@ func (p *OllamaProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 	var toolCalls []dsc.ToolCall
 	if len(resp.Message.ToolCalls) > 0 {
 		for _, tc := range resp.Message.ToolCalls {
-			var args map[string]interface{}
-			if argsJSON, err := json.Marshal(tc.Function.Arguments); err == nil {
-				json.Unmarshal(argsJSON, &args)
-			}
+			argsJSON, _ := json.Marshal(tc.Function.Arguments)
+			args, raw, _ := dsc.DecodeToolArguments(tc.Function.Name, string(argsJSON))
 			toolCalls = append(toolCalls, dsc.ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: args,
+				ID:           tc.ID,
+				Name:         tc.Function.Name,
+				Arguments:    args,
+				RawArguments: raw,
 			})
 		}
 	}
@@ -306,14 +306,12 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []dsc.Message,
 				var toolCalls []dsc.ToolCall
 				for _, key := range toolCallOrder {
 					acc := toolCallAccums[key]
-					var args map[string]interface{}
-					if acc.ArgumentsStr != "" {
-						json.Unmarshal([]byte(acc.ArgumentsStr), &args)
-					}
+					args, raw, _ := dsc.DecodeToolArguments(acc.Name, acc.ArgumentsStr)
 					toolCalls = append(toolCalls, dsc.ToolCall{
-						ID:        acc.ID,
-						Name:      acc.Name,
-						Arguments: args,
+						ID:           acc.ID,
+						Name:         acc.Name,
+						Arguments:    args,
+						RawArguments: raw,
 					})
 				}
 

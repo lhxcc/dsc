@@ -721,8 +721,7 @@ func chatWithProvider(provider LLMProvider, ctx context.Context, req *proto.Chat
 	}
 	toolCalls := make([]*proto.ToolCall, len(resp.ToolCalls))
 	for i, tc := range resp.ToolCalls {
-		argsJSON, _ := json.Marshal(tc.Arguments)
-		toolCalls[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: string(argsJSON)}
+		toolCalls[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: tc.ArgumentsJSON()}
 	}
 	return &proto.ChatResponse{
 		Content:      resp.Content,
@@ -767,8 +766,7 @@ func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream
 		}
 		toolCalls := make([]*proto.ToolCall, len(item.ToolCalls))
 		for i, tc := range item.ToolCalls {
-			argsJSON, _ := json.Marshal(tc.Arguments)
-			toolCalls[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: string(argsJSON)}
+			toolCalls[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: tc.ArgumentsJSON()}
 		}
 		if err := stream.Send(&proto.ChatStreamResponse{
 			Content:      item.Content,

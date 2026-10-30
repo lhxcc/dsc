@@ -860,18 +860,30 @@ func (a *ReactLoopAgent) runLoop(ctx context.Context, input string, images []str
 				a.logger.Warn("incremental session save failed", "turn", turnNo, "step", stepNo, "error", err)
 			}
 
-			// 截断防护（工具调用）：截断响应携带的工具调用，参数 JSON 可能被拦腰
-			// 切断——不得以残缺参数下发执行（历史上表现为以空参/残参触达工具，
-			// shell 报「無參數被提供」类错误）。落合成 tool/result 保持
-			// tool_use/tool_result 配对（协议要求），请模型重发完整调用。
-			if truncated && !json.Valid([]byte(tc.ArgumentsJson)) {
-				reason := fmt.Sprintf("模型输出在 finish_reason=%s 处被截断，工具 %s 的参数 JSON 不完整，本次未执行；请重新发出参数完整的工具调用。", finishReason, tc.Name)
+			// 参数不合法（输出被截断，或模型自己漏了闭合标签——引擎的解析器会把后文折进
+			// 第一个值，参数于是断在字符串中间）。不执行工具，落一条合成 tool/result 保持
+			// tool_use/tool_result 配对（协议要求），并把**模型自己写下的原文**回给它，请它
+			// 重发。原文同时留在会话历史里（assistant 消息携带 ArgumentsJson），模型下一
+			// 步能读到，才可能补上缺失的 </parameter>——那是它唯一的自纠依据。
+			//
+			// 这不再是「截断专用」：截断只是参数不合法的原因之一。早先只有 truncated 才走
+			// 这条路，于是模型漏写标签的调用被当成合法调用下发；而在 core 层曾有一次改动把
+			// 同一个错误变成「本轮失败」，直接在模型看到之前中止了整轮。
+			//
+			// 空串不算畸形：provider 对「不收参数的工具」发出的参数文本就是空串（或 {}），
+			// 那不是错误；把它当失败会让 ask_user_question 之类再也调不动。
+			if strings.TrimSpace(tc.ArgumentsJson) != "" && !json.Valid([]byte(tc.ArgumentsJson)) {
+				reason := fmt.Sprintf("工具 %s 的调用没有执行：它的参数不是合法 JSON（%s）。%s\n"+
+					"这通常意味着上一条调用漏了闭合标签（例如 </parameter>），解析器于是把后面的内容折进了第一个参数值。"+
+					"请重新发出格式完整的调用：参数写成一个 JSON 对象，只转义一层。",
+					tc.Name, argsSyntaxProblem(tc.ArgumentsJson), truncationCause(truncated, finishReason))
 				sess.Append(session.ToolResult, &session.ToolResultData{
 					Turn: turnNo, Step: stepNo, CallID: tc.Id,
 					Content: reason,
 					Error:   reason,
 				}, &session.SurfaceOp{Op: session.SurfaceAppend})
-				a.logger.Info("truncated tool call skipped", "turn", turnNo, "step", stepNo, "tool", tc.Name, "argsLen", len(tc.ArgumentsJson))
+				a.logger.Warn("malformed tool call returned to model", "turn", turnNo, "step", stepNo,
+					"tool", tc.Name, "argsLen", len(tc.ArgumentsJson), "truncated", truncated)
 				if emit != nil {
 					emit(&dsc.RunStreamResponse{Output: fmt.Sprintf("\n[工具结果: %s 错误] %s\n", tc.Name, reason), Status: "tool", ToolName: tc.Name, ToolResult: reason, Error: reason, Usage: a.usageSnapshot()})
 				}

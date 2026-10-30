@@ -154,13 +154,15 @@ func (p *OpenAIProvider) toOpenAIMessages(messages []dsc.Message) []openai.ChatC
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			msg.ToolCalls = make([]openai.ToolCall, len(m.ToolCalls))
 			for j, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Arguments)
+				// ArgumentsJSON() 而不是 json.Marshal(tc.Arguments)：后者把一份「解析失败的
+				// 调用」写成 "null"，模型回看历史时只知道自己调过工具、参数未知——它正是
+				// 靠这段原文才能发现漏了闭合标签并改对。
 				msg.ToolCalls[j] = openai.ToolCall{
 					ID:   tc.ID,
 					Type: "function",
 					Function: openai.FunctionCall{
 						Name:      tc.Name,
-						Arguments: string(argsJSON),
+						Arguments: tc.ArgumentsJSON(),
 					},
 				}
 			}
@@ -352,12 +354,13 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 	if len(choice.Message.ToolCalls) > 0 {
 		result.ToolCalls = make([]dsc.ToolCall, len(choice.Message.ToolCalls))
 		for i, tc := range choice.Message.ToolCalls {
-			var args map[string]interface{}
-			json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			// 同步流式路径：解析失败时保留原文，否则模型在历史里只看到参数 null
+			args, raw, _ := dsc.DecodeToolArguments(tc.Function.Name, tc.Function.Arguments)
 			result.ToolCalls[i] = dsc.ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: args,
+				ID:           tc.ID,
+				Name:         tc.Function.Name,
+				Arguments:    args,
+				RawArguments: raw,
 			}
 		}
 	}
@@ -593,12 +596,15 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []dsc.Message,
 				var toolCalls []dsc.ToolCall
 				for _, idx := range idxList {
 					acc := toolCallAccums[idx]
-					var args map[string]interface{}
-					json.Unmarshal([]byte(acc.ArgumentsStr), &args)
+					// 不吞解析失敗：代理端一次漏寫 </parameter> 就足以讓參數不合法，而這裡
+					// 曾是唯一還留著原文的地方——用 Unmarshal 的錯誤把它丟掉（得到 nil map，
+					// 再序列化成 "null"），模型在歷史裡就再也看不到自己寫錯了什麼。
+					args, raw, _ := dsc.DecodeToolArguments(acc.Name, acc.ArgumentsStr)
 					toolCalls = append(toolCalls, dsc.ToolCall{
-						ID:        acc.ID,
-						Name:      acc.Name,
-						Arguments: args,
+						ID:           acc.ID,
+						Name:         acc.Name,
+						Arguments:    args,
+						RawArguments: raw,
 					})
 				}
 
