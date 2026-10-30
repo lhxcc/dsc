@@ -100,7 +100,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	// ssh_list：空会话 → 表格视图（列定义 + "0" 徽标）
 	if resp := run("ssh_list", `{}`); resp.Error != "" {
 		t.Fatalf("ssh_list = %+v", resp)
-	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "SSH Sessions" || v.Badge == nil || v.Badge.Text != "0" || len(v.Columns) != 3 {
+	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "SSH Sessions" || v.Badge == nil || v.Badge.Text != "0" || len(v.Columns) != 4 {
 		t.Fatalf("ssh_list view = %+v", v)
 	}
 

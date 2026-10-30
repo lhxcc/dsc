@@ -1,6 +1,7 @@
-// tool-ssh：SSH 远程命令执行终端插件。提供 ssh_connect / ssh_exec / ssh_list /
-// ssh_close 四类持久会话能力（参考 GhostClaw 的 SSH 工具集）。登录支持密码或
-// 私钥；会话按 id 缓存复用，方便模型连续在远程主机上执行命令。
+// tool-ssh：SSH 远程操作插件。提供 ssh_connect / ssh_exec / ssh_shell_exec /
+// ssh_shell_close / ssh_list / ssh_close（参考 GhostClaw 的 SSH 工具集）。
+// 登录支持密码或私钥；连接按 id 常驻复用（带保活），其中 ssh_shell_exec 在连接上
+// 维持一个常驻 sh，使 cd / export 等状态跨调用保留。
 package main
 
 import (
@@ -46,6 +47,13 @@ type sshSession struct {
 	mu     sync.Mutex
 	client *ssh.Client
 	stopKA chan struct{}
+
+	// 持久 shell（ssh_shell_exec 用）：懒启动、随连接替换而作废。
+	// shellRunMu 串行化同一会话上的命令——一个 sh 只有一个前台。
+	shellMu     sync.Mutex
+	shellRunMu  sync.Mutex
+	shell       *persistentShell
+	shellClient *ssh.Client
 }
 
 // sshKeepaliveEvery 保活间隔。
@@ -124,6 +132,8 @@ func keepaliveLoop(c *ssh.Client, stop <-chan struct{}) {
 
 // setClient 安装（或替换）底层连接，并重启保活循环。旧连接随后关闭。
 func (s *sshSession) setClient(c *ssh.Client) {
+	// 旧连接上的 shell 已经跟着连接死了，先摘掉再换。
+	s.dropShell()
 	s.mu.Lock()
 	old := s.client
 	stop := s.stopKA
@@ -353,7 +363,12 @@ func (m *SSHSessionManager) list() []SSHSessionInfo {
 		if !ok {
 			continue
 		}
-		out = append(out, SSHSessionInfo{ID: id, Host: s.addr, Alive: s.alive(2 * time.Second)})
+		out = append(out, SSHSessionInfo{
+			ID:    id,
+			Host:  s.addr,
+			Alive: s.alive(2 * time.Second),
+			Shell: s.hasShell(),
+		})
 	}
 	return out
 }
@@ -368,6 +383,8 @@ func (m *SSHSessionManager) close(id string) bool {
 	if !ok {
 		return false
 	}
+	// 先关 shell（它的 sh 与前台命令都在这条连接上），再停保活、关连接。
+	s.dropShell()
 	// 先停保活，再关连接：否则旧循环可能在关闭后又发一次请求。
 	s.mu.Lock()
 	stop := s.stopKA
@@ -410,6 +427,8 @@ type SSHSessionInfo struct {
 	ID    string `json:"id"`
 	Host  string `json:"host"`
 	Alive bool   `json:"alive"`
+	// Shell 该会话上是否已有持久 shell（ssh_shell_exec 起的）。有的话 cd/env 还在。
+	Shell bool `json:"shell"`
 }
 
 // SSHListResult ssh_list 的结果。
@@ -476,10 +495,17 @@ func sshListView(result string) (json.RawMessage, error) {
 			state = "up"
 			live++
 		}
-		rows = append(rows, dsc.ViewRow{"id": s.ID, "host": s.Host, "state": state})
+		shell := "-"
+		if s.Shell {
+			shell = "yes"
+		}
+		rows = append(rows, dsc.ViewRow{"id": s.ID, "host": s.Host, "state": state, "shell": shell})
 	}
 	return dsc.TableView("SSH Sessions", &dsc.ViewBadge{Text: fmt.Sprintf("%d", live), Tone: "teal"},
-		[]dsc.ViewColumn{{Key: "id", Title: "id"}, {Key: "host", Title: "host"}, {Key: "state", Title: "state"}}, rows), nil
+		[]dsc.ViewColumn{
+			{Key: "id", Title: "id"}, {Key: "host", Title: "host"},
+			{Key: "state", Title: "state"}, {Key: "shell", Title: "shell"},
+		}, rows), nil
 }
 
 // sshCloseView 构造 ssh_close 结果的结构化视图（卡片），session_id 取自调用参数。
@@ -595,6 +621,59 @@ func main() {
 		return string(b), nil
 	}
 
+	// ssh_shell_exec：在同一条连接上跑一个常驻 sh，命令之间共享 cwd/env。
+	shellExecSchema := json.RawMessage(`{
+                "type": "object",
+                "properties": {
+                        "session_id": {"type": "string", "description": "SSH session ID from ssh_connect"},
+                        "command": {"type": "string", "description": "Command (or shell script) to run in the persistent shell"}
+                },
+                "required": ["session_id", "command"]
+        }`)
+	shellExecHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
+		var p struct {
+			SessionID string `json:"session_id"`
+			Command   string `json:"command"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+		if p.SessionID == "" || p.Command == "" {
+			return "", fmt.Errorf("session_id and command are required")
+		}
+		out, code, err := globalSSH.execShell(ctx, p.SessionID, p.Command)
+		res := SSHExecResult{Success: err == nil, Output: out, ExitCode: code}
+		if err != nil {
+			res.Error = err.Error()
+		}
+		b, _ := json.Marshal(res)
+		return string(b), nil
+	}
+
+	// ssh_shell_close：关持久 shell，连接保留。
+	shellCloseSchema := json.RawMessage(`{
+                "type": "object",
+                "properties": {
+                        "session_id": {"type": "string", "description": "SSH session ID whose persistent shell should be closed"}
+                },
+                "required": ["session_id"]
+        }`)
+	shellCloseHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
+		var p struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+		closed, err := globalSSH.closeShell(p.SessionID)
+		res := SSHCloseResult{Success: err == nil, Closed: closed}
+		if err != nil {
+			res.Error = err.Error()
+		}
+		b, _ := json.Marshal(res)
+		return string(b), nil
+	}
+
 	sdk := dsc.New(dsc.Config{
 		Name:    "ssh",
 		Version: "1.0.0",
@@ -609,17 +688,27 @@ func main() {
 			return sshConnectView(result)
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "ssh_exec", Description: "Run a command on an existing SSH session and return its combined output and exit code. Each call opens a fresh channel on the persistent connection, so working directory and environment do NOT carry over from the previous call — combine steps in one command (\"cd /path && make\"). Output is streamed back as it arrives (long commands report activity instead of looking stuck), and cancelling a call stops only that command: the connection and the session ID stay usable.", Schema: execSchema, Handler: execHandler,
+	sdk.Tool(dsc.Tool{Name: "ssh_exec", Description: "Run a command on an existing SSH session and return its combined output and exit code. Each call opens a fresh channel on the persistent connection, so working directory and environment do NOT carry over from the previous call — combine steps in one command (\"cd /path && make\"). Output is streamed back as it arrives (long commands report activity instead of looking stuck), and cancelling a call stops only that command: the connection and the session ID stay usable. For stateful multi-step work (cd/env must persist) use ssh_shell_exec instead.", Schema: execSchema, Handler: execHandler,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return sshExecView(result)
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "ssh_list", Description: "List SSH sessions with host and live state. A session reported alive:false has lost its transport; the next ssh_exec reconnects it under the same ID, so you do not need to connect again.", Schema: listSchema, Handler: listHandler,
+	sdk.Tool(dsc.Tool{Name: "ssh_shell_exec", Description: "Run a command inside a PERSISTENT shell (/bin/sh) on the same SSH connection. Unlike ssh_exec, the shell process stays alive between calls, so cd / export / umask / shell functions persist until you call ssh_shell_close or the connection drops — use this for multi-step work in one directory (clone then build then test). No PTY is allocated: full-screen programs (vim, top) and password prompts do not work here; use ssh_exec for a one-shot command, or for such programs. Cancelling a call resets the shell (cwd/env are lost).", Schema: shellExecSchema, Handler: shellExecHandler,
+		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
+			return sshExecView(result)
+		},
+	})
+	sdk.Tool(dsc.Tool{Name: "ssh_shell_close", Description: "Close the persistent shell of a session (any command still running in it is terminated). The SSH connection and its session ID stay usable; the next ssh_shell_exec starts a fresh shell.", Schema: shellCloseSchema, Handler: shellCloseHandler,
+		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
+			return sshCloseView(args, result)
+		},
+	})
+	sdk.Tool(dsc.Tool{Name: "ssh_list", Description: "List SSH sessions with host, live state and whether a persistent shell is open (shell:true means cd/env from earlier ssh_shell_exec calls are still in effect). A session reported alive:false has lost its transport; the next ssh_exec reconnects it under the same ID, so you do not need to connect again.", Schema: listSchema, Handler: listHandler,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return sshListView(result)
 		},
 	})
-	sdk.Tool(dsc.Tool{Name: "ssh_close", Description: "Close an SSH session by ID. This terminates any command still running on that session and drops the connection.", Schema: closeSchema, Handler: closeHandler,
+	sdk.Tool(dsc.Tool{Name: "ssh_close", Description: "Close an SSH session by ID. This closes its persistent shell, terminates any command still running on it, and drops the connection: the session ID becomes invalid.", Schema: closeSchema, Handler: closeHandler,
 		ViewFn: func(ctx context.Context, args json.RawMessage, result string) (json.RawMessage, error) {
 			return sshCloseView(args, result)
 		},

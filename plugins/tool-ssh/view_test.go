@@ -56,7 +56,7 @@ func TestSSHExecView(t *testing.T) {
 // TestSSHListView ssh_list 视图：表格，徽标为**存活**会话数；断开的那条要看得出来。
 func TestSSHListView(t *testing.T) {
 	view, _ := sshListView(`{"success":true,"sessions":[
-		{"id":"ssh-1","host":"a:22","alive":true},
+		{"id":"ssh-1","host":"a:22","alive":true,"shell":true},
 		{"id":"ssh-2","host":"b:22","alive":false}]}`)
 	var v dsc.View
 	if err := json.Unmarshal(view, &v); err != nil {
@@ -65,13 +65,13 @@ func TestSSHListView(t *testing.T) {
 	if v.Kind != "table" || v.Title != "SSH Sessions" || v.Badge == nil || v.Badge.Text != "1" || v.Badge.Tone != "teal" {
 		t.Fatalf("view 头 = %+v", v)
 	}
-	if len(v.Columns) != 3 || len(v.Rows) != 2 {
+	if len(v.Columns) != 4 || len(v.Rows) != 2 {
 		t.Fatalf("columns/rows = %+v / %+v", v.Columns, v.Rows)
 	}
-	if v.Rows[0]["id"] != "ssh-1" || v.Rows[0]["state"] != "up" || v.Rows[0]["host"] != "a:22" {
+	if v.Rows[0]["id"] != "ssh-1" || v.Rows[0]["state"] != "up" || v.Rows[0]["host"] != "a:22" || v.Rows[0]["shell"] != "yes" {
 		t.Fatalf("row0 = %+v", v.Rows[0])
 	}
-	if v.Rows[1]["state"] != "down" {
+	if v.Rows[1]["state"] != "down" || v.Rows[1]["shell"] != "-" {
 		t.Fatalf("断线会话应显示 down: %+v", v.Rows[1])
 	}
 
