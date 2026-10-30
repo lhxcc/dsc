@@ -54,7 +54,13 @@ func NewTokenMeter(window int) *TokenMeter { return core.NewTokenMeter(window) }
 // 相加会把命中缓存的请求算成近两倍（历史 bug，见 commit 1de5494）。
 func PromptSideTokens(usage *Usage) int { return core.PromptSideTokens(usage) }
 
-// EstimateTextTokens 估算一段文本的 token 数（宽字符 1 token/字，其余 4 字节/token）。
+// init 采用宿主注入的估算系数（DSC_TOKEN_COEF）。
+//
+// 系数是进程级全局量：宿主判超窗、插件算压缩预算必须是同一套数，否则「按 A 判、按 B 学」。
+// 宿主在拉起插件时把当场生效的那套写进环境变量，这里读一次即可；没有注入就保持内置默认。
+func init() { core.LoadTokenCoefFromEnv() }
+
+// EstimateTextTokens 估算一段文本的 token 数（按字符类别加权，系数见 core token_coef.go）。
 func EstimateTextTokens(s string) int { return core.EstimateTextTokens(s) }
 
 // EstimateMessageTokens 估算单条消息（文本 + 角色/结构开销 + 工具调用 + 图像引用）。

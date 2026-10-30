@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 
@@ -360,10 +361,11 @@ type SurfaceStats struct {
 
 // EstimatorCoefficients 返回估算器当前的千分权重与类别名（顺序即 SurfaceStats.Classes
 // 的下标）。供离线校准工具（tools/tokcal）对比「现用系数」与「按账本重拟合的结果」。
-func EstimatorCoefficients() (names []string, perMille []int) {
+func EstimatorCoefficients() (names []string, perMille []float64) {
+	c := ActiveTokenCoefs()
 	return []string{"letter", "space", "digit", "punct", "wide", "emoji", "symbol"},
-		[]int{tokPerMilleLetter, tokPerMilleSpace, tokPerMilleDigit, tokPerMillePunct,
-			tokPerMilleWide, tokPerMilleEmoji, tokPerMilleSymbol}
+		[]float64{c.PerMille[clsLetter], c.PerMille[clsSpace], c.PerMille[clsDigit],
+			c.PerMille[clsPunct], c.PerMille[clsWide], c.PerMille[clsEmoji], c.PerMille[clsSymbol]}
 }
 
 // EstimateTextTokens 估算一段文本的 token 数：**按字符类别加权累加**（千分整数，
@@ -375,7 +377,7 @@ func EstimateTextTokens(s string) int {
 	if s == "" {
 		return 0
 	}
-	acc := 0
+	acc := 0.0
 	addText(s, &acc, nil)
 	if t := tokensFromPerMille(acc); t > 0 {
 		return t
@@ -384,10 +386,14 @@ func EstimateTextTokens(s string) int {
 }
 
 // addText 把一段文本按类别累加进 acc；counts 非 nil 时同时累计各类字符数。
-func addText(s string, acc *int, counts *[textClassCount]int) {
+//
+// 权重取自**进程级生效系数**（ActiveTokenCoefs）：启动时一次确定，运行期不变。
+// 宿主与插件因此永远用同一套数——各自读文件会读到不同版本。
+func addText(s string, acc *float64, counts *[textClassCount]int) {
+	c := ActiveTokenCoefs()
 	for _, r := range s {
-		w, class := tokenWeight(r)
-		*acc += w
+		class := tokenClassOf(r)
+		*acc += c.PerMille[class]
 		if counts != nil {
 			counts[class]++
 		}
@@ -395,33 +401,33 @@ func addText(s string, acc *int, counts *[textClassCount]int) {
 }
 
 // tokensFromPerMille 把千分累加值折算成 token（向上取整）。
-func tokensFromPerMille(acc int) int {
+func tokensFromPerMille(acc float64) int {
 	if acc <= 0 {
 		return 0
 	}
-	return (acc + 999) / 1000
+	return int(math.Ceil(acc / 1000))
 }
 
-// tokenWeight 返回单个字符的千分权重与类别（见 tokPerMille* 常量）。
-func tokenWeight(r rune) (int, int) {
+// tokenClassOf 返回字符所属类别（权重由 ActiveTokenCoefs 按类别给出）。
+func tokenClassOf(r rune) int {
 	switch {
 	case r < 0x80:
 		switch {
 		case r >= '0' && r <= '9':
-			return tokPerMilleDigit, clsDigit
+			return clsDigit
 		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-			return tokPerMilleSpace, clsSpace
+			return clsSpace
 		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
-			return tokPerMilleLetter, clsLetter
+			return clsLetter
 		}
-		return tokPerMillePunct, clsPunct
+		return clsPunct
 	case isWideRune(r):
 		if r >= 0x1F300 && r <= 0x1FAFF {
-			return tokPerMilleEmoji, clsEmoji
+			return clsEmoji
 		}
-		return tokPerMilleWide, clsWide
+		return clsWide
 	}
-	return tokPerMilleSymbol, clsSymbol
+	return clsSymbol
 }
 
 // isWideRune 报告是否为 CJK 一族（一字接近一个 token）的宽字符：CJK 部首、假名、
@@ -502,7 +508,7 @@ func MeasureProtoMessages(msgs []*proto.Message) SurfaceStats {
 			continue
 		}
 		st.Msgs++
-		acc := 0
+		acc := 0.0
 		addText(m.GetContent(), &acc, &st.Classes)
 		toks := tokensFromPerMille(acc)
 		if m.GetRole() == "tool" {
@@ -514,7 +520,7 @@ func MeasureProtoMessages(msgs []*proto.Message) SurfaceStats {
 			toks += imageStructuralTokens(img)
 		}
 		for _, tc := range m.GetToolCalls() {
-			tcAcc := 0
+			tcAcc := 0.0
 			addText(tc.GetName()+tc.GetArgumentsJson(), &tcAcc, &st.Classes)
 			toks += tokensFromPerMille(tcAcc) + 8
 			st.ToolCalls++

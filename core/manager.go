@@ -288,8 +288,20 @@ func (m *Manager) SetModelName(name string) {
 		return
 	}
 	m.mu.Lock()
+	first := m.modelName == "" && name != ""
 	m.modelName = name
 	m.mu.Unlock()
+	if !first {
+		return
+	}
+	// 第一次知道模型名：此时才谈得上「按这个模型拟合/挑一套系数」。
+	//
+	// 必须发生在插件启动之前——pluginCmd/coreEnv 在拉起子进程时把当前生效系数注入
+	// DSC_TOKEN_COEF，宿主与插件从此同源。运行期不再改（见 token_coef.go 头注释）。
+	m.RefitTokenCoefs(false)
+	if c := m.loadTokenCoefs(); c != nil {
+		SetActiveTokenCoefs(c)
+	}
 }
 
 // ContextWindow 返回当前的上下文窗口（token 数；0 = 未知）。
@@ -376,6 +388,15 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	// 分词器校准表：启动时读盘（冷启动第一帧就有据可依）；没有则从历史账本重建。
 	m.loadCalibration()
 	m.warmCalibrationFromLedgers()
+	// 估算系数：先按账本试着重拟合（门槛不满足就跳过），再读出生效的一套。
+	// 顺序很重要——**在插件启动之前**确定，宿主随后把它注入插件 env（DSC_TOKEN_COEF），
+	// 全进程才会用同一把尺子。
+	// 注意此时 modelName 未必已设置（main 在 NewManager 之后才 SetModelName），
+	// 所以这里只做「借用」：取文件里记的 active_model 那一套。真正的按模型拟合
+	// 在 SetModelName 第一次拿到模型名时做（见那里的注释）。
+	if c := m.loadTokenCoefs(); c != nil {
+		SetActiveTokenCoefs(c)
+	}
 	// 事件总线监听器 panic 恢复时用宿主主 logger 记录调用栈（定位根因）。
 	m.events.SetLogger(m.logger)
 	m.ptc = cfg.PTC
@@ -2570,6 +2591,9 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 		// 在 NewClient 内部的环境变量凭据链里抢先命中终端遗留的认证变量。
 		env = mirrorLLMEnvToLegacyNames(env)
 	}
+	// 估算系数随进程注入：插件进程启动时读同一份，宿主与插件永远用一把尺子。
+	// 不能让各进程各自读文件——启动时序不同时会读到不同版本（见 token_coef.go）。
+	env = append(env, tokenCoefEnvKey+"="+FormatTokenCoefSpec(ActiveTokenCoefs()))
 	return env
 }
 

@@ -192,6 +192,12 @@ func (m *Manager) observeRatio(sessionID, model string, sample UsageSample) {
 	m.saveCalibrationLocked()
 	m.calibMu.Unlock()
 
+	// 每满 500 帧试着重拟合一次系数（后台、失败无副作用）：系数是进程级的，
+	// 运行期不能换，所以这里只写文件，下个进程启动才生效。
+	if samples%500 == 0 {
+		go m.RefitTokenCoefs(false)
+	}
+
 	if hits >= 3 {
 		m.logger.Warn("tokenizer calibration drifting",
 			"model", model, "factor", fmt.Sprintf("%.3f", factor),
