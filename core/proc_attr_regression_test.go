@@ -38,6 +38,9 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 	//（对应文件受 //go:build 约束，Windows 控制台闪窗链路不涉及），且属非本仓库
 	// 维护的 vendored 内部实现，不修改（对齐 libs/vodka 豁免口径）。
 	// builder：开发者本机构建工具，始终运行在开发者终端内，非 TUI 运行时链路。
+	// 测试文件同样扫描：e2e 测试会拉起真实 dsc.exe / 插件二进制，缺隐藏控制台时
+	// 开发者与 CI 都会看到终端窗口一闪而过。此前这里跳过 _test.go，于是「测试里新加
+	// 派生点」永远不受约束——实测就是几次 go test 弹出窗口，而守衛一直是绿的。
 	skipDirs := map[string]bool{
 		".git":                         true,
 		"node_modules":                 true,
@@ -50,6 +53,10 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 		filepath.ToSlash("libs/anthropic-sdk-go"):          true,
 		filepath.ToSlash("plugins/tool-2fa-master/vendor"): true,
 		filepath.ToSlash("builder"):                        true,
+		// libs/* 是本仓 vendored / fork 的第三方库：它们的测试拉起自己的解释器
+		//（mvdan/sh 的 sh、go-lua 的 lua 等），属库自身行为，不在本仓运行时链路内。
+		filepath.ToSlash("libs/sh"):     true,
+		filepath.ToSlash("libs/go-lua"): true,
 	}
 
 	// 文件豁免（相对仓库根，"/" 分隔）：派生点不直接接触 exec.Cmd 启动属性、
@@ -64,6 +71,14 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 		"plugin/client.go": "RunnerFunc 路径 spec 占位，从不 Start",
 		// 测试辅助文件（文件名不带 _test.go 后缀但仅供测试使用）。
 		"libs/sh/internal/testing.go": "测试 helper，非运行时链路",
+		// 本守衛自身：源码里以字符串字面量列出派生点特征，不实际拉起进程。
+		"core/proc_attr_regression_test.go": "守衛测试：仅以字符串匹配扫描，不派生进程",
+		// 元测试：只统计 core/manager.go 源码里出现了几个 exec.Command（不是派生点）。
+		"core/plugin_cmd_test.go": "元测试：统计源码文本，不派生进程",
+		// go-plugin fork 独立模块：与 core 无依赖关系（引 core 会成环），自有
+		// proc_attr 由 cmdrunner 统一处理；测试拉起的是 fork 自身的 sample 插件。
+		"plugin/client_test.go": "go-plugin fork 独立模块，经 cmdrunner 统一隐藏",
+		"plugin/plugin_test.go": "go-plugin fork 独立模块，经 cmdrunner 统一隐藏",
 	}
 
 	// 防护网标记：文件内出现任一标记即视为已直接接入防护。
@@ -100,7 +115,7 @@ func TestRuntimeSpawnSitesConsoleHidden(t *testing.T) {
 			return nil
 		}
 		name := d.Name()
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if !strings.HasSuffix(name, ".go") {
 			return nil
 		}
 		data, readErr := os.ReadFile(path)

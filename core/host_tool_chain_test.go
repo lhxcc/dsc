@@ -24,6 +24,7 @@ import (
 func buildToolBin(t *testing.T, pluginDir, out string) {
 	t.Helper()
 	cmd := exec.Command("go", "build", "-o", out, ".")
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = pluginDir
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", pluginDir, err, b)
@@ -41,6 +42,7 @@ func TestHostToolChainPropagatesPluginViewJson(t *testing.T) {
 	// 1. 以宿主侧客户端 spawn 真实工具插件（与生产 loadPluginWithBroker 同路径：
 	// 经 grpcClient.Conn 直接建 ToolServiceClient，而非 Dispense 具名插件）
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+dir)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  Handshake,

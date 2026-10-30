@@ -58,7 +58,9 @@ dsc.register_tool("mytool", { description = "自包含测试工具", parameters 
 	}
 	// 插件名 demo、脚本注册名 mytool → 模型可见工具名 demo_mytool（<插件名>_<注册名>）
 	dspPath := filepath.Join(dspDir, "demo.dsp")
-	if out, err := exec.Command(packer, "-name", "demo", "-o", dspPath, src).CombinedOutput(); err != nil {
+	runCmd := exec.Command(packer, "-name", "demo", "-o", dspPath, src)
+	ConfigureChildProcessAttrs(runCmd)
+	if out, err := runCmd.CombinedOutput(); err != nil {
 		t.Fatalf("dsp-pack: %v\n%s", err, out)
 	}
 	before, err := os.ReadFile(dspPath)
@@ -71,6 +73,7 @@ dsc.register_tool("mytool", { description = "自包含测试工具", parameters 
 
 	// 2. 以宿主侧客户端 spawn 真实 tool-sql-host；cwd = dir，使 ./dsp 命中上面的载体
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "DSC_MODE=creation")
 	client := plugin.NewClient(&plugin.ClientConfig{

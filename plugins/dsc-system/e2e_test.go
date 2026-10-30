@@ -40,12 +40,15 @@ func TestE2EWithHostClient(t *testing.T) {
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	// 2. 以宿主侧客户端拉起插件进程（同 registerDscCoreLocked 的主连接路径）
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(),
 		"DSC_REPEAT_THRESHOLDS=3,5",
 		"DSC_REPEAT_EXCLUDE=todo_write",
@@ -139,7 +142,9 @@ func TestFsObservationE2E(t *testing.T) {
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
@@ -150,6 +155,7 @@ func TestFsObservationE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+ws)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
@@ -309,12 +315,15 @@ func TestFsObservationE2E(t *testing.T) {
 func TestSpillE2E(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	spillDir := filepath.Join(dir, "spill")
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_SPILL_DIR="+spillDir)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
@@ -403,7 +412,9 @@ func TestSkillE2E(t *testing.T) {
 
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
@@ -421,6 +432,7 @@ func TestSkillE2E(t *testing.T) {
 
 	// 3. 以宿主侧客户端拉起插件进程
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_SKILLS_DIR="+skillsDir)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
@@ -553,12 +565,15 @@ func TestCompactionBasicE2E(t *testing.T) {
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	// 2. 拉起插件进程：小窗口（阈值 800）
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(),
 		"DSC_COMPACTION_BASIC_CONTEXT_WINDOW=1000",
 	)
@@ -670,13 +685,16 @@ func TestImageOffloadE2E(t *testing.T) {
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "dsc-system.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	spawn := func(env ...string) proto.PluginHookServiceClient {
 		t.Helper()
 		cmd := exec.Command(exe)
+		dsc.ConfigureChildProcessAttrs(cmd)
 		cmd.Env = append(os.Environ(), env...)
 		client := plugin.NewClient(&plugin.ClientConfig{
 			HandshakeConfig:  dsc.Handshake,

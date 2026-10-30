@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	dsc "dsc-sdk"
+
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -108,8 +110,10 @@ func makeJunction(t *testing.T, target, link string) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	out, err := exec.Command("cmd", "/c", "mklink", "/J",
-		filepath.FromSlash(link), filepath.FromSlash(target)).CombinedOutput()
+	mklink := exec.Command("cmd", "/c", "mklink", "/J",
+		filepath.FromSlash(link), filepath.FromSlash(target))
+	dsc.ConfigureChildProcessAttrs(mklink)
+	out, err := mklink.CombinedOutput()
 	if err != nil {
 		t.Logf("mklink /J 失败（%v）: %s", err, strings.TrimSpace(string(out)))
 		return false

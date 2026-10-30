@@ -635,6 +635,7 @@ func main() {
 	if err == nil && mainCfg != nil {
 		core.WorkspaceRoot = resolveWorkspaceRoot(cwd, mainCfg.WorkspaceRoot)
 	}
+	warnIfWorkspaceIsInstallDir(logger, core.WorkspaceRoot)
 
 	// -patch overlay 合并：加载所有 patch 文件并合并到 mainCfg（对齐 DSH --patch）。
 	// patch 文件含插件条目配置（如 MCP 客户端），合并后启动时自动应用。
@@ -1095,4 +1096,35 @@ func main() {
 	logger.Info("shutting down...")
 	mgr.Shutdown()
 	os.Exit(exitCode)
+}
+
+// warnIfWorkspaceIsInstallDir 提示「工作区根就是安装目录」。
+//
+// 工作区根默认取启动目录，而会话键（`sessions/<键>.jsonl`）、记忆库、压缩后端状态
+// 全都按它命名。于是从安装目录直接跑 `dsc.exe` 时，会把安装目录当成一个项目，
+// 在 sessions/ 里留下 `E=--Programs--dsc-for-windows-amd64-xxxx` 这类文件——
+// 看起来像「程序拿自己的路径当会话名」，其实是启动位置的问题。
+//
+// 不自动改：把根挪走会让「同一项目同一份会话」的前提失效（换目录=换项目）。
+// 只提示，并给出两条明确出路。
+func warnIfWorkspaceIsInstallDir(logger hclog.Logger, root string) {
+	if logger == nil || root == "" {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	exeDir, err := core.PAbs(core.PDir(exe))
+	if err != nil {
+		return
+	}
+	absRoot, err := core.PAbs(root)
+	if err != nil || absRoot != exeDir {
+		return
+	}
+	logger.Warn("workspace root is the DSC installation directory",
+		"workspace_root", root,
+		"hint", "会话/记忆/压缩状态按工作区根命名，安装目录会被当成一个项目。"+
+			"请到项目目录启动 dsc，或在 config.yaml 用 workspace_root 指定项目根")
 }

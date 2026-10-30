@@ -85,6 +85,7 @@ func TestHotReloadAgentReconnect(t *testing.T) {
 func buildAgentBin(t *testing.T, dir, out string) {
 	t.Helper()
 	cmd := exec.Command("go", "build", "-o", out, ".")
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = dir
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", dir, err, b)
@@ -149,6 +150,7 @@ func GetAgentForTest(m *Manager, name string) (Agent, bool) {
 func loadTestAgent(t *testing.T, m *Manager, name, exe, execDir string) (Agent, *plugin.GRPCClient) {
 	t.Helper()
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = execDir
 	cmd.Env = append(os.Environ(),
 		"DSC_WORKSPACE_ROOT="+execDir,

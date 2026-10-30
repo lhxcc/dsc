@@ -24,12 +24,15 @@ func TestE2EWithHostClient(t *testing.T) {
 
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	exe := filepath.Join(dir, "dsc-notify.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	// 2. 以宿主侧客户端拉起插件进程
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_NOTIFY_NO_AUDIO=1")
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,

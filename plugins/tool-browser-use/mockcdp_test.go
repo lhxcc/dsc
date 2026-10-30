@@ -226,12 +226,15 @@ func TestE2EWithMockChromium(t *testing.T) {
 	// 2. 构建插件 exe（独立 module 的完整独立开发者路径）
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "tool-browser-use.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
 	// 3. 以 DSC_BROWSER_CDP_URL 指向 mock 拉起插件（跳过本地 chromium 启动）
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_BROWSER_CDP_URL="+mock.wsURL)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,

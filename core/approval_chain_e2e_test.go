@@ -29,6 +29,7 @@ func TestApprovalChainEscalationRealPlugin(t *testing.T) {
 
 	// spawn 真实 shell 插件（与生产 loadPluginWithBroker 同路径）。
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+filepath.ToSlash(dir))
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  Handshake,

@@ -25,6 +25,7 @@ func TestHostDscChainRegistersHook(t *testing.T) {
 
 	// 1. 以宿主侧客户端 spawn 真实 dsc 插件（与 tool-filesystem 宿主链测试同款路径）
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_NOTIFY_NO_AUDIO=1")
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  Handshake,
