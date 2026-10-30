@@ -3221,7 +3221,24 @@ func (m *Model) buildHelpText() string {
 }
 
 // runSlashCommand 处理斜杆命令；返回是否已处理以及要执行的命令。
+//
+// 已处理时**一律清空输入框**：这条文本已经被命令消费，留在框里看起来就是「按了
+// 回车没反应」。以前清空是各 case 各自 SetValue("") 的，于是漏了「插件声明的命令」
+// 那条路（/context、/mcp 之类由插件声明、TUI 只转发）——按回车后文字赖在输入行。
+// 放在这里是为了让「谁处理谁负责清」变成结构性的，而不是靠每个分支自觉。
 func (m *Model) runSlashCommand(cmd string) (bool, tea.Cmd) {
+	handled, next := m.dispatchSlashCommand(cmd)
+	if handled {
+		m.input.SetValue("")
+		m.completion = completion{}
+		m.syncInputHeight()
+		m.render()
+	}
+	return handled, next
+}
+
+// dispatchSlashCommand 真正的分发（内置命令与插件命令都在这里）。
+func (m *Model) dispatchSlashCommand(cmd string) (bool, tea.Cmd) {
 	// 仅真正的斜杆命令（以 "/" 开头）才记录调用；普通消息不得被误判为斜杆命令，
 	// 否则直接写 stderr 会把「slash command invoked …」叠到 TUI 输入框上方造成残影。
 	if !strings.HasPrefix(cmd, "/") {

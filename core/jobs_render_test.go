@@ -21,7 +21,7 @@ func TestRenderJobOutputShowsPartialAndProgress(t *testing.T) {
 			StartedAt: now.Add(-4*time.Minute - 12*time.Second),
 		},
 	}
-	out := renderJobOutput(rd)
+	out := renderJobOutput(rd, 0)
 
 	for _, want := range []string{
 		"[partial output",
@@ -50,7 +50,7 @@ func TestRenderJobOutputWithoutActivityProbe(t *testing.T) {
 	rd := jobs.Read{Snapshot: jobs.JobSnapshot{
 		Status: jobs.StatusRunning, StartedAt: now.Add(-90 * time.Second),
 	}}
-	out := renderJobOutput(rd)
+	out := renderJobOutput(rd, 0)
 	if !strings.Contains(out, "running for 1m30s") {
 		t.Fatalf("应给出已跑时长：\n%s", out)
 	}
@@ -72,12 +72,84 @@ func TestRenderJobOutputTerminalHasNoProgressNote(t *testing.T) {
 		},
 		ReadCount: 1,
 	}
-	out := renderJobOutput(rd)
+	out := renderJobOutput(rd, 0)
 	if strings.Contains(out, "running for") || strings.Contains(out, "last activity") {
 		t.Fatalf("落定任务不应出现进度摘要：\n%s", out)
 	}
 	if !strings.Contains(out, "[status: completed]") {
 		t.Fatalf("缺状态行：\n%s", out)
+	}
+}
+
+// TestRenderJobOutputExplainsSilentJob 运行中、尾部通道可用、却 0 字节：
+// 必须解释「为什么没有输出」并给出路，而不是只丢一行 (no output yet)。
+//
+// 现场：起一个加载超大模型的命令，job_output 在加载期间永远是 (no output yet)，
+// 人工跑同一条命令却看得见打印。差别在子进程自己的 stdio 缓冲，模型不知道这件事，
+// 只会反复读同一个空结果。
+func TestRenderJobOutputExplainsSilentJob(t *testing.T) {
+	now := time.Now()
+	rd := jobs.Read{
+		Streaming:    true,
+		Tailable:     true,
+		PartialBytes: 0,
+		LastActivity: now.Add(-2 * time.Second),
+		Snapshot: jobs.JobSnapshot{
+			Status: jobs.StatusRunning, StartedAt: now.Add(-5*time.Minute - 12*time.Second),
+		},
+	}
+	out := renderJobOutput(rd, 1)
+
+	for _, want := range []string{
+		"(no output yet)",
+		"[status: running]",
+		"running for 5m12s",
+		"0 B written", // 0 字节是事实，不是「我们没读到」
+		"block-buffers", // 解释原因：子进程自己的缓冲
+		"0 bytes here means 0 bytes",
+		"python -u",        // 给出路（Windows 上不带 stdbuf）
+		"> log 2>&1",       // 重定向会同样静音——说清代价
+		"completion notice", // 收手：完成会通知
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("缺 %q：\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderJobOutputSilentRepeatReadIsShort 第二次读空只点明「还是 0 字节」：
+// 整段缓冲解释只在第一次给，重复给等于每次轮询都烧一遍 token。
+func TestRenderJobOutputSilentRepeatReadIsShort(t *testing.T) {
+	now := time.Now()
+	rd := jobs.Read{
+		Streaming: true, Tailable: true,
+		LastActivity: now.Add(-2 * time.Second),
+		Snapshot: jobs.JobSnapshot{
+			Status: jobs.StatusRunning, StartedAt: now.Add(-5 * time.Minute),
+		},
+	}
+	out := renderJobOutput(rd, 3)
+	if !strings.Contains(out, "read #3") || !strings.Contains(out, "still 0 bytes") {
+		t.Fatalf("重复读空应点明次数与字节数：\n%s", out)
+	}
+	if strings.Contains(out, "block-buffers") {
+		t.Fatalf("重复读空不该再贴一遍整段解释：\n%s", out)
+	}
+}
+
+// TestRenderJobOutputFinalOnlyKeepsItsOwnNote 只在终态给输出的工具不能套用
+// 「缓冲」那套说辞：它的 0 字节与子进程缓冲无关，开错药方会让模型白折腾。
+func TestRenderJobOutputFinalOnlyKeepsItsOwnNote(t *testing.T) {
+	rd := jobs.Read{
+		LastActivity: time.Now().Add(-time.Minute),
+		Snapshot:     jobs.JobSnapshot{Status: jobs.StatusRunning, StartedAt: time.Now().Add(-2 * time.Minute)},
+	}
+	out := renderJobOutput(rd, 1)
+	if !strings.Contains(out, "exposes output only when it finishes") {
+		t.Fatalf("应说明这类任务只在结束时才有输出：\n%s", out)
+	}
+	if strings.Contains(out, "block-buffers") {
+		t.Fatalf("不该把缓冲这套解释套到不给运行期输出的工具上：\n%s", out)
 	}
 }
 

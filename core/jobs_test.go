@@ -281,12 +281,12 @@ func TestDetachJobContextSurvivesTurnCancel(t *testing.T) {
 // 界面上表现为两张一模一样的输出卡，看起来像渲染重复。
 func TestRenderJobOutputMarksRepeatRead(t *testing.T) {
 	rd := jobs.Read{Text: "boom", Snapshot: jobs.JobSnapshot{Status: jobs.StatusCompleted}, ReadCount: 1}
-	first := renderJobOutput(rd)
+	first := renderJobOutput(rd, 0)
 	if strings.Contains(first, "read #") {
 		t.Fatalf("首次读取不应带重复提示: %q", first)
 	}
 	rd.ReadCount = 2
-	second := renderJobOutput(rd)
+	second := renderJobOutput(rd, 0)
 	if !strings.Contains(second, "read #2") || !strings.Contains(second, "not changed") {
 		t.Fatalf("第二次读取应标注重复: %q", second)
 	}
