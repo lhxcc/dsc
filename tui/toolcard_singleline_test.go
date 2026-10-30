@@ -75,6 +75,12 @@ func TestRenderToolCallShowsContextSearchArgs(t *testing.T) {
 	if !strings.Contains(got, "· 20") {
 		t.Fatalf("截断后仍应保留条数上限: %q", got)
 	}
+
+	// 取回模式：参数里没有 query，卡片要显示要取回的消息 id（否则只剩工具名）
+	got = renderToolCall("context_search", `{"message_id":"event-3921"}`)
+	if !strings.Contains(got, "event-3921") {
+		t.Fatalf("按 id 取回时应显示 id: %q", got)
+	}
 }
 
 // TestSingleLine 折叠规则：CR/LF/TAB 与连续空白 → 单个空格，首尾不留空白。

@@ -2115,12 +2115,17 @@ func toolArgValue(name, argsJSON string) string {
 	if json.Unmarshal([]byte(argsJSON), &m) != nil {
 		return ""
 	}
-	v, ok := m[key]
+	// 会话检索有两种用法：按关键词搜、按消息 id 取回原文。后者根本不带 query，
+	// 所以「主参缺失」不直接返回空——否则取回那张卡只剩工具名，看不出在读哪一段。
+	raw, ok := m[key]
+	if (!ok || blankArg(raw)) && name == "context_search" {
+		raw, ok = m["message_id"]
+	}
 	if !ok {
 		return ""
 	}
 	var arg string
-	switch x := v.(type) {
+	switch x := raw.(type) {
 	case string:
 		arg = strings.TrimSpace(x)
 	case float64:
@@ -2139,6 +2144,17 @@ func toolArgValue(name, argsJSON string) string {
 		}
 	}
 	return arg
+}
+
+// blankArg 判断一个参数值是否「等于没给」（缺失、null、空串、纯空白）。
+func blankArg(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	}
+	return false
 }
 
 // toolCardArgMax 卡片括号里主参的最大显示宽度（rune）。

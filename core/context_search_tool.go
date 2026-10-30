@@ -30,6 +30,14 @@ const (
 	contextSearchDefaultLimit = 8
 	contextSearchMaxLimit     = 20
 	contextSearchSnippetRunes = 240
+	// 按 id 取回完整消息时的单次上限（rune）。
+	//
+	// 取回是「模型明确说要这一条」的动作，所以给得比片段大得多；但仍要封顶：一条
+	// 工具结果可能是几万 token 的单条内容，整段塞回去等于把刚裁掉的历史又倒进来。
+	// 超出上限时返回一段并给出 offset，模型可以自己续读——上限因此可算：
+	// 单次上限 × 次数，全在模型手里。
+	contextSearchDefaultFullRunes = 8000
+	contextSearchMaxFullRunes     = 32000
 )
 
 type contextSearchTool struct{ m *Manager }
@@ -39,7 +47,8 @@ func (t *contextSearchTool) Name() string { return contextSearchToolName }
 func (t *contextSearchTool) Description() string {
 	return "Search this session's FULL recorded history (every user/assistant message and tool output, including the parts the sliding window has dropped from your context) for a keyword or phrase. " +
 		"Use it when you need something that happened earlier but is no longer visible: an earlier decision, a file path, a command you ran, an error message, a value someone gave you. " +
-		"Multiple words are ANDed (all must appear in the same message). Returns a short snippet per match plus its position in the log. " +
+		"Multiple words are ANDed (all must appear in the same message). Each hit is one message — not a whole turn and not a whole step — and comes back as a short snippet plus its id and position in the log. " +
+		"To read one of them in full, call this tool again with message_id=<that id>: it returns that single message verbatim (max_chars per call, default 8000, and offset to page through a long one). " +
 		"This scans the whole session log, so keep queries specific."
 }
 
@@ -47,24 +56,31 @@ func (t *contextSearchTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "Keyword or phrase to look for. Multiple space-separated words must all appear in the same message."},
-    "limit": {"type": "integer", "description": "Maximum number of matches to return (default 8, max 20)."}
+    "query": {"type": "string", "description": "Keyword or phrase to look for. Multiple space-separated words must all appear in the same message. Required unless message_id is given."},
+    "limit": {"type": "integer", "description": "Maximum number of matches to return (default 8, max 20)."},
+    "message_id": {"type": "string", "description": "Return this one message in full instead of searching. Use the id printed with a hit (e.g. event-3921). message_id and query are alternatives; when both are given, message_id wins."},
+    "max_chars": {"type": "integer", "description": "When fetching one message: max characters to return (default 8000, max 32000)."},
+    "offset": {"type": "integer", "description": "When fetching one message: character offset to continue from a truncated fetch."}
   },
-  "required": ["query"]
+  "additionalProperties": false
 }`)
 }
 
 func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var in struct {
-		Query string `json:"query"`
-		Limit int    `json:"limit"`
+		Query     string `json:"query"`
+		Limit     int    `json:"limit"`
+		MessageID string `json:"message_id"`
+		MaxChars  int    `json:"max_chars"`
+		Offset    int    `json:"offset"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
+	msgID := strings.TrimSpace(in.MessageID)
 	terms := strings.Fields(strings.ToLower(in.Query))
-	if len(terms) == 0 {
-		return "", fmt.Errorf("query is empty")
+	if len(terms) == 0 && msgID == "" {
+		return "", fmt.Errorf("query is empty: provide query to search, or message_id to read one message in full")
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -85,9 +101,14 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 	if len(msgs) == 0 {
 		return "(this session has no recorded messages yet)", nil
 	}
+	// 取回模式：只认 id，不做检索——两者是不同意图，同时给时以取回为准。
+	if msgID != "" {
+		return fetchMessageFull(msgs, msgID, in.MaxChars, in.Offset)
+	}
 
 	type hit struct {
 		idx     int
+		id      string
 		role    string
 		snippet string
 	}
@@ -99,7 +120,7 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 		}
 		total++
 		if len(hits) < limit {
-			hits = append(hits, hit{i, m.GetRole(), snippetAround(m.GetContent(), terms, contextSearchSnippetRunes)})
+			hits = append(hits, hit{i, m.GetId(), m.GetRole(), snippetAround(m.GetContent(), terms, contextSearchSnippetRunes)})
 		}
 	}
 	if total == 0 {
@@ -111,11 +132,67 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 		"These come from the full session log, not from the (possibly trimmed) window:\n",
 		total, in.Query, len(msgs), len(hits))
 	for _, h := range hits {
-		fmt.Fprintf(&b, "\n[#%d %s] %s\n", h.idx, h.role, h.snippet)
+		fmt.Fprintf(&b, "\n[#%d %s %s] %s\n", h.idx, h.id, h.role, h.snippet)
 	}
 	if total > len(hits) {
 		fmt.Fprintf(&b, "\n(%d more match(es) not shown — narrow the query or raise limit, max %d.)\n",
 			total-len(hits), contextSearchMaxLimit)
+	}
+	// 片段只是指路：要看原文就按 id 取回那一条（不是整步、也不是整轮）。
+	fmt.Fprintf(&b, "\n(For the full text of any hit: call again with message_id=<id>, e.g. message_id=%q.)", hits[0].id)
+	return b.String(), nil
+}
+
+// fetchMessageFull 按 id 返回单条消息的正文（可按 offset/max_chars 分段取）。
+//
+// 单位明确是「一条派生消息」：取一条 tool 结果不会带出同一步的其它工具输出，取一条
+// assistant 也不会带出下一步。返回的正文是**派生视图**里那一份（工具结果已做 TOON
+// 规范化）——与检索匹配的文本同一份，所以片段和全文不会互相矛盾。
+func fetchMessageFull(msgs []*proto.Message, id string, maxChars, offset int) (string, error) {
+	var msg *proto.Message
+	for _, m := range msgs {
+		if m.GetId() == id {
+			msg = m
+			break
+		}
+	}
+	if msg == nil {
+		return "", fmt.Errorf("message %q not found in this session's history (ids look like event-3921; take one from a search result)", id)
+	}
+	if maxChars <= 0 {
+		maxChars = contextSearchDefaultFullRunes
+	}
+	if maxChars > contextSearchMaxFullRunes {
+		maxChars = contextSearchMaxFullRunes
+	}
+	full := []rune(msg.GetContent())
+	total := len(full)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + maxChars
+	if end > total {
+		end = total
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s %s · %d chars total · showing %d-%d]\n", msg.GetId(), msg.GetRole(), total, offset, end)
+	b.WriteString(string(full[offset:end]))
+	if offset == 0 {
+		// 工具调用只能在同一份消息对象里，正文之外单独列出；只在第一段给，续读时不重复。
+		if calls := msg.GetToolCalls(); len(calls) > 0 {
+			b.WriteString("\n\n[tool calls in this message]")
+			for _, tc := range calls {
+				fmt.Fprintf(&b, "\n- %s %s", tc.GetName(), tc.GetArgumentsJson())
+			}
+		}
+	}
+	if end < total {
+		fmt.Fprintf(&b, "\n\n[truncated at %d of %d chars — call again with message_id=%q offset=%d to continue]",
+			end, total, id, end)
 	}
 	return b.String(), nil
 }
