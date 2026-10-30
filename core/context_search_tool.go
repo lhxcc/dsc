@@ -30,6 +30,18 @@ const (
 	contextSearchDefaultLimit = 8
 	contextSearchMaxLimit     = 20
 	contextSearchSnippetRunes = 240
+	// 按 id 取回完整消息时的余量控制。
+	//
+	// 不设死字节上限：能读多少由**当前上下文还剩多少**决定——窗口 200K、已用 20K 时
+	// 一条 3 万字符的工具输出本该整段读到，写死 8000 会逼模型反复分段甚至换别的工具
+	// 绕路，那才是真浪费。反过来窗口 8K 时也必须有下限，否则「取回」只会回一句空话：
+	// 这时给一个最小配额，让宿主滑窗去腾地方。
+	contextSearchMinFetchTokens = 1000
+	// 预留比例与下限：取回的内容马上会成为下一步请求的一部分，得给模型的下一步
+	// 输出和后续工具结果留位置，不能贴着窗口顶棚把余量一次性用光。
+	contextSearchReserveRatio       = 8    // 1/8 窗口
+	contextSearchReserveMin         = 2000 // 但至少留这么多 token
+	contextSearchUnknownWindowChars = 8000 // 窗口未知时的兜底字符数
 )
 
 type contextSearchTool struct{ m *Manager }
@@ -39,7 +51,8 @@ func (t *contextSearchTool) Name() string { return contextSearchToolName }
 func (t *contextSearchTool) Description() string {
 	return "Search this session's FULL recorded history (every user/assistant message and tool output, including the parts the sliding window has dropped from your context) for a keyword or phrase. " +
 		"Use it when you need something that happened earlier but is no longer visible: an earlier decision, a file path, a command you ran, an error message, a value someone gave you. " +
-		"Multiple words are ANDed (all must appear in the same message). Returns a short snippet per match plus its position in the log. " +
+		"Multiple words are ANDed (all must appear in the same message). Each hit is one message — not a whole turn and not a whole step — and comes back as a short snippet plus its id and position in the log. " +
+		"To read one of them in full, call this tool again with message_id=<that id>: it returns that single message verbatim, as much as the remaining context allows — it is only split when the message does not fit, and then the reply gives the offset to continue. " +
 		"This scans the whole session log, so keep queries specific."
 }
 
@@ -47,24 +60,31 @@ func (t *contextSearchTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "Keyword or phrase to look for. Multiple space-separated words must all appear in the same message."},
-    "limit": {"type": "integer", "description": "Maximum number of matches to return (default 8, max 20)."}
+    "query": {"type": "string", "description": "Keyword or phrase to look for. Multiple space-separated words must all appear in the same message. Required unless message_id is given."},
+    "limit": {"type": "integer", "description": "Maximum number of matches to return (default 8, max 20)."},
+    "message_id": {"type": "string", "description": "Return this one message in full instead of searching. Use the id printed with a hit (e.g. event-3921). message_id and query are alternatives; when both are given, message_id wins."},
+    "max_chars": {"type": "integer", "description": "When fetching one message: optional cap on characters returned, for when you only want the beginning. Omit it to get the whole message whenever it fits the remaining context — do not use it to keep fetches small, a needlessly small fetch wastes another call later."},
+    "offset": {"type": "integer", "description": "When fetching one message: character offset to continue from a fetch that was truncated (the reply names the exact value)."}
   },
-  "required": ["query"]
+  "additionalProperties": false
 }`)
 }
 
 func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var in struct {
-		Query string `json:"query"`
-		Limit int    `json:"limit"`
+		Query     string `json:"query"`
+		Limit     int    `json:"limit"`
+		MessageID string `json:"message_id"`
+		MaxChars  int    `json:"max_chars"`
+		Offset    int    `json:"offset"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
+	msgID := strings.TrimSpace(in.MessageID)
 	terms := strings.Fields(strings.ToLower(in.Query))
-	if len(terms) == 0 {
-		return "", fmt.Errorf("query is empty")
+	if len(terms) == 0 && msgID == "" {
+		return "", fmt.Errorf("query is empty: provide query to search, or message_id to read one message in full")
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -85,9 +105,14 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 	if len(msgs) == 0 {
 		return "(this session has no recorded messages yet)", nil
 	}
+	// 取回模式：只认 id，不做检索——两者是不同意图，同时给时以取回为准。
+	if msgID != "" {
+		return t.fetchMessage(ctx, msgs, msgID, in.MaxChars, in.Offset)
+	}
 
 	type hit struct {
 		idx     int
+		id      string
 		role    string
 		snippet string
 	}
@@ -99,7 +124,7 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 		}
 		total++
 		if len(hits) < limit {
-			hits = append(hits, hit{i, m.GetRole(), snippetAround(m.GetContent(), terms, contextSearchSnippetRunes)})
+			hits = append(hits, hit{i, m.GetId(), m.GetRole(), snippetAround(m.GetContent(), terms, contextSearchSnippetRunes)})
 		}
 	}
 	if total == 0 {
@@ -111,13 +136,162 @@ func (t *contextSearchTool) Execute(ctx context.Context, args json.RawMessage) (
 		"These come from the full session log, not from the (possibly trimmed) window:\n",
 		total, in.Query, len(msgs), len(hits))
 	for _, h := range hits {
-		fmt.Fprintf(&b, "\n[#%d %s] %s\n", h.idx, h.role, h.snippet)
+		fmt.Fprintf(&b, "\n[#%d %s %s] %s\n", h.idx, h.id, h.role, h.snippet)
 	}
 	if total > len(hits) {
 		fmt.Fprintf(&b, "\n(%d more match(es) not shown — narrow the query or raise limit, max %d.)\n",
 			total-len(hits), contextSearchMaxLimit)
 	}
+	// 片段只是指路：要看原文就按 id 取回那一条（不是整步、也不是整轮）。
+	fmt.Fprintf(&b, "\n(For the full text of any hit: call again with message_id=<id>, e.g. message_id=%q.)", hits[0].id)
 	return b.String(), nil
+}
+
+// fetchMessage 按 id 返回单条消息的正文，能读多少取决于**当前上下文余量**。
+//
+// 单位明确是「一条派生消息」：取一条 tool 结果不会带出同一步的其它工具输出，取一条
+// assistant 也不会带出下一步。返回的正文是**派生视图**里那一份（工具结果已做 TOON
+// 规范化）——与检索匹配的文本同一份，所以片段和全文不会互相矛盾。
+//
+// 为什么上限来自余量而不是常量：写死的字节数与小窗口/大窗口都对不上——小窗口该缩，
+// 大窗口却白白截断。模型要的是一条完整消息，条件允许就应整段给；条件不允许才分段，
+// 并把「还剩多少」说清楚，让它自己决定是续读还是换个办法。
+func (t *contextSearchTool) fetchMessage(ctx context.Context, msgs []*proto.Message, id string, maxChars, offset int) (string, error) {
+	var msg *proto.Message
+	for _, m := range msgs {
+		if m.GetId() == id {
+			msg = m
+			break
+		}
+	}
+	if msg == nil {
+		return "", fmt.Errorf("message %q not found in this session's history (ids look like event-3921; take one from a search result)", id)
+	}
+	full := []rune(msg.GetContent())
+	total := len(full)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+
+	budget := t.fetchBudgetTokens(CallerFromContext(ctx), msgs)
+	available := total - offset
+	count := fitRunes(full[offset:], budget)
+	budgetLimited := count < available // 本次截断是上下文余量造成的
+	if maxChars > 0 && maxChars < count {
+		count = maxChars // 模型自己要求更少：尊重，且不是「放不下」
+		budgetLimited = false
+	}
+	end := offset + count
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s %s · %d chars total · showing %d-%d]", msg.GetId(), msg.GetRole(), total, offset, end)
+	if budget > 0 {
+		fmt.Fprintf(&b, " · ≈%d tokens of request headroom left", budget)
+	}
+	b.WriteString("\n")
+	b.WriteString(string(full[offset:end]))
+	if offset == 0 {
+		// 工具调用只能在同一份消息对象里，正文之外单独列出；只在第一段给，续读时不重复。
+		if calls := msg.GetToolCalls(); len(calls) > 0 {
+			b.WriteString("\n\n[tool calls in this message]")
+			for _, tc := range calls {
+				fmt.Fprintf(&b, "\n- %s %s", tc.GetName(), tc.GetArgumentsJson())
+			}
+		}
+	}
+	if end < total {
+		reason := "requested max_chars"
+		if budgetLimited {
+			reason = "the rest does not fit the remaining context headroom"
+		}
+		fmt.Fprintf(&b, "\n\n[truncated at %d of %d chars — %s; call again with message_id=%q offset=%d to read on]",
+			end, total, reason, id, end)
+	}
+	return b.String(), nil
+}
+
+// fetchBudgetTokens 计算这次取回还能占用多少 token。
+//
+// **口径只有一个**：与宿主裁窗（enforceRequestCeiling）完全同一套——同样的
+// EstimateProtoMessagesTokens/EstimateProtoToolTokens 估算、同样的 contextCeilingRatio
+// 上限、同样的 ceilingInflation 偏差系数。不新造第三个数字（那正是「标题栏、面板、
+// provider 三处对不上」的老问题）：这里算的「余量」就是裁窗开始丢历史之前还剩多少，
+// 返回的正文按同一个估算器折算成字符数，所以「装得下」与「不会被裁」是同一句话。
+//
+// 返回 0 表示窗口未知（调用方退回保守字符数）。
+func (t *contextSearchTool) fetchBudgetTokens(sessionID string, msgs []*proto.Message) int {
+	if t.m == nil {
+		return 0
+	}
+	window := t.m.ContextWindow()
+	if window <= 0 {
+		return 0
+	}
+	return t.m.requestHeadroomTokens(sessionID, msgs)
+}
+
+// requestHeadroomTokens 返回「下一次请求在下限之上还能再放多少 token」。
+//
+// 推导与 enforceRequestCeiling 一一对应：
+//
+//	允许的估算上限 limit = window × contextCeilingRatio ÷ inflation
+//	当前表面 surface = 估算(消息) + 估算(工具目录)
+//	余量 = limit − surface
+//
+// 它描述的是「再往里加这么多，宿主仍然不需要滑窗」。
+func (m *Manager) requestHeadroomTokens(sessionID string, msgs []*proto.Message) int {
+	if m == nil {
+		return 0
+	}
+	window := m.ContextWindow()
+	if window <= 0 {
+		return 0
+	}
+	tools := m.AllToolsProto() // 工具目录每次请求都要发，漏算它会高估余量
+	m.mu.Lock()
+	model := m.modelName
+	m.mu.Unlock()
+
+	surface := EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
+	inflation := m.ceilingInflation(sessionID, ToolsFingerprint(tools), model, window)
+	limit := float64(window) * contextCeilingRatio
+	if inflation > 1 {
+		limit /= inflation
+	}
+	headroom := int(limit) - surface
+	if headroom < contextSearchMinFetchTokens {
+		// 已经贴着上限（或超出）：仍给一个最小配额。宿主会滑窗腾地方，
+		// 回一句「没地方了」对模型毫无用处。
+		headroom = contextSearchMinFetchTokens
+	}
+	return headroom
+}
+
+// fitRunes 返回 text 开头能放进 budgetTokens 的最长前缀（按 rune 计）。
+//
+// 二分而不是按平均值折算：同一段文本里 CJK（1 token/字）与 ASCII（4 字符/token）
+// 混排，平均值会让中文日志被砍掉一半、纯英文日志又留下超出预算的内容。
+func fitRunes(text []rune, budgetTokens int) int {
+	if len(text) == 0 {
+		return 0
+	}
+	if budgetTokens <= 0 {
+		// 窗口未知：退回一个保守的字符数，宁可少给也不要凭空塞爆窗口。
+		return min(len(text), contextSearchUnknownWindowChars)
+	}
+	lo, hi := 0, len(text)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if EstimateTextTokens(string(text[:mid])) <= budgetTokens {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
 }
 
 // loadSessionForSearch 按调用方会话 id 载入会话日志；不可用时退回默认（项目）会话。

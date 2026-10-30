@@ -291,6 +291,19 @@ func (m *Manager) SetModelName(name string) {
 	m.mu.Unlock()
 }
 
+// ContextWindow 返回当前的上下文窗口（token 数；0 = 未知）。
+//
+// 供需要「还剩多少余量」的调用方使用（如按 id 取回整条历史消息时决定能读多少）：
+// 写死的字节上限与窗口无关，小窗口会截断本该读全的内容、大窗口又白白限制住模型。
+func (m *Manager) ContextWindow() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.contextWindow
+}
+
 func (m *Manager) SetContextWindow(window int) {
 	if m == nil {
 		return

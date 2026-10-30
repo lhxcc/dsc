@@ -46,6 +46,43 @@ func TestRenderToolCallFoldsDescription(t *testing.T) {
 	}
 }
 
+// TestRenderToolCallShowsContextSearchArgs 会话检索的卡片要像 shell 那样带上「搜索组合」：
+// 关键词是主参，模型显式给了 limit 时补在同一个括号里（不同 limit 是两次不同的检索）。
+// 之前这张卡只有 ● ContextSearch，看不出模型到底搜了什么。
+func TestRenderToolCallShowsContextSearchArgs(t *testing.T) {
+	got := renderToolCall("context_search", `{"query":"SQLITE_BUSY 记忆插件"}`)
+	if !strings.Contains(got, "ContextSearch") || !strings.Contains(got, "SQLITE_BUSY 记忆插件") {
+		t.Fatalf("应显示工具名与关键词: %q", got)
+	}
+	if strings.Contains(got, "·") {
+		t.Fatalf("未显式给 limit 时不应补条数: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("卡片必须是单行: %q", got)
+	}
+
+	got = renderToolCall("context_search", `{"query":"multi\nline keyword","limit":20}`)
+	if strings.Contains(got, "\n") {
+		t.Fatalf("关键词里的换行也要折叠: %q", got)
+	}
+	if !strings.Contains(got, "multi line keyword · 20") {
+		t.Fatalf("应带出显式的条数上限: %q", got)
+	}
+
+	// 关键词很长时，整体截断不得把条数挤掉（先给它留宽度再截关键词）
+	long := strings.Repeat("长", 80)
+	got = renderToolCall("context_search", `{"query":"`+long+`","limit":20}`)
+	if !strings.Contains(got, "· 20") {
+		t.Fatalf("截断后仍应保留条数上限: %q", got)
+	}
+
+	// 取回模式：参数里没有 query，卡片要显示要取回的消息 id（否则只剩工具名）
+	got = renderToolCall("context_search", `{"message_id":"event-3921"}`)
+	if !strings.Contains(got, "event-3921") {
+		t.Fatalf("按 id 取回时应显示 id: %q", got)
+	}
+}
+
 // TestSingleLine 折叠规则：CR/LF/TAB 与连续空白 → 单个空格，首尾不留空白。
 func TestSingleLine(t *testing.T) {
 	cases := map[string]string{

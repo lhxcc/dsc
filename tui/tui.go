@@ -2200,6 +2200,7 @@ var toolArgKey = map[string]string{
 	"skill":                "name",
 	"install_skill":        "name",
 	"uninstall_skill":      "name",
+	"context_search":       "query",
 	"job_output":           "job_id",
 	"job_kill":             "job_id",
 	"load_dsc_plugin":      "name",
@@ -2239,20 +2240,53 @@ func toolArgValue(name, argsJSON string) string {
 	if json.Unmarshal([]byte(argsJSON), &m) != nil {
 		return ""
 	}
-	v, ok := m[key]
+	// 会话检索有两种用法：按关键词搜、按消息 id 取回原文。后者根本不带 query，
+	// 所以「主参缺失」不直接返回空——否则取回那张卡只剩工具名，看不出在读哪一段。
+	raw, ok := m[key]
+	if (!ok || blankArg(raw)) && name == "context_search" {
+		raw, ok = m["message_id"]
+	}
 	if !ok {
 		return ""
 	}
-	switch x := v.(type) {
+	var arg string
+	switch x := raw.(type) {
 	case string:
-		return strings.TrimSpace(x)
+		arg = strings.TrimSpace(x)
 	case float64:
-		return strconv.Itoa(int(x))
+		arg = strconv.Itoa(int(x))
 	case bool:
-		return strconv.FormatBool(x)
+		arg = strconv.FormatBool(x)
 	}
-	return ""
+	// 会话检索的「搜索组合」不只是一个词：模型还会要条数上限，而同一个词配 8 条和
+	// 配 20 条是两次不同的检索。只在模型**显式传了** limit 时补上它——默认档不入卡片，
+	// 否则每张卡都挂一个多余的 ·8，反而看不出模型到底改了什么。
+	// 先给补充信息留出宽度再截关键词：整体截断会把条数挤掉。
+	if name == "context_search" && arg != "" {
+		if n, ok := m["limit"].(float64); ok && n > 0 {
+			suffix := fmt.Sprintf(" · %d", int(n))
+			arg = clampToolArg(arg, toolCardArgMax-len([]rune(suffix))-1) + suffix
+		}
+	}
+	return arg
 }
+
+// blankArg 判断一个参数值是否「等于没给」（缺失、null、空串、纯空白）。
+func blankArg(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	}
+	return false
+}
+
+// toolCardArgMax 卡片括号里主参的最大显示宽度（rune）。
+//
+// 抽成常量是因为「主参 + 补充信息」需要按整段宽度算：会话检索要在关键词后面补条数，
+// 直接拼再统一截断会把补充信息挤掉——那是这次调用最想让人看见的东西。
+const toolCardArgMax = 60
 
 // clampToolArg 把工具主参**折叠成单行**并截断到最大宽度。
 //
@@ -2349,9 +2383,9 @@ func renderToolCall(name, argsJSON string) string {
 		// 参数本身已是带括号的表达式（如 Lisp 的 (+ 1 2)）时不再叠加括号，
 		// 避免出现 ● Lisp((+ 1 2)) 的双括号；否则按 ● Verb(arg) 包裹展示。
 		if strings.HasPrefix(arg, "(") && strings.HasSuffix(arg, ")") {
-			head += dimSty.Render(clampToolArg(arg, 60))
+			head += dimSty.Render(clampToolArg(arg, toolCardArgMax))
 		} else {
-			head += dimSty.Render("(" + clampToolArg(arg, 60) + ")")
+			head += dimSty.Render("(" + clampToolArg(arg, toolCardArgMax) + ")")
 		}
 	}
 	line := "  " + dot + " " + head
