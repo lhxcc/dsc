@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,7 +78,16 @@ func (m *SSHSessionManager) connect(host string, port int, username, password, p
 }
 
 // exec 在指定会话上执行命令，返回合并输出与退出码。
-func (m *SSHSessionManager) exec(id, command string) (string, int, error) {
+//
+// 边跑边读，而不是 CombinedOutput 一把梭：
+//   - 输出全攒在内存里、命令结束才返回，在这边就表现为「远程构建跑了 20 分钟、
+//     本地零活动」——宿主的空闲看门狗（10 分钟）会把一次正常构建判死；
+//   - 转后台之后 job_output 也只能显示 (no output yet)，因为尾部队列里什么都没有。
+//
+// 所以改成 Start + 双管道并发拷贝：每读到一块就 TouchActivity（跨进程续命）并
+// AppendOutput（尾部快照）。终止也一并处理：ctx 取消时关掉会话，让阻塞的 Read
+// 立刻返回——否则看门狗早就取消了，这边的 goroutine 还挂在远端命令上。
+func (m *SSHSessionManager) exec(ctx context.Context, id, command string) (string, int, error) {
 	m.mu.Lock()
 	c := m.sessions[id]
 	m.mu.Unlock()
@@ -88,16 +99,69 @@ func (m *SSHSessionManager) exec(id, command string) (string, int, error) {
 		return "", 0, err
 	}
 	defer sess.Close()
-	out, err := sess.CombinedOutput(command)
-	code := 0
+
+	stdout, err := sess.StdoutPipe()
 	if err != nil {
-		if ee, ok := err.(*ssh.ExitError); ok {
+		return "", 0, err
+	}
+	stderr, err := sess.StderrPipe()
+	if err != nil {
+		return "", 0, err
+	}
+
+	var (
+		mu  sync.Mutex
+		out strings.Builder
+	)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = sess.Close()
+		case <-done:
+		}
+	}()
+
+	if err := sess.Start(command); err != nil {
+		return "", 0, err
+	}
+
+	var wg sync.WaitGroup
+	drain := func(r io.Reader) {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				mu.Lock()
+				out.Write(chunk)
+				mu.Unlock()
+				dsc.TouchActivity(ctx)       // 让宿主的看门狗知道「远端还在吐东西」
+				dsc.AppendOutput(ctx, chunk) // 后台任务的实时尾巴
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go drain(stdout)
+	go drain(stderr)
+
+	waitErr := sess.Wait()
+	wg.Wait()
+
+	code := 0
+	if waitErr != nil {
+		if ee, ok := waitErr.(*ssh.ExitError); ok {
 			code = ee.ExitStatus()
 		} else {
 			code = 1
 		}
 	}
-	return string(out), code, err
+	return out.String(), code, waitErr
 }
 
 func (m *SSHSessionManager) list() []string {
@@ -270,7 +334,7 @@ func main() {
 		if p.SessionID == "" || p.Command == "" {
 			return "", fmt.Errorf("session_id and command are required")
 		}
-		out, code, err := globalSSH.exec(p.SessionID, p.Command)
+		out, code, err := globalSSH.exec(ctx, p.SessionID, p.Command)
 		res := SSHExecResult{Success: err == nil, Output: out, ExitCode: code}
 		if err != nil {
 			res.Error = err.Error()
