@@ -109,6 +109,20 @@ func (m *Manager) noteOverflow(sessionID string, actual, max, sent int) {
 	m.overflowAdj[sessionID] = adj
 	m.overflowMu.Unlock()
 
+	// 服务端亲口报了更小的上限：把**进程级窗口**也降到它。
+	//
+	// 配置里的 context_window 可能比服务端实际能给的大（云端宣传 1M、或用户在 128K
+	// 后面补个 0）。那条假设一旦不成立，标题栏、压力估算、裁窗比例全都建立在一个用不
+	// 出来的数上；已经撞过一次 4xx，没有必要每次都撞。只降不升：provider 报的比配置
+	// 大时保留配置（配置可以刻意调低来省成本）。
+	if max >= 1024 {
+		if cur := m.ContextWindow(); cur <= 0 || max < cur {
+			m.SetContextWindow(max)
+			m.logger.Warn("provider reports a smaller context window; lowering it",
+				"from", cur, "to", max)
+		}
+	}
+
 	m.logger.Warn("context overflow reported by provider; tightening the request budget and sliding the window",
 		"session", sessionID, "provider_actual", actual, "provider_max", max,
 		"our_estimate", sent, "inflation", adj.inflation)

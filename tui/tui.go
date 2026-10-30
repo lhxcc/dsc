@@ -3938,10 +3938,24 @@ func shortTokens(n int) string {
 	}
 }
 
+// ctxWindowSize 返回当前上下文总容量。
+//
+// 以宿主为准而不是构造时的快照：窗口可能被下调（服务端探测到的容量更小，
+// 或 provider 4xx 亲口报过更小的上限），继续显示配置里那个用不出来的数，就等于
+// 「标题栏说 1.3M、实际按 1.0M 裁」——同一件事两个数字那种问题。
+func (m *Model) ctxWindowSize() int {
+	if m.manager != nil {
+		if v := m.manager.ContextWindow(); v > 0 {
+			return v
+		}
+	}
+	return m.contextWindow
+}
+
 // capacityTag 渲染「已用/总容量」，如 12K/128K；容量未设置时只显示已用。
 func (m *Model) capacityTag() string {
-	if m.contextWindow > 0 {
-		return fmt.Sprintf("%s/%s", shortTokens(m.usedTokens), shortTokens(m.contextWindow))
+	if w := m.ctxWindowSize(); w > 0 {
+		return fmt.Sprintf("%s/%s", shortTokens(m.usedTokens), shortTokens(w))
 	}
 	return shortTokens(m.usedTokens)
 }
@@ -4095,10 +4109,10 @@ func (m *Model) runInfoLine() string {
 		}
 	}
 	if m.usedTokens > 0 {
-		if m.contextWindow > 0 {
+		if w := m.ctxWindowSize(); w > 0 {
 			// 已知总容量时显示已用百分比（两位小数精度）；极小占比也至少
 			// 显示 0.01%，避免 0.00% 误导
-			pct := float64(m.usedTokens) * 100 / float64(m.contextWindow)
+			pct := float64(m.usedTokens) * 100 / float64(w)
 			if pct < 0.01 {
 				pct = 0.01
 			}
