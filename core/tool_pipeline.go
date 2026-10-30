@@ -195,6 +195,8 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 		m.logger.Warn("tool execution failed", "tool", toolName, "duration_ms", time.Since(start).Milliseconds(), "error", "tool not found")
 		return m.toolNotFoundError(toolName)
 	}
+	// 本次调用的 id：跨进程活动通道（GetActivity）与后台任务的观察都按它索引。
+	callID := ToolCallIDFromContext(ctx)
 	// timeout-policy：声明 timeoutMs 的工具设置协作式截止时间（对齐 DSH）
 	execCtx, timeoutMs := ctx, 0
 	if tp, ok := tool.(TimeoutProvider); ok {
@@ -203,6 +205,45 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 			var cancel context.CancelFunc
 			execCtx, cancel = context.WithTimeout(ctx, time.Duration(ms)*time.Millisecond)
 			defer cancel()
+		}
+	}
+	// 默认空闲预算（没有 auto-background 能力的工具）。
+	//
+	// 这类工具不会被「交给后台」——它们没声明自己适合脱离本轮继续跑。于是安静到预算
+	// 耗尽时只剩一个选择：终止本次调用（而不是像命令那样转后台让模型反复 job_output）。
+	// 不这么做，一个卡住的工具会一直占着这一轮。
+	//
+	// 三条不装：策略插件已经裁决过（别套两层计时器）、工具自带 timeoutMs（尊重它）、
+	// 该工具声明了 auto-background（那条路走前台宽限期，见 runWithGrace）。
+	var defaultIdle time.Duration
+	if autoBackgroundGrace > 0 && timeoutMs == 0 && !hasIdleDeadline(execCtx) {
+		autoBG := false
+		if ct, ok := tool.(CapabilityTool); ok {
+			autoBG = ct.HasCapability(CapabilityAutoBackground)
+		}
+		if !autoBG {
+			var cancel context.CancelFunc
+			execCtx, cancel = WithIdleDeadline(execCtx, autoBackgroundGrace)
+			defer cancel()
+			defaultIdle = autoBackgroundGrace
+		}
+	}
+	// 跨进程续命：看门狗装在宿主 ctx 上（`WithIdleDeadline` 用的是 ctx value），而活动
+	// 信号在执行方进程里产生——ctx value 过不了 gRPC，插件里的 `TouchActivity` 摸到的
+	// 是**另一个空的句柄**，等于 no-op。不补这一步，凡在插件进程里跑的工具，看门狗都是
+	// 固定时长上限，策略插件声称的「活跃续命」对这些工具其实是假话（一条持续输出 15
+	// 分钟的构建照样在第 10 分钟被杀，文案还写着「no output」）。
+	//
+	// 补法：能报活动的工具（实现 activityProbe，`GetActivity` 那条跨进程通道）由宿主
+	// 轮询替它续命。宿主内联运行的工具（如 subagent）本来就能直接 TouchActivity，不需要。
+	if hasIdleDeadline(execCtx) && callID != "" {
+		if probe, ok := tool.(activityProbe); ok {
+			budget := defaultIdle
+			if budget <= 0 {
+				budget = autoBackgroundGrace
+			}
+			stop := renewIdleFromActivity(execCtx, probe, callID, budget)
+			defer stop()
 		}
 	}
 	// 通用 panic recover：任何工具执行 panic 都转为错误返回，避免宿主进程崩溃。
@@ -255,6 +296,11 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 				break
 			}
 		}
+	}
+	// 默认空闲预算触发：换成模型能行动的文案（说明它为什么被停、以及长任务该怎么做）。
+	if defaultIdle > 0 && IdleDeadlineExceeded(execCtx) {
+		err = fmt.Errorf("tool call stopped: no output for %s. This tool cannot be moved to background, "+
+			"so the call was cancelled instead of holding the turn open — pass run_in_background:true if you expect it to run long", defaultIdle)
 	}
 	// 结果净化：工具输出可能携带非法 UTF-8（如 Windows 原生命令的 OEM 码页输出、
 	// GBK 编码的文件内容），原样进入会话日志/LLM 请求后，proto string 字段会拒绝
@@ -467,7 +513,10 @@ func (m *Manager) startBackgroundTool(ctx context.Context, toolName string, args
 	if err != nil {
 		return "", "", err
 	}
-	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop with job_kill.", toolName, jobID)
+	// 两个提示都带 job_id：只写 job_kill 而不给参数，模型会去试外部手段终止进程
+	// （taskkill/kill 之类），而外部终止不会更新本任务记录——它一直挂在 running。
+	result := fmt.Sprintf("Background job started: %s. Track it with job_output (job_id: %s). Stop it with job_kill (job_id: %s).",
+		toolName, jobID, jobID)
 	return result, "", nil
 }
 
@@ -490,12 +539,38 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 	// （"rpc error: code = Canceled desc = context canceled"），输出也随之丢失——
 	// 而 `run_in_background` 的语义正是「脱离本轮继续跑」。这里复制归属信息
 	//（会话、审批策略）到独立 ctx，生命周期交给 job 注册表（job_kill/进程退出）。
-	jobCtx := detachJobContext(ctx)
+	// job_kill 必须真的能停：Cancel 之前只往一个没人读的 channel 里塞了 reason，
+	// 工具照旧跑到底（模型于是改用 taskkill 之类的外部手段，而外部手段杀了进程之后
+	// 本任务记录还挂在 running）。改成派生可取消 ctx——Cancel 一按，gRPC 调用被取消，
+	// 插件的 Handler 收到 ctx 取消去杀子进程，流水线随之落定。
+	jobCtx, cancelJob := context.WithCancel(detachJobContext(ctx))
+	var (
+		killMu     sync.Mutex
+		killReason string
+		killed     bool
+	)
 
 	// 观察通道：能流式上报的工具（插件把自己的输出登记进 GetActivity）在这里被探测出
 	// 尾部输出与最近活动时间，job_output 于是在任务落定前也能回答「它在说什么」。
 	// 探测不到就是 nil——任务退回原来的 final-output 行为。
 	tailFn, activityFn := m.jobProbes(toolName, ToolCallIDFromContext(ctx))
+	// 缓存最近一次读到的尾部：任务被 job_kill 终止时工具结果通常是空的（ctx 取消），
+	// 但用户/模型已经看到过前面那些输出——落定后不该退化成 (no output yet)。
+	var (
+		lastMu    sync.Mutex
+		lastTail  string
+		lastTotal int64
+	)
+	if tailFn != nil {
+		probe := tailFn
+		tailFn = func() (string, int64) {
+			text, total := probe()
+			lastMu.Lock()
+			lastTail, lastTotal = text, total
+			lastMu.Unlock()
+			return text, total
+		}
+	}
 
 	jobID, err := m.jobs.Start(jobs.StartSpec{
 		Kind:  toolName,
@@ -503,45 +578,55 @@ func (m *Manager) startBackgroundJob(ctx context.Context, toolName string, argsJ
 		Owner: caller,
 		Start: func() (jobs.JobHooks, error) {
 			doneCh := make(chan jobs.JobOutcome, 1)
-			// job_kill 需要能终止流水线；jobCtx 已脱离回合取消（detachJobContext），
-			// 这里只叠加一层可取消性，终止来源仅限 job_kill。
-			runCtx, cancel := context.WithCancel(jobCtx)
-
-			var mu sync.Mutex
-			cancelReason := ""
-
 			go func() {
-				defer cancel()
 				// 异步执行完整流水线（pre-execute → execute → post-execute）
-				result, view, err := m.executeBackgroundPipeline(runCtx, toolName, argsJSON)
+				result, view, err := m.executeBackgroundPipeline(jobCtx, toolName, argsJSON)
 				// 视图与管道错误交回宽限期路径（jobs.JobOutcome 只带输出文本）。
 				sink.set(view, err)
-				mu.Lock()
-				reason := cancelReason
-				mu.Unlock()
-				if runCtx.Err() != nil {
-					detail := "cancelled"
-					if reason != "" {
-						detail = reason
-					}
-					doneCh <- jobs.JobOutcome{Status: jobs.StatusKilled, Detail: detail, Output: result}
-					return
-				}
 				// 终态由 settleBackgroundOutcome 统一决定：流水线报错即 failed，
 				// 结果里的 [exit_code: N] 非 0 同样判 failed，让模型能从 [status: ...]
 				// 直接看出脚本失败（命令非零退出不算 Go error）。
 				status, detail := settleBackgroundOutcome(result, err)
+				// 经 job_kill 终止的，落定状态记 killed 而不是 failed——「被取消」和
+				// 「自己出错」在事后排查里是两件事，混成 context canceled 会误导。
+				killMu.Lock()
+				wasKilled, reason := killed, killReason
+				killMu.Unlock()
+				if wasKilled {
+					status, detail = jobs.StatusKilled, "killed by caller"
+					if reason != "" {
+						detail += ": " + reason
+					}
+					// 保住「杀之前已经打印出来的那一段」：结束态的 Text 为空时用它兜底，
+					// 否则模型看到的是 (no output yet)，前面看到的 tick 全没了。
+					//
+					// 兜底时必须**明说是终止前抓到的尾巴**：这段文本是唯一一次「终态却带着
+					// 输出」的情形，不标注的话模型会把它当成完整结果，甚至以为任务还在跑
+					// （正文里没有 running 行，但也没有「到此为止」的交代）。
+					lastMu.Lock()
+					tail, total := lastTail, lastTotal
+					lastMu.Unlock()
+					if result == "" && tail != "" {
+						if total > int64(len(tail)) {
+							result = fmt.Sprintf("[stopped when killed — showing the last %s of %s it had printed; there is no more]\n%s",
+								humanBytes(int64(len(tail))), humanBytes(total), tail)
+						} else {
+							result = "[stopped when killed — this is everything it printed]\n" + tail
+						}
+					}
+				}
 				doneCh <- jobs.JobOutcome{Status: status, Detail: detail, Output: result}
 			}()
 
 			return jobs.JobHooks{
 				Cancel: func(reason string) {
-					mu.Lock()
-					if cancelReason == "" {
-						cancelReason = reason
+					killMu.Lock()
+					killed = true
+					if reason != "" {
+						killReason = reason
 					}
-					mu.Unlock()
-					cancel()
+					killMu.Unlock()
+					cancelJob()
 				},
 				Done: doneCh,
 				// 最终输出仍以 Done.Output 为权威；TailOutput 只服务「任务还没结束」的观察。

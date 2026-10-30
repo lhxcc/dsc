@@ -28,15 +28,15 @@ const CapabilityAutoBackground = "auto-background"
 // defaultAutoBackgroundGrace 前台**空闲预算**：命令前端等待期间，超过这么久没有
 // 任何输出（活动）就转入后台。
 //
-// 这不是「最多等多久」：只要有输出，预算就重新计时（活跃续命），命令可以一直在
-// 前台跑完；只有真的安静下来（编译中、阻塞在网络、卡在交互）才把控制权交回模型。
-// 3 分钟是实测定下的经验值：60s 太短——长编译、慢速网络拉取、模型刚起的长驻进程都
-// 会在这段时间里一声不响，于是被提前转后台、模型随后一次次去读空结果。
-const defaultAutoBackgroundGrace = 3 * time.Minute
-
-// maxAutoBackgroundForeground 前台等待的硬上限：即便命令一直在输出，也不能让模型
-// 无限期被占住——到点同样转后台（任务继续跑，只是先把它交出去）。
-const maxAutoBackgroundForeground = 10 * time.Minute
+// **没有「最多等多久」这回事**：只要有输出，预算就重新计时（活跃续命），命令可以
+// 一直在前台跑到结束——预算只对「安静」计价。10 分钟是实测定下的值：3 分钟太短，
+// 长编译、慢速网络拉取、模型刚起的长驻进程都会在这段时间里一声不响，被提前转后台，
+// 模型随后得反复调 job_output 去看一个还没有输出的任务（那种调用毫无信息量）。
+//
+// 刻意**不设前台硬顶**：一条持续输出的命令（长构建日志、verbose 测试）值得一直占着
+// 前台，因为它的结果就是模型下一步要用的东西；把它挪到后台只会让模型多绕一次
+// job_output。失去控制权的情形由「安静 10 分钟」覆盖，不由总时长覆盖。
+const defaultAutoBackgroundGrace = 10 * time.Minute
 
 // autoBackgroundGrace 生效的前台空闲预算（0 = 关闭自动后台，工具永远同步执行）。
 // 可用 DSC_AUTO_BACKGROUND_SECS 覆盖（正数秒数；0 或负数表示关闭）。
@@ -134,7 +134,6 @@ func (m *Manager) runWithGrace(ctx context.Context, toolName string, argsJSON js
 	}
 	callID := ToolCallIDFromContext(ctx)
 	lastActivity := time.Now()
-	foregroundDeadline := lastActivity.Add(maxAutoBackgroundForeground)
 
 	for {
 		// 单次等待不超过「剩余预算」与 250ms 的较小者：否则短预算会被一次长等待
@@ -162,22 +161,20 @@ func (m *Manager) runWithGrace(ctx context.Context, toolName string, argsJSON js
 			}
 		}
 		idle := time.Since(lastActivity)
-		if idle < autoBackgroundGrace && time.Now().Before(foregroundDeadline) {
+		if idle < autoBackgroundGrace {
 			continue
 		}
 
-		// 预算耗尽（或到硬顶）：任务留在后台继续跑。必须 Release——不放开的话它落定
-		// 时一声不响，正是「长任务完成了没人知道」的老毛病。
+		// 预算耗尽：任务留在后台继续跑。必须 Release——不放开的话它落定时一声不响，
+		// 正是「长任务完成了没人知道」的老毛病。
 		m.jobs.Release(jobID)
 		reason := fmt.Sprintf("no output for %s", idle.Round(time.Second))
-		if idle < autoBackgroundGrace {
-			reason = "foreground budget exhausted"
-		}
 		m.logger.Info("auto background: moved to job", "tool", toolName, "job", jobID, "reason", reason)
 		result = fmt.Sprintf(
 			"Command still running (%s); moved to background (job_id: %s, status: %s). "+
-				"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill if needed.",
-			reason, jobID, snap.Status, jobID)
+				"It keeps running on its own — read its output with job_output (job_id: %s) and stop it with job_kill (job_id: %s). "+
+				"Don't kill it through the shell (taskkill/kill): that leaves this job record stuck at running.",
+			reason, jobID, snap.Status, jobID, jobID)
 		return result, "", true, nil
 	}
 }

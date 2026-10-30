@@ -75,7 +75,7 @@ func TestBackgroundJobKillCancelsExecution(t *testing.T) {
 		t.Fatalf("kill: %v", err)
 	}
 	waitJobStatus(t, m, id, jobs.StatusKilled)
-	if snap, _ := m.jobs.Get(id, ""); snap.Detail != "test kill" {
+	if snap, _ := m.jobs.Get(id, ""); !strings.Contains(snap.Detail, "test kill") {
 		t.Fatalf("kill detail = %q, want reason propagated", snap.Detail)
 	}
 }

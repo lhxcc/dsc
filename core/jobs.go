@@ -189,7 +189,10 @@ func (t *jobTool) Description() string {
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
-		return "Request cancellation of a background job, forwarding an optional reason. A finished job returns its terminal status instead."
+		return "Stop a background job: pass its job_id (the one printed when the job started) and an optional reason. " +
+			"This cancels the running tool call, so the process it started is terminated and the job settles as killed. " +
+			"Kill it this way rather than through the shell (taskkill/kill): external termination bypasses the job record and leaves it stuck at running. " +
+			"A finished job returns its terminal status instead."
 	}
 	return ""
 }

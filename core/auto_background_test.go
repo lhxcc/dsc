@@ -105,13 +105,13 @@ func TestAutoBackgroundMovesToBackgroundAfterGrace(t *testing.T) {
 	}
 }
 
-// TestAutoBackgroundWithoutCapabilityStaysSync 未声明能力的工具不受影响，
-// 即便执行时间超过宽限期也不转后台。
+// TestAutoBackgroundWithoutCapabilityStaysSync 未声明能力的工具**不登记任务**：
+// 它没有「交出去继续跑」的资格，所以预算内跑完就原样同步返回（job_list 里不留记录）。
 func TestAutoBackgroundWithoutCapabilityStaysSync(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
-	withGrace(t, 10*time.Millisecond)
+	withGrace(t, 200*time.Millisecond)
 	if err := m.toolRegistry.Register(&graceTool{
-		name: "plain_cmd", delay: 40 * time.Millisecond, out: "sync",
+		name: "plain_cmd", delay: 10 * time.Millisecond, out: "sync",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -122,6 +122,35 @@ func TestAutoBackgroundWithoutCapabilityStaysSync(t *testing.T) {
 	}
 	if out != "sync" {
 		t.Fatalf("out = %q，未声明能力的工具应原样同步返回", out)
+	}
+	if n := len(m.jobs.List("")); n != 0 {
+		t.Fatalf("未声明能力的工具不应登记任务，job_list = %d", n)
+	}
+}
+
+// TestAutoBackgroundWithoutCapabilityTerminates 未声明 auto-background 能力的工具：
+// 安静到预算耗尽就**终止**本次调用，而不是转后台（它没声明适合脱离本轮继续跑），
+// 更不能无限期占着这一轮。
+func TestAutoBackgroundWithoutCapabilityTerminates(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 30*time.Millisecond)
+	if err := m.toolRegistry.Register(&graceTool{
+		name: "plain_slow", delay: 10 * time.Second, out: "never",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	start := time.Now()
+	_, err := m.ExecuteTool(context.Background(), "plain_slow", json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("超过预算应终止并报错")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("应在预算附近终止，实际等了 %v", elapsed)
+	}
+	if !strings.Contains(err.Error(), "cannot be moved to background") ||
+		!strings.Contains(err.Error(), "run_in_background") {
+		t.Fatalf("错误文案应说明为何终止、以及长任务该怎么做，实际 %q", err)
 	}
 	if n := len(m.jobs.List("")); n != 0 {
 		t.Fatalf("未声明能力的工具不应登记任务，job_list = %d", n)
@@ -287,4 +316,66 @@ func TestBackgroundPipelinePreservesToolCallID(t *testing.T) {
 		t.Fatalf("后台执行看到的 call id = %q，期望 call-abc（丢了它，插件侧活动上报就落在空键上，宿主永远读不到）", got)
 	}
 	close(tool.release)
+}
+
+// chattyRemoteTool 模拟「在插件进程里跑、但持续有输出」的工具：执行期间持续上报
+// 活动（activityProbe），自身调不到宿主的看门狗句柄。
+type chattyRemoteTool struct {
+	name     string
+	run      time.Duration
+	started  chan struct{}
+	lastSeen time.Time
+	mu       sync.Mutex
+}
+
+func (t *chattyRemoteTool) Name() string        { return t.name }
+func (t *chattyRemoteTool) Description() string { return "chatty remote tool" }
+func (t *chattyRemoteTool) ParametersSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object"}`)
+}
+
+func (t *chattyRemoteTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	if t.started != nil {
+		close(t.started)
+	}
+	deadline := time.Now().Add(t.run)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+		t.mu.Lock()
+		t.lastSeen = time.Now()
+		t.mu.Unlock()
+	}
+	return "chatty done", nil
+}
+
+// LastActivity 实现 activityProbe：宿主的续命轮询读的就是它。
+func (t *chattyRemoteTool) LastActivity(context.Context, string) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastSeen, !t.lastSeen.IsZero()
+}
+
+// TestDefaultIdleRenewsFromRemoteActivity 远程工具的活动信号过不了 gRPC（看门狗句柄在
+// 宿主 ctx 里），所以宿主必须轮询 GetActivity 替它续命；否则「活跃续命」对插件工具是
+// 假话——一条持续输出的命令照样在预算到点时被杀，文案还写着 no output。
+func TestDefaultIdleRenewsFromRemoteActivity(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 300*time.Millisecond) // 预算远小于总耗时
+	tool := &chattyRemoteTool{name: "chatty_remote", run: 900 * time.Millisecond}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := WithToolCallID(context.Background(), "call-chatty")
+	out, err := m.ExecuteTool(ctx, "chatty_remote", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("有持续活动时不该被终止：%v", err)
+	}
+	if out != "chatty done" {
+		t.Fatalf("out = %q", out)
+	}
 }

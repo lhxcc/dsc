@@ -123,7 +123,8 @@ func (t *workflowTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		if jerr != nil {
 			return "", jerr
 		}
-		return fmt.Sprintf("workflow %q started in background (job %s). Track it with job_output.", p.Meta.Name, job), nil
+		return fmt.Sprintf("workflow %q started in background (job %s). Track it with job_output (job_id: %s). Stop it with job_kill (job_id: %s).",
+			p.Meta.Name, job, job, job), nil
 	}
 	run, err := workflow.Start(ctx, req)
 	if err != nil {
