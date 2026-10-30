@@ -138,6 +138,12 @@ func TestContextSearchNoSession(t *testing.T) {
 // 「命中给片段、按 id 取回给全文」这一对行为。
 func newLongMessageFixture(t *testing.T) (*contextSearchTool, context.Context, string) {
 	t.Helper()
+	return newMessageFixture(t, strings.Repeat("构建日志：磁盘已满，写入失败。", 200))
+}
+
+// newMessageFixture 建一个只含一条 assistant 消息（正文为 content）的会话。
+func newMessageFixture(t *testing.T, content string) (*contextSearchTool, context.Context, string) {
+	t.Helper()
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	st, err := m.sessionStore()
 	if err != nil {
@@ -147,9 +153,8 @@ func newLongMessageFixture(t *testing.T) (*contextSearchTool, context.Context, s
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	long := strings.Repeat("构建日志：磁盘已满，写入失败。", 200) // 远超片段上限
 	sess.Append(session.AssistantMessage, &session.AssistantMessageData{
-		Content: long,
+		Content: content,
 		ToolCalls: []*proto.ToolCall{
 			{Id: "call-1", Name: "shell", ArgumentsJson: `{"command":"df -h"}`},
 		},
@@ -157,7 +162,7 @@ func newLongMessageFixture(t *testing.T) (*contextSearchTool, context.Context, s
 	if err := st.Save(sess); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	return &contextSearchTool{m: m}, WithCaller(context.Background(), "sess-fetch"), long
+	return &contextSearchTool{m: m}, WithCaller(context.Background(), "sess-fetch"), content
 }
 
 // extractMessageID 从检索结果里取出第一条命中的消息 id（形如 event-3）。
@@ -259,4 +264,45 @@ func mustSearch(t *testing.T, tool *contextSearchTool, ctx context.Context, quer
 		t.Fatalf("Execute: %v", err)
 	}
 	return out
+}
+
+// TestContextSearchFetchUsesRequestHeadroom 取回的上限来自**上下文余量**，不是常量：
+// 同样一条 1.2 万字符的消息，大窗口应整条读完，小窗口才分段。
+//
+// 这条测试防的就是「写死 8000 字符」：窗口 200K、表面才十几 K 时，一条 1.2 万字符的
+// 消息完全放得下，截断只会逼模型再调一次（甚至换别的工具绕路），纯属浪费。
+func TestContextSearchFetchUsesRequestHeadroom(t *testing.T) {
+	content := strings.Repeat("磁盘已满写入失败", 1500) // 12000 字符，远超旧的 8000 上限
+	tool, ctx, long := newMessageFixture(t, content)
+	id := extractMessageID(t, mustSearch(t, tool, ctx, "磁盘已满"))
+
+	tool.m.SetContextWindow(200000)
+	full, err := tool.Execute(ctx, json.RawMessage(`{"message_id":"`+id+`"}`))
+	if err != nil {
+		t.Fatalf("取回: %v", err)
+	}
+	if !strings.Contains(full, long) {
+		t.Fatalf("大窗口下应整条返回（%d 字符），got 长度 %d", len([]rune(long)), len([]rune(full)))
+	}
+	if strings.Contains(full, "truncated") {
+		t.Fatalf("放得下时不应截断:\n%.400s", full)
+	}
+
+	// 同一个窗口收到 20K：余量不够，必须分段并说清是余量不够（不是模型要得少）
+	tool2, ctx2, _ := newMessageFixture(t, content)
+	id2 := extractMessageID(t, mustSearch(t, tool2, ctx2, "磁盘已满"))
+	tool2.m.SetContextWindow(20000)
+	part, err := tool2.Execute(ctx2, json.RawMessage(`{"message_id":"`+id2+`"}`))
+	if err != nil {
+		t.Fatalf("取回: %v", err)
+	}
+	if !strings.Contains(part, "truncated at") || !strings.Contains(part, "remaining context headroom") {
+		t.Fatalf("小窗口应因余量不足而分段:\n%.400s", part)
+	}
+	if !strings.Contains(part, "tokens of request headroom left") {
+		t.Fatalf("回执应带上算出来的余量，便于判断:\n%.400s", part)
+	}
+	if strings.Contains(part, long) {
+		t.Fatal("小窗口下不应整条返回")
+	}
 }
