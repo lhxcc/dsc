@@ -76,6 +76,16 @@ func TouchActivity(ctx context.Context) {
 	}
 }
 
+// hasIdleDeadline 报告 ctx 上是否已装看门狗。
+//
+// 用途：宿主给「没有策略裁决、也没有 auto-background 能力」的工具补一个默认空闲预算时，
+// 要先确认没人在管——策略插件已经装了就别再套一层（两层计时器会互相抢先后，
+// 模型看到的文案也会随机变成宿主的通用措辞）。
+func hasIdleDeadline(ctx context.Context) bool {
+	h, _ := ctx.Value(activityKey{}).(*activityHandle)
+	return h != nil
+}
+
 // IdleDeadlineExceeded 报告 ctx 是否因空闲看门狗触发而取消。
 // 供执行域安装方（工具流水线桥）在执行返回后判定：cause 为 ErrIdleDeadline
 // 时以裁决文案替换执行错误。

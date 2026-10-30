@@ -205,6 +205,27 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 			defer cancel()
 		}
 	}
+	// 默认空闲预算（没有 auto-background 能力的工具）。
+	//
+	// 这类工具不会被「交给后台」——它们没声明自己适合脱离本轮继续跑。于是安静到预算
+	// 耗尽时只剩一个选择：终止本次调用（而不是像命令那样转后台让模型反复 job_output）。
+	// 不这么做，一个卡住的工具会一直占着这一轮。
+	//
+	// 三条不装：策略插件已经裁决过（别套两层计时器）、工具自带 timeoutMs（尊重它）、
+	// 该工具声明了 auto-background（那条路走前台宽限期，见 runWithGrace）。
+	var defaultIdle time.Duration
+	if autoBackgroundGrace > 0 && timeoutMs == 0 && !hasIdleDeadline(execCtx) {
+		autoBG := false
+		if ct, ok := tool.(CapabilityTool); ok {
+			autoBG = ct.HasCapability(CapabilityAutoBackground)
+		}
+		if !autoBG {
+			var cancel context.CancelFunc
+			execCtx, cancel = WithIdleDeadline(execCtx, autoBackgroundGrace)
+			defer cancel()
+			defaultIdle = autoBackgroundGrace
+		}
+	}
 	// 通用 panic recover：任何工具执行 panic 都转为错误返回，避免宿主进程崩溃。
 	// 覆盖 host 内置工具（runCodeTool / cron 管理工具等）与 RemoteTool（虽插件 SDK
 	// 已 recover 一次，但若插件未用 SDK或 RemoteTool 自身 gRPC 调用 panic 仍兜底）。
@@ -231,6 +252,11 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = &ToolTimeoutError{Tool: toolName, Ms: timeoutMs}
+	}
+	// 默认空闲预算触发：换成模型能行动的文案（说明它为什么被停、以及长任务该怎么做）。
+	if defaultIdle > 0 && IdleDeadlineExceeded(execCtx) {
+		err = fmt.Errorf("tool call stopped: no output for %s. This tool cannot be moved to background, "+
+			"so the call was cancelled instead of holding the turn open — pass run_in_background:true if you expect it to run long", defaultIdle)
 	}
 	// 结果净化：工具输出可能携带非法 UTF-8（如 Windows 原生命令的 OEM 码页输出、
 	// GBK 编码的文件内容），原样进入会话日志/LLM 请求后，proto string 字段会拒绝

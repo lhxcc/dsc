@@ -105,13 +105,13 @@ func TestAutoBackgroundMovesToBackgroundAfterGrace(t *testing.T) {
 	}
 }
 
-// TestAutoBackgroundWithoutCapabilityStaysSync 未声明能力的工具不受影响，
-// 即便执行时间超过宽限期也不转后台。
+// TestAutoBackgroundWithoutCapabilityStaysSync 未声明能力的工具**不登记任务**：
+// 它没有「交出去继续跑」的资格，所以预算内跑完就原样同步返回（job_list 里不留记录）。
 func TestAutoBackgroundWithoutCapabilityStaysSync(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
-	withGrace(t, 10*time.Millisecond)
+	withGrace(t, 200*time.Millisecond)
 	if err := m.toolRegistry.Register(&graceTool{
-		name: "plain_cmd", delay: 40 * time.Millisecond, out: "sync",
+		name: "plain_cmd", delay: 10 * time.Millisecond, out: "sync",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -122,6 +122,35 @@ func TestAutoBackgroundWithoutCapabilityStaysSync(t *testing.T) {
 	}
 	if out != "sync" {
 		t.Fatalf("out = %q，未声明能力的工具应原样同步返回", out)
+	}
+	if n := len(m.jobs.List("")); n != 0 {
+		t.Fatalf("未声明能力的工具不应登记任务，job_list = %d", n)
+	}
+}
+
+// TestAutoBackgroundWithoutCapabilityTerminates 未声明 auto-background 能力的工具：
+// 安静到预算耗尽就**终止**本次调用，而不是转后台（它没声明适合脱离本轮继续跑），
+// 更不能无限期占着这一轮。
+func TestAutoBackgroundWithoutCapabilityTerminates(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 30*time.Millisecond)
+	if err := m.toolRegistry.Register(&graceTool{
+		name: "plain_slow", delay: 10 * time.Second, out: "never",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	start := time.Now()
+	_, err := m.ExecuteTool(context.Background(), "plain_slow", json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("超过预算应终止并报错")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("应在预算附近终止，实际等了 %v", elapsed)
+	}
+	if !strings.Contains(err.Error(), "cannot be moved to background") ||
+		!strings.Contains(err.Error(), "run_in_background") {
+		t.Fatalf("错误文案应说明为何终止、以及长任务该怎么做，实际 %q", err)
 	}
 	if n := len(m.jobs.List("")); n != 0 {
 		t.Fatalf("未声明能力的工具不应登记任务，job_list = %d", n)
