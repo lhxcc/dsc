@@ -156,6 +156,9 @@ type Manager struct {
 	calibDriftHits map[string]int       // 连续漂移计数的当前段
 	calibMu        sync.RWMutex
 
+	// stalePluginsWarned 记录已经提示过「插件比宿主旧」的插件，避免每次拉起都刷一条。
+	stalePluginsWarned map[string]bool
+
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
 	stopHooks map[string][]func() error
 
@@ -2673,12 +2676,75 @@ func (m *Manager) pluginCmd(entry PluginEntry, binaryPath, execDir string) *exec
 	if execDir == "" {
 		execDir = m.config.ExecDir
 	}
+	m.warnIfPluginStale(entry.Name, binaryPath)
 	cmd := exec.Command(binaryPath)
 	if execDir != "" {
 		cmd.Dir = execDir
 	}
 	cmd.Env = m.coreEnv(entry)
 	return cmd
+}
+
+// warnIfPluginStale 提示「插件二进制比宿主旧」。
+//
+// 现场代价：连续几次部署只替换了 dsc.exe，插件仍是几小时前的版本——宿主已按新的估算
+// 系数/收口策略工作，插件却还在用旧口径算压缩预算，而现象看起来是「修复没生效」。
+// 部署漏拷不是运行时能修的，但至少要说出来，而不是让人对着「明明改了却没变化」猜。
+func (m *Manager) warnIfPluginStale(name, binaryPath string) {
+	if m == nil || strings.TrimSpace(binaryPath) == "" {
+		return
+	}
+	hostMTime, err := hostExeMTime()
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(binaryPath)
+	if err != nil {
+		return
+	}
+	// 留 1 分钟余量：构建与拷贝的时间差不该报警。
+	if !info.ModTime().Before(hostMTime.Add(-time.Minute)) {
+		return
+	}
+	m.mu.Lock()
+	if m.stalePluginsWarned == nil {
+		m.stalePluginsWarned = make(map[string]bool)
+	}
+	warned := m.stalePluginsWarned[name]
+	m.stalePluginsWarned[name] = true
+	m.mu.Unlock()
+	if warned {
+		return
+	}
+	m.logger.Warn("plugin binary is older than the host executable",
+		"plugin", name, "binary", binaryPath,
+		"plugin_built", info.ModTime().Format(time.RFC3339),
+		"host_built", hostMTime.Format(time.RFC3339),
+		"hint", "部署只替换了主程序：插件仍是旧版，行为可能与宿主的新口径不一致——请整包重新部署并重启")
+}
+
+// hostExeMTime 返回宿主可执行文件的修改时间（构建时间的近似）。缓存：一次进程内不变。
+var (
+	hostExeMTimeOnce sync.Once
+	hostExeMTimeVal  time.Time
+	hostExeMTimeErr  error
+)
+
+func hostExeMTime() (time.Time, error) {
+	hostExeMTimeOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			hostExeMTimeErr = err
+			return
+		}
+		info, err := os.Stat(exe)
+		if err != nil {
+			hostExeMTimeErr = err
+			return
+		}
+		hostExeMTimeVal = info.ModTime()
+	})
+	return hostExeMTimeVal, hostExeMTimeErr
 }
 
 // newPluginClientConfig 是插件客户端配置的唯一构造入口（与 pluginCmd 配套）。
