@@ -169,3 +169,27 @@ func TestManagerAutoFitsAndApplies(t *testing.T) {
 		t.Fatalf("系数未按账本校正: %v", active.PerMille)
 	}
 }
+
+// TestOverflowSampleFeedsRatioNotFit provider 400 的报数是一条真实样本（sent↔actual），
+// 但**没有构成计数**：它必须进比例校准，不得进系数最小二乘（全零类别列会把权重推高）。
+func TestOverflowSampleFeedsRatioNotFit(t *testing.T) {
+	resetCoefs(t)
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	sample := UsageSample{Model: "m400", Sent: 1000, Actual: 1170, NoClasses: true}
+
+	m.recordUsageSample("sess", sample)
+	m.calibMu.RLock()
+	c := m.calib["m400"]
+	m.calibMu.RUnlock()
+	if c == nil || c.Samples != 1 {
+		t.Fatalf("比例校准应吸收这条样本: %+v", c)
+	}
+	if c.Factor < 1.16 || c.Factor > 1.18 {
+		t.Fatalf("比例应约 1.17，got %.3f", c.Factor)
+	}
+
+	// 系数拟合：这类样本一律跳过（这里只有它们，所以样本不足）
+	if _, err := FitTokenCoefficients("m400", []UsageSample{sample}, DefaultTokenCoefs()); err == nil {
+		t.Fatal("无构成计数的样本不应参与系数拟合")
+	}
+}

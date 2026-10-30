@@ -31,6 +31,15 @@ const (
 	// 「渲染后 1.07M」发出的——宁可早丢一点，也不要用 400 去发现偏差。
 	contextCeilingRatio = 0.90
 
+	// contextCeilingUnvalidatedRatio 是「本会话还没有任何实测」时的收口比例。
+	//
+	// 0.90 的余量是按「偏差系数已经可信」设计的：它假设 inflation 能吸收我们的估算误差。
+	// 但续上一份长会话（重启后第一次请求）时，既没有本会话锚点，跨会话校准又可能来自
+	// 完全不同量级的请求——实测过一次：939,014 估算（余量后）→ provider 1,099,278，
+	// 差 17%，远超 10% 的余量，直接 400。那一刻历史最厚、最没有依据，就该多让一步：
+	// 0.80 换来的是一次不撞墙，代价只是首帧少留一点旧历史（压缩后端本来也会压）。
+	contextCeilingUnvalidatedRatio = 0.80
+
 	// estimateInflationMax 估算偏差系数的上限。只放大、不缩小：估算偏大时多丢历史
 	// 是净损失，而偏差系数本身就是从「provider 比我们算得多」这一现象里得来的。
 	estimateInflationMax = 1.5
@@ -213,18 +222,28 @@ func slideNote(dropped, droppedTokens int) *proto.Message {
 // inflation 由 estimateInflation 给出（≥1），用于把「我们算的」放大成「provider 大概
 // 会算的」再与上限比较。window<=0（窗口未知）时不裁。
 func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, inflation float64) (out []*proto.Message, dropped, before, after int, fits bool) {
+	return enforceRequestCeilingAt(msgs, toolsTokens, window, inflation, contextCeilingRatio)
+}
+
+// enforceRequestCeilingAt 是 enforceRequestCeiling 的显式比例版本：ratio 是「允许占窗口
+// 的比例」。正常档 0.90；本会话尚无实测时更保守；被 provider 拒过之后逐次递减（见
+// overflowTrimRatio）——单靠 inflation 一个比例在「越裁越密」的尾部上不保证收敛。
+func enforceRequestCeilingAt(msgs []*proto.Message, toolsTokens, window int, inflation, ratio float64) (out []*proto.Message, dropped, before, after int, fits bool) {
 	if window <= 0 || len(msgs) == 0 {
 		return msgs, 0, 0, 0, true
 	}
 	if inflation < 1 {
 		inflation = 1
 	}
+	if ratio <= 0 || ratio > 1 {
+		ratio = contextCeilingRatio
+	}
 	before = EstimateProtoMessagesTokens(msgs) + toolsTokens
 	effective := int(float64(before) * inflation)
 	if effective <= window {
 		return msgs, 0, before, before, true
 	}
-	limit := int(float64(window) * contextCeilingRatio)
+	limit := int(float64(window) * ratio)
 	// 裁剪按「真实估算」做，但预算按放大后的口径收紧：把 limit 除以 inflation，
 	// 等价于「让 provider 看到的不超过 limit」。
 	if inflation > 1 {

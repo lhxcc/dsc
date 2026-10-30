@@ -314,7 +314,8 @@ func readUsageLedger(path string) ([]UsageSample, error) {
 func FitTokenCoefficients(model string, samples []UsageSample, current *TokenCoefSet) (*TokenCoefSet, error) {
 	rows := make([]UsageSample, 0, len(samples))
 	for _, s := range samples {
-		if s.Model == model && s.Sent > 0 && s.Actual > 0 {
+		// NoClasses 的样本（provider 4xx 报数）没有构成，只能进比例校准，不能进系数拟合。
+		if s.Model == model && s.Sent > 0 && s.Actual > 0 && !s.NoClasses {
 			rows = append(rows, s)
 		}
 	}

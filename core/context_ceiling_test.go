@@ -412,3 +412,76 @@ func TestFinishPreStepTrimsWhenWindowUnknown(t *testing.T) {
 		t.Fatal("最后一条消息必须保留")
 	}
 }
+
+// TestCeilingConservativeWithoutSessionEvidence 续长会话的首帧没有本会话实测时，
+// 用更保守的收口比例（0.80 而不是 0.90）。
+//
+// 现场：939,014 估算（0.90 余量后）→ provider 1,099,278，差 17%，10% 的余量根本不够，
+// 直接 400。那一刻历史最厚、最没有依据，就该多让一步。
+func TestCeilingConservativeWithoutSessionEvidence(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(100_000)
+	m.SetModelName("model-a")
+	s := &llmAggregateServer{m: m}
+
+	big := strings.Repeat("这行内容会占掉不少 tokens，用来把窗口填满。", 4000)
+	msgs := []*proto.Message{{Role: "user", Content: big}, {Role: "user", Content: "最后一条"}}
+	out, err := s.finishPreStep(&proto.ChatRequest{Messages: msgs, SessionId: "no-anchor"}, msgs, false)
+	if err != nil {
+		t.Fatalf("不应报错（应滑窗收口）: %v", err)
+	}
+	after := EstimateProtoMessagesTokens(out.Messages)
+	// 无证据档：不得超过 0.80×窗口（留下 20% 余量给估算误差）
+	if limit := int(float64(100_000) * contextCeilingUnvalidatedRatio); after > limit {
+		t.Fatalf("无本会话实测时应按 0.80 收口：after=%d limit=%d", after, limit)
+	}
+	// 但它不该比有证据档（0.90）更保守到离谱：至少保留 40% 窗口的历史
+	if after < 40_000 {
+		t.Fatalf("收口过头：after=%d", after)
+	}
+}
+
+// TestCeilingShrinksAfterEachRejection 被 provider 拒过之后，重试目标逐次递减：
+// 单靠一个 inflation 比例在「越裁越密」的尾部上不保证收敛。
+func TestCeilingShrinksAfterEachRejection(t *testing.T) {
+	if overflowTrimRatio(1) >= contextCeilingRatio || overflowTrimRatio(2) >= overflowTrimRatio(1) {
+		t.Fatalf("重试比例必须递减：1→%.2f 2→%.2f", overflowTrimRatio(1), overflowTrimRatio(2))
+	}
+
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(100_000)
+	m.SetModelName("model-a")
+	s := &llmAggregateServer{m: m}
+	// 先给它一个本会话锚点（否则走的是无证据档，比值会更低）
+	m.recordSessionAnchor("over", sessionUsageAnchor{promptTokens: 50_000, sentEstimate: 50_000, model: "model-a", contextWindow: 100_000})
+
+	// 多条中等消息：裁剪才有粒度（两条超长消息会被「至少保留最后一条」压到同一档）
+	body := strings.Repeat("这行内容会占掉不少 tokens，用来把窗口填满。", 60)
+	var msgs []*proto.Message
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: body})
+	}
+	msgs = append(msgs, &proto.Message{Role: "user", Content: "最后一条"})
+	req := &proto.ChatRequest{Messages: msgs, SessionId: "over"}
+
+	before, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("首次收口不应报错: %v", err)
+	}
+	first := EstimateProtoMessagesTokens(before.Messages)
+
+	// 模拟被 provider 拒两次：每次 noteOverflow 都会把重试目标压一档
+	m.noteOverflow("over", 110_000, 100_000, 90_000)
+	m.noteOverflow("over", 105_000, 100_000, 85_000)
+	after2, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("重试收口不应报错: %v", err)
+	}
+	second := EstimateProtoMessagesTokens(after2.Messages)
+	if second >= first {
+		t.Fatalf("被拒两次后应收得更紧：first=%d second=%d", first, second)
+	}
+	if second > int(float64(100_000)*overflowTrimRatio(2)) {
+		t.Fatalf("应按第 2 档目标收口：second=%d limit=%d", second, int(float64(100_000)*overflowTrimRatio(2)))
+	}
+}

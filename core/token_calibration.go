@@ -45,6 +45,10 @@ type UsageSample struct {
 	MsgEst  int    `json:"msg_est"`
 	ToolEst int    `json:"tool_est"`
 	Classes [7]int `json:"classes"`
+	// NoClasses 表示这条样本只有总量（来自 provider 的 400 报数），没有构成计数：
+	// 它可以进比例校准（actual/sent 是真实证据），但**不得**参与系数最小二乘——
+	// 全零的类别列会让拟合把权重往上推。
+	NoClasses bool `json:"no_classes,omitempty"`
 }
 
 // modelCalibration 单个模型的校准条目。

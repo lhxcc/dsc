@@ -340,9 +340,20 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 	}
 	if window > 0 {
 		inflation := s.m.ceilingInflation(session, s.m.modelName)
+		// 收口比例：有本会话实测才用 0.90 的常规余量；续长会话的首帧没有依据，
+		// 用更保守的 0.80；被 provider 拒过之后逐次递减，保证重试一定收敛。
+		ratio := contextCeilingRatio
+		if _, ok := s.m.lastSessionAnchor(session); !ok {
+			ratio = contextCeilingUnvalidatedRatio
+		}
+		if adj, ok := s.m.overflowFor(session); ok {
+			if r := overflowTrimRatio(adj.attempts); r > 0 && r < ratio {
+				ratio = r
+			}
+		}
 		var before, after int
 		var fits bool
-		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
+		trimmed, dropped, before, after, fits = enforceRequestCeilingAt(msgs, toolsTokens, window, inflation, ratio)
 		surface = after
 		if !fits {
 			// 滑窗之后仍超：剩下的这一段本身就是这一轮的内容（通常是最后一条工具结果），
@@ -555,9 +566,20 @@ func (s *llmAggregateServer) emitRequestError(ctx context.Context, req *proto.Ch
 	// 强制截断），一次就把几百条真实消息永久埋掉。这里改为「记住 provider 的实测值与
 	// 上限 → 收紧本会话预算 → 要求重试」，重试时 pre-step 收口会滑窗（会话日志不动）。
 	if code == "context_window_exceeded" {
-		sent := EstimateProtoMessagesTokens(req.GetMessages()) + EstimateProtoToolTokens(req.GetTools())
+		stats := MeasureRequestSurface(req.GetMessages(), req.GetTools())
 		actual, max := overflowParse(err.Error())
-		s.m.noteOverflow(req.GetSessionId(), actual, max, sent)
+		s.m.noteOverflow(req.GetSessionId(), actual, max, stats.Estimate)
+		// 被拒的一次同样是真实证据：provider 亲口报了多少，除以我们算的多少，就是这一
+		// 档内容规模的偏差。**记进账本与比例校准**，这样下一发（乃至下次启动）就有依据，
+		// 而不是每次都在同一个规模上重新学。没有构成计数，所以标 NoClasses 让它只进
+		// 比例、不进系数拟合。
+		if actual > 0 {
+			s.m.recordUsageSample(req.GetSessionId(), UsageSample{
+				Model: s.m.modelName, Sent: stats.Estimate, Actual: actual,
+				Msgs: stats.Msgs, MsgEst: stats.MsgEstimate, ToolEst: stats.ToolEstimate,
+				NoClasses: true,
+			})
+		}
 		return true
 	}
 	result, _ := s.m.dispatchEventToPlugins(EventAgentRequestError, AgentRequestErrorEvent{
