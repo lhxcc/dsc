@@ -146,7 +146,7 @@ type Manager struct {
 	// 供 agent/pre-step 计算投影压力（对齐 DSH tokenMeter.measure 的 baseline+delta）：
 	// 只有信封可比时才把用量当底数，否则退回启发式估算。
 	// 仅流式请求（ChatStream 回传 usage）记录；非流式 Chat 不携带 usage。
-	sessionAnchors  map[string]sessionUsageAnchor
+	sessionAnchors  map[string]*sessionAnchorSet
 	sessionAnchorMu sync.RWMutex
 
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
@@ -359,7 +359,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		events:              NewEventBus(),
 		policyOff:           make(map[string][]func()),
 		sessionApproval:     make(map[string]ApprovalPolicy),
-		sessionAnchors:      make(map[string]sessionUsageAnchor),
+		sessionAnchors:      make(map[string]*sessionAnchorSet),
 		jobs:                jobs.NewRegistry(),
 	}
 	m.jobs.SetLogger(m.logger)

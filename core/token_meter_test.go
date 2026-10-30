@@ -69,35 +69,59 @@ func TestTokenMeterShouldCompact(t *testing.T) {
 	}
 }
 
-// TestTokenMeterEstimateTextTokens 校验文本估算：按字符分类累加——宽字符 1 token/字，
-// 其余 4 字节/token。
+// TestTokenMeterEstimateTextTokens 校验文本估算：按字符类别加权（字母 0.226、空白
+// 0.139、数字 0.624、标点 0.734、CJK 0.873、emoji 1.8、其余符号 1.0）。
 //
-// 回归背景：旧实现取「整串字节/4」与「整串 rune 数」的较大者，纯 ASCII 时 runes==bytes，
-// 于是按 1 token/字符计（真实约 0.25），代码类会话被高估 4~5 倍，进而触发毫无必要的
-// 上下文裁剪/压缩。此处的期望值就是按正确口径重算的：
+// 这些系数来自「把真实会话片段发给模型端点读 usage.prompt_tokens」的最小二乘拟合，
+// 不是拍脑袋。两处旧假设都被实测否证：窄字符并不统一（标点/数字比字母贵 3 倍），
+// CJK 也不是 1 token/字（实测 0.87）。
 func TestTokenMeterEstimateTextTokens(t *testing.T) {
 	cases := []struct {
 		in   string
 		want int
 		why  string
 	}{
-		{"hello", 2, "5 字节英文 → ceil(5/4)"},
-		{"你好", 2, "两个 CJK 字 → 2"},
-		{"hi你好", 3, "ceil(2/4)=1 + 2 CJK 字"},
+		{"hello", 2, "5 字母 ×0.226 = 1.13 → 2"},
+		{"你好", 2, "2 CJK ×0.873 = 1.75 → 2"},
+		{"hi你好", 3, "2 字母 0.45 + 2 CJK 1.75 = 2.2 → 3"},
 		{"", 0, "空串"},
-		{"if (x < 10) { y = z; }", 6, "18 字节代码 → ceil(18/4)，不得按字符数算成 19"},
-		{"全角（），。", 6, "全角标点按 1 token/字"},
-		{"abc你好def", 4, "窄字节 3+3 合并后 ceil(6/4)=2 + 2 CJK 字（宽窄边界不另计）"},
+		{"if (x < 10) { y = z; }", 9, "代码：5 字母 + 2 数字 + 7 标点 + 8 空白 ≈ 8.6 → 9"},
+		{"全角（），。", 6, "6 个全角字符 ≈ 5.2 → 6"},
+		{"abc你好def", 4, "6 字母 1.36 + 2 CJK 1.75 = 3.1 → 4"},
 	}
 	for _, c := range cases {
 		if got := EstimateTextTokens(c.in); got != c.want {
 			t.Errorf("EstimateTextTokens(%q) = %d, want %d（%s）", c.in, got, c.want, c.why)
 		}
 	}
-	// 纯 ASCII 长文本不得再退化成「1 token/字符」（旧 bug 的判据）
+	// 纯 ASCII 长文本按字母 0.226 折算，不得退化成 1 token/字符
 	ascii := strings.Repeat("a", 4000)
-	if got := EstimateTextTokens(ascii); got != 1000 {
-		t.Errorf("4000 字节纯 ASCII 应约 1000 tokens，got %d（按字符数算会是 4000）", got)
+	if got := EstimateTextTokens(ascii); got != 904 {
+		t.Errorf("4000 个字母应约 904 tokens，got %d（按字符数算会是 4000）", got)
+	}
+}
+
+// TestEstimateOrdersContentByClass 分类系数的**方向**必须对：同样是 N 个字符，
+// 工具输出（标点/数字）比英文散文贵、CJK 比英文贵、emoji 最贵。
+//
+// 这条守的是「构成相关误差」——偏差系数只能整体缩放，修不了「这一步是 JSON 工具输出、
+// 那一步是中文段落」带来的漂移。系数值可以再校，顺序不能反。
+func TestEstimateOrdersContentByClass(t *testing.T) {
+	n := 300
+	letter := EstimateTextTokens(strings.Repeat("a", n))
+	space := EstimateTextTokens(strings.Repeat(" ", n))
+	digit := EstimateTextTokens(strings.Repeat("7", n))
+	punct := EstimateTextTokens(strings.Repeat(";", n))
+	cjk := EstimateTextTokens(strings.Repeat("字", n))
+	emoji := EstimateTextTokens(strings.Repeat("🙂", n))
+
+	if !(space < letter && letter < digit && digit < punct && punct < cjk && cjk < emoji) {
+		t.Fatalf("分类顺序错误：space=%d letter=%d digit=%d punct=%d cjk=%d emoji=%d",
+			space, letter, digit, punct, cjk, emoji)
+	}
+	// 数量级：同一份 1KB 的 JSON 与 1KB 英文，差距不该只有个位数
+	if punct < letter*2 {
+		t.Fatalf("标点应显著高于字母（实测 0.734 vs 0.226），got punct=%d letter=%d", punct, letter)
 	}
 }
 
@@ -141,7 +165,7 @@ func TestEstimateProtoMessageTokens(t *testing.T) {
 	if got != 6 {
 		t.Errorf("ascii user msg = %d, want 6", got)
 	}
-	// CJK：每字 1 token（rune 计数），3 字 + 4 = 7
+	// CJK：3 字 ×0.873 = 2.6 → 3，+4 = 7
 	got = EstimateProtoMessageTokens(&proto.Message{Role: "user", Content: "你好啊"})
 	if got != 7 {
 		t.Errorf("cjk user msg = %d, want 7", got)
@@ -167,9 +191,9 @@ func TestEstimateProtoMessageTokens(t *testing.T) {
 	got = EstimateProtoMessageTokens(&proto.Message{
 		Role:      "assistant",
 		ToolCalls: []*proto.ToolCall{{Name: "shell", ArgumentsJson: `{"cmd":"ls"}`}},
-	}) // content 空 0 + 4 + EstimateTextTokens(`shell{"cmd":"ls"}`)(17 字节 → 5) + 8 = 17
-	if got != 17 {
-		t.Errorf("tool-call msg = %d, want 17", got)
+	}) // content 0 + 4 + EstimateTextTokens(`shell{"cmd":"ls"}`)=8（10 字母 2.3 + 7 标点 5.1）+ 8 = 20
+	if got != 20 {
+		t.Errorf("tool-call msg = %d, want 20", got)
 	}
 	// 列表求和
 	msgs := []*proto.Message{

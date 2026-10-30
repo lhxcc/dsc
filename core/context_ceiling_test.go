@@ -152,25 +152,25 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 1_100_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("偏差系数 = %v，期望约 1.1", got)
 	}
 
 	// 工具目录变了（升级）→ 偏差系数照样成立
-	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("工具目录变化不应作废偏差系数，得到 %v", got)
 	}
 
 	// 窗口变了 → 比例与窗口无关，照样成立
 	m.SetContextWindow(131072)
-	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("窗口变化不应作废偏差系数，得到 %v", got)
 	}
 	m.SetContextWindow(1_048_576)
 
 	// 换模型（分词器不同）→ 照样成立：比例只移动一两成，清零则等于丢掉全部记忆
 	m.SetModelName("model-b")
-	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("换模型不应作废偏差系数，得到 %v", got)
 	}
 
@@ -179,12 +179,12 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 800_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s2"); got != 1 {
+	if got := m.estimateInflation("s2", "model-a"); got != 1 {
 		t.Fatalf("偏大不应缩小，得到 %v", got)
 	}
 
 	// 无锚点（首次请求/重启）→ 1
-	if got := m.estimateInflation("nope"); got != 1 {
+	if got := m.estimateInflation("nope", "model-a"); got != 1 {
 		t.Fatalf("无锚点应为 1，得到 %v", got)
 	}
 
@@ -193,8 +193,39 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 3_000_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s3"); got != estimateInflationMax {
+	if got := m.estimateInflation("s3", "model-a"); got != estimateInflationMax {
 		t.Fatalf("应夹到 %v，得到 %v", estimateInflationMax, got)
+	}
+}
+
+// TestInflationBorrowsAcrossModels 换模型时，系数先借上一个模型的，等这一帧的用量
+// 结算后再换成自己的——而不是退回 1。
+//
+// 退回 1 等于在「刚切过去、还没有任何新用量」的那一刻放弃全部记忆，而那正是历史最厚
+// 的时候；借来的比例只差一两成，两害相权取其轻。每个模型自己的比例都保留，切回去
+// 还能用。
+func TestInflationBorrowsAcrossModels(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.recordSessionAnchor("s", sessionUsageAnchor{
+		promptTokens: 1_100_000, sentEstimate: 1_000_000, model: "model-a",
+	})
+	if got := m.estimateInflation("s", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("同模型应用自己的比例，得到 %v", got)
+	}
+	// 换到从没见过的模型：借上一份，不得退回 1
+	if got := m.estimateInflation("s", "model-b"); got < 1.09 || got > 1.11 {
+		t.Fatalf("换模型应先借上一个模型的比例，得到 %v（退回 1 就是这个问题本身）", got)
+	}
+	// 新模型结算一帧后，用自己的比例
+	m.recordSessionAnchor("s", sessionUsageAnchor{
+		promptTokens: 1_300_000, sentEstimate: 1_000_000, model: "model-b",
+	})
+	if got := m.estimateInflation("s", "model-b"); got < 1.29 || got > 1.31 {
+		t.Fatalf("新模型应改用自己的比例，得到 %v", got)
+	}
+	// 切回旧模型：它自己的比例还在
+	if got := m.estimateInflation("s", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("切回旧模型应仍记得它的比例，得到 %v", got)
 	}
 }
 

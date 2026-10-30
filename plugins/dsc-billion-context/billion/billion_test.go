@@ -1109,7 +1109,7 @@ func TestTierNudgeIgnoresSmallBlockCount(t *testing.T) {
 	cfg := DefaultConfig(1_000_000)
 	cfg.NudgeThresholdPct = 0.30
 	state := CreateInitialState()
-	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 50 token，合计 ~500 token
+	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 45 token（字母 0.226/字），合计 ~450 token
 	for i := 0; i < 10; i++ {
 		state.Blocks = append(state.Blocks, CompressionBlock{
 			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
@@ -1135,11 +1135,12 @@ func TestTierNudgeFiresOnSummaryMass(t *testing.T) {
 	cfg := DefaultConfig(1_000_000)
 	cfg.NudgeThresholdPct = 0.30
 	state := CreateInitialState()
-	// 40 条摘要、每条 8000 字节 ASCII ≈ 2000 token，合计 ~80K > 75000 门槛
+	// 40 条摘要、每条 9000 字节 ASCII ≈ 2034 token（换算器按字母 0.226/字），
+	// 合计 ~81K > 75000 门槛
 	for i := 0; i < 40; i++ {
 		state.Blocks = append(state.Blocks, CompressionBlock{
 			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
-			Summary: strings.Repeat("y", 8000), CompressedTokens: 20000,
+			Summary: strings.Repeat("y", 9000), CompressedTokens: 20000,
 		})
 	}
 	state.NextBlockID = 40

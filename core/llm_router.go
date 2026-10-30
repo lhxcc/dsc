@@ -326,7 +326,7 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 			"hint", "宿主未拿到窗口（配置/探测都缺）：按默认值收口，避免发出必然被 provider 拒绝的请求")
 	}
 	if window > 0 {
-		inflation := s.m.ceilingInflation(session)
+		inflation := s.m.ceilingInflation(session, s.m.modelName)
 		var before, after int
 		var fits bool
 		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
@@ -414,6 +414,18 @@ type sessionUsageAnchor struct {
 	contextWindow int    // 产生该用量时的上下文窗口（0 = 未知）
 }
 
+// sessionAnchorSet 一个会话的用量锚点：最近一次（与信封无关，供热路径读）加上
+// 按模型分开的一份。
+//
+// 为什么要按模型分开：估算偏差（provider 计数 / 我们的估算）是分詞器相关的属性。
+// 换模型后比例会变，但**不该因此退回 1**——那等于在最缺依据的时刻（刚切过去、还没
+// 产生任何新用量）放弃全部记忆。所以这里保留每个模型最近一次的比例：当前模型有记录
+// 就用它，没有就借「上一个用过的那份」，等这一帧的新用量结算后自动换成自己的。
+type sessionAnchorSet struct {
+	latest  sessionUsageAnchor
+	byModel map[string]sessionUsageAnchor
+}
+
 // recordSessionAnchor 按会话记录最近一次成功 LLM 请求的用量锚点
 // （对齐 DSH tokenMeter 的 pressureTokens + request header 语义）。空会话 id 或
 // 非正用量忽略（内部调用/非流式请求无上报值，不污染会话状态）。
@@ -426,7 +438,24 @@ func (m *Manager) recordSessionAnchor(sessionID string, a sessionUsageAnchor) {
 	m.clearOverflow(sessionID)
 	m.sessionAnchorMu.Lock()
 	defer m.sessionAnchorMu.Unlock()
-	m.sessionAnchors[sessionID] = a
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		set = &sessionAnchorSet{byModel: make(map[string]sessionUsageAnchor, 2)}
+		m.sessionAnchors[sessionID] = set
+	}
+	set.latest = a
+	if a.model != "" {
+		// 只留最近几个：一个会话切模型的次数很少，但别让这张表无限长。
+		if len(set.byModel) >= 4 {
+			for k := range set.byModel {
+				if k != a.model {
+					delete(set.byModel, k)
+					break
+				}
+			}
+		}
+		set.byModel[a.model] = a
+	}
 }
 
 // lastSessionAnchor 返回某会话最近一次的用量锚点（ok=false = 无记录：
@@ -437,8 +466,38 @@ func (m *Manager) lastSessionAnchor(sessionID string) (sessionUsageAnchor, bool)
 	}
 	m.sessionAnchorMu.RLock()
 	defer m.sessionAnchorMu.RUnlock()
-	a, ok := m.sessionAnchors[sessionID]
-	return a, ok
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		return sessionUsageAnchor{}, false
+	}
+	return set.latest, true
+}
+
+// anchorForModel 取「用来推断估算偏差」的锚点：当前模型自己的优先，没有就借最近一次
+// 别的模型的（borrowed=true）。
+//
+// 借用是显式的、临时的：它只影响下一帧的预算判定，这一帧结算出的用量立刻写进
+// 当前模型名下，下一帧就用它自己的比例。宁可先用别家的数（偏差通常只差一两成），
+// 也不要在刚切模型时把系数退回 1——那是我们已知最危险的一侧。
+func (m *Manager) anchorForModel(sessionID, model string) (sessionUsageAnchor, bool, bool) {
+	if m == nil || sessionID == "" {
+		return sessionUsageAnchor{}, false, false
+	}
+	m.sessionAnchorMu.RLock()
+	defer m.sessionAnchorMu.RUnlock()
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		return sessionUsageAnchor{}, false, false
+	}
+	if model != "" {
+		if a, ok := set.byModel[model]; ok {
+			return a, true, false
+		}
+	}
+	if set.latest.promptTokens > 0 && set.latest.sentEstimate > 0 {
+		return set.latest, true, true
+	}
+	return sessionUsageAnchor{}, false, false
 }
 
 // projectPressure 由「锚点 + 当前表面」得出本轮压力（对齐 DSH tokenMeter.measure 的

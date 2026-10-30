@@ -68,7 +68,8 @@ func envelopeMatches(anchor sessionUsageAnchor, curToolsHash, curModel string, w
 // 两者一除就是这类内容的系统性偏差。它正是「算得不准，于是以为装得下」的修正项：
 // 判定上限时用放大后的估算，而不是相信我们自己的算数。
 //
-// **这个系数不随工具目录、窗口、模型变化而作废。** 下面三条按代价排过序：
+// **这个系数不随工具目录、窗口变化而作废；换模型时先借上一个模型的比例，再用自己
+// 的替换。** 下面三条按代价排过序：
 //
 //   - 估算偏差本身是量级上的问题（实测中文 + 工具负载，provider 数到的常是我们估算的
 //     1.4–1.7 倍），而换分词器只让比例移动一两成——丢掉记忆的误差比「用旧比例」大得多；
@@ -80,8 +81,10 @@ func envelopeMatches(anchor sessionUsageAnchor, curToolsHash, curModel string, w
 // 只在该次请求没被改写的情况下有意义——被压缩改写过的那次，promptTokens 描述的是
 // 改写后的表面、sentEstimate 也是（recordSessionAnchor 记的正是改写后的 req），所以
 // 仍然可比。provider 用量低于我们的估算时不缩小系数（偏大只会白丢历史）。
-func (m *Manager) estimateInflation(sessionID string) float64 {
-	anchor, ok := m.lastSessionAnchor(sessionID)
+func (m *Manager) estimateInflation(sessionID, model string) float64 {
+	// 当前模型自己的锚点优先；没有就借最近一次别的模型的（anchorForModel 的 borrowed）。
+	// 借来的比例只服务这一帧：本帧结算出的用量会写进当前模型名下，下一帧自动换成自己的。
+	anchor, ok, _ := m.anchorForModel(sessionID, model)
 	if !ok || anchor.promptTokens <= 0 || anchor.sentEstimate <= 0 {
 		return 1
 	}
@@ -99,8 +102,8 @@ func (m *Manager) estimateInflation(sessionID string) float64 {
 //
 // 两条来源的性质不同，都保留：锚点来自成功请求（promptTokens / sentEstimate），是长期
 // 系统偏差；超窗记录来自被拒的那一次，是一次**实证**——它一定比锚点更接近真相。
-func (m *Manager) ceilingInflation(sessionID string) float64 {
-	inflation := m.estimateInflation(sessionID)
+func (m *Manager) ceilingInflation(sessionID, model string) float64 {
+	inflation := m.estimateInflation(sessionID, model)
 	if adj, ok := m.overflowFor(sessionID); ok && adj.inflation > inflation {
 		inflation = adj.inflation
 	}

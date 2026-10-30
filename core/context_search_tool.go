@@ -251,9 +251,12 @@ func (m *Manager) requestHeadroomTokens(sessionID string, msgs []*proto.Message)
 		return 0
 	}
 	tools := m.AllToolsProto() // 工具目录每次请求都要发，漏算它会高估余量
+	m.mu.Lock()
+	model := m.modelName
+	m.mu.Unlock()
 
 	surface := EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
-	inflation := m.ceilingInflation(sessionID)
+	inflation := m.ceilingInflation(sessionID, model)
 	limit := float64(window) * contextCeilingRatio
 	if inflation > 1 {
 		limit /= inflation
