@@ -32,6 +32,17 @@ type hostMeterState struct {
 	// 真实表面判断「还没到阈值」——用户看到的现象就是「都 90% 了还不压缩」。
 	// 展示口径必须跟真正发出去的东西走，否则数字只是在描述一个不存在的请求。
 	actual int
+	// calib 是「实测用量 / 表面估算」的比值，用来把**改写后表面**的估算拉回真实量级。
+	//
+	// 为什么需要：压缩后端改写请求后，宿主只能用自己的估算去量那份新表面；而这个
+	// 估算对中文、工具负载系统性偏低（实测约 0.8），直接拿来显示会比 provider 真实
+	// 计数低 20%。现场就是这样：标题栏 397K、/context 面板 487K、provider 实报 498777
+	// ——同一个请求两个数，用户当然会问哪个对。
+	//
+	// 校准只在「同一请求既有 actual 又有实测」时更新（actual 每步开头会被清零，
+	// 所以有 actual 就说明这一步确实被改写过，两者对得上）。比值夹在 [0.5,2]，
+	// 并做指数平滑，避免单帧抖动让标题栏跳来跳去。
+	calib float64
 	// seed 是启动时用会话日志里的**历史**读数预置的提示值（上一次请求的用量）。
 	// 它不是测量：换了模型/窗口之后就只是在说「这份历史大概多大」。因此写在单独
 	// 字段、优先级最低，且不参与 MeasuredPromptTokens（否则会被误当成实测）。
@@ -102,10 +113,22 @@ func (h *HostContextMeters) NoteUsage(sessionID string, u *Usage, reportedContex
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st := h.stateLocked(sessionID)
+	measured := PromptSideTokens(u)
 	// 无增量基线（baseline=0）：Project 退化为实测值，作为"没有上报值时的下界"。
-	st.meter.SampleUsage(PromptSideTokens(u), 0)
+	st.meter.SampleUsage(measured, 0)
 	if reportedContextTokens > 0 {
 		st.reported = reportedContextTokens
+	}
+	// 用同一请求的实测校准改写后表面的估算（见 hostMeterState.calib 的注释）。
+	// actual 只在本步被改写时非 0，因此这里不会把「未改写一步的实测」错配到别的表面。
+	if st.actual > 0 && measured > 0 {
+		if ratio := float64(measured) / float64(st.actual); ratio >= 0.5 && ratio <= 2 {
+			if st.calib == 0 {
+				st.calib = ratio
+			} else {
+				st.calib = st.calib*0.7 + ratio*0.3
+			}
+		}
 	}
 }
 
@@ -134,7 +157,12 @@ func (h *HostContextMeters) ContextTokens(sessionID string) int {
 	v := st.seed
 	switch {
 	case st.actual > 0:
+		// 估算有已知的偏低偏差，用实测校准后的值才是「真实占用」；
+		// 校准数据还没到（第一帧改写）时先用原始估算，下一条响应对上就修正。
 		v = st.actual
+		if st.calib > 0 {
+			v = int(float64(v)*st.calib + 0.5)
+		}
 	case st.reported > 0:
 		v = st.reported
 	case st.meter.MeasuredPromptTokens() > 0:

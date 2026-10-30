@@ -302,3 +302,31 @@ func TestAskEmitsUserQuestionEvent(t *testing.T) {
 		t.Fatalf("事件载荷不对：%+v", got)
 	}
 }
+
+// TestContextTokensCalibratesRewrittenSurface 压缩后端改写请求后，宿主只能用自己的
+// 估算量那份新表面，而估算对中文/工具负载系统性偏低（实测偏低约 20%）。现场：
+// 标题栏 397K（原始估算）、/context 面板 487K（实测口径）、provider 实报 498777
+// 用同一请求的实测校准后，标题栏必须回到真实量级。
+func TestContextTokensCalibratesRewrittenSurface(t *testing.T) {
+	h := NewHostContextMeters(1_048_576)
+
+	// 压缩后宿主量到的表面（估算 397K），紧接着是同一次请求的实测 498777
+	h.NoteActualSurface("s", 397_000)
+	h.NoteUsage("s", &Usage{PromptTokens: 498_777, ContextTokens: 498_777}, 498_777)
+	if got := h.ContextTokens("s"); got < 490_000 || got > 505_000 {
+		t.Fatalf("校准后应接近实测 498777，got %d", got)
+	}
+
+	// 下一次改写后表面变小：校准继续作用在新表面上，而不是退回原始估算
+	h.NoteActualSurface("s", 240_000)
+	if got := h.ContextTokens("s"); got < 290_000 || got > 310_000 {
+		t.Fatalf("校准应继续作用于新表面：got %d", got)
+	}
+
+	// 离谱的实测比例（0.03%）不能污染校准
+	h.NoteActualSurface("s", 300_000)
+	h.NoteUsage("s", &Usage{PromptTokens: 100, ContextTokens: 100}, 100)
+	if got := h.ContextTokens("s"); got < 350_000 || got > 400_000 {
+		t.Fatalf("异常比例应被夹住，got %d", got)
+	}
+}

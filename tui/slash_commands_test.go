@@ -273,3 +273,29 @@ func TestSlashCompletionEscReturnsToParent(t *testing.T) {
 		t.Fatal("未进入分组时的 esc 应关闭菜单")
 	}
 }
+
+// TestSlashCommandClearsInput 命令被处理后输入框必须清空。
+//
+// 现场：插件声明的命令（/context 等）只由 TUI 转发，转发分支忘了 SetValue("")，
+// 于是敲完回车、命令输出已经打印出来，输入行里仍留着 "/context"，看起来像没提交。
+// 现在统一在 runSlashCommand 出口清，内置命令与插件命令一视同仁。
+func TestSlashCommandClearsInput(t *testing.T) {
+	m := newRenderCacheModel(t)
+
+	m.input.SetValue("/help")
+	if handled, _ := m.runSlashCommand(strings.TrimSpace(m.input.Value())); !handled {
+		t.Fatal("/help 应被处理")
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("命令处理后输入框应清空，仍有 %q", got)
+	}
+
+	// 不是命令的普通文本不能被清（它要作为消息发出去）
+	m.input.SetValue("普通消息")
+	if handled, _ := m.runSlashCommand(strings.TrimSpace(m.input.Value())); handled {
+		t.Fatal("普通文本不该被当作命令处理")
+	}
+	if got := m.input.Value(); got != "普通消息" {
+		t.Fatalf("普通文本不应被改动，got %q", got)
+	}
+}
