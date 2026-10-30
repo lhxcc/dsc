@@ -111,8 +111,9 @@ func TierMassThreshold(config Config) int {
 //  3. 存在可压缩范围（被覆盖消息外、保留区外）
 //
 // 增长门控（growth-gating）：
-//   - baselineTokens 在压缩成功后被重置为 0（见 ApplyCompression）
-//   - 下次 nudge 要求 currentTokens > baselineTokens + growthFloor
+//   - 提示时记下当时的规模（lastNudgeTokens），下次要求再涨够 growthFloor
+//   - 规模**变小**时（宿主滑窗裁剪、或压缩成功让表面回落）由调用方把基线
+//     下移到当前规模：旧基线已经不可达，守着它等于永久关闭提示
 //   - 这防止"压缩后立即又触发 nudge"的反馈循环
 func DecideNudge(messages []CoreMessage, state *CompressionState, config Config, tokenCount int) NudgeDecision {
 	decision := NudgeDecision{Breakdown: map[string]int{}}
@@ -136,15 +137,15 @@ func DecideNudge(messages []CoreMessage, state *CompressionState, config Config,
 
 	// 增长门控：自上次 nudge/baseline 后必须有增长（门槛随窗口缩放）
 	growthFloor := GrowthFloorTokens(config)
-	if state.Nudge.BaselineTokens > 0 {
-		if tokenCount-state.Nudge.BaselineTokens < growthFloor {
+	if state.Nudge.LastNudgeTokens > 0 {
+		if tokenCount-state.Nudge.LastNudgeTokens < growthFloor {
 			decision.Reason = fmt.Sprintf("insufficient growth since baseline (%d - %d < %d)",
-				tokenCount, state.Nudge.BaselineTokens, growthFloor)
+				tokenCount, state.Nudge.LastNudgeTokens, growthFloor)
 			return decision
 		}
 	}
 	decision.Breakdown["growthFloor"] = growthFloor
-	decision.Breakdown["baselineTokens"] = state.Nudge.BaselineTokens
+	decision.Breakdown["lastNudgeTokens"] = state.Nudge.LastNudgeTokens
 
 	// 计算可压缩范围，并按最小字符量门合并（#309：推荐永不低于 apply 侧最小门）
 	ranges := ComputeCompressibleRanges(messages, state, config)

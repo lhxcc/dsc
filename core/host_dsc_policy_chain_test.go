@@ -29,6 +29,7 @@ func TestHostDscPolicyChainPropagatesNotices(t *testing.T) {
 
 	// 1. spawn 真实插件进程（阈值 2 便于断言；排除表清空避免宿主 env 泄漏干扰）
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_REPEAT_THRESHOLDS=2", "DSC_REPEAT_EXCLUDE=")
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  Handshake,
@@ -122,6 +123,7 @@ func TestHostDscPolicyChainHonorsWorkspacePathForms(t *testing.T) {
 	}
 
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+filepath.ToSlash(ws))
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  Handshake,

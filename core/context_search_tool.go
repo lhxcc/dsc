@@ -256,7 +256,7 @@ func (m *Manager) requestHeadroomTokens(sessionID string, msgs []*proto.Message)
 	m.mu.Unlock()
 
 	surface := EstimateProtoMessagesTokens(msgs) + EstimateProtoToolTokens(tools)
-	inflation := m.ceilingInflation(sessionID, ToolsFingerprint(tools), model, window)
+	inflation := m.ceilingInflation(sessionID, model)
 	limit := float64(window) * contextCeilingRatio
 	if inflation > 1 {
 		limit /= inflation

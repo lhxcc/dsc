@@ -34,15 +34,19 @@ func assertView(t *testing.T, resp *proto.ExecuteToolResponse) dsc.ToolView {
 func TestE2EWithHostClient(t *testing.T) {
 	dir := t.TempDir()
 	exe := dsc.PJoin(dir, "tool-code-review")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
+	spawnCmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(spawnCmd)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
 		Plugins:          map[string]plugin.Plugin{},
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
-		Cmd:              exec.Command(exe),
+		Cmd:              spawnCmd,
 	})
 	defer client.Kill()
 

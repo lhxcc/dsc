@@ -69,9 +69,13 @@ func osGroupEnv(prefix string, useDSC bool, suffix string) string {
 	return strings.TrimSpace(os.Getenv(name))
 }
 
-// probeContextWindow 探测 LLAMACPP（或兼容 OpenAI 的服务）的上下文窗口大小。
-// 通过 GET {baseURL}/models 读取首条模型的 meta.n_ctx（LLAMACPP 提供），
-// 失败或未提供时返回 0，由调用方回退到配置值或默认 128K。
+// probeContextWindow 探测兼容 OpenAI 的服务的上下文窗口容量，返回 0 表示「服务端没说」。
+//
+// 字段按「谁最可信」排：llama.cpp 家族给 `meta.n_ctx`（真实运行时的 n_ctx，最准），
+// vLLM 给 `max_model_len`；网关/代理（LiteLLM、各类 OpenAI 兼容层）常见的写法是
+// `context_length`、`max_input_tokens`、`context_window`。多认几种是因为这条探测是
+// 「配置不得超过服务容量」这条规则的唯一信息来源——云端没有探测值时只能靠 4xx 事后教，
+// 那要白烧一次请求。
 func probeContextWindow(baseURL string) int {
 	u := strings.TrimRight(baseURL, "/") + "/models"
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -93,7 +97,10 @@ func probeContextWindow(baseURL string) int {
 			Meta struct {
 				Nctx int `json:"n_ctx"`
 			} `json:"meta"`
-			MaxModelLen int `json:"max_model_len"`
+			MaxModelLen    int `json:"max_model_len"`
+			ContextLength  int `json:"context_length"`
+			MaxInputTokens int `json:"max_input_tokens"`
+			ContextWindow  int `json:"context_window"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -102,13 +109,42 @@ func probeContextWindow(baseURL string) int {
 	if len(payload.Data) == 0 {
 		return 0
 	}
-	if payload.Data[0].Meta.Nctx > 0 {
-		return payload.Data[0].Meta.Nctx
-	}
-	if payload.Data[0].MaxModelLen > 0 {
-		return payload.Data[0].MaxModelLen
+	for _, v := range []int{
+		payload.Data[0].Meta.Nctx,
+		payload.Data[0].MaxModelLen,
+		payload.Data[0].ContextLength,
+		payload.Data[0].MaxInputTokens,
+		payload.Data[0].ContextWindow,
+	} {
+		if v > 0 {
+			return v
+		}
 	}
 	return 0
+}
+
+// resolveContextWindow 决定实际使用的上下文窗口，返回（窗口, 来源, 是否被服务端钳制）。
+//
+// **服务端能提供的容量是上限，配置只能往下调**：
+//   - 配置写大了（云端常被宣传成 1M，或用户图省事在 128K 后面补个 0）时，按服务端实测
+//     容量截断——否则每轮都要靠 provider 的 4xx 教一遍，白白烧掉一次请求与一段重试；
+//   - 配置写小了（用 32K 省成本）时保留配置值：那是用户的刻意选择，不该被抬高；
+//   - 探测不到（云端一律如此）时配置优先，再退回默认 128K。
+//
+// 三个来源的优先级因此是「配置与实测取小，再退默认」，而不是早先的「配置优先、实测只填空」。
+func resolveContextWindow(configured, probed, def int) (window int, source string, clamped bool) {
+	switch {
+	case configured > 0:
+		window, source = configured, "config"
+	case probed > 0:
+		window, source = probed, "probe"
+	default:
+		window, source = def, "default"
+	}
+	if probed > 0 && window > probed {
+		window, source, clamped = probed, "probe-clamped", true
+	}
+	return window, source, clamped
 }
 
 func loadConfig(path string) (*core.Config, error) {
@@ -615,6 +651,7 @@ func main() {
 	if err == nil && mainCfg != nil {
 		core.WorkspaceRoot = resolveWorkspaceRoot(cwd, mainCfg.WorkspaceRoot)
 	}
+	warnIfWorkspaceIsInstallDir(logger, core.WorkspaceRoot)
 
 	// -patch overlay 合并：加载所有 patch 文件并合并到 mainCfg（对齐 DSH --patch）。
 	// patch 文件含插件条目配置（如 MCP 客户端），合并后启动时自动应用。
@@ -775,10 +812,12 @@ func main() {
 		fail("LLM binary not found for provider %q at %q", activeLLMName, activeLLMBinary)
 	}
 
-	// 上下文窗口容量（token 数）：配置 context_window 显式 → 探测 LLAMACPP /v1/models 的
-	// n_ctx → 默认 128K×1024。探测总是执行（OPENAI 组 BASE_URL 缺席回退 ANTHROPIC 组，
-	// 同一 llama.cpp 端口 /v1/models 同源）：命中即取探测值（最准），未命中（云端）取配置
-	// 值或默认——窗口来源随端点自然切换，该值同时是注入 LLM 插件的默认输出上限（见后）。
+	// 上下文窗口容量（token 数）：服务端实测容量是**上限**（探测 LLAMACPP 家族 /v1/models
+	// 的 n_ctx / max_model_len），配置 context_window 只能往下调，不能凭空放大——云端把
+	// 模型吹成 1M、或用户在 128K 后面补个 0，都会让「发出去的一定装得下」这条前提失效，
+	// 结果每轮都靠 provider 的 4xx 教一遍。探测总是执行（OPENAI 组 BASE_URL 缺席回退
+	// ANTHROPIC 组，同一 llama.cpp 端口 /v1/models 同源）：命中即作为上限，未命中（云端）
+	// 才完全按配置/默认。该值同时是注入 LLM 插件的默认输出上限（见后）。
 	probeWindow := 0
 	// 上下文窗口探测同样按 provider 整组决定前缀（DSC_ 优先、旧名回退），不与终端
 	// 同名变量混用。
@@ -792,18 +831,14 @@ func main() {
 	if probeWindow > 0 {
 		logger.Info("context window probed from llm server", "window", probeWindow)
 	}
-	contextWindow := 0
-	windowSource := "default"
+	configuredWindow := 0
 	if mainCfg != nil && mainCfg.ContextWindow > 0 {
-		contextWindow = mainCfg.ContextWindow
-		windowSource = "config"
+		configuredWindow = mainCfg.ContextWindow
 	}
-	if contextWindow == 0 && probeWindow > 0 {
-		contextWindow = probeWindow
-		windowSource = "probe"
-	}
-	if contextWindow == 0 {
-		contextWindow = defaultContextWindow
+	contextWindow, windowSource, clamped := resolveContextWindow(configuredWindow, probeWindow, defaultContextWindow)
+	if clamped {
+		logger.Warn("configured context_window exceeds what the server reports; using the server value",
+			"configured", configuredWindow, "server", probeWindow)
 	}
 	logger.Info("context window", "window", contextWindow, "source", windowSource)
 	// 工作区根与默认会话标识：会话存档文件名就是「工作区路径 → 会话键」的编码，
@@ -1077,4 +1112,35 @@ func main() {
 	logger.Info("shutting down...")
 	mgr.Shutdown()
 	os.Exit(exitCode)
+}
+
+// warnIfWorkspaceIsInstallDir 提示「工作区根就是安装目录」。
+//
+// 工作区根默认取启动目录，而会话键（`sessions/<键>.jsonl`）、记忆库、压缩后端状态
+// 全都按它命名。于是从安装目录直接跑 `dsc.exe` 时，会把安装目录当成一个项目，
+// 在 sessions/ 里留下 `E=--Programs--dsc-for-windows-amd64-xxxx` 这类文件——
+// 看起来像「程序拿自己的路径当会话名」，其实是启动位置的问题。
+//
+// 不自动改：把根挪走会让「同一项目同一份会话」的前提失效（换目录=换项目）。
+// 只提示，并给出两条明确出路。
+func warnIfWorkspaceIsInstallDir(logger hclog.Logger, root string) {
+	if logger == nil || root == "" {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	exeDir, err := core.PAbs(core.PDir(exe))
+	if err != nil {
+		return
+	}
+	absRoot, err := core.PAbs(root)
+	if err != nil || absRoot != exeDir {
+		return
+	}
+	logger.Warn("workspace root is the DSC installation directory",
+		"workspace_root", root,
+		"hint", "会话/记忆/压缩状态按工作区根命名，安装目录会被当成一个项目。"+
+			"请到项目目录启动 dsc，或在 config.yaml 用 workspace_root 指定项目根")
 }

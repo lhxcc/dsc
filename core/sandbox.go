@@ -238,11 +238,17 @@ func sandboxCheck(policy SandboxPolicy, toolName, argsJSON string, resolve sandb
 	case SandboxReadOnly:
 		// read-only：任何可写操作一律拒绝；无法定位写路径的执行器整体禁用。
 		if d.write || d.unknownWrite {
-			return fmt.Errorf("sandbox: read-only policy blocks write via %s", toolName)
+			return fmt.Errorf("write via %s is blocked: this session is read-only", toolName)
 		}
 	case SandboxWorkspaceWrite:
 		if d.write && (d.path == "" || !inWorkspace(d.path)) {
-			return fmt.Errorf("sandbox: workspace-write policy blocks write outside workspace to %q via %s", d.path, toolName)
+			// 必须带上**具体路径与工作区根**：模型看到的只有这一条错误，它得靠这句话
+			// 判断「是我路径写错了」还是「该申请升级」。只说「被拒」等于逼它猜——
+			// 现场就是猜错后改走 shell、用相对路径写进了工作区里的同名相对目录。
+			if d.path == "" {
+				return fmt.Errorf("cannot determine the write target of %s; it is refused under workspace-write", toolName)
+			}
+			return fmt.Errorf("write to %q is outside the workspace root %q", d.path, WorkspaceRoot)
 		}
 		// 不可定位写路径的执行器在 workspace-write 下放行（缺省档，见 legacy 注释）。
 	}
@@ -403,8 +409,11 @@ func sandboxPolicyWith(get func() SandboxPolicy, resolve sandboxWriteResolver) W
 			mode = inv.EscalatedMode // 本调用已升级获批：以更宽档复审
 		}
 		if err := sandboxCheck(mode, inv.ToolName, inv.ArgumentsJSON, resolve); err != nil {
-			return fmt.Errorf("%s\n%s",
-				sandboxDenialMarker(sandboxModeString(mode)), escalationHintMarker(escalationSubject(inv.ToolName)))
+			// 具体原因（写到哪个路径、工作区根在哪）不能丢：它决定了模型下一步是改路径
+			// 还是申请升级。此前这里只输出通用标记，等于把已经算出来的信息扔掉。
+			return fmt.Errorf("%s %s\n%s",
+				sandboxDenialMarker(sandboxModeString(mode)), err.Error(),
+				escalationHintMarker(escalationSubject(inv.ToolName), mode))
 		}
 		return next(ctx)
 	}

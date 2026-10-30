@@ -32,6 +32,7 @@ end)`
 	exe := filepath.Join(dir, "tool-lua-host.exe")
 	buildToolBin(t, filepath.Join("..", "plugins", "tool-lua-host"), exe)
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "DSC_MODE=creation")
 	client := plugin.NewClient(&plugin.ClientConfig{

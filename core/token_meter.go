@@ -2,9 +2,9 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
-	"unicode/utf8"
 
 	"dsc/proto"
 )
@@ -311,36 +311,132 @@ func EstimateMessageTokens(msg *Message) int {
 	return toks
 }
 
-// EstimateTextTokens 估算一段文本的 token 数，**按字符分类累加**：
-//   - 宽字符（CJK 表意/假名/韩文/全角符号/emoji）：1 token/字
-//     （UTF-8 三字节，按字节/4 会低估到 0.75/字）
-//   - 其余（ASCII/拉丁/代码）：4 字节/token
+// 每千字符的 token 数（per-mille）。这组系数不是猜的：用真实会话内容切段，逐段
+// 发给模型端点读 `usage.prompt_tokens`，再对「各类字符数 → token 数」做最小二乘得到
+// （36 段训练 / 12 段留出，留出集 pred/actual 中位 1.008、p10–p90 = 0.90–1.10）。
 //
-// 旧实现取「整串字节/4」与「整串 rune 数」的**较大者**，意图是「英文按 /4、CJK 按字数」，
-// 但整串只能取一个规则：纯 ASCII/代码时 runes == bytes，于是按 1 token/字符计，是真实值的
-// 4~5 倍。后果是代码类会话被算到窗口之上，触发毫无必要的上下文裁剪与压缩
-// （实测同一份会话：估算 1,113,557，按本函数口径约 209,589，而服务端实际约 332K）。
+// 旧公式是「宽字符 1 token/字、其余 4 字节/token」，两个假设都被实测否证：
+//   - 窄字符并不等价：标点 0.73/字、数字 0.62/字、字母 0.23/字、空白 0.14/字。
+//     工具输出、代码、JSON 全是前两类，按 0.25 估会低估 1.5–3 倍；
+//   - CJK 也不是 1 token/字，实测 0.87（合成重复文本才会掉到 0.62——BPE 会合并）。
+//
+// 这两处误差方向相反，在混合内容里互相抵消，所以旧公式「看起来还能用」；但只要会话
+// 偏向一侧（纯中文，或纯工具输出）就会系统性偏掉，而偏差系数只能修正整体比例，
+// 修不了「按内容构成变化」的部分——那正是这份分类系数的意义。
+const (
+	tokPerMilleLetter = 226  // ASCII 字母 / 拉丁词
+	tokPerMilleSpace  = 139  // 空白（空格、换行、制表）
+	tokPerMilleDigit  = 624  // ASCII 数字
+	tokPerMillePunct  = 734  // ASCII 标点与符号：{}[](),:;" + - * / = 等
+	tokPerMilleWide   = 873  // CJK 表意、假名、谚文、全角符号
+	tokPerMilleEmoji  = 1800 // emoji（多为多 token）
+	tokPerMilleSymbol = 1000 // 其余非 ASCII 符号与字母（破折号、箭头、引号、带音标字母）
+)
+
+// 文本类别下标（SurfaceStats.Classes 的顺序；改顺序会让历史账本里的数组失去意义）。
+const (
+	clsLetter = iota
+	clsSpace
+	clsDigit
+	clsPunct
+	clsWide
+	clsEmoji
+	clsSymbol
+	textClassCount = 7
+)
+
+// SurfaceStats 一次请求表面的量与构成。
+//
+// 除了总量，还记各类字符的计数：整体比值（actual/sent）只能告诉我们「差多少」，
+// 记下构成才能回答「差在哪种内容上」，也才有可能按模型重拟合系数（见 token_calibration.go
+// 与会话账本）。
+type SurfaceStats struct {
+	Estimate     int // 消息 + 工具目录（= MsgEstimate + ToolEstimate）
+	MsgEstimate  int // 仅消息
+	ToolEstimate int // 仅工具目录
+	Msgs         int
+	ToolCalls    int
+	Classes      [textClassCount]int
+}
+
+// EstimatorCoefficients 返回估算器当前的千分权重与类别名（顺序即 SurfaceStats.Classes
+// 的下标）。供离线校准工具（tools/tokcal）对比「现用系数」与「按账本重拟合的结果」。
+func EstimatorCoefficients() (names []string, perMille []float64) {
+	c := ActiveTokenCoefs()
+	return []string{"letter", "space", "digit", "punct", "wide", "emoji", "symbol"},
+		[]float64{c.PerMille[clsLetter], c.PerMille[clsSpace], c.PerMille[clsDigit],
+			c.PerMille[clsPunct], c.PerMille[clsWide], c.PerMille[clsEmoji], c.PerMille[clsSymbol]}
+}
+
+// EstimateTextTokens 估算一段文本的 token 数：**按字符类别加权累加**（千分整数，
+// 最后一次性四舍五入，避免逐字取整把短文本抬到 1 token/字）。
+//
+// 分类见 tokPerMille* 常量。非空文本至少返回 1——空串返回 0，调用方据此区分
+// 「没有内容」与「内容很短」。
 func EstimateTextTokens(s string) int {
 	if s == "" {
 		return 0
 	}
-	wide, narrow := 0, 0
-	for _, r := range s {
-		if isWideRune(r) {
-			wide++
-			continue
-		}
-		narrow += utf8.RuneLen(r)
+	acc := 0.0
+	addText(s, &acc, nil)
+	if t := tokensFromPerMille(acc); t > 0 {
+		return t
 	}
-	return wide + (narrow+3)/4
+	return 1
 }
 
-// isWideRune 报告是否为「一字约一个 token」的宽字符。范围取 East Asian Wide/Fullwidth
-// 的常见区段 + emoji：宁可把这几个区段判宽（1/字），也不要让 CJK 按字节/4 低估。
+// addText 把一段文本按类别累加进 acc；counts 非 nil 时同时累计各类字符数。
+//
+// 权重取自**进程级生效系数**（ActiveTokenCoefs）：启动时一次确定，运行期不变。
+// 宿主与插件因此永远用同一套数——各自读文件会读到不同版本。
+func addText(s string, acc *float64, counts *[textClassCount]int) {
+	c := ActiveTokenCoefs()
+	for _, r := range s {
+		class := tokenClassOf(r)
+		*acc += c.PerMille[class]
+		if counts != nil {
+			counts[class]++
+		}
+	}
+}
+
+// tokensFromPerMille 把千分累加值折算成 token（向上取整）。
+func tokensFromPerMille(acc float64) int {
+	if acc <= 0 {
+		return 0
+	}
+	return int(math.Ceil(acc / 1000))
+}
+
+// tokenClassOf 返回字符所属类别（权重由 ActiveTokenCoefs 按类别给出）。
+func tokenClassOf(r rune) int {
+	switch {
+	case r < 0x80:
+		switch {
+		case r >= '0' && r <= '9':
+			return clsDigit
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			return clsSpace
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
+			return clsLetter
+		}
+		return clsPunct
+	case isWideRune(r):
+		if r >= 0x1F300 && r <= 0x1FAFF {
+			return clsEmoji
+		}
+		return clsWide
+	}
+	return clsSymbol
+}
+
+// isWideRune 报告是否为 CJK 一族（一字接近一个 token）的宽字符：CJK 部首、假名、
+// 统一表意、谚文、兼容表意、全角字符、emoji、扩展区。判宽的代价（按 0.87/字）远小于
+// 把 CJK 当 ASCII 按字节折算（会低估到 0.75/字以下）。
 func isWideRune(r rune) bool {
 	switch {
 	case r < 0x1100:
-		return false // ASCII / 拉丁 / 希腊 / 西里尔等：按字节折 4
+		return false // ASCII / 拉丁 / 希腊 / 西里尔等
 	case r <= 0x115F:
 		return true // 韩文字母
 	case r == 0x2329 || r == 0x232A:
@@ -400,6 +496,52 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 	return total
 }
 
+// MeasureProtoMessages 边量边记构成：估算值与 EstimateProtoMessagesTokens **逐字节
+// 同口径**（同一套权重、同一套消息/工具调用开销），额外输出各类字符计数。
+//
+// 两件事必须同源：判超窗用的是估算值，而校准表用的是「估算值 + 构成」。若两处各算一遍，
+// 一旦公式改动就会出现「按 A 判、按 B 学」——正是我们反复踩的那种两个尺子的问题。
+func MeasureProtoMessages(msgs []*proto.Message) SurfaceStats {
+	var st SurfaceStats
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+		st.Msgs++
+		acc := 0.0
+		addText(m.GetContent(), &acc, &st.Classes)
+		toks := tokensFromPerMille(acc)
+		if m.GetRole() == "tool" {
+			toks += 6
+		} else {
+			toks += 4
+		}
+		for _, img := range m.GetImages() {
+			toks += imageStructuralTokens(img)
+		}
+		for _, tc := range m.GetToolCalls() {
+			tcAcc := 0.0
+			addText(tc.GetName()+tc.GetArgumentsJson(), &tcAcc, &st.Classes)
+			toks += tokensFromPerMille(tcAcc) + 8
+			st.ToolCalls++
+		}
+		st.MsgEstimate += toks
+	}
+	st.Estimate = st.MsgEstimate
+	return st
+}
+
+// MeasureRequestSurface 量「最终要发的表面」：消息 + 工具目录，并带上构成计数。
+//
+// 工具目录不计入 Classes（它同构、重复，与消息内容不是一类文本，见 estimateOneToolTokens），
+// 单独记在 ToolEstimate 里。
+func MeasureRequestSurface(msgs []*proto.Message, tools []*proto.Tool) SurfaceStats {
+	st := MeasureProtoMessages(msgs)
+	st.ToolEstimate = EstimateProtoToolTokens(tools)
+	st.Estimate = st.MsgEstimate + st.ToolEstimate
+	return st
+}
+
 // EstimateToolTokens 估算工具定义的 token 数（system prompt 中的工具目录）。
 // 每个工具按 name + description + parameters JSON 的字符估算 + 固定结构开销。
 func EstimateToolTokens(tools []Tool) int {
@@ -429,16 +571,22 @@ func EstimateProtoToolTokens(tools []*proto.Tool) int {
 	return total
 }
 
-// estimateOneToolTokens 单个工具定义的 token 估算（唯一公式）：
-// name + description + parameters JSON 的文本估算 + JSON schema 结构开销。
+// estimateOneToolTokens 单个工具定义的 token 估算（唯一公式）。
+//
+// **刻意不用 EstimateTextTokens**：那组系数是为「异质内容」拟合的，而工具定义是
+// 高度重复的同构 JSON——provider 紧凑序列化后，`"type":"string"`、`"description":`
+// 这类片段被 BPE 反复合并。实测边际成本只有 0.257 token/字符（schema 250 字符 → 75
+// token；2274 字符 → 595 token），用内容系数（0.6–0.7/字符）会高估 2 倍以上，而工具
+// 目录是每次请求都发的固定成本，几百个工具下差出来就是几万 token。
+//
+// 因此这里按「字节/4 + 小固定开销」，与实测同量级。
 func estimateOneToolTokens(name, description, parametersJSON string) int {
-	return EstimateTextTokens(name) + EstimateTextTokens(description) +
-		EstimateTextTokens(parametersJSON) + toolDefinitionOverheadTokens
+	return toolDefinitionOverheadTokens + (len(name)+len(description)+len(parametersJSON)+3)/4
 }
 
 // toolDefinitionOverheadTokens 单个工具定义的固定结构开销（外层对象、字段名、
-// 分隔符等），与具体 schema 无关的常量部分。
-const toolDefinitionOverheadTokens = 16
+// 分隔符等），与具体 schema 无关的常量部分。实测截距约 11 token。
+const toolDefinitionOverheadTokens = 11
 
 // FormatPressure 格式化压力比为人读字符串（如 "78%"）。
 func FormatPressure(pressure float64) string {

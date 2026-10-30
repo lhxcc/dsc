@@ -458,3 +458,36 @@ func TestParseSandboxPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestSandboxDenialNamesPathAndRoot 拒绝信息必须带**具体路径与工作区根**。
+//
+// 现场（另一台机器）：模型在 workspace-write 下改 F:/EhviewerNz/... 被拒，但它只看到
+// 「file access denied under workspace-write mode」——没有任何路径与边界信息。于是它
+// 猜成「工具坏了」，改走 shell，用相对路径把内容写进了工作区里的同名相对目录，
+// 再回头编辑时报「文件已变更」。一句话缺失，换来十几步弯路。
+func TestSandboxDenialNamesPathAndRoot(t *testing.T) {
+	orig := WorkspaceRoot
+	WorkspaceRoot = t.TempDir() + "/ws"
+	defer func() { WorkspaceRoot = orig }()
+	m := newRouterManager()
+	m.events.OnWaterfall(EventToolPreExecute, sandboxPolicy(fixedPolicy(SandboxWorkspaceWrite)))
+	_ = m.toolRegistry.Register(&mockTool{name: "str_replace_editor"})
+
+	target := "/etc/hosts"
+	_, err := m.ExecuteTool(context.Background(), "str_replace_editor",
+		json.RawMessage(`{"command":"insert","path":"`+jsonPath(target)+`","new_str":"x","insert_line":1}`))
+	if err == nil {
+		t.Fatal("越界写应被拒")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "outside the workspace root") {
+		t.Fatalf("拒绝信息应说明越界与工作区根: %v", msg)
+	}
+	if !strings.Contains(msg, "workspace-write") {
+		t.Fatalf("拒绝信息应带上当前档位: %v", msg)
+	}
+	// 升级提示要直接给出可填的档位字面量（模型只需照抄，不必自己推阶梯表）
+	if !strings.Contains(msg, `sandbox_permissions="danger-full-access"`) {
+		t.Fatalf("升级提示应给出具体档位: %v", msg)
+	}
+}

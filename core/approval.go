@@ -134,9 +134,15 @@ func sandboxDenialMarker(mode string) string {
 }
 
 // escalationHintMarker 对齐 DSH：被拒后同回合的升级提示。
-func escalationHintMarker(subject string) string {
-	return "[sandbox: escalation available — retry this exact " + subject +
-		" once with sandbox_permissions (the narrowest wider mode that suffices) + justification; the approval prompt asks the user]"
+//
+// 直接写出**从当前档位可用的那一个**档位名：模型要填的是字面量，让它自己从阶梯表里
+// 推一步，实测就是「提示看到了、参数字段填错/漏填」。窄一级优先（够用就别要全开）。
+func escalationHintMarker(subject string, from SandboxPolicy) string {
+	target := "danger-full-access"
+	if from == SandboxReadOnly {
+		target = "workspace-write"
+	}
+	return fmt.Sprintf("[sandbox: escalation available — retry this exact %s once with sandbox_permissions=%q + justification; the approval prompt asks the user]", subject, target)
 }
 
 // escalationSubject 返回升级提示的工具族名词（对齐 DSH：bash 命令族→command、文件操作族→operation）。

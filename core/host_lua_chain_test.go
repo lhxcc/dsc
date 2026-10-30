@@ -45,6 +45,7 @@ dsc.register_tool("mytool", { description = "自包含测试工具", parameters 
 
 	// 以宿主侧客户端 spawn 真实 lua-host；cwd = dir，使 ./scripts 落在上面脚本目录
 	cmd := exec.Command(exe)
+	ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "DSC_MODE=creation")
 	client := plugin.NewClient(&plugin.ClientConfig{

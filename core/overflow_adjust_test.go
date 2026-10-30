@@ -188,3 +188,21 @@ func (p *overflowProvider) Name(context.Context) string       { return "overflow
 func (p *overflowProvider) Version(context.Context) string    { return "test" }
 func (p *overflowProvider) HealthCheck(context.Context) error { return nil }
 func (p *overflowProvider) VisionEnabled() bool               { return false }
+
+// TestNoteOverflowLowersContextWindow provider 亲口报了更小的上限时，把进程级窗口
+// 一起降下来：配置可以写得比服务端容量大，那条假设不成立后，标题栏、压力估算、
+// 裁窗比例都会跟着错。只降不升——报得比配置大时保留配置（可能是有意调低省成本）。
+func TestNoteOverflowLowersContextWindow(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(1310720) // 用户「128K 后面补个 0」
+
+	m.noteOverflow("sess-over", 1075596, 1048576, 900000)
+	if got := m.ContextWindow(); got != 1048576 {
+		t.Fatalf("应降到 provider 报的上限，got %d", got)
+	}
+	// 后续报一个更大的上限，不得把窗口抬回去
+	m.noteOverflow("sess-over", 0, 2000000, 900000)
+	if got := m.ContextWindow(); got != 1048576 {
+		t.Fatalf("只降不升，got %d", got)
+	}
+}

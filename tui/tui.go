@@ -805,18 +805,14 @@ func (m *Model) displayModelName() string {
 	return m.agent.Name(m.ctx)
 }
 
-// llmSupportsImages 报告当前活跃 LLM 是否启用图像输入：经 manager 缓存的活跃 LLM
-// 插件 capabilities（llmMetadataServer.GetInfo 上报 supports_images）判定。manager
-// 缺失、活跃 LLM 未注册或能力未知时返回 true（放行，避免误报）。
+// llmSupportsImages 报告当前活跃 LLM 是否启用图像输入：判定放在宿主（
+// core.Manager.SupportsImageInput），与读图工具的门控同一来源——两处各写一遍
+// 就会出现「TUI 提示不支持、工具却读得到」这类自相矛盾。
 func (m *Model) llmSupportsImages() bool {
 	if m.manager == nil {
 		return true
 	}
-	info, ok := m.manager.GetPluginMetadata(m.manager.ActiveLLMName())
-	if !ok || info == nil || info.Capabilities == nil {
-		return true
-	}
-	return info.Capabilities["supports_images"] != "false"
+	return m.manager.SupportsImageInput()
 }
 
 // Update 处理消息
@@ -2201,6 +2197,7 @@ var toolArgKey = map[string]string{
 	"install_skill":        "name",
 	"uninstall_skill":      "name",
 	"context_search":       "query",
+	"read_image":           "file_path",
 	"job_output":           "job_id",
 	"job_kill":             "job_id",
 	"load_dsc_plugin":      "name",
@@ -4060,10 +4057,24 @@ func shortTokens(n int) string {
 	}
 }
 
+// ctxWindowSize 返回当前上下文总容量。
+//
+// 以宿主为准而不是构造时的快照：窗口可能被下调（服务端探测到的容量更小，
+// 或 provider 4xx 亲口报过更小的上限），继续显示配置里那个用不出来的数，就等于
+// 「标题栏说 1.3M、实际按 1.0M 裁」——同一件事两个数字那种问题。
+func (m *Model) ctxWindowSize() int {
+	if m.manager != nil {
+		if v := m.manager.ContextWindow(); v > 0 {
+			return v
+		}
+	}
+	return m.contextWindow
+}
+
 // capacityTag 渲染「已用/总容量」，如 12K/128K；容量未设置时只显示已用。
 func (m *Model) capacityTag() string {
-	if m.contextWindow > 0 {
-		return fmt.Sprintf("%s/%s", shortTokens(m.usedTokens), shortTokens(m.contextWindow))
+	if w := m.ctxWindowSize(); w > 0 {
+		return fmt.Sprintf("%s/%s", shortTokens(m.usedTokens), shortTokens(w))
 	}
 	return shortTokens(m.usedTokens)
 }
@@ -4217,10 +4228,10 @@ func (m *Model) runInfoLine() string {
 		}
 	}
 	if m.usedTokens > 0 {
-		if m.contextWindow > 0 {
+		if w := m.ctxWindowSize(); w > 0 {
 			// 已知总容量时显示已用百分比（两位小数精度）；极小占比也至少
 			// 显示 0.01%，避免 0.00% 误导
-			pct := float64(m.usedTokens) * 100 / float64(m.contextWindow)
+			pct := float64(m.usedTokens) * 100 / float64(w)
 			if pct < 0.01 {
 				pct = 0.01
 			}

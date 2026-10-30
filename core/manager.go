@@ -152,8 +152,18 @@ type Manager struct {
 	// 供 agent/pre-step 计算投影压力（对齐 DSH tokenMeter.measure 的 baseline+delta）：
 	// 只有信封可比时才把用量当底数，否则退回启发式估算。
 	// 仅流式请求（ChatStream 回传 usage）记录；非流式 Chat 不携带 usage。
-	sessionAnchors  map[string]sessionUsageAnchor
+	sessionAnchors  map[string]*sessionAnchorSet
 	sessionAnchorMu sync.RWMutex
+
+	// 分词器校准表（按模型）：每帧结算的 (实测/估算) 都汇进来，跨会话、跨重启有效。
+	// 冷启动的第一帧就靠它，而不是退回 1——见 token_calibration.go。
+	calib          map[string]*modelCalibration
+	calibRecent    map[string][]float64 // 每模型最近若干帧比值（算离散度，不落盘原始值）
+	calibDriftHits map[string]int       // 连续漂移计数的当前段
+	calibMu        sync.RWMutex
+
+	// stalePluginsWarned 记录已经提示过「插件比宿主旧」的插件，避免每次拉起都刷一条。
+	stalePluginsWarned map[string]bool
 
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
 	stopHooks map[string][]func() error
@@ -287,8 +297,20 @@ func (m *Manager) SetModelName(name string) {
 		return
 	}
 	m.mu.Lock()
+	first := m.modelName == "" && name != ""
 	m.modelName = name
 	m.mu.Unlock()
+	if !first {
+		return
+	}
+	// 第一次知道模型名：此时才谈得上「按这个模型拟合/挑一套系数」。
+	//
+	// 必须发生在插件启动之前——pluginCmd/coreEnv 在拉起子进程时把当前生效系数注入
+	// DSC_TOKEN_COEF，宿主与插件从此同源。运行期不再改（见 token_coef.go 头注释）。
+	m.RefitTokenCoefs(false)
+	if c := m.loadTokenCoefs(); c != nil {
+		SetActiveTokenCoefs(c)
+	}
 }
 
 // ContextWindow 返回当前的上下文窗口（token 数；0 = 未知）。
@@ -365,10 +387,25 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		events:              NewEventBus(),
 		policyOff:           make(map[string][]func()),
 		sessionApproval:     make(map[string]ApprovalPolicy),
-		sessionAnchors:      make(map[string]sessionUsageAnchor),
+		sessionAnchors:      make(map[string]*sessionAnchorSet),
+		calib:               make(map[string]*modelCalibration),
+		calibRecent:         make(map[string][]float64),
+		calibDriftHits:      make(map[string]int),
 		jobs:                jobs.NewRegistry(),
 	}
 	m.jobs.SetLogger(m.logger)
+	// 分词器校准表：启动时读盘（冷启动第一帧就有据可依）；没有则从历史账本重建。
+	m.loadCalibration()
+	m.warmCalibrationFromLedgers()
+	// 估算系数：先按账本试着重拟合（门槛不满足就跳过），再读出生效的一套。
+	// 顺序很重要——**在插件启动之前**确定，宿主随后把它注入插件 env（DSC_TOKEN_COEF），
+	// 全进程才会用同一把尺子。
+	// 注意此时 modelName 未必已设置（main 在 NewManager 之后才 SetModelName），
+	// 所以这里只做「借用」：取文件里记的 active_model 那一套。真正的按模型拟合
+	// 在 SetModelName 第一次拿到模型名时做（见那里的注释）。
+	if c := m.loadTokenCoefs(); c != nil {
+		SetActiveTokenCoefs(c)
+	}
 	// 事件总线监听器 panic 恢复时用宿主主 logger 记录调用栈（定位根因）。
 	m.events.SetLogger(m.logger)
 	m.ptc = cfg.PTC
@@ -392,6 +429,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	// 宿主内置会话检索工具：滑窗把早期记录裁掉后，模型仍能按关键词精确取回原话。
 	_ = m.toolRegistry.Register(&contextSearchTool{m: m})
+	// 宿主内置读图工具：模型执行中途要看图（截图、图表、UI 稿）时用；与输入框
+	// 「@图片」共用同一条附件管线（dsc-img://<sha256>），不另建缓存。
+	_ = m.toolRegistry.Register(&readImageTool{m: m})
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
 		// 已完成却只会造成重复唤醒的两种情形直接丢弃：
@@ -2670,6 +2710,9 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 		// 在 NewClient 内部的环境变量凭据链里抢先命中终端遗留的认证变量。
 		env = mirrorLLMEnvToLegacyNames(env)
 	}
+	// 估算系数随进程注入：插件进程启动时读同一份，宿主与插件永远用一把尺子。
+	// 不能让各进程各自读文件——启动时序不同时会读到不同版本（见 token_coef.go）。
+	env = append(env, tokenCoefEnvKey+"="+FormatTokenCoefSpec(ActiveTokenCoefs()))
 	return env
 }
 
@@ -2749,12 +2792,75 @@ func (m *Manager) pluginCmd(entry PluginEntry, binaryPath, execDir string) *exec
 	if execDir == "" {
 		execDir = m.config.ExecDir
 	}
+	m.warnIfPluginStale(entry.Name, binaryPath)
 	cmd := exec.Command(binaryPath)
 	if execDir != "" {
 		cmd.Dir = execDir
 	}
 	cmd.Env = m.coreEnv(entry)
 	return cmd
+}
+
+// warnIfPluginStale 提示「插件二进制比宿主旧」。
+//
+// 现场代价：连续几次部署只替换了 dsc.exe，插件仍是几小时前的版本——宿主已按新的估算
+// 系数/收口策略工作，插件却还在用旧口径算压缩预算，而现象看起来是「修复没生效」。
+// 部署漏拷不是运行时能修的，但至少要说出来，而不是让人对着「明明改了却没变化」猜。
+func (m *Manager) warnIfPluginStale(name, binaryPath string) {
+	if m == nil || strings.TrimSpace(binaryPath) == "" {
+		return
+	}
+	hostMTime, err := hostExeMTime()
+	if err != nil {
+		return
+	}
+	info, err := os.Stat(binaryPath)
+	if err != nil {
+		return
+	}
+	// 留 1 分钟余量：构建与拷贝的时间差不该报警。
+	if !info.ModTime().Before(hostMTime.Add(-time.Minute)) {
+		return
+	}
+	m.mu.Lock()
+	if m.stalePluginsWarned == nil {
+		m.stalePluginsWarned = make(map[string]bool)
+	}
+	warned := m.stalePluginsWarned[name]
+	m.stalePluginsWarned[name] = true
+	m.mu.Unlock()
+	if warned {
+		return
+	}
+	m.logger.Warn("plugin binary is older than the host executable",
+		"plugin", name, "binary", binaryPath,
+		"plugin_built", info.ModTime().Format(time.RFC3339),
+		"host_built", hostMTime.Format(time.RFC3339),
+		"hint", "部署只替换了主程序：插件仍是旧版，行为可能与宿主的新口径不一致——请整包重新部署并重启")
+}
+
+// hostExeMTime 返回宿主可执行文件的修改时间（构建时间的近似）。缓存：一次进程内不变。
+var (
+	hostExeMTimeOnce sync.Once
+	hostExeMTimeVal  time.Time
+	hostExeMTimeErr  error
+)
+
+func hostExeMTime() (time.Time, error) {
+	hostExeMTimeOnce.Do(func() {
+		exe, err := os.Executable()
+		if err != nil {
+			hostExeMTimeErr = err
+			return
+		}
+		info, err := os.Stat(exe)
+		if err != nil {
+			hostExeMTimeErr = err
+			return
+		}
+		hostExeMTimeVal = info.ModTime()
+	})
+	return hostExeMTimeVal, hostExeMTimeErr
 }
 
 // newPluginClientConfig 是插件客户端配置的唯一构造入口（与 pluginCmd 配套）。

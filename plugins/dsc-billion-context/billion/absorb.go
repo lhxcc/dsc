@@ -22,7 +22,7 @@ var BillionManagedTools = map[string]bool{
 	"compress":       true,
 	"decompress":     true,
 	"search_context": true,
-	"billion_status":     true,
+	"billion_status": true,
 	"absorb":         true,
 }
 

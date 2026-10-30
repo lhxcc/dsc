@@ -1109,7 +1109,7 @@ func TestTierNudgeIgnoresSmallBlockCount(t *testing.T) {
 	cfg := DefaultConfig(1_000_000)
 	cfg.NudgeThresholdPct = 0.30
 	state := CreateInitialState()
-	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 50 token，合计 ~500 token
+	// 10 个小 T1 块：每条摘要是 200 字节 ASCII ≈ 45 token（字母 0.226/字），合计 ~450 token
 	for i := 0; i < 10; i++ {
 		state.Blocks = append(state.Blocks, CompressionBlock{
 			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
@@ -1135,11 +1135,12 @@ func TestTierNudgeFiresOnSummaryMass(t *testing.T) {
 	cfg := DefaultConfig(1_000_000)
 	cfg.NudgeThresholdPct = 0.30
 	state := CreateInitialState()
-	// 40 条摘要、每条 8000 字节 ASCII ≈ 2000 token，合计 ~80K > 75000 门槛
+	// 40 条摘要、每条 9000 字节 ASCII ≈ 2034 token（换算器按字母 0.226/字），
+	// 合计 ~81K > 75000 门槛
 	for i := 0; i < 40; i++ {
 		state.Blocks = append(state.Blocks, CompressionBlock{
 			BlockID: fmt.Sprintf("b%d", i), Active: true, Tier: Tier1,
-			Summary: strings.Repeat("y", 8000), CompressedTokens: 20000,
+			Summary: strings.Repeat("y", 9000), CompressedTokens: 20000,
 		})
 	}
 	state.NextBlockID = 40
@@ -1190,7 +1191,7 @@ func nudgeFixture(t *testing.T) ([]CoreMessage, *CompressionState, Config) {
 
 // TestNudgeGrowthGateStopsRepeating 增长门控必须真的生效：同一规模不得反复提示。
 //
-// 以前 BaselineTokens 只会被置 0、从不写入真实规模，`if BaselineTokens > 0` 恒不成立，
+// 以前基线只会被置 0、从不写入真实规模，`if 基线 > 0` 恒不成立，
 // 于是只要越过使用率阈值，之后每一轮都再提示一次「该压缩了」——模型便每隔几步压一次，
 // 把细节反复蒸干。这条用例钉住「提示时记下规模、未增长不再提示、长够才再提示」。
 func TestNudgeGrowthGateStopsRepeating(t *testing.T) {
@@ -1200,8 +1201,8 @@ func TestNudgeGrowthGateStopsRepeating(t *testing.T) {
 	if first.Nudge == nil || !first.Nudge.ShouldInject {
 		t.Fatalf("首次应提示压缩，reason=%v", first.Nudge)
 	}
-	if state.Nudge.BaselineTokens != 5000 {
-		t.Fatalf("提示后应记下本次规模 5000，实际 %d", state.Nudge.BaselineTokens)
+	if state.Nudge.LastNudgeTokens != 5000 {
+		t.Fatalf("提示后应记下本次规模 5000，实际 %d", state.Nudge.LastNudgeTokens)
 	}
 
 	// 规模没变：不得再提示
@@ -1221,18 +1222,54 @@ func TestNudgeGrowthGateStopsRepeating(t *testing.T) {
 	}
 }
 
-// TestCompressionKeepsNudgeBaseline 压缩成功不得把 baseline 清零——清零等于关掉增长
-// 门控，压缩完下一轮又会立刻提示，正是「每几步压一次」的另一半原因。
+// TestNudgeRebasesWhenSurfaceShrinks 表面变小（宿主滑窗裁剪 / 压缩成功）时，基线必须
+// 下移到当前规模，否则增长门控会永久关闭。
+//
+// 现场：基线 1,668,489、当前用量 528K、增长门槛 22,500，而窗口只有 1,048,576——
+// `tokenCount - 基线` 恒为负，永远到不了 1,690,989，压缩从此不再触发，上下文卡死。
+func TestNudgeRebasesWhenSurfaceShrinks(t *testing.T) {
+	msgs, state, config := nudgeFixture(t)
+
+	if first := ProcessTurn(msgs, state, config, 9000); !first.Nudge.ShouldInject {
+		t.Fatalf("首次应提示，reason=%q", first.Nudge.Reason)
+	}
+	if state.Nudge.LastNudgeTokens != 9000 {
+		t.Fatalf("提示后应记下规模 9000，实际 %d", state.Nudge.LastNudgeTokens)
+	}
+
+	// 宿主滑窗裁剪：表面掉到 4600（仍高于 45% 阈值 4500）
+	shrunk := ProcessTurn(msgs, state, config, 4600)
+	if state.Nudge.LastNudgeTokens != 4600 {
+		t.Fatalf("表面缩小后基线应下移到 4600，实际 %d", state.Nudge.LastNudgeTokens)
+	}
+	if shrunk.Nudge.ShouldInject {
+		t.Fatal("刚缩小时不应立刻再提示（那会变成每裁剪一次就压一次）")
+	}
+	if !strings.Contains(shrunk.Nudge.Reason, "insufficient growth") {
+		t.Fatalf("缩小后应因增长不足而拒绝，reason=%q", shrunk.Nudge.Reason)
+	}
+
+	// 从新基线再涨够一个增长门槛 → 恢复提示
+	floor := GrowthFloorTokens(config)
+	regrown := ProcessTurn(msgs, state, config, 4600+floor)
+	if !regrown.Nudge.ShouldInject {
+		t.Fatalf("从新基线长够 %d 后应恢复提示，reason=%q", floor, regrown.Nudge.Reason)
+	}
+}
+
+// TestCompressionKeepsNudgeBaseline 压缩成功不得把基线清零——清零等于关掉增长门控，
+// 压缩完下一轮又会立刻提示，正是「每几步压一次」的另一半原因。压缩造成的表面回落
+// 由下一条用例（表面缩小时下移基线）负责。
 func TestCompressionKeepsNudgeBaseline(t *testing.T) {
 	msgs, state, config := nudgeFixture(t)
-	state.Nudge.BaselineTokens = 5000
+	state.Nudge.LastNudgeTokens = 5000
 
 	ranges := []PruneRange{{StartRef: "m00000", EndRef: "m00001", Summary: strings.Repeat("s", 120)}}
 	_, res := ApplyCompression(ranges, msgs, state, config)
 	if res.BlocksCreated == 0 {
 		t.Fatalf("前置条件：应产生压缩块，errors=%v", res.Errors)
 	}
-	if state.Nudge.BaselineTokens != 5000 {
-		t.Fatalf("压缩后 baseline 不应清零，实际 %d", state.Nudge.BaselineTokens)
+	if state.Nudge.LastNudgeTokens != 5000 {
+		t.Fatalf("压缩后基线不应清零，实际 %d", state.Nudge.LastNudgeTokens)
 	}
 }

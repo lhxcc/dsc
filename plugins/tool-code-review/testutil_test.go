@@ -22,6 +22,7 @@ func newGitRepo(t *testing.T) string {
 func gitCmdT(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)

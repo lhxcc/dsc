@@ -27,6 +27,30 @@ type overflowAdjustment struct {
 	// maxTokens provider 自己报的上下文上限（0 = 未知）。比配置值小的时候以它为准——
 	// 配置可能写的是模型的理论窗口，而端点实际允许的更小。
 	maxTokens int
+	// attempts 本会话累计被 provider 拒绝的次数（每次重试都成功一次就清零）。
+	//
+	// 它决定重试时的裁窗目标：**只靠一个 inflation 比例会不收敛**。trim 掉的越旧越轻、
+	// 留下的尾部越密，同一个比例在裁完之后的表面上又会低估一截（实测：939,014 估算 →
+	// 1,099,278 实测，按 1.17 重裁到 804,900，若尾部密度再高一档就仍然撞墙）。所以
+	// 每失败一次就把目标比例再压一档，用「多丢一点历史」换确定性收敛。
+	attempts int
+}
+
+// overflowTrimRatio 第 n 次被拒之后下一次请求的收口比例（相对窗口）。
+//
+// 正常比例 0.90；被拒一次后 0.78；再拒 0.68；之后不再继续压（再低就等于把历史丢光，
+// 而这通常意味着「这一轮本身太大」，该报错而不是继续裁）。
+func overflowTrimRatio(attempts int) float64 {
+	switch {
+	case attempts <= 0:
+		return 0
+	case attempts == 1:
+		return 0.78
+	case attempts == 2:
+		return 0.68
+	default:
+		return 0.60
+	}
 }
 
 // overflowParse 从 provider 的错误文本里取出（实际用量, 上限）。
@@ -105,9 +129,25 @@ func (m *Manager) noteOverflow(sessionID string, actual, max, sent int) {
 		if prev.maxTokens > 0 && (adj.maxTokens == 0 || prev.maxTokens < adj.maxTokens) {
 			adj.maxTokens = prev.maxTokens
 		}
+		adj.attempts = prev.attempts
 	}
+	adj.attempts++
 	m.overflowAdj[sessionID] = adj
 	m.overflowMu.Unlock()
+
+	// 服务端亲口报了更小的上限：把**进程级窗口**也降到它。
+	//
+	// 配置里的 context_window 可能比服务端实际能给的大（云端宣传 1M、或用户在 128K
+	// 后面补个 0）。那条假设一旦不成立，标题栏、压力估算、裁窗比例全都建立在一个用不
+	// 出来的数上；已经撞过一次 4xx，没有必要每次都撞。只降不升：provider 报的比配置
+	// 大时保留配置（配置可以刻意调低来省成本）。
+	if max >= 1024 {
+		if cur := m.ContextWindow(); cur <= 0 || max < cur {
+			m.SetContextWindow(max)
+			m.logger.Warn("provider reports a smaller context window; lowering it",
+				"from", cur, "to", max)
+		}
+	}
 
 	m.logger.Warn("context overflow reported by provider; tightening the request budget and sliding the window",
 		"session", sessionID, "provider_actual", actual, "provider_max", max,

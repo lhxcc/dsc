@@ -31,9 +31,24 @@ const (
 	// 「渲染后 1.07M」发出的——宁可早丢一点，也不要用 400 去发现偏差。
 	contextCeilingRatio = 0.90
 
+	// contextCeilingUnvalidatedRatio 是「本会话还没有任何实测」时的收口比例。
+	//
+	// 0.90 的余量是按「偏差系数已经可信」设计的：它假设 inflation 能吸收我们的估算误差。
+	// 但续上一份长会话（重启后第一次请求）时，既没有本会话锚点，跨会话校准又可能来自
+	// 完全不同量级的请求——实测过一次：939,014 估算（余量后）→ provider 1,099,278，
+	// 差 17%，远超 10% 的余量，直接 400。那一刻历史最厚、最没有依据，就该多让一步：
+	// 0.80 换来的是一次不撞墙，代价只是首帧少留一点旧历史（压缩后端本来也会压）。
+	contextCeilingUnvalidatedRatio = 0.80
+
 	// estimateInflationMax 估算偏差系数的上限。只放大、不缩小：估算偏大时多丢历史
 	// 是净损失，而偏差系数本身就是从「provider 比我们算得多」这一现象里得来的。
 	estimateInflationMax = 1.5
+
+	// defaultCeilingWindow 窗口未知时的收口兜底（128K）。
+	//
+	// 只在宿主没拿到窗口时使用（配置缺失、探测失败、装配顺序出错）。它不是「猜测」，
+	// 而是一条安全底线：宁可多丢历史，也不把一份必然被拒的请求发出去。
+	defaultCeilingWindow = 128 * 1024
 
 	// overflowInflationMax 是「provider 亲口说过超窗」之后的偏差上限。比锚点推断宽松：
 	// 那是实测值除以我们的估算，不是推断；夹这个上限只为防止一次异常文本把预算压到
@@ -59,18 +74,32 @@ func envelopeMatches(anchor sessionUsageAnchor, curToolsHash, curModel string, w
 // estimateInflation 返回「我们的估算相对 provider 实际用量」的放大系数（≥1）。
 //
 // 锚点记的是同一次请求的两个数：我们算的 sentEstimate 与 provider 报的 promptTokens。
-// 两者一除就是这一模型、这类内容的系统性偏差。它正是「算得不准，于是以为装得下」的
-// 修正项：判定上限时用放大后的估算，而不是相信我们自己的算数。
+// 两者一除就是这类内容的系统性偏差。它正是「算得不准，于是以为装得下」的修正项：
+// 判定上限时用放大后的估算，而不是相信我们自己的算数。
+//
+// **这个系数不随工具目录、窗口变化而作废；换模型时先借上一个模型的比例，再用自己
+// 的替换。** 下面三条按代价排过序：
+//
+//   - 估算偏差本身是量级上的问题（实测中文 + 工具负载，provider 数到的常是我们估算的
+//     1.4–1.7 倍），而换分词器只让比例移动一两成——丢掉记忆的误差比「用旧比例」大得多；
+//   - 工具目录与窗口是每次升级、每次调参都在变的东西。按「变了就作废」，重启后的第一条
+//     请求永远退回 inflation=1，而那恰恰是历史最厚、最没有新实测可学的时刻；
+//   - 系数偏大的代价只是多丢一点历史（本轮还能工作），偏小的代价是整轮 400。两者不对等，
+//     所以宁可保留旧记忆，也不为了「精确」而清零。
 //
 // 只在该次请求没被改写的情况下有意义——被压缩改写过的那次，promptTokens 描述的是
 // 改写后的表面、sentEstimate 也是（recordSessionAnchor 记的正是改写后的 req），所以
 // 仍然可比。provider 用量低于我们的估算时不缩小系数（偏大只会白丢历史）。
-func (m *Manager) estimateInflation(sessionID, curToolsHash, curModel string, window int) float64 {
-	anchor, ok := m.lastSessionAnchor(sessionID)
+func (m *Manager) estimateInflation(sessionID, model string) float64 {
+	// 当前模型自己的锚点优先；没有就借最近一次别的模型的（anchorForModel 的 borrowed）。
+	// 借来的比例只服务这一帧：本帧结算出的用量会写进当前模型名下，下一帧自动换成自己的。
+	anchor, ok, _ := m.anchorForModel(sessionID, model)
 	if !ok || anchor.promptTokens <= 0 || anchor.sentEstimate <= 0 {
-		return 1
-	}
-	if !envelopeMatches(anchor, curToolsHash, curModel, window) {
+		// 本会话还没结算过（冷启动/新会话）：用**跨会话累积的模型校准表**，而不是 1。
+		// 这是「重启后第一个请求」唯一能拿到的依据，也正是历史上最容易撞墙的那一刻。
+		if f := m.calibrationFor(model); f > 0 {
+			return f
+		}
 		return 1
 	}
 	inflation := float64(anchor.promptTokens) / float64(anchor.sentEstimate)
@@ -87,8 +116,8 @@ func (m *Manager) estimateInflation(sessionID, curToolsHash, curModel string, wi
 //
 // 两条来源的性质不同，都保留：锚点来自成功请求（promptTokens / sentEstimate），是长期
 // 系统偏差；超窗记录来自被拒的那一次，是一次**实证**——它一定比锚点更接近真相。
-func (m *Manager) ceilingInflation(sessionID, curToolsHash, curModel string, window int) float64 {
-	inflation := m.estimateInflation(sessionID, curToolsHash, curModel, window)
+func (m *Manager) ceilingInflation(sessionID, model string) float64 {
+	inflation := m.estimateInflation(sessionID, model)
 	if adj, ok := m.overflowFor(sessionID); ok && adj.inflation > inflation {
 		inflation = adj.inflation
 	}
@@ -193,18 +222,28 @@ func slideNote(dropped, droppedTokens int) *proto.Message {
 // inflation 由 estimateInflation 给出（≥1），用于把「我们算的」放大成「provider 大概
 // 会算的」再与上限比较。window<=0（窗口未知）时不裁。
 func enforceRequestCeiling(msgs []*proto.Message, toolsTokens, window int, inflation float64) (out []*proto.Message, dropped, before, after int, fits bool) {
+	return enforceRequestCeilingAt(msgs, toolsTokens, window, inflation, contextCeilingRatio)
+}
+
+// enforceRequestCeilingAt 是 enforceRequestCeiling 的显式比例版本：ratio 是「允许占窗口
+// 的比例」。正常档 0.90；本会话尚无实测时更保守；被 provider 拒过之后逐次递减（见
+// overflowTrimRatio）——单靠 inflation 一个比例在「越裁越密」的尾部上不保证收敛。
+func enforceRequestCeilingAt(msgs []*proto.Message, toolsTokens, window int, inflation, ratio float64) (out []*proto.Message, dropped, before, after int, fits bool) {
 	if window <= 0 || len(msgs) == 0 {
 		return msgs, 0, 0, 0, true
 	}
 	if inflation < 1 {
 		inflation = 1
 	}
+	if ratio <= 0 || ratio > 1 {
+		ratio = contextCeilingRatio
+	}
 	before = EstimateProtoMessagesTokens(msgs) + toolsTokens
 	effective := int(float64(before) * inflation)
 	if effective <= window {
 		return msgs, 0, before, before, true
 	}
-	limit := int(float64(window) * contextCeilingRatio)
+	limit := int(float64(window) * ratio)
 	// 裁剪按「真实估算」做，但预算按放大后的口径收紧：把 limit 除以 inflation，
 	// 等价于「让 provider 看到的不超过 limit」。
 	if inflation > 1 {

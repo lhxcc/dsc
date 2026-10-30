@@ -128,14 +128,27 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 				// 压力判定以此精确底数 + 启发式增量（对齐 DSH tokenMeter pressureTokens）。
 				// 仅流式请求携带 usage；非流式 Chat 不记录（保持 0 → 插件退回启发式）。
 				if call.Usage != nil && call.Usage.PromptTokens > 0 {
+					// 量一次**最终发出表面**（消息 + 工具目录）：估算与构成出自同一遍扫描，
+					// 判超窗与喂校准表必须同源。
+					stats := MeasureRequestSurface(req.Messages, req.Tools)
 					// 记录锚点：req 是经 pre-step 改写后的最终请求，所以这里的估算与
 					// 指纹描述的就是真正发出的那个表面（压缩后端改写后的）。
 					s.m.recordSessionAnchor(req.GetSessionId(), sessionUsageAnchor{
 						promptTokens:  int(call.Usage.PromptTokens),
-						sentEstimate:  EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools),
+						sentEstimate:  stats.Estimate,
 						toolsHash:     ToolsFingerprint(req.Tools),
 						model:         s.m.modelName,
 						contextWindow: s.m.contextWindow,
+					})
+					// 喂校准：账本（可审计/可重拟合）+ 按模型的校准表（跨会话、跨重启）。
+					s.m.recordUsageSample(req.GetSessionId(), UsageSample{
+						Model:   s.m.modelName,
+						Sent:    stats.Estimate,
+						Actual:  int(call.Usage.PromptTokens),
+						Msgs:    stats.Msgs,
+						MsgEst:  stats.MsgEstimate,
+						ToolEst: stats.ToolEstimate,
+						Classes: stats.Classes,
 					})
 				}
 				return nil
@@ -318,11 +331,32 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 	// 窗口取「配置值」与「provider 亲口报过的上限」的较小者：被 4xx 教过一次之后，
 	// 就不必每次都去撞那面墙。
 	window := s.m.effectiveWindow(session)
+	// 窗口未知（0）时**不能跳过收口**：那等于把整份派生历史原样发给 provider，
+	// 而历史往往远超任何窗口——实测一次 98MB 会话重启后就这样发了 2,060,734 的估算，
+	// provider 直接 400（1,268,641 > 1,048,576）。窗口没装配好是宿主自己的问题，
+	// 不该由「发一个必然被拒的请求」来暴露；这里按 128K 保守兜底并告警。
+	if window <= 0 {
+		window = defaultCeilingWindow
+		s.m.logger.Warn("context window unknown at request time; enforcing the conservative default",
+			"session", session, "window", window,
+			"hint", "宿主未拿到窗口（配置/探测都缺）：按默认值收口，避免发出必然被 provider 拒绝的请求")
+	}
 	if window > 0 {
-		inflation := s.m.ceilingInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, window)
+		inflation := s.m.ceilingInflation(session, s.m.modelName)
+		// 收口比例：有本会话实测才用 0.90 的常规余量；续长会话的首帧没有依据，
+		// 用更保守的 0.80；被 provider 拒过之后逐次递减，保证重试一定收敛。
+		ratio := contextCeilingRatio
+		if _, ok := s.m.lastSessionAnchor(session); !ok {
+			ratio = contextCeilingUnvalidatedRatio
+		}
+		if adj, ok := s.m.overflowFor(session); ok {
+			if r := overflowTrimRatio(adj.attempts); r > 0 && r < ratio {
+				ratio = r
+			}
+		}
 		var before, after int
 		var fits bool
-		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
+		trimmed, dropped, before, after, fits = enforceRequestCeilingAt(msgs, toolsTokens, window, inflation, ratio)
 		surface = after
 		if !fits {
 			// 滑窗之后仍超：剩下的这一段本身就是这一轮的内容（通常是最后一条工具结果），
@@ -407,6 +441,18 @@ type sessionUsageAnchor struct {
 	contextWindow int    // 产生该用量时的上下文窗口（0 = 未知）
 }
 
+// sessionAnchorSet 一个会话的用量锚点：最近一次（与信封无关，供热路径读）加上
+// 按模型分开的一份。
+//
+// 为什么要按模型分开：估算偏差（provider 计数 / 我们的估算）是分詞器相关的属性。
+// 换模型后比例会变，但**不该因此退回 1**——那等于在最缺依据的时刻（刚切过去、还没
+// 产生任何新用量）放弃全部记忆。所以这里保留每个模型最近一次的比例：当前模型有记录
+// 就用它，没有就借「上一个用过的那份」，等这一帧的新用量结算后自动换成自己的。
+type sessionAnchorSet struct {
+	latest  sessionUsageAnchor
+	byModel map[string]sessionUsageAnchor
+}
+
 // recordSessionAnchor 按会话记录最近一次成功 LLM 请求的用量锚点
 // （对齐 DSH tokenMeter 的 pressureTokens + request header 语义）。空会话 id 或
 // 非正用量忽略（内部调用/非流式请求无上报值，不污染会话状态）。
@@ -419,7 +465,24 @@ func (m *Manager) recordSessionAnchor(sessionID string, a sessionUsageAnchor) {
 	m.clearOverflow(sessionID)
 	m.sessionAnchorMu.Lock()
 	defer m.sessionAnchorMu.Unlock()
-	m.sessionAnchors[sessionID] = a
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		set = &sessionAnchorSet{byModel: make(map[string]sessionUsageAnchor, 2)}
+		m.sessionAnchors[sessionID] = set
+	}
+	set.latest = a
+	if a.model != "" {
+		// 只留最近几个：一个会话切模型的次数很少，但别让这张表无限长。
+		if len(set.byModel) >= 4 {
+			for k := range set.byModel {
+				if k != a.model {
+					delete(set.byModel, k)
+					break
+				}
+			}
+		}
+		set.byModel[a.model] = a
+	}
 }
 
 // lastSessionAnchor 返回某会话最近一次的用量锚点（ok=false = 无记录：
@@ -430,8 +493,38 @@ func (m *Manager) lastSessionAnchor(sessionID string) (sessionUsageAnchor, bool)
 	}
 	m.sessionAnchorMu.RLock()
 	defer m.sessionAnchorMu.RUnlock()
-	a, ok := m.sessionAnchors[sessionID]
-	return a, ok
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		return sessionUsageAnchor{}, false
+	}
+	return set.latest, true
+}
+
+// anchorForModel 取「用来推断估算偏差」的锚点：当前模型自己的优先，没有就借最近一次
+// 别的模型的（borrowed=true）。
+//
+// 借用是显式的、临时的：它只影响下一帧的预算判定，这一帧结算出的用量立刻写进
+// 当前模型名下，下一帧就用它自己的比例。宁可先用别家的数（偏差通常只差一两成），
+// 也不要在刚切模型时把系数退回 1——那是我们已知最危险的一侧。
+func (m *Manager) anchorForModel(sessionID, model string) (sessionUsageAnchor, bool, bool) {
+	if m == nil || sessionID == "" {
+		return sessionUsageAnchor{}, false, false
+	}
+	m.sessionAnchorMu.RLock()
+	defer m.sessionAnchorMu.RUnlock()
+	set := m.sessionAnchors[sessionID]
+	if set == nil {
+		return sessionUsageAnchor{}, false, false
+	}
+	if model != "" {
+		if a, ok := set.byModel[model]; ok {
+			return a, true, false
+		}
+	}
+	if set.latest.promptTokens > 0 && set.latest.sentEstimate > 0 {
+		return set.latest, true, true
+	}
+	return sessionUsageAnchor{}, false, false
 }
 
 // projectPressure 由「锚点 + 当前表面」得出本轮压力（对齐 DSH tokenMeter.measure 的
@@ -476,9 +569,20 @@ func (s *llmAggregateServer) emitRequestError(ctx context.Context, req *proto.Ch
 	// 强制截断），一次就把几百条真实消息永久埋掉。这里改为「记住 provider 的实测值与
 	// 上限 → 收紧本会话预算 → 要求重试」，重试时 pre-step 收口会滑窗（会话日志不动）。
 	if code == "context_window_exceeded" {
-		sent := EstimateProtoMessagesTokens(req.GetMessages()) + EstimateProtoToolTokens(req.GetTools())
+		stats := MeasureRequestSurface(req.GetMessages(), req.GetTools())
 		actual, max := overflowParse(err.Error())
-		s.m.noteOverflow(req.GetSessionId(), actual, max, sent)
+		s.m.noteOverflow(req.GetSessionId(), actual, max, stats.Estimate)
+		// 被拒的一次同样是真实证据：provider 亲口报了多少，除以我们算的多少，就是这一
+		// 档内容规模的偏差。**记进账本与比例校准**，这样下一发（乃至下次启动）就有依据，
+		// 而不是每次都在同一个规模上重新学。没有构成计数，所以标 NoClasses 让它只进
+		// 比例、不进系数拟合。
+		if actual > 0 {
+			s.m.recordUsageSample(req.GetSessionId(), UsageSample{
+				Model: s.m.modelName, Sent: stats.Estimate, Actual: actual,
+				Msgs: stats.Msgs, MsgEst: stats.MsgEstimate, ToolEst: stats.ToolEstimate,
+				NoClasses: true,
+			})
+		}
 		return true
 	}
 	result, _ := s.m.dispatchEventToPlugins(EventAgentRequestError, AgentRequestErrorEvent{
@@ -631,8 +735,14 @@ func chatWithProvider(provider LLMProvider, ctx context.Context, req *proto.Chat
 }
 
 // chatStreamWithProvider 以 provider 执行流式调用并逐帧转发；
-// 首个帧起标记 call.StreamStarted（此后失败不再切换/重试），
+// 真发出过内容帧才标记 call.StreamStarted（此后失败不再切换/重试，避免重复输出），
 // 并随帧累计 finish_reason/工具调用数/用量供结算日志。
+//
+// 为什么按「帧里有内容」而不是「收到过帧」标记：provider 把 HTTP 400 之类**请求阶段**
+// 的失败也做成一个带 Error 的帧（`LLM stream error: … prompt is too long: 1268641
+// tokens > 1048576 maximum`）。按「收到过帧」标记的话，一个还没吐字的 400 会被判成
+// 「已经流式输出过」，于是上层既不重试、也不记超窗收紧——整条自愈路径（4xx → 收紧预算
+// → 滑窗 → 重试）被跳过，用户直接看到原始 400。实测就是这么发生的。
 func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer, call *LLMCall) error {
 	messages, tools := protoMessagesToPlugin(req)
 	ch, err := provider.ChatStream(stream.Context(), messages, tools)
@@ -641,7 +751,6 @@ func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream
 		return err
 	}
 	for item := range ch {
-		call.StreamStarted = true
 		if item.Error != "" {
 			call.Err = fmt.Errorf("LLM stream error: %s", item.Error)
 			return call.Err
@@ -654,6 +763,10 @@ func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream
 		}
 		if item.Usage != nil {
 			call.Usage = item.Usage
+		}
+		// 只有「真的对外发出过内容」才算流已开始：纯用量帧、空帧都不算。
+		if item.Content != "" || item.Reasoning != "" || len(item.ToolCalls) > 0 {
+			call.StreamStarted = true
 		}
 		toolCalls := make([]*proto.ToolCall, len(item.ToolCalls))
 		for i, tc := range item.ToolCalls {

@@ -52,6 +52,7 @@ func TestProcessJobInheritedByChild(t *testing.T) {
 		t.Skipf("当前环境不支持 Job Object 嵌套：%v", err)
 	}
 	cmd := exec.Command("cmd", "/c", "ping -n 6 127.0.0.1 > NUL")
+	ConfigureChildProcessAttrs(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动子进程失败: %v", err)
 	}

@@ -99,3 +99,20 @@ func TestSingleLine(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderToolCallShowsReadImagePath 读图卡片要显示读的是哪个文件。
+//
+// 与 shell/ContextSearch 同理：图片路径是这次调用唯一的实质信息，卡片只剩一个
+// ● ReadImage 的话，用户看不出模型到底在看哪张图（多图任务里尤其无从对账）。
+func TestRenderToolCallShowsReadImagePath(t *testing.T) {
+	got := renderToolCall("read_image", `{"file_path":"/workspace/shots/login-error.png"}`)
+	if !strings.Contains(got, "ReadImage") {
+		t.Fatalf("应显示工具名: %q", got)
+	}
+	if !strings.Contains(got, "login-error.png") {
+		t.Fatalf("应显示读取的路径: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("卡片必须是单行: %q", got)
+	}
+}

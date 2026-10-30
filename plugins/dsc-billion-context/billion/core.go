@@ -255,6 +255,19 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	}
 
 	// 7. decide-nudge：决策是否注入压缩提示（注入由 adapter 追加为尾部 user 消息）
+	// 增长门控的基线要跟着「表面变小」走。
+	//
+	// 旧口径把基线当成只涨不落的高水位：一次宿主滑窗裁剪（或一次压缩）之后，规模从
+	// 1.6M 掉到 500K，而基线还在 1.6M —— 之后永远满足不了 `tokenCount - 基线 >= 增长门槛`，
+	// 于是再也不提示压缩，上下文就卡在那个规模上不动（实测现场：基线 1,668,489、
+	// 当前 528K、门槛 22,500，而窗口只有 1,048,576，永远到不了 1,690,989）。
+	//
+	// 表面缩小 = 参照点失效，以当前规模重新起算：既不丢失「攒够再压」的语义（仍要再涨
+	// 一个增长门槛），也不会把门控变成一次性开关。
+	if state.Nudge.LastNudgeTokens > 0 && tokenCount < state.Nudge.LastNudgeTokens {
+		state.Nudge.LastNudgeTokens = tokenCount
+	}
+
 	nudge := DecideNudge(messages, state, config, tokenCount)
 	// 记下这次提示发生时的上下文规模：下一次提示必须在此基础上再涨够
 	// growthFloor（见 DecideNudge 的增长门控）。
@@ -264,7 +277,7 @@ func ProcessTurn(messages []CoreMessage, state *CompressionState, config Config,
 	// 都会再提示一次「该压缩了」，模型于是每隔几步就压一次，把细节反复蒸干。增长
 	// 门控才是「攒够一段再压」的唯一实现，留空等于没有。
 	if nudge.ShouldInject {
-		state.Nudge.BaselineTokens = tokenCount
+		state.Nudge.LastNudgeTokens = tokenCount
 	}
 
 	// 8. emergency-truncate：最后安全阀——上下文接近满且模型未主动压缩时，截断

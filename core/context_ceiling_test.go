@@ -137,48 +137,95 @@ func TestEnforceRequestCeilingAppliesInflation(t *testing.T) {
 }
 
 // TestEstimateInflation 偏差系数来自锚点里同一请求的两个数（provider 用量 / 我们的估算）。
+//
+// 系数刻意**不因工具目录、窗口、模型变化而作废**：这些差异让比例移动一两成，而丢掉
+// 记忆的代价是「重启后第一条请求退回 inflation=1」——那恰恰是历史最厚、最没有新实测
+// 可学的时刻。现场代价是一个 98MB 长会话重启后把 92.7 万的估算发成了 126.9 万
+// （provider 上限 104.8 万），直接 400。
 func TestEstimateInflation(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetModelName("model-a")
 	tools := []*proto.Tool{{Name: "shell", Description: "run", ParametersJson: `{"type":"object"}`}}
 	hash := ToolsFingerprint(tools)
 
 	m.recordSessionAnchor("s1", sessionUsageAnchor{
 		promptTokens: 1_100_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s1", hash, m.modelName, 1_048_576); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("偏差系数 = %v，期望约 1.1", got)
+	}
+
+	// 工具目录变了（升级）→ 偏差系数照样成立
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("工具目录变化不应作废偏差系数，得到 %v", got)
+	}
+
+	// 窗口变了 → 比例与窗口无关，照样成立
+	m.SetContextWindow(131072)
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("窗口变化不应作废偏差系数，得到 %v", got)
+	}
+	m.SetContextWindow(1_048_576)
+
+	// 换模型（分词器不同）→ 照样成立：比例只移动一两成，清零则等于丢掉全部记忆
+	m.SetModelName("model-b")
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("换模型不应作废偏差系数，得到 %v", got)
 	}
 
 	// 估算偏大时不用（缩小会白丢历史）
 	m.recordSessionAnchor("s2", sessionUsageAnchor{
 		promptTokens: 800_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s2", hash, m.modelName, 1_048_576); got != 1 {
+	if got := m.estimateInflation("s2", "model-a"); got != 1 {
 		t.Fatalf("偏大不应缩小，得到 %v", got)
 	}
 
-	// 信封不可比（工具目录不同 / 窗口不同）→ 不用
-	if got := m.estimateInflation("s1", "other-hash", m.modelName, 1_048_576); got != 1 {
-		t.Fatalf("工具目录不同应退回 1，得到 %v", got)
-	}
-	if got := m.estimateInflation("s1", hash, m.modelName, 131072); got != 1 {
-		t.Fatalf("窗口不同应退回 1，得到 %v", got)
-	}
-
 	// 无锚点（首次请求/重启）→ 1
-	if got := m.estimateInflation("nope", hash, m.modelName, 1_048_576); got != 1 {
+	if got := m.estimateInflation("nope", "model-a"); got != 1 {
 		t.Fatalf("无锚点应为 1，得到 %v", got)
 	}
 
 	// 极端偏差要夹住，避免一次异常用量把窗口吃得只剩一条
 	m.recordSessionAnchor("s3", sessionUsageAnchor{
 		promptTokens: 3_000_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s3", hash, m.modelName, 1_048_576); got != estimateInflationMax {
+	if got := m.estimateInflation("s3", "model-a"); got != estimateInflationMax {
 		t.Fatalf("应夹到 %v，得到 %v", estimateInflationMax, got)
+	}
+}
+
+// TestInflationBorrowsAcrossModels 换模型时，系数先借上一个模型的，等这一帧的用量
+// 结算后再换成自己的——而不是退回 1。
+//
+// 退回 1 等于在「刚切过去、还没有任何新用量」的那一刻放弃全部记忆，而那正是历史最厚
+// 的时候；借来的比例只差一两成，两害相权取其轻。每个模型自己的比例都保留，切回去
+// 还能用。
+func TestInflationBorrowsAcrossModels(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.recordSessionAnchor("s", sessionUsageAnchor{
+		promptTokens: 1_100_000, sentEstimate: 1_000_000, model: "model-a",
+	})
+	if got := m.estimateInflation("s", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("同模型应用自己的比例，得到 %v", got)
+	}
+	// 换到从没见过的模型：借上一份，不得退回 1
+	if got := m.estimateInflation("s", "model-b"); got < 1.09 || got > 1.11 {
+		t.Fatalf("换模型应先借上一个模型的比例，得到 %v（退回 1 就是这个问题本身）", got)
+	}
+	// 新模型结算一帧后，用自己的比例
+	m.recordSessionAnchor("s", sessionUsageAnchor{
+		promptTokens: 1_300_000, sentEstimate: 1_000_000, model: "model-b",
+	})
+	if got := m.estimateInflation("s", "model-b"); got < 1.29 || got > 1.31 {
+		t.Fatalf("新模型应改用自己的比例，得到 %v", got)
+	}
+	// 切回旧模型：它自己的比例还在
+	if got := m.estimateInflation("s", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("切回旧模型应仍记得它的比例，得到 %v", got)
 	}
 }
 
@@ -330,5 +377,111 @@ func TestSingleOversizedMessageFailsLocally(t *testing.T) {
 	}
 	if big.Content != orig || len(big.Content) != len(orig) {
 		t.Fatal("不得截断/改写原文（那会让「窗口内都是原文」不成立）")
+	}
+}
+
+// TestFinishPreStepTrimsWhenWindowUnknown 宿主没拿到窗口时也必须收口。
+//
+// 现场：一次 98MB 会话重启后，请求把整份派生历史原样发了出去——我们自己的估算
+// 2,060,734，provider 计数 1,268,641，直接 400。整份历史 4.98MB / 3.93 字节每 token，
+// 与「全量估算 ÷ 全量实际 = 1.62」完全吻合，说明那一发**根本没有裁**。收口是热路径上
+// 唯一的确定性防线，不能因为窗口是 0 就跳过：按默认 128K 兜底，宁可多丢历史。
+func TestFinishPreStepTrimsWhenWindowUnknown(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(0) // 窗口未知
+	s := &llmAggregateServer{m: m}
+
+	big := strings.Repeat("这段历史很长，需要被裁掉。", 20000) // 远超 128K
+	msgs := []*proto.Message{
+		{Role: "user", Content: big},
+		{Role: "assistant", Content: big},
+		{Role: "user", Content: "最后一条必须保留"},
+	}
+	req := &proto.ChatRequest{Messages: msgs, SessionId: "sess-unknown"}
+	out, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("窗口未知不应直接报错（应滑窗收口）：%v", err)
+	}
+	after := EstimateProtoMessagesTokens(out.Messages)
+	ratio := contextCeilingRatio // 变量化：常量表达式不能直接转 int
+	limit := int(float64(defaultCeilingWindow) * ratio)
+	if after > limit {
+		t.Fatalf("窗口未知时也必须裁到默认上限内：after=%d limit=%d", after, limit)
+	}
+	if out.Messages[len(out.Messages)-1].GetContent() != "最后一条必须保留" {
+		t.Fatal("最后一条消息必须保留")
+	}
+}
+
+// TestCeilingConservativeWithoutSessionEvidence 续长会话的首帧没有本会话实测时，
+// 用更保守的收口比例（0.80 而不是 0.90）。
+//
+// 现场：939,014 估算（0.90 余量后）→ provider 1,099,278，差 17%，10% 的余量根本不够，
+// 直接 400。那一刻历史最厚、最没有依据，就该多让一步。
+func TestCeilingConservativeWithoutSessionEvidence(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(100_000)
+	m.SetModelName("model-a")
+	s := &llmAggregateServer{m: m}
+
+	big := strings.Repeat("这行内容会占掉不少 tokens，用来把窗口填满。", 4000)
+	msgs := []*proto.Message{{Role: "user", Content: big}, {Role: "user", Content: "最后一条"}}
+	out, err := s.finishPreStep(&proto.ChatRequest{Messages: msgs, SessionId: "no-anchor"}, msgs, false)
+	if err != nil {
+		t.Fatalf("不应报错（应滑窗收口）: %v", err)
+	}
+	after := EstimateProtoMessagesTokens(out.Messages)
+	// 无证据档：不得超过 0.80×窗口（留下 20% 余量给估算误差）
+	if limit := int(float64(100_000) * contextCeilingUnvalidatedRatio); after > limit {
+		t.Fatalf("无本会话实测时应按 0.80 收口：after=%d limit=%d", after, limit)
+	}
+	// 但它不该比有证据档（0.90）更保守到离谱：至少保留 40% 窗口的历史
+	if after < 40_000 {
+		t.Fatalf("收口过头：after=%d", after)
+	}
+}
+
+// TestCeilingShrinksAfterEachRejection 被 provider 拒过之后，重试目标逐次递减：
+// 单靠一个 inflation 比例在「越裁越密」的尾部上不保证收敛。
+func TestCeilingShrinksAfterEachRejection(t *testing.T) {
+	if overflowTrimRatio(1) >= contextCeilingRatio || overflowTrimRatio(2) >= overflowTrimRatio(1) {
+		t.Fatalf("重试比例必须递减：1→%.2f 2→%.2f", overflowTrimRatio(1), overflowTrimRatio(2))
+	}
+
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(100_000)
+	m.SetModelName("model-a")
+	s := &llmAggregateServer{m: m}
+	// 先给它一个本会话锚点（否则走的是无证据档，比值会更低）
+	m.recordSessionAnchor("over", sessionUsageAnchor{promptTokens: 50_000, sentEstimate: 50_000, model: "model-a", contextWindow: 100_000})
+
+	// 多条中等消息：裁剪才有粒度（两条超长消息会被「至少保留最后一条」压到同一档）
+	body := strings.Repeat("这行内容会占掉不少 tokens，用来把窗口填满。", 60)
+	var msgs []*proto.Message
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs, &proto.Message{Role: "user", Content: body})
+	}
+	msgs = append(msgs, &proto.Message{Role: "user", Content: "最后一条"})
+	req := &proto.ChatRequest{Messages: msgs, SessionId: "over"}
+
+	before, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("首次收口不应报错: %v", err)
+	}
+	first := EstimateProtoMessagesTokens(before.Messages)
+
+	// 模拟被 provider 拒两次：每次 noteOverflow 都会把重试目标压一档
+	m.noteOverflow("over", 110_000, 100_000, 90_000)
+	m.noteOverflow("over", 105_000, 100_000, 85_000)
+	after2, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("重试收口不应报错: %v", err)
+	}
+	second := EstimateProtoMessagesTokens(after2.Messages)
+	if second >= first {
+		t.Fatalf("被拒两次后应收得更紧：first=%d second=%d", first, second)
+	}
+	if second > int(float64(100_000)*overflowTrimRatio(2)) {
+		t.Fatalf("应按第 2 档目标收口：second=%d limit=%d", second, int(float64(100_000)*overflowTrimRatio(2)))
 	}
 }

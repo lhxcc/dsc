@@ -39,7 +39,9 @@ func TestE2EWithHostClient(t *testing.T) {
 
 	// 1. 构建插件 exe（独立 module 的完整独立开发者路径）
 	exe := filepath.Join(dir, "tool-filesystem.exe")
-	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	dsc.ConfigureChildProcessAttrs(buildCmd)
+	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 
@@ -51,6 +53,7 @@ func TestE2EWithHostClient(t *testing.T) {
 
 	// 3. 以宿主侧客户端拉起插件进程（注入 DSC_WORKSPACE_ROOT）
 	cmd := exec.Command(exe)
+	dsc.ConfigureChildProcessAttrs(cmd)
 	cmd.Env = append(os.Environ(), "DSC_WORKSPACE_ROOT="+ws)
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig:  dsc.Handshake,
