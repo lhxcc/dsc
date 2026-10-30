@@ -317,3 +317,65 @@ func TestBackgroundPipelinePreservesToolCallID(t *testing.T) {
 	}
 	close(tool.release)
 }
+
+// chattyRemoteTool 模拟「在插件进程里跑、但持续有输出」的工具：执行期间持续上报
+// 活动（activityProbe），自身调不到宿主的看门狗句柄。
+type chattyRemoteTool struct {
+	name     string
+	run      time.Duration
+	started  chan struct{}
+	lastSeen time.Time
+	mu       sync.Mutex
+}
+
+func (t *chattyRemoteTool) Name() string        { return t.name }
+func (t *chattyRemoteTool) Description() string { return "chatty remote tool" }
+func (t *chattyRemoteTool) ParametersSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object"}`)
+}
+
+func (t *chattyRemoteTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	if t.started != nil {
+		close(t.started)
+	}
+	deadline := time.Now().Add(t.run)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+		t.mu.Lock()
+		t.lastSeen = time.Now()
+		t.mu.Unlock()
+	}
+	return "chatty done", nil
+}
+
+// LastActivity 实现 activityProbe：宿主的续命轮询读的就是它。
+func (t *chattyRemoteTool) LastActivity(context.Context, string) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastSeen, !t.lastSeen.IsZero()
+}
+
+// TestDefaultIdleRenewsFromRemoteActivity 远程工具的活动信号过不了 gRPC（看门狗句柄在
+// 宿主 ctx 里），所以宿主必须轮询 GetActivity 替它续命；否则「活跃续命」对插件工具是
+// 假话——一条持续输出的命令照样在预算到点时被杀，文案还写着 no output。
+func TestDefaultIdleRenewsFromRemoteActivity(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	withGrace(t, 300*time.Millisecond) // 预算远小于总耗时
+	tool := &chattyRemoteTool{name: "chatty_remote", run: 900 * time.Millisecond}
+	if err := m.toolRegistry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := WithToolCallID(context.Background(), "call-chatty")
+	out, err := m.ExecuteTool(ctx, "chatty_remote", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("有持续活动时不该被终止：%v", err)
+	}
+	if out != "chatty done" {
+		t.Fatalf("out = %q", out)
+	}
+}

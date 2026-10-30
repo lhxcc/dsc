@@ -195,6 +195,8 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 		m.logger.Warn("tool execution failed", "tool", toolName, "duration_ms", time.Since(start).Milliseconds(), "error", "tool not found")
 		return m.toolNotFoundError(toolName)
 	}
+	// 本次调用的 id：跨进程活动通道（GetActivity）与后台任务的观察都按它索引。
+	callID := ToolCallIDFromContext(ctx)
 	// timeout-policy：声明 timeoutMs 的工具设置协作式截止时间（对齐 DSH）
 	execCtx, timeoutMs := ctx, 0
 	if tp, ok := tool.(TimeoutProvider); ok {
@@ -224,6 +226,24 @@ func (m *Manager) executeToolBody(ctx context.Context, inv *ToolInvocation, tool
 			execCtx, cancel = WithIdleDeadline(execCtx, autoBackgroundGrace)
 			defer cancel()
 			defaultIdle = autoBackgroundGrace
+		}
+	}
+	// 跨进程续命：看门狗装在宿主 ctx 上（`WithIdleDeadline` 用的是 ctx value），而活动
+	// 信号在执行方进程里产生——ctx value 过不了 gRPC，插件里的 `TouchActivity` 摸到的
+	// 是**另一个空的句柄**，等于 no-op。不补这一步，凡在插件进程里跑的工具，看门狗都是
+	// 固定时长上限，策略插件声称的「活跃续命」对这些工具其实是假话（一条持续输出 15
+	// 分钟的构建照样在第 10 分钟被杀，文案还写着「no output」）。
+	//
+	// 补法：能报活动的工具（实现 activityProbe，`GetActivity` 那条跨进程通道）由宿主
+	// 轮询替它续命。宿主内联运行的工具（如 subagent）本来就能直接 TouchActivity，不需要。
+	if hasIdleDeadline(execCtx) && callID != "" {
+		if probe, ok := tool.(activityProbe); ok {
+			budget := defaultIdle
+			if budget <= 0 {
+				budget = autoBackgroundGrace
+			}
+			stop := renewIdleFromActivity(execCtx, probe, callID, budget)
+			defer stop()
 		}
 	}
 	// 通用 panic recover：任何工具执行 panic 都转为错误返回，避免宿主进程崩溃。

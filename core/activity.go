@@ -86,6 +86,51 @@ func hasIdleDeadline(ctx context.Context) bool {
 	return h != nil
 }
 
+// renewIdleFromActivity 用跨进程活动信号替看门狗续命（宿主侧轮询 GetActivity）。
+//
+// 起因：`WithIdleDeadline` 把句柄放在 ctx value 里，取消能跨 gRPC 传播，但 **value 不能**
+// ——插件进程里的 `dsc.TouchActivity` 摸到的是另一个空句柄，等于 no-op。于是任何在插件
+// 进程里跑的「长但有输出」的工具，看门狗都会在第 N 分钟准时开枪，文案还写着 no output。
+//
+// 这里由宿主按 GetActivity（正在跨进程的那条线）轮询执行方的最近活动时间，有推进就
+// TouchActivity 续命。轮询间隔取预算的 1/4 并夹在 [100ms, 5s]：10 分钟预算 → 5 秒一次，
+// 对 10 分钟的时间尺度足够灵敏，也不会给插件添明显的 RPC 负担。
+//
+// 返回的 stop 必须调用（defer），否则 goroutine 会活到 ctx 结束——快速工具上无所谓，
+// 长任务里会白占一个协程。
+func renewIdleFromActivity(ctx context.Context, probe activityProbe, callID string, budget time.Duration) (stop func()) {
+	if probe == nil || callID == "" {
+		return func() {}
+	}
+	interval := budget / 4
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var last time.Time
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if ts, ok := probe.LastActivity(ctx, callID); ok && ts.After(last) {
+				last = ts
+				TouchActivity(ctx)
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
 // IdleDeadlineExceeded 报告 ctx 是否因空闲看门狗触发而取消。
 // 供执行域安装方（工具流水线桥）在执行返回后判定：cause 为 ErrIdleDeadline
 // 时以裁决文案替换执行错误。
