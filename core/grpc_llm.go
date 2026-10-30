@@ -65,6 +65,24 @@ type ChatStreamResponse struct {
 }
 
 // ToolCall 工具调用结构体
+// unparseableArgs reports a tool call whose arguments are not valid JSON.
+//
+// The service hands the model's text through, and a model can write a call it cannot close: one missing </parameter>
+// makes the engine's parser fold the rest of the call into the first value, and the assembled arguments then end
+// inside a string (reported from a 2080 Ti box: `{"command":"cd F:/X && sed -i '968d' a.xml <parameter=description>
+// Delete line 968 </tool_call>`).  Running that call with an empty argument set - which this file used to do - runs
+// the tool on a guess.  The message keeps the beginning of what arrived, because that is what tells a reader whether
+// the model or the parser is at fault.
+func unparseableArgs(name, argumentsJSON string, cause error) error {
+	shown := argumentsJSON
+	if len(shown) > 200 {
+		shown = shown[:200] + "..."
+	}
+	return fmt.Errorf("tool call %q has arguments that are not valid JSON (%v); the model's call was probably left "+
+		"unterminated (a missing </parameter> folds the rest of the call into the first value). Arguments as received: %s",
+		name, cause, shown)
+}
+
 type ToolCall struct {
 	ID        string                 `json:"id"`
 	Name      string                 `json:"name"`
@@ -293,7 +311,7 @@ func (c *llmGRPCClient) Chat(ctx context.Context, messages []Message, tools []To
 	for i, tc := range resp.ToolCalls {
 		var args map[string]interface{}
 		if err := json.Unmarshal([]byte(tc.ArgumentsJson), &args); err != nil {
-			return nil, fmt.Errorf("failed to parse tool call arguments for %s: %w", tc.Name, err)
+			return nil, unparseableArgs(tc.Name, tc.ArgumentsJson, err)
 		}
 		toolCalls[i] = ToolCall{ID: tc.Id, Name: tc.Name, Arguments: args}
 	}
@@ -328,12 +346,21 @@ func (c *llmGRPCClient) ChatStream(ctx context.Context, messages []Message, tool
 				return
 			}
 			toolCalls := make([]ToolCall, len(resp.ToolCalls))
+			var argErr error
 			for i, tc := range resp.ToolCalls {
 				var args map[string]interface{}
 				if err := json.Unmarshal([]byte(tc.ArgumentsJson), &args); err != nil {
-					args = map[string]interface{}{}
+					// NOT an empty argument set: a call whose arguments do not parse is a call the model got
+					// wrong, and running the tool with {} would act on a guess (a shell tool with no command,
+					// or worse, one that defaults).  Report it and stop the turn.
+					argErr = unparseableArgs(tc.Name, tc.ArgumentsJson, err)
+					break
 				}
 				toolCalls[i] = ToolCall{ID: tc.Id, Name: tc.Name, Arguments: args}
+			}
+			if argErr != nil {
+				ch <- &ChatStreamResponse{Error: argErr.Error()}
+				return
 			}
 			ch <- &ChatStreamResponse{
 				Content:      resp.Content,

@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"dsc/proto/metadata"
@@ -52,5 +54,48 @@ func TestLLMMetadataCapabilities(t *testing.T) {
 	}
 	if infoOff.Capabilities[CapabilityLLM] != "true" {
 		t.Fatalf("LLM 插件（vision=false）也应上报 %s=true, got %q", CapabilityLLM, infoOff.Capabilities[CapabilityLLM])
+	}
+}
+
+// A call whose arguments do not parse must be REPORTED, not run with an empty argument set.
+//
+// Reported from a 2080 Ti box.  The model left one </parameter> out, the engine's parser folded the rest of the call
+// into the first value, and the assembled arguments ended inside a string.  This file used to unmarshal that into
+// map[string]interface{}{} and hand the tool an empty command - a tool acting on a guess.
+func TestUnparseableArgsIsReported(t *testing.T) {
+	// The shape the service produced for that report.
+	broken := `{"command":"cd F:/X && sed -i '968d' a.xml <parameter=description> Delete line 968 </tool_call>`
+
+	var args map[string]interface{}
+	err := json.Unmarshal([]byte(broken), &args)
+	if err == nil {
+		t.Fatal("the specimen must not parse; the test is meaningless otherwise")
+	}
+
+	got := unparseableArgs("exec_command", broken, err)
+	if got == nil {
+		t.Fatal("a call with unparseable arguments must produce an error")
+	}
+	msg := got.Error()
+	for _, want := range []string{"exec_command", "not valid JSON", "</parameter>", "sed -i"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the message should carry %q so a reader can tell model from parser; got: %s", want, msg)
+		}
+	}
+
+	// A well-formed call is unaffected.
+	if e := unparseableArgs("x", `{"a":1}`, nil); e == nil {
+		t.Log("nil cause still produces a message (never called that way, but it must not panic)")
+	}
+
+	// The message is bounded: a huge argument string must not become a huge log line.  The wording around it is
+	// fixed, so what is checked is that the ARGUMENTS were clipped, not the total length.
+	long := strings.Repeat("a", 5000)
+	m := unparseableArgs("t", long, err).Error()
+	if strings.Contains(m, strings.Repeat("a", 201)) {
+		t.Errorf("the argument dump should be clipped to 200 characters, got %d chars total", len(m))
+	}
+	if !strings.Contains(m, "...") {
+		t.Errorf("a clipped dump should say so with an ellipsis: %s", m)
 	}
 }
