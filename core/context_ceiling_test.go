@@ -137,47 +137,62 @@ func TestEnforceRequestCeilingAppliesInflation(t *testing.T) {
 }
 
 // TestEstimateInflation 偏差系数来自锚点里同一请求的两个数（provider 用量 / 我们的估算）。
+//
+// 可比性判定刻意**不看工具目录指纹、也不看窗口**：偏差来自分词器与内容密度，换工具、
+// 换窗口都不影响它；而工具目录每次升级都会变。按旧口径（指纹不符即作废），升级后的
+// 第一条请求退回 inflation=1——现场代价是一个 98MB 长会话重启后把 92.7 万的估算发成
+// 了 126.9 万（provider 上限 104.8 万），直接 400。
 func TestEstimateInflation(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetModelName("model-a")
 	tools := []*proto.Tool{{Name: "shell", Description: "run", ParametersJson: `{"type":"object"}`}}
 	hash := ToolsFingerprint(tools)
 
 	m.recordSessionAnchor("s1", sessionUsageAnchor{
 		promptTokens: 1_100_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s1", hash, m.modelName, 1_048_576); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
 		t.Fatalf("偏差系数 = %v，期望约 1.1", got)
+	}
+
+	// 工具目录变了（升级）→ 偏差系数照样成立
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("工具目录变化不应作废偏差系数，得到 %v", got)
+	}
+
+	// 窗口变了 → 比例与窗口无关，照样成立
+	m.SetContextWindow(131072)
+	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+		t.Fatalf("窗口变化不应作废偏差系数，得到 %v", got)
+	}
+	m.SetContextWindow(1_048_576)
+
+	// 换模型（分词器可能不同）→ 作废
+	if got := m.estimateInflation("s1", "model-b"); got != 1 {
+		t.Fatalf("换模型应退回 1，得到 %v", got)
 	}
 
 	// 估算偏大时不用（缩小会白丢历史）
 	m.recordSessionAnchor("s2", sessionUsageAnchor{
 		promptTokens: 800_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s2", hash, m.modelName, 1_048_576); got != 1 {
+	if got := m.estimateInflation("s2", "model-a"); got != 1 {
 		t.Fatalf("偏大不应缩小，得到 %v", got)
 	}
 
-	// 信封不可比（工具目录不同 / 窗口不同）→ 不用
-	if got := m.estimateInflation("s1", "other-hash", m.modelName, 1_048_576); got != 1 {
-		t.Fatalf("工具目录不同应退回 1，得到 %v", got)
-	}
-	if got := m.estimateInflation("s1", hash, m.modelName, 131072); got != 1 {
-		t.Fatalf("窗口不同应退回 1，得到 %v", got)
-	}
-
 	// 无锚点（首次请求/重启）→ 1
-	if got := m.estimateInflation("nope", hash, m.modelName, 1_048_576); got != 1 {
+	if got := m.estimateInflation("nope", "model-a"); got != 1 {
 		t.Fatalf("无锚点应为 1，得到 %v", got)
 	}
 
 	// 极端偏差要夹住，避免一次异常用量把窗口吃得只剩一条
 	m.recordSessionAnchor("s3", sessionUsageAnchor{
 		promptTokens: 3_000_000, sentEstimate: 1_000_000,
-		toolsHash: hash, model: m.modelName, contextWindow: 1_048_576,
+		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s3", hash, m.modelName, 1_048_576); got != estimateInflationMax {
+	if got := m.estimateInflation("s3", "model-a"); got != estimateInflationMax {
 		t.Fatalf("应夹到 %v，得到 %v", estimateInflationMax, got)
 	}
 }
@@ -330,5 +345,38 @@ func TestSingleOversizedMessageFailsLocally(t *testing.T) {
 	}
 	if big.Content != orig || len(big.Content) != len(orig) {
 		t.Fatal("不得截断/改写原文（那会让「窗口内都是原文」不成立）")
+	}
+}
+
+// TestFinishPreStepTrimsWhenWindowUnknown 宿主没拿到窗口时也必须收口。
+//
+// 现场：一次 98MB 会话重启后，请求把整份派生历史原样发了出去——我们自己的估算
+// 2,060,734，provider 计数 1,268,641，直接 400。整份历史 4.98MB / 3.93 字节每 token，
+// 与「全量估算 ÷ 全量实际 = 1.62」完全吻合，说明那一发**根本没有裁**。收口是热路径上
+// 唯一的确定性防线，不能因为窗口是 0 就跳过：按默认 128K 兜底，宁可多丢历史。
+func TestFinishPreStepTrimsWhenWindowUnknown(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(0) // 窗口未知
+	s := &llmAggregateServer{m: m}
+
+	big := strings.Repeat("这段历史很长，需要被裁掉。", 20000) // 远超 128K
+	msgs := []*proto.Message{
+		{Role: "user", Content: big},
+		{Role: "assistant", Content: big},
+		{Role: "user", Content: "最后一条必须保留"},
+	}
+	req := &proto.ChatRequest{Messages: msgs, SessionId: "sess-unknown"}
+	out, err := s.finishPreStep(req, msgs, false)
+	if err != nil {
+		t.Fatalf("窗口未知不应直接报错（应滑窗收口）：%v", err)
+	}
+	after := EstimateProtoMessagesTokens(out.Messages)
+	ratio := contextCeilingRatio // 变量化：常量表达式不能直接转 int
+	limit := int(float64(defaultCeilingWindow) * ratio)
+	if after > limit {
+		t.Fatalf("窗口未知时也必须裁到默认上限内：after=%d limit=%d", after, limit)
+	}
+	if out.Messages[len(out.Messages)-1].GetContent() != "最后一条必须保留" {
+		t.Fatal("最后一条消息必须保留")
 	}
 }

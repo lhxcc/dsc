@@ -315,8 +315,18 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 	// 窗口取「配置值」与「provider 亲口报过的上限」的较小者：被 4xx 教过一次之后，
 	// 就不必每次都去撞那面墙。
 	window := s.m.effectiveWindow(session)
+	// 窗口未知（0）时**不能跳过收口**：那等于把整份派生历史原样发给 provider，
+	// 而历史往往远超任何窗口——实测一次 98MB 会话重启后就这样发了 2,060,734 的估算，
+	// provider 直接 400（1,268,641 > 1,048,576）。窗口没装配好是宿主自己的问题，
+	// 不该由「发一个必然被拒的请求」来暴露；这里按 128K 保守兜底并告警。
+	if window <= 0 {
+		window = defaultCeilingWindow
+		s.m.logger.Warn("context window unknown at request time; enforcing the conservative default",
+			"session", session, "window", window,
+			"hint", "宿主未拿到窗口（配置/探测都缺）：按默认值收口，避免发出必然被 provider 拒绝的请求")
+	}
 	if window > 0 {
-		inflation := s.m.ceilingInflation(session, ToolsFingerprint(req.Tools), s.m.modelName, window)
+		inflation := s.m.ceilingInflation(session, s.m.modelName)
 		var before, after int
 		var fits bool
 		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)
@@ -628,8 +638,14 @@ func chatWithProvider(provider LLMProvider, ctx context.Context, req *proto.Chat
 }
 
 // chatStreamWithProvider 以 provider 执行流式调用并逐帧转发；
-// 首个帧起标记 call.StreamStarted（此后失败不再切换/重试），
+// 真发出过内容帧才标记 call.StreamStarted（此后失败不再切换/重试，避免重复输出），
 // 并随帧累计 finish_reason/工具调用数/用量供结算日志。
+//
+// 为什么按「帧里有内容」而不是「收到过帧」标记：provider 把 HTTP 400 之类**请求阶段**
+// 的失败也做成一个带 Error 的帧（`LLM stream error: … prompt is too long: 1268641
+// tokens > 1048576 maximum`）。按「收到过帧」标记的话，一个还没吐字的 400 会被判成
+// 「已经流式输出过」，于是上层既不重试、也不记超窗收紧——整条自愈路径（4xx → 收紧预算
+// → 滑窗 → 重试）被跳过，用户直接看到原始 400。实测就是这么发生的。
 func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer, call *LLMCall) error {
 	messages, tools := protoMessagesToPlugin(req)
 	ch, err := provider.ChatStream(stream.Context(), messages, tools)
@@ -638,7 +654,6 @@ func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream
 		return err
 	}
 	for item := range ch {
-		call.StreamStarted = true
 		if item.Error != "" {
 			call.Err = fmt.Errorf("LLM stream error: %s", item.Error)
 			return call.Err
@@ -651,6 +666,10 @@ func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream
 		}
 		if item.Usage != nil {
 			call.Usage = item.Usage
+		}
+		// 只有「真的对外发出过内容」才算流已开始：纯用量帧、空帧都不算。
+		if item.Content != "" || item.Reasoning != "" || len(item.ToolCalls) > 0 {
+			call.StreamStarted = true
 		}
 		toolCalls := make([]*proto.ToolCall, len(item.ToolCalls))
 		for i, tc := range item.ToolCalls {

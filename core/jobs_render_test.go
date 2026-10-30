@@ -104,11 +104,11 @@ func TestRenderJobOutputExplainsSilentJob(t *testing.T) {
 		"(no output yet)",
 		"[status: running]",
 		"running for 5m12s",
-		"0 B written", // 0 字节是事实，不是「我们没读到」
+		"0 B written",   // 0 字节是事实，不是「我们没读到」
 		"block-buffers", // 解释原因：子进程自己的缓冲
 		"0 bytes here means 0 bytes",
-		"python -u",        // 给出路（Windows 上不带 stdbuf）
-		"> log 2>&1",       // 重定向会同样静音——说清代价
+		"python -u",         // 给出路（Windows 上不带 stdbuf）
+		"> log 2>&1",        // 重定向会同样静音——说清代价
 		"completion notice", // 收手：完成会通知
 	} {
 		if !strings.Contains(out, want) {
