@@ -326,7 +326,7 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 			"hint", "宿主未拿到窗口（配置/探测都缺）：按默认值收口，避免发出必然被 provider 拒绝的请求")
 	}
 	if window > 0 {
-		inflation := s.m.ceilingInflation(session, s.m.modelName)
+		inflation := s.m.ceilingInflation(session)
 		var before, after int
 		var fits bool
 		trimmed, dropped, before, after, fits = enforceRequestCeiling(msgs, toolsTokens, window, inflation)

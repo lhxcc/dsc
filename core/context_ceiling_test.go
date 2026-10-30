@@ -138,10 +138,10 @@ func TestEnforceRequestCeilingAppliesInflation(t *testing.T) {
 
 // TestEstimateInflation 偏差系数来自锚点里同一请求的两个数（provider 用量 / 我们的估算）。
 //
-// 可比性判定刻意**不看工具目录指纹、也不看窗口**：偏差来自分词器与内容密度，换工具、
-// 换窗口都不影响它；而工具目录每次升级都会变。按旧口径（指纹不符即作废），升级后的
-// 第一条请求退回 inflation=1——现场代价是一个 98MB 长会话重启后把 92.7 万的估算发成
-// 了 126.9 万（provider 上限 104.8 万），直接 400。
+// 系数刻意**不因工具目录、窗口、模型变化而作废**：这些差异让比例移动一两成，而丢掉
+// 记忆的代价是「重启后第一条请求退回 inflation=1」——那恰恰是历史最厚、最没有新实测
+// 可学的时刻。现场代价是一个 98MB 长会话重启后把 92.7 万的估算发成了 126.9 万
+// （provider 上限 104.8 万），直接 400。
 func TestEstimateInflation(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	m.SetModelName("model-a")
@@ -152,25 +152,26 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 1_100_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
 		t.Fatalf("偏差系数 = %v，期望约 1.1", got)
 	}
 
 	// 工具目录变了（升级）→ 偏差系数照样成立
-	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
 		t.Fatalf("工具目录变化不应作废偏差系数，得到 %v", got)
 	}
 
 	// 窗口变了 → 比例与窗口无关，照样成立
 	m.SetContextWindow(131072)
-	if got := m.estimateInflation("s1", "model-a"); got < 1.09 || got > 1.11 {
+	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
 		t.Fatalf("窗口变化不应作废偏差系数，得到 %v", got)
 	}
 	m.SetContextWindow(1_048_576)
 
-	// 换模型（分词器可能不同）→ 作废
-	if got := m.estimateInflation("s1", "model-b"); got != 1 {
-		t.Fatalf("换模型应退回 1，得到 %v", got)
+	// 换模型（分词器不同）→ 照样成立：比例只移动一两成，清零则等于丢掉全部记忆
+	m.SetModelName("model-b")
+	if got := m.estimateInflation("s1"); got < 1.09 || got > 1.11 {
+		t.Fatalf("换模型不应作废偏差系数，得到 %v", got)
 	}
 
 	// 估算偏大时不用（缩小会白丢历史）
@@ -178,12 +179,12 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 800_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s2", "model-a"); got != 1 {
+	if got := m.estimateInflation("s2"); got != 1 {
 		t.Fatalf("偏大不应缩小，得到 %v", got)
 	}
 
 	// 无锚点（首次请求/重启）→ 1
-	if got := m.estimateInflation("nope", "model-a"); got != 1 {
+	if got := m.estimateInflation("nope"); got != 1 {
 		t.Fatalf("无锚点应为 1，得到 %v", got)
 	}
 
@@ -192,7 +193,7 @@ func TestEstimateInflation(t *testing.T) {
 		promptTokens: 3_000_000, sentEstimate: 1_000_000,
 		toolsHash: hash, model: "model-a", contextWindow: 1_048_576,
 	})
-	if got := m.estimateInflation("s3", "model-a"); got != estimateInflationMax {
+	if got := m.estimateInflation("s3"); got != estimateInflationMax {
 		t.Fatalf("应夹到 %v，得到 %v", estimateInflationMax, got)
 	}
 }

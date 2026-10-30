@@ -62,40 +62,27 @@ func envelopeMatches(anchor sessionUsageAnchor, curToolsHash, curModel string, w
 	return true
 }
 
-// inflationComparable 判定用量锚点能否用来推断**估算偏差**（estimateInflation 专用）。
-//
-// 与 envelopeMatches 的差别：**不看工具目录指纹，也不看窗口**。
-//
-//   - 偏差（provider 实际 / 我们的估算）来自分词器与内容密度，换一批工具、换一个窗口
-//     都不会让它失效；
-//   - 而工具目录恰恰是最容易变的东西——任何一次升级都会改 schema 或描述。按旧口径
-//     "指纹变了就作废"，每次升级后的第一条请求都退回 inflation=1。对长会话这是最危险
-//     的时刻：历史最厚、可压缩空间最大，而首帧没有任何真实用量可比对，只能靠历史偏差
-//     兜底。偏差系数是**记忆**，不该被一次工具改版抹掉。
-//
-// 只有模型（分词器）换了才作废——那才是比例真正不可比的情形。
-func inflationComparable(anchor sessionUsageAnchor, curModel string) bool {
-	if anchor.model != "" && curModel != "" && anchor.model != curModel {
-		return false
-	}
-	return true
-}
-
 // estimateInflation 返回「我们的估算相对 provider 实际用量」的放大系数（≥1）。
 //
 // 锚点记的是同一次请求的两个数：我们算的 sentEstimate 与 provider 报的 promptTokens。
-// 两者一除就是这一模型、这类内容的系统性偏差。它正是「算得不准，于是以为装得下」的
-// 修正项：判定上限时用放大后的估算，而不是相信我们自己的算数。
+// 两者一除就是这类内容的系统性偏差。它正是「算得不准，于是以为装得下」的修正项：
+// 判定上限时用放大后的估算，而不是相信我们自己的算数。
+//
+// **这个系数不随工具目录、窗口、模型变化而作废。** 下面三条按代价排过序：
+//
+//   - 估算偏差本身是量级上的问题（实测中文 + 工具负载，provider 数到的常是我们估算的
+//     1.4–1.7 倍），而换分词器只让比例移动一两成——丢掉记忆的误差比「用旧比例」大得多；
+//   - 工具目录与窗口是每次升级、每次调参都在变的东西。按「变了就作废」，重启后的第一条
+//     请求永远退回 inflation=1，而那恰恰是历史最厚、最没有新实测可学的时刻；
+//   - 系数偏大的代价只是多丢一点历史（本轮还能工作），偏小的代价是整轮 400。两者不对等，
+//     所以宁可保留旧记忆，也不为了「精确」而清零。
 //
 // 只在该次请求没被改写的情况下有意义——被压缩改写过的那次，promptTokens 描述的是
 // 改写后的表面、sentEstimate 也是（recordSessionAnchor 记的正是改写后的 req），所以
 // 仍然可比。provider 用量低于我们的估算时不缩小系数（偏大只会白丢历史）。
-func (m *Manager) estimateInflation(sessionID, curModel string) float64 {
+func (m *Manager) estimateInflation(sessionID string) float64 {
 	anchor, ok := m.lastSessionAnchor(sessionID)
 	if !ok || anchor.promptTokens <= 0 || anchor.sentEstimate <= 0 {
-		return 1
-	}
-	if !inflationComparable(anchor, curModel) {
 		return 1
 	}
 	inflation := float64(anchor.promptTokens) / float64(anchor.sentEstimate)
@@ -112,8 +99,8 @@ func (m *Manager) estimateInflation(sessionID, curModel string) float64 {
 //
 // 两条来源的性质不同，都保留：锚点来自成功请求（promptTokens / sentEstimate），是长期
 // 系统偏差；超窗记录来自被拒的那一次，是一次**实证**——它一定比锚点更接近真相。
-func (m *Manager) ceilingInflation(sessionID, curModel string) float64 {
-	inflation := m.estimateInflation(sessionID, curModel)
+func (m *Manager) ceilingInflation(sessionID string) float64 {
+	inflation := m.estimateInflation(sessionID)
 	if adj, ok := m.overflowFor(sessionID); ok && adj.inflation > inflation {
 		inflation = adj.inflation
 	}
