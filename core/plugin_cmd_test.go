@@ -319,3 +319,54 @@ func envToMap(t *testing.T, env []string) map[string]string {
 	}
 	return out
 }
+
+// TestPluginCmdDeduplicatesInjectedKeys 守护「coreEnv 后来追加的键也必须去重」。
+//
+// 上面那个用例能过，可能只是因为它撞上的宿主变量恰好没被 coreEnv 再注入一次。
+// 这里把三类会被 coreEnv 追加的键**预先放进宿主环境**，制造真正的冲突：
+//   - DSC_TOKEN_COEF：启动脚本会导出，dsc 拉插件时继承下来，coreEnv 又会按当前
+//     系数再注入一遍——两者数值本来就不同（老脚本 vs 重新拟合后的值）；
+//   - DSC_PLUGIN_CONFIG：上一级进程（或嵌套启动）可能带下来；
+//   - entry.Env 里显式配置的同一个键。
+//
+// 未去重时子进程收到两个同名项，胜出者取决于 os/exec 与 CreateProcess 的装配细节。
+// 现场事故就是这个形状：配置里写着新值，插件读到的却是旧值。
+func TestPluginCmdDeduplicatesInjectedKeys(t *testing.T) {
+	const staleCoef = "1,1,1,1,1,1,1"
+	t.Setenv("DSC_TOKEN_COEF", staleCoef)
+	t.Setenv("DSC_PLUGIN_CONFIG", `{"stale":true}`)
+
+	m := NewManager(&ManagerConfig{})
+	entry := PluginEntry{
+		Name:   "llm-b",
+		Type:   "llm",
+		Env:    map[string]string{"DSC_ANTHROPIC_MODEL": "config-model"},
+		Config: map[string]interface{}{"fresh": true},
+	}
+	cmd := m.pluginCmd(entry, "llm-b.exe", "")
+
+	// 键唯一（不只是 DSC_ANTHROPIC_MODEL 一家）。
+	seen := make(map[string]string, len(cmd.Env))
+	for _, kv := range cmd.Env {
+		i := strings.Index(kv, "=")
+		if i <= 0 {
+			continue
+		}
+		k, v := kv[:i], kv[i+1:]
+		if prev, dup := seen[k]; dup {
+			t.Fatalf("env 含重复键 %q（值 %q / %q）", k, prev, v)
+		}
+		seen[k] = v
+	}
+
+	// 而且留下的必须是**新**的那个：去重不能把后注入的值丢掉。
+	if got := seen["DSC_TOKEN_COEF"]; got == staleCoef || got == "" {
+		t.Fatalf("DSC_TOKEN_COEF = %q，期望按当前系数重算的新值（宿主遗留值 %q 必须被覆盖）", got, staleCoef)
+	}
+	if got := seen["DSC_PLUGIN_CONFIG"]; !strings.Contains(got, "fresh") {
+		t.Fatalf("DSC_PLUGIN_CONFIG = %q，期望 entry.Config 的新值而非宿主遗留值", got)
+	}
+	if got := seen["DSC_ANTHROPIC_MODEL"]; got != "config-model" {
+		t.Fatalf("DSC_ANTHROPIC_MODEL = %q，期望 config-model", got)
+	}
+}

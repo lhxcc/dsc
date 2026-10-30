@@ -2574,6 +2574,28 @@ func buildEnv(pluginName string, custom map[string]string, allowSecrets bool) []
 	return env
 }
 
+// setEnv 把 key=value 合并进 env 列表：先剔掉已有同名键，再追加。
+//
+// 不能图省事直接 append。env 里本来就可能已有同名键：宿主环境自己就常带着
+// DSC_TOKEN_COEF（启动脚本会导出，dsc 再拉插件时就继承了它），DSC_PLUGIN_CONFIG
+// 也可能由上一级进程带下来。直接 append 会让子进程收到两个同名项，谁胜出取决于
+// os/exec 与操作系统的装配细节（Windows 的 CreateProcess env 块尤其如此），而这
+// 正是现场事故的形状——配置里写着新值，插件读到的却是旧值。
+//
+// 按 key 合并之后，pluginCmd 注释里那句「恒为完整列表且天然去重」对所有注入的键
+// 都成立，而不只是 buildEnv 里经过 map 合并的那部分。
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, prefix+value)
+}
+
 // coreEnv 计算插件进程 env：宿主环境 + 插件自定义 env。
 // 互通服务 ID 不再经 env 注入（握手时序问题）：改为宿主加载工具插件后经
 // ToolService.SetInterconnect 把挂载在本插件 client broker 上的服务 ID 传入
@@ -2589,7 +2611,7 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 	// 的配置形状——换个人接 MCP 就得改核心。
 	if len(entry.Config) > 0 {
 		if data, err := json.Marshal(entry.Config); err == nil {
-			env = append(env, "DSC_PLUGIN_CONFIG="+string(data))
+			env = setEnv(env, "DSC_PLUGIN_CONFIG", string(data))
 		}
 	}
 	if entry.Type == "llm" {
@@ -2599,7 +2621,7 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 	}
 	// 估算系数随进程注入：插件进程启动时读同一份，宿主与插件永远用一把尺子。
 	// 不能让各进程各自读文件——启动时序不同时会读到不同版本（见 token_coef.go）。
-	env = append(env, tokenCoefEnvKey+"="+FormatTokenCoefSpec(ActiveTokenCoefs()))
+	env = setEnv(env, tokenCoefEnvKey, FormatTokenCoefSpec(ActiveTokenCoefs()))
 	return env
 }
 
