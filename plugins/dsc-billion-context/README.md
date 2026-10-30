@@ -59,6 +59,7 @@ absorb / crush 都是有損的：一旦摘要成一段話，原文就沒了。CC
    - 應用 prune（被壓縮塊覆蓋的消息替換為 summary，原位嵌入保持前綴穩定）
    - 清理孤兒 tool-call/result/reasoning 配對
    - 決策是否注入 nudge 提示（45% 閾值 + 隨窗口縮放的增長門 + T2/T3 蒸餾（質量優先））
+     · 增長門的基線是「上次提示時的規模」，**表面變小時下移到當前規模**（宿主滑窗裁剪或壓縮成功都會讓表面回落）；守著不可達的舊基線等於永久關閉提示
 7. 返回改寫後的消息列表給宿主，宿主透傳給 LLM
 8. 模型調 `compress` 工具時，插件從緩存的 `lastMessages` 解析 `mNNNNN` 邊界執行壓縮
 9. 上下文溢出不由插件處理：超窗的處置權在宿主（收緊預算 → 滑窗 → 重試，全程無損）。
@@ -125,7 +126,7 @@ plugins:
 - T1/T2/T3 完整多層壓縮與蒸餾
 - 前綴緩存穩定（原位嵌入 + 不注入標籤 + nudge 尾部追加）
 - 孤兒 tool-call/result/reasoning 配對清理
-- nudge 決策（閾值門 + 增長門（隨窗口縮放）+ baseline 重置 + T2/T3 **質量觸發**：可回收摘要 tokens ≥ 1.5×nudgeGrowthTokens；計數路徑默認關閉，對齊 acp-kernel #379「block COUNT is not a need signal」）
+- nudge 決策（閾值門 + 增長門（隨窗口縮放）+ 基線隨表面縮小下移 + T2/T3 **質量觸發**：可回收摘要 tokens ≥ 1.5×nudgeGrowthTokens；計數路徑默認關閉，對齊 acp-kernel #379「block COUNT is not a need signal」）
 - billion system prompt 經 `Hook.ContextFn` 貢獻（對齊 DSH `ctx.systemPrompt.section`）
 - 穩定消息 ID（宿主下發的 `event-<seq>`，不含視圖 index／內容 hash）
 - 超窗交給宿主滑窗（不再訂閱 `agent/request-error`，不做有損緊急壓縮）

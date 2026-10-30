@@ -30,8 +30,8 @@ import (
 
 	"dsc/proto"
 
-	billion "dsc-billion-context/billion"
 	bcadapter "dsc-billion-context/adapter"
+	billion "dsc-billion-context/billion"
 )
 
 // BillionContext 插件主结构。
@@ -404,7 +404,7 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 			fmt.Fprintf(os.Stderr, "[billion-context] nudge: reason=%q tokens=%d limit=%d threshold=%d growthFloor=%d baseline=%d\n",
 				result.Nudge.Reason, result.Nudge.Breakdown["usage"], bc.config.ModelContextLimit,
 				result.Nudge.Breakdown["thresholdTokens"], billion.GrowthFloorTokens(bc.config),
-				result.Nudge.Breakdown["baselineTokens"])
+				result.Nudge.Breakdown["lastNudgeTokens"])
 			renderedMsgs = append(renderedMsgs, billion.CoreMessage{
 				ID:          "billion_nudge",
 				Role:        billion.RoleUser,

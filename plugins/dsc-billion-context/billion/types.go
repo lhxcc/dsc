@@ -110,10 +110,15 @@ type MessageRefMap struct {
 
 // NudgeState nudge 决策状态（防反馈循环）。
 type NudgeState struct {
-	LastPerMessageNudgeTokens int            `json:"lastPerMessageNudgeTokens"`
-	LastNudgeShownTokens      int            `json:"lastNudgeShownTokens"`
-	BaselineTokens            int            `json:"baselineTokens"`
-	Anchors                   map[string]any `json:"anchors,omitempty"`
+	LastPerMessageNudgeTokens int `json:"lastPerMessageNudgeTokens"`
+	LastNudgeShownTokens      int `json:"lastNudgeShownTokens"`
+	// LastNudgeTokens 上次注入压缩提示时的上下文规模（token）。
+	//
+	// 它是「高水位」式的参照点，**不是阈值**：下次提示要求规模至少再涨
+	// GrowthFloorTokens 才值得再打扰模型（防「压完立刻又提示」）。名字取成
+	// lastNudge* 是为了不再被误读成阈值——旧名 baselineTokens 已经造成过一次误解。
+	LastNudgeTokens int            `json:"lastNudgeTokens"`
+	Anchors         map[string]any `json:"anchors,omitempty"`
 }
 
 // CompressionStats 压缩统计。
