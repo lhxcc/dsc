@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -185,7 +186,7 @@ func (t *jobTool) Name() string { return t.name }
 func (t *jobTool) Description() string {
 	switch t.name {
 	case "job_output":
-		return "Read a background job's output and status. While the job runs you get whatever is observable at that moment: tools that stream report a partial tail ('[partial output — last 4.0 KB of 37.0 KB so far]'), and every running job reports how long it has been running plus when it last produced output — that is how you tell 'still working' from 'stuck'. Tools that only produce output at the end answer '(no output yet)'; polling will not change that, and a completion notice reaches you automatically when the job ends. This call waits a few seconds first (to catch jobs that are about to finish or that just started printing), then reports the current state. Do not poll in a loop; if you need a fresh signal, one re-read after a short separate command (e.g. a curl/health check) is enough. Only use wait:true when you cannot take another step without the settled result: it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
+		return "Read a background job's output and status. While the job runs you get whatever is observable at that moment: tools that stream report a partial tail ('[partial output — last 4.0 KB of 37.0 KB so far]'), and every running job reports how long it has been running plus when it last produced output — that is how you tell 'still working' from 'stuck'. A running job with nothing to show answers '(no output yet)' and tells you which case it is: the tool cannot stream (output only arrives when it ends), or nothing has been written yet — usually a program block-buffering its own stdout because it is a pipe rather than a terminal, which is why a manual run shows prints and this does not; read that note before you retry, because it says what would actually help (run unbuffered, keep output attached) and how many times you have already asked. Polling does not change any of this, and a completion notice reaches you automatically when the job ends. This call waits a few seconds first (to catch jobs that are about to finish or that just started printing), then reports the current state. Do not poll in a loop; if you need a fresh signal, one re-read after a short separate command (e.g. a curl/health check) is enough. Only use wait:true when you cannot take another step without the settled result: it blocks until the job ends (max 60s, and an expired wait still notifies you later). Responses end with [status: ...]."
 	case "job_list":
 		return "List background jobs visible to this caller as '<id> [<kind>] <status> — <label>', one per line."
 	case "job_kill":
@@ -262,12 +263,13 @@ func (t *jobTool) execOutput(ctx context.Context, args json.RawMessage, caller s
 	if !p.Wait && rd.Text == "" && jobRunning(rd.Snapshot.Status) {
 		rd = t.awaitFirstOutput(ctx, p.JobID, caller, rd)
 	}
-	out := renderJobOutput(rd)
-	if rd.Text == "" && rd.Partial == "" && jobRunning(rd.Snapshot.Status) && !rd.Streaming {
-		// 这类任务运行期没有可读输出：说清楚「别轮询」，否则模型会反复读空串。
-		out += "\n[note: this job exposes output only when it finishes; it is still running. " +
-			"Stop polling — a completion notice will reach you. Use wait:true only if you truly cannot proceed without the result.]"
+	// 运行中读到空：记一次，供返回文本点明「这是第 N 次、还是 0 字节」。
+	// 只数 job_output 调用本身，不数 awaitFirstOutput 内部的轮询读（那会数成几百次）。
+	emptyReads := 0
+	if rd.Text == "" && rd.Partial == "" && jobRunning(rd.Snapshot.Status) {
+		emptyReads = t.m.jobs.NoteEmptyRead(p.JobID, caller)
 	}
+	out := renderJobOutput(rd, emptyReads)
 	if waitDropped {
 		out += "\n[note: blocking wait is disabled on this host; returned the current state instead. You will be notified when the job finishes.]"
 	}
@@ -335,10 +337,13 @@ func (t *jobTool) awaitFirstOutput(ctx context.Context, id, caller string, last 
 // renderJobOutput 渲染 job_output 结果（对齐 DSH：输出 + [status: ...] 结尾；
 // 空输出用 (no output yet)）。
 //
+// emptyReads 是「运行中读到空」的第几次（见 jobs.Registry.NoteEmptyRead）：
+// 第一次给完整解释与出路，之后再读只点明「还是 0 字节」，不再重复整段说明。
+//
 // 重复读取要明说：最终输出任务是幂等的，模型连读两次拿到的是同一段文字，而它
 // 无从知道自己已经读过（实测表现为同一个任务被反复读取、界面上出现两张一模一样
 // 输出卡）。这里在第 2 次及以后的读取尾部标注次数与「内容未变」，模型据此收手。
-func renderJobOutput(rd jobs.Read) string {
+func renderJobOutput(rd jobs.Read, emptyReads int) string {
 	var b strings.Builder
 	switch {
 	case rd.Text != "":
@@ -352,14 +357,20 @@ func renderJobOutput(rd jobs.Read) string {
 	default:
 		b.WriteString("(no output yet)")
 	}
+	empty := rd.Text == "" && rd.Partial == ""
+	running := jobRunning(rd.Snapshot.Status)
 	b.WriteString("\n[status: " + string(rd.Snapshot.Status) + "]")
 	if rd.Snapshot.Detail != "" {
 		b.WriteString(" " + rd.Snapshot.Detail)
 	}
 	// 运行中补一句「跑了多久 / 上次动是多久前」：final-output 任务这时没有可读输出，
 	// 模型唯一能判断的是它还在动、还是已经安静很久（那才是该考虑 job_kill 的时候）。
-	if jobRunning(rd.Snapshot.Status) {
-		b.WriteString("\n" + jobProgressNote(rd))
+	if running {
+		b.WriteString("\n" + jobProgressNote(rd, empty))
+	}
+	// 「在跑但一个字节都没有」需要解释：不解释，模型只会反复读空串。
+	if empty && running {
+		b.WriteString("\n" + silentJobNote(rd, emptyReads))
 	}
 	if rd.ReadCount > 1 {
 		fmt.Fprintf(&b, "\n[note: read #%d of this job's final output; it has not changed since your previous read — no need to read it again]", rd.ReadCount)
@@ -367,9 +378,56 @@ func renderJobOutput(rd jobs.Read) string {
 	return b.String()
 }
 
+// silentJobNote 解释「任务在跑，却一个字节都没有」，并给出唯一可行的下一步。
+//
+// 这段文本存在的理由很具体：启动期加载（大模型、冷编译、慢磁盘）最常见的形态是
+// 「进程活着、job_output 却永远是 (no output yet)」，而人工在终端里跑同一条命令
+// 明明看得见打印。差别不在读取链路，在**子进程自己的缓冲**：stdout 是管道而不是
+// 终端时按块（4–8 KB）缓冲，打印要等缓冲写满或进程退出才离开子进程——字节根本
+// 还没到我们这里，所以它也不在任何「尾部快照」里。
+//
+// 因此这里明确三件事，缺一不可：0 字节是真的 0 字节（不是我们没读到）；为什么；
+// 想看实时输出该怎么做。否则模型拿到的只是一句它无法行动的「没有输出」。
+func silentJobNote(rd jobs.Read, emptyReads int) string {
+	if !rd.Streaming {
+		// 这类工具运行期根本不提供输出（final-output）：不是缓冲问题，别开错药方。
+		if emptyReads > 1 {
+			return fmt.Sprintf("[note: still no output — this is read #%d, and this job only reports output when it finishes. Stop polling; a completion notice reaches you.]", emptyReads)
+		}
+		return "[note: this job exposes output only when it finishes; it is still running. " +
+			"Stop polling — a completion notice will reach you. Use wait:true only if you truly cannot proceed without the result.]"
+	}
+	if emptyReads > 1 {
+		return fmt.Sprintf("[note: still nothing written — read #%d, still 0 bytes. Nothing changed since the previous read; "+
+			"the reason and the way to get live output are in the first read's note. Stop polling — a completion notice reaches you.]", emptyReads)
+	}
+	return "[why no output: the process has not written anything yet. A child process whose stdout is a pipe rather than a " +
+		"terminal block-buffers its own prints (typically 4–8 KB, or until it exits), so startup output can stay inside the " +
+		"process for minutes even though the same command shows prints when run in a terminal. 0 bytes here means 0 bytes " +
+		"arrived — nothing was dropped on this side.]\n" +
+		"[what helps: " + unbufferedHint() + " A log redirect (`> log 2>&1`) silences this view as well, so keep output " +
+		"attached if you want to watch progress here — redirect freely when the log file itself is what you are after. " +
+		"Otherwise stop polling: a completion notice reaches you.]"
+}
+
+// unbufferedHint 按平台给出「让子进程别缓冲」的具体写法。
+//
+// 不写平台无关的一句话：`stdbuf` 在 Windows 上不存在，写上去等于让模型去撞墙；
+// 而 python 的 -u / PYTHONUNBUFFERED 两边都有，是这类启动脚本最通用的开关。
+func unbufferedHint() string {
+	if runtime.GOOS == "windows" {
+		return "restart it unbuffered (`python -u`, or PYTHONUNBUFFERED=1) and keep stdout/stderr attached."
+	}
+	return "restart it unbuffered (`python -u`, PYTHONUNBUFFERED=1, or `stdbuf -oL <cmd>`) and keep stdout/stderr attached."
+}
+
+
 // jobProgressNote 运行中任务的进度摘要（elapsed + 上次输出）。
-func jobProgressNote(rd jobs.Read) string {
-	parts := make([]string, 0, 2)
+//
+// empty=true（运行中、还没有任何可读输出）时说清字节数：尾部通道可用却仍报 0 字节，
+// 是「子进程还没吐字」的直接证据；只说「还在跑」会让模型以为再读一次就有了。
+func jobProgressNote(rd jobs.Read, empty bool) string {
+	parts := make([]string, 0, 3)
 	if !rd.Snapshot.StartedAt.IsZero() {
 		parts = append(parts, "running for "+humanDuration(time.Since(rd.Snapshot.StartedAt)))
 	}
@@ -381,6 +439,9 @@ func jobProgressNote(rd jobs.Read) string {
 	case !rd.Snapshot.StartedAt.IsZero():
 		// 工具不上报活动（旧插件）：不编造「多久没输出」，只说明这一点。
 		parts = append(parts, "this tool does not report activity")
+	}
+	if empty && rd.Tailable {
+		parts = append(parts, humanBytes(rd.PartialBytes)+" written")
 	}
 	if len(parts) == 0 {
 		return "[still running]"

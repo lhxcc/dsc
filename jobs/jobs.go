@@ -219,6 +219,7 @@ type Job struct {
 	snapshot      JobSnapshot
 	output        string // final-output 终态输出（幂等读）
 	terminalReads int    // 终态输出被读次数（见 Read.ReadCount）
+	emptyReads    int    // 运行期「读到空」的次数（见 NoteEmptyRead）
 	cancel        func(reason string)
 	readOutput    func() string            // nil = 非增量
 	tailOutput    func() (string, int64)   // 可选：运行期输出快照
@@ -448,6 +449,23 @@ func (r *Registry) Read(id, caller string) (Read, error) {
 		return Read{}, err
 	}
 	return r.readLocked(j), nil
+}
+
+// NoteEmptyRead 记录一次「运行中被读到空」的调用，返回这是第几次（0 = 无法记录）。
+//
+// 为什么单独计数：终态输出有 ReadCount（幂等重读要点明「内容没变」），但**运行期
+// 读空**是另一件事——模型最常见的行为是刚转后台就立刻 job_output，拿回一行
+// (no output yet) 后不知道该收手，于是再读一次。调用方据此可以在返回里点明
+// 「这是第 N 次，还是 0 字节」，把「以为没读对」和「本来就还没吐字」分开。
+func (r *Registry) NoteEmptyRead(id, caller string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, err := r.authorize(id, caller)
+	if err != nil {
+		return 0
+	}
+	j.emptyReads++
+	return j.emptyReads
 }
 
 // ReadHost 读取任意任务输出与状态（宿主管理视图：TUI /jobs output，跳过 owner 隔离）。

@@ -156,6 +156,20 @@ func main() {
 	if extraAdvice != "" {
 		description += " " + extraAdvice
 	}
+	// 输出去向的建议：只说明后果，不做拦截。
+	//
+	// job_output 能看到的运行期输出，全部来自这条命令**连着我们**的 stdout/stderr。
+	// 一旦 `> log 2>&1`，字节直接进文件，job_output 只能看到"(no output yet)"直到
+	// 命令结束——而这恰好是「想盯进度」和「想留日志」两个目标冲突的地方。要不要
+	// 重定向只有模型自己知道（它知道后面还有没有别的步骤要读那个文件），所以这里
+	// 只把代价讲清楚，然后明确说重定向也完全可以。
+	description += " If you plan to watch its progress with job_output while it runs, keep stdout and stderr attached: " +
+		"redirecting them (`> log 2>&1`) sends the output straight to the file and makes the running job look silent."
+	if runtime.GOOS != "windows" {
+		// tee 是外部程序：Windows 上默认没有，写上去等于让模型去撞墙。
+		description += " Use `2>&1 | tee log` when you want the file and a live view together."
+	}
+	description += " When the log file is what you actually need, redirect anyway — that is a legitimate choice."
 
 	// 定義 shell 工具
 	schema := json.RawMessage(`{
