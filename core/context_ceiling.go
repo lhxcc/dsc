@@ -86,6 +86,11 @@ func (m *Manager) estimateInflation(sessionID, model string) float64 {
 	// 借来的比例只服务这一帧：本帧结算出的用量会写进当前模型名下，下一帧自动换成自己的。
 	anchor, ok, _ := m.anchorForModel(sessionID, model)
 	if !ok || anchor.promptTokens <= 0 || anchor.sentEstimate <= 0 {
+		// 本会话还没结算过（冷启动/新会话）：用**跨会话累积的模型校准表**，而不是 1。
+		// 这是「重启后第一个请求」唯一能拿到的依据，也正是历史上最容易撞墙的那一刻。
+		if f := m.calibrationFor(model); f > 0 {
+			return f
+		}
 		return 1
 	}
 	inflation := float64(anchor.promptTokens) / float64(anchor.sentEstimate)

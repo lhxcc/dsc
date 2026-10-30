@@ -125,14 +125,27 @@ func (s *llmAggregateServer) ChatStream(req *proto.ChatRequest, stream proto.LLM
 				// 压力判定以此精确底数 + 启发式增量（对齐 DSH tokenMeter pressureTokens）。
 				// 仅流式请求携带 usage；非流式 Chat 不记录（保持 0 → 插件退回启发式）。
 				if call.Usage != nil && call.Usage.PromptTokens > 0 {
+					// 量一次**最终发出表面**（消息 + 工具目录）：估算与构成出自同一遍扫描，
+					// 判超窗与喂校准表必须同源。
+					stats := MeasureRequestSurface(req.Messages, req.Tools)
 					// 记录锚点：req 是经 pre-step 改写后的最终请求，所以这里的估算与
 					// 指纹描述的就是真正发出的那个表面（压缩后端改写后的）。
 					s.m.recordSessionAnchor(req.GetSessionId(), sessionUsageAnchor{
 						promptTokens:  int(call.Usage.PromptTokens),
-						sentEstimate:  EstimateProtoMessagesTokens(req.Messages) + EstimateProtoToolTokens(req.Tools),
+						sentEstimate:  stats.Estimate,
 						toolsHash:     ToolsFingerprint(req.Tools),
 						model:         s.m.modelName,
 						contextWindow: s.m.contextWindow,
+					})
+					// 喂校准：账本（可审计/可重拟合）+ 按模型的校准表（跨会话、跨重启）。
+					s.m.recordUsageSample(req.GetSessionId(), UsageSample{
+						Model:   s.m.modelName,
+						Sent:    stats.Estimate,
+						Actual:  int(call.Usage.PromptTokens),
+						Msgs:    stats.Msgs,
+						MsgEst:  stats.MsgEstimate,
+						ToolEst: stats.ToolEstimate,
+						Classes: stats.Classes,
 					})
 				}
 				return nil

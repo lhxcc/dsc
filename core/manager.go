@@ -149,6 +149,13 @@ type Manager struct {
 	sessionAnchors  map[string]*sessionAnchorSet
 	sessionAnchorMu sync.RWMutex
 
+	// 分词器校准表（按模型）：每帧结算的 (实测/估算) 都汇进来，跨会话、跨重启有效。
+	// 冷启动的第一帧就靠它，而不是退回 1——见 token_calibration.go。
+	calib          map[string]*modelCalibration
+	calibRecent    map[string][]float64 // 每模型最近若干帧比值（算离散度，不落盘原始值）
+	calibDriftHits map[string]int       // 连续漂移计数的当前段
+	calibMu        sync.RWMutex
+
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
 	stopHooks map[string][]func() error
 
@@ -360,9 +367,15 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		policyOff:           make(map[string][]func()),
 		sessionApproval:     make(map[string]ApprovalPolicy),
 		sessionAnchors:      make(map[string]*sessionAnchorSet),
+		calib:               make(map[string]*modelCalibration),
+		calibRecent:         make(map[string][]float64),
+		calibDriftHits:      make(map[string]int),
 		jobs:                jobs.NewRegistry(),
 	}
 	m.jobs.SetLogger(m.logger)
+	// 分词器校准表：启动时读盘（冷启动第一帧就有据可依）；没有则从历史账本重建。
+	m.loadCalibration()
+	m.warmCalibrationFromLedgers()
 	// 事件总线监听器 panic 恢复时用宿主主 logger 记录调用栈（定位根因）。
 	m.events.SetLogger(m.logger)
 	m.ptc = cfg.PTC

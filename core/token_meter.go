@@ -332,6 +332,40 @@ const (
 	tokPerMilleSymbol = 1000 // 其余非 ASCII 符号与字母（破折号、箭头、引号、带音标字母）
 )
 
+// 文本类别下标（SurfaceStats.Classes 的顺序；改顺序会让历史账本里的数组失去意义）。
+const (
+	clsLetter = iota
+	clsSpace
+	clsDigit
+	clsPunct
+	clsWide
+	clsEmoji
+	clsSymbol
+	textClassCount = 7
+)
+
+// SurfaceStats 一次请求表面的量与构成。
+//
+// 除了总量，还记各类字符的计数：整体比值（actual/sent）只能告诉我们「差多少」，
+// 记下构成才能回答「差在哪种内容上」，也才有可能按模型重拟合系数（见 token_calibration.go
+// 与会话账本）。
+type SurfaceStats struct {
+	Estimate     int // 消息 + 工具目录（= MsgEstimate + ToolEstimate）
+	MsgEstimate  int // 仅消息
+	ToolEstimate int // 仅工具目录
+	Msgs         int
+	ToolCalls    int
+	Classes      [textClassCount]int
+}
+
+// EstimatorCoefficients 返回估算器当前的千分权重与类别名（顺序即 SurfaceStats.Classes
+// 的下标）。供离线校准工具（tools/tokcal）对比「现用系数」与「按账本重拟合的结果」。
+func EstimatorCoefficients() (names []string, perMille []int) {
+	return []string{"letter", "space", "digit", "punct", "wide", "emoji", "symbol"},
+		[]int{tokPerMilleLetter, tokPerMilleSpace, tokPerMilleDigit, tokPerMillePunct,
+			tokPerMilleWide, tokPerMilleEmoji, tokPerMilleSymbol}
+}
+
 // EstimateTextTokens 估算一段文本的 token 数：**按字符类别加权累加**（千分整数，
 // 最后一次性四舍五入，避免逐字取整把短文本抬到 1 token/字）。
 //
@@ -342,38 +376,52 @@ func EstimateTextTokens(s string) int {
 		return 0
 	}
 	acc := 0
-	for _, r := range s {
-		acc += tokenWeightPerMille(r)
-	}
-	if acc <= 0 {
-		return 1
-	}
-	if t := (acc + 999) / 1000; t > 0 {
+	addText(s, &acc, nil)
+	if t := tokensFromPerMille(acc); t > 0 {
 		return t
 	}
 	return 1
 }
 
-// tokenWeightPerMille 返回单个字符的千分权重（见 tokPerMille* 常量）。
-func tokenWeightPerMille(r rune) int {
+// addText 把一段文本按类别累加进 acc；counts 非 nil 时同时累计各类字符数。
+func addText(s string, acc *int, counts *[textClassCount]int) {
+	for _, r := range s {
+		w, class := tokenWeight(r)
+		*acc += w
+		if counts != nil {
+			counts[class]++
+		}
+	}
+}
+
+// tokensFromPerMille 把千分累加值折算成 token（向上取整）。
+func tokensFromPerMille(acc int) int {
+	if acc <= 0 {
+		return 0
+	}
+	return (acc + 999) / 1000
+}
+
+// tokenWeight 返回单个字符的千分权重与类别（见 tokPerMille* 常量）。
+func tokenWeight(r rune) (int, int) {
 	switch {
 	case r < 0x80:
 		switch {
 		case r >= '0' && r <= '9':
-			return tokPerMilleDigit
+			return tokPerMilleDigit, clsDigit
 		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
-			return tokPerMilleSpace
+			return tokPerMilleSpace, clsSpace
 		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
-			return tokPerMilleLetter
+			return tokPerMilleLetter, clsLetter
 		}
-		return tokPerMillePunct
+		return tokPerMillePunct, clsPunct
 	case isWideRune(r):
 		if r >= 0x1F300 && r <= 0x1FAFF {
-			return tokPerMilleEmoji
+			return tokPerMilleEmoji, clsEmoji
 		}
-		return tokPerMilleWide
+		return tokPerMilleWide, clsWide
 	}
-	return tokPerMilleSymbol
+	return tokPerMilleSymbol, clsSymbol
 }
 
 // isWideRune 报告是否为 CJK 一族（一字接近一个 token）的宽字符：CJK 部首、假名、
@@ -440,6 +488,52 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 		total += EstimateProtoMessageTokens(m)
 	}
 	return total
+}
+
+// MeasureProtoMessages 边量边记构成：估算值与 EstimateProtoMessagesTokens **逐字节
+// 同口径**（同一套权重、同一套消息/工具调用开销），额外输出各类字符计数。
+//
+// 两件事必须同源：判超窗用的是估算值，而校准表用的是「估算值 + 构成」。若两处各算一遍，
+// 一旦公式改动就会出现「按 A 判、按 B 学」——正是我们反复踩的那种两个尺子的问题。
+func MeasureProtoMessages(msgs []*proto.Message) SurfaceStats {
+	var st SurfaceStats
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+		st.Msgs++
+		acc := 0
+		addText(m.GetContent(), &acc, &st.Classes)
+		toks := tokensFromPerMille(acc)
+		if m.GetRole() == "tool" {
+			toks += 6
+		} else {
+			toks += 4
+		}
+		for _, img := range m.GetImages() {
+			toks += imageStructuralTokens(img)
+		}
+		for _, tc := range m.GetToolCalls() {
+			tcAcc := 0
+			addText(tc.GetName()+tc.GetArgumentsJson(), &tcAcc, &st.Classes)
+			toks += tokensFromPerMille(tcAcc) + 8
+			st.ToolCalls++
+		}
+		st.MsgEstimate += toks
+	}
+	st.Estimate = st.MsgEstimate
+	return st
+}
+
+// MeasureRequestSurface 量「最终要发的表面」：消息 + 工具目录，并带上构成计数。
+//
+// 工具目录不计入 Classes（它同构、重复，与消息内容不是一类文本，见 estimateOneToolTokens），
+// 单独记在 ToolEstimate 里。
+func MeasureRequestSurface(msgs []*proto.Message, tools []*proto.Tool) SurfaceStats {
+	st := MeasureProtoMessages(msgs)
+	st.ToolEstimate = EstimateProtoToolTokens(tools)
+	st.Estimate = st.MsgEstimate + st.ToolEstimate
+	return st
 }
 
 // EstimateToolTokens 估算工具定义的 token 数（system prompt 中的工具目录）。
