@@ -60,7 +60,11 @@ func (t *runCodeTool) Execute(ctx context.Context, args json.RawMessage) (string
 	}
 
 	// 由工具目录生成 SDK，拼接在用户脚本之前执行。
-	sdk := coderuntime.GenerateSDK(toolSpecsFromProto(t.m.AllToolsProto(), runCodeToolName))
+	// 排除 run_code 自身（避免嵌套/遮蔽歧义）与「返回图像附件」的工具：Lua 绑定只能
+	// 拿回字符串，图像会静默丢掉——模型收到一段描述却看不见图，还以为看过了。
+	skip := t.imageToolNames()
+	skip[runCodeToolName] = true
+	sdk := coderuntime.GenerateSDK(toolSpecsFromProto(t.m.AllToolsProto(), skip))
 	var timeout time.Duration
 	if p.TimeoutMs > 0 {
 		timeout = time.Duration(p.TimeoutMs) * time.Millisecond
@@ -149,13 +153,31 @@ func runCodeView(_ context.Context, _ json.RawMessage, result string) (string, e
 	return string(v), nil
 }
 
+// imageToolNames 列出「会返回图像附件」的工具名（实现 ViewImageExecutor 的那些）。
+//
+// 它们不能进 run_code 的 LuA SDK：run_code 的绑定只能把结果作为字符串交回程序，
+// 附件无处可放，于是图像被静默丢弃、模型读到一段描述却看不到图。让它在程序里
+// 根本不存在，比让它「成功但什么都看不到」诚实。
+func (t *runCodeTool) imageToolNames() map[string]bool {
+	out := map[string]bool{}
+	if t.m == nil {
+		return out
+	}
+	for _, tl := range t.m.GetToolRegistry().VisibleTools() {
+		if _, ok := tl.(ViewImageExecutor); ok {
+			out[tl.Name()] = true
+		}
+	}
+	return out
+}
+
 // toolSpecsFromProto 把宿主工具目录（[]*proto.Tool）转成 SDK 用的 ToolSpec 列表，
-// 按工具名排序（稳定、前缀缓存友好）；skip 指定的工具（如 run_code 自身）排除，
-// 避免在同名 Lua 全局下造成嵌套/遮蔽歧义。
-func toolSpecsFromProto(tools []*proto.Tool, skip string) []coderuntime.ToolSpec {
+// 按工具名排序（稳定、前缀缓存友好）；skip 里的工具排除——既避免同名 Lua 全局下
+// 的嵌套/遮蔽歧义（run_code 自身），也用于挡掉图像类工具（见 imageToolNames）。
+func toolSpecsFromProto(tools []*proto.Tool, skip map[string]bool) []coderuntime.ToolSpec {
 	out := make([]coderuntime.ToolSpec, 0, len(tools))
 	for _, t := range tools {
-		if t.Name == skip {
+		if skip[t.Name] {
 			continue
 		}
 		out = append(out, coderuntime.ToolSpec{

@@ -697,18 +697,14 @@ func (m *Model) displayModelName() string {
 	return m.agent.Name(m.ctx)
 }
 
-// llmSupportsImages 报告当前活跃 LLM 是否启用图像输入：经 manager 缓存的活跃 LLM
-// 插件 capabilities（llmMetadataServer.GetInfo 上报 supports_images）判定。manager
-// 缺失、活跃 LLM 未注册或能力未知时返回 true（放行，避免误报）。
+// llmSupportsImages 报告当前活跃 LLM 是否启用图像输入：判定放在宿主（
+// core.Manager.SupportsImageInput），与读图工具的门控同一来源——两处各写一遍
+// 就会出现「TUI 提示不支持、工具却读得到」这类自相矛盾。
 func (m *Model) llmSupportsImages() bool {
 	if m.manager == nil {
 		return true
 	}
-	info, ok := m.manager.GetPluginMetadata(m.manager.ActiveLLMName())
-	if !ok || info == nil || info.Capabilities == nil {
-		return true
-	}
-	return info.Capabilities["supports_images"] != "false"
+	return m.manager.SupportsImageInput()
 }
 
 // Update 处理消息
@@ -2076,6 +2072,7 @@ var toolArgKey = map[string]string{
 	"install_skill":        "name",
 	"uninstall_skill":      "name",
 	"context_search":       "query",
+	"read_image":           "file_path",
 	"job_output":           "job_id",
 	"job_kill":             "job_id",
 	"load_dsc_plugin":      "name",

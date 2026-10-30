@@ -423,6 +423,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 	// 宿主内置会话检索工具：滑窗把早期记录裁掉后，模型仍能按关键词精确取回原话。
 	_ = m.toolRegistry.Register(&contextSearchTool{m: m})
+	// 宿主内置读图工具：模型执行中途要看图（截图、图表、UI 稿）时用；与输入框
+	// 「@图片」共用同一条附件管线（dsc-img://<sha256>），不另建缓存。
+	_ = m.toolRegistry.Register(&readImageTool{m: m})
 	// 后台任务完成 → 宿主事件总线（通用送达：TUI 唤醒、web/novelforge 等插件订阅）
 	m.jobs.OnJobDone(func(s jobs.JobSnapshot) {
 		// 已完成却只会造成重复唤醒的两种情形直接丢弃：
