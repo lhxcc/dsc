@@ -140,6 +140,27 @@ type Registry struct {
 	logger        hclog.Logger // 监听器 panic 等内部错误的日志出口；nil 则静默
 }
 
+// NewID 生成 <kind>-<2n 位小写十六进制> 的标识（n = 随机字节数）。
+//
+// 与 ShortID 的分工：ShortID 固定 7 位十六进制（28 位熵），靠「同一张表里查重后
+// 重生成」兜底，够用于进程内的任务表；NewID 按调用方给的字节数取熵，用于**跨表、
+// 跨文件**指认 id 的场景——那里没有一张表可以用来查重，唯一性只能靠宽度：8 字节
+// （64 位）在几万条规模下碰撞概率可以忽略（28 位在 2 万条时已接近 3/4）。
+func NewID(kind string, n int) string {
+	if n <= 0 {
+		n = 4
+	}
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand 不可用（极罕见）：退回纳秒时间熵，仍带低位噪声
+		x := uint64(time.Now().UnixNano())
+		for i := range b {
+			b[i] = byte(x >> (8 * (i % 8)))
+		}
+	}
+	return kind + "-" + hex.EncodeToString(b)
+}
+
 // ShortID 生成 Git 风格的短哈希标识：<kind>-<7 位小写十六进制>。
 //
 // 所有「需要人类可读唯一标识」的地方共用它：后台任务（Registry.Start）、
@@ -149,13 +170,8 @@ type Registry struct {
 //
 // 需要同表查重时（如后台任务表）用 newJobID；单次生成用它。
 func ShortID(kind string) string {
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 不可用（极罕见）：退回纳秒时间熵，仍带低位噪声
-		n := time.Now().UnixNano()
-		b = [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
-	}
-	return kind + "-" + hex.EncodeToString(b[:])[:7]
+	id := NewID(kind, 4) // 4 字节 = 8 位十六进制，展示取前 7 位
+	return id[:len(id)-1]
 }
 
 // newJobID 生成后台任务标识（同表内查重，撞了就重生成）。
