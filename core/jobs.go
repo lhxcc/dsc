@@ -421,7 +421,6 @@ func unbufferedHint() string {
 	return "restart it unbuffered (`python -u`, PYTHONUNBUFFERED=1, or `stdbuf -oL <cmd>`) and keep stdout/stderr attached."
 }
 
-
 // jobProgressNote 运行中任务的进度摘要（elapsed + 上次输出）。
 //
 // empty=true（运行中、还没有任何可读输出）时说清字节数：尾部通道可用却仍报 0 字节，

@@ -223,26 +223,45 @@ func enqueueMemory(content, source, project string) {
 	}
 }
 
-// flushPendingMemories 把队列里待写的记忆以单个事务落盘。可被多处并发调用（定时器、
-// 读工具入口、AfterTool）：先取出并清空，再各自落盘自己那批。
+// flushPendingMemories 把队列里待写的记忆按项目库分组落盘（每组一个事务）。
+// 可被多处并发调用（定时器、读工具入口、AfterTool）：先取出并清空，再各自落盘自己那批。
+//
+// 分组是分库的直接后果：一批里可能同时有本项目与全局层的记录，它们属于不同文件，
+// 不能塞进同一个事务。组内仍是「一事务多行」，逐条的 fsync 成本不变。
 func flushPendingMemories() {
 	pendingWrites.Lock()
 	batch := pendingWrites.items
 	pendingWrites.items = nil
 	pendingWrites.Unlock()
-	if len(batch) == 0 || DB == nil {
+	if len(batch) == 0 {
 		return
 	}
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		for _, m := range batch {
-			if _, _, err := addMemoryTx(tx, m.content, m.source, m.project); err != nil {
-				return err
-			}
+
+	var order []string
+	groups := map[string][]pendingMemory{}
+	for _, m := range batch {
+		if _, ok := groups[m.project]; !ok {
+			order = append(order, m.project)
 		}
-		return nil
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "memory-service: flush %d memories failed: %v\n", len(batch), err)
+		groups[m.project] = append(groups[m.project], m)
+	}
+	for _, project := range order {
+		db, err := dbs.db(project)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "memory-service: open db for %q failed, dropping %d memories: %v\n", project, len(groups[project]), err)
+			continue
+		}
+		err = db.Transaction(func(tx *gorm.DB) error {
+			for _, m := range groups[project] {
+				if _, _, err := addMemoryTx(tx, m.content, m.source, m.project); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "memory-service: flush %d memories to %q failed: %v\n", len(groups[project]), project, err)
+		}
 	}
 }
 

@@ -1,8 +1,8 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
 	"os"
 	osexec "os/exec"
@@ -146,8 +146,25 @@ func TestE2EWithHostClient(t *testing.T) {
 		t.Fatalf("带标点关键词 memory_search view = %+v", v)
 	}
 
-	// 7. 记忆库落点校验：<hostDir>/memory/memory.db（跨会话，非项目级）
-	if _, err := os.Stat(filepath.Join(hostDir, "memory", "memory.db")); err != nil {
-		t.Fatalf("memory.db 未创建于宿主可执行目录 memory 下: %v", err)
+	// 7. 记忆库落点校验：<hostDir>/memory/<项目键>.db（本项目一份，global 一份），
+	// 旧的单库 memory.db 不再出现——分库之后同一份安装上的多个项目各写各的文件。
+	memDir := filepath.Join(hostDir, "memory")
+	entries, err := os.ReadDir(memDir)
+	if err != nil {
+		t.Fatalf("memory 目录未创建: %v", err)
+	}
+	var dbs []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".db") {
+			dbs = append(dbs, e.Name())
+		}
+	}
+	if len(dbs) < 2 {
+		t.Fatalf("应至少有两个项目库（当前项目 + global），实际 %v", dbs)
+	}
+	for _, name := range dbs {
+		if name == "memory.db" {
+			t.Fatalf("不应再出现旧单库 memory.db，实际 %v", dbs)
+		}
 	}
 }

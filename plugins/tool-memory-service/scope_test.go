@@ -3,27 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"testing"
 
 	dsc "dsc-sdk"
-
 )
-
-// setupMemoryDB 把全局 DB 指到临时库，测试结束恢复（DB 是包级单例）。
-func setupMemoryDB(t *testing.T) {
-	t.Helper()
-	old := DB
-	if err := initDB(filepath.Join(t.TempDir(), "memory.db")); err != nil {
-		t.Fatalf("initDB: %v", err)
-	}
-	t.Cleanup(func() {
-		if sqlDB, err := DB.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
-		DB = old
-	})
-}
 
 // asProject 切换当前工作区（项目键由它派生，与会话文件名同一套规则）。
 // 插件进程里工作区根是 dsc.WorkspaceRoot（宿主启动时按 DSC_WORKSPACE_ROOT 设定），
@@ -68,7 +51,7 @@ func searchVia(t *testing.T, keyword, scope string) []map[string]any {
 // TestProjectScopeIsolation project 档严格等于「当前项目」：A 项目的记忆不得出现在
 // B 项目，也没有跨项目翻查的档位（别的项目的私有细节不该被顺手带进上下文）。
 func TestProjectScopeIsolation(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	addVia(t, "proj-a 使用 CMake 而非 Make", "current")
 
@@ -102,7 +85,7 @@ func TestProjectScopeIsolation(t *testing.T) {
 // TestGlobalScopeIsSeparate global 档只含全局共享层：任一项目都能显式查到，
 // 但 project 档（默认）不会把它混进来——两档严格互斥，不做隐式合并。
 func TestGlobalScopeIsSeparate(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	addVia(t, "用户偏好中文回复", "global")
 	addVia(t, "proj-a 私有约定", "current")
@@ -144,7 +127,7 @@ func TestGlobalScopeIsSeparate(t *testing.T) {
 // TestDedupPerProject 去重按「项目 + 内容」：两个项目各自记同一结论是两条独立记忆，
 // 否则 A 项目写入会导致 B 项目误以为「已有」而拿不到自己的那条。
 func TestDedupPerProject(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	first := addVia(t, "构建用 ninja", "current")
 
@@ -174,12 +157,12 @@ func TestDedupPerProject(t *testing.T) {
 
 // TestMemoryProjectColumnStamp 写入时把当前项目键落到 project 列（与会话键同源）。
 func TestMemoryProjectColumnStamp(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	addVia(t, "记录一条", "current")
 
 	var mem Memory
-	if err := DB.Where("content = ?", "记录一条").First(&mem).Error; err != nil {
+	if err := dbFor(t, currentProjectKey()).Where("content = ?", "记录一条").First(&mem).Error; err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}
 	if want := dsc.ProjectSessionKey(); mem.Project != want {
@@ -199,7 +182,7 @@ func mustJSON(v any) json.RawMessage {
 // TestAddRequiresScope scope 必填且只接受两档：缺省或乱填都应报错，
 // 不允许写出「没有归属」的记忆（那种数据无法管理）。
 func TestAddRequiresScope(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 
 	if _, err := handleAdd(context.Background(), mustJSON(map[string]string{"content": "缺归属"})); err == nil {
@@ -213,14 +196,14 @@ func TestAddRequiresScope(t *testing.T) {
 	}
 
 	var count int64
-	DB.Model(&Memory{}).Count(&count)
+	dbFor(t, currentProjectKey()).Model(&Memory{}).Count(&count)
 	if count != 0 {
 		t.Fatalf("报错的写入不应落库，got %d 行", count)
 	}
 
 	// 合法写入仍正常
 	addVia(t, "有归属", "current")
-	DB.Model(&Memory{}).Count(&count)
+	dbFor(t, currentProjectKey()).Model(&Memory{}).Count(&count)
 	if count != 1 {
 		t.Fatalf("合法写入应落 1 行，got %d", count)
 	}
@@ -228,16 +211,16 @@ func TestAddRequiresScope(t *testing.T) {
 
 // TestUpdateScopeValidates 改归属时给非法值要报错；不传 scope 则不动归属。
 func TestUpdateScopeValidates(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	res := addVia(t, "条目", "current")
-	id := int64(res["id"].(float64))
+	id := res["id"].(string)
 
 	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "scope": "all"})); err == nil {
 		t.Fatal("非法 scope 应报错")
 	}
 	var mem Memory
-	if err := DB.First(&mem, id).Error; err != nil {
+	if err := dbFor(t, currentProjectKey()).Where("id = ?", id).First(&mem).Error; err != nil {
 		t.Fatal(err)
 	}
 	if mem.Project != currentProjectKey() {
@@ -248,16 +231,16 @@ func TestUpdateScopeValidates(t *testing.T) {
 	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "content": "条目2"})); err != nil {
 		t.Fatalf("改内容应成功: %v", err)
 	}
-	DB.First(&mem, id)
+	dbFor(t, currentProjectKey()).Where("id = ?", id).First(&mem)
 	if mem.Project != currentProjectKey() {
 		t.Fatalf("未传 scope 时归属应保持，got %q", mem.Project)
 	}
 
-	// 显式改到全局层
+	// 显式改到全局层（跨库搬移：旧库删、全局库写，id 不变）
 	if _, err := handleUpdate(context.Background(), mustJSON(map[string]any{"id": id, "scope": "global"})); err != nil {
 		t.Fatalf("改到全局应成功: %v", err)
 	}
-	DB.First(&mem, id)
+	dbFor(t, globalProject).Where("id = ?", id).First(&mem)
 	if mem.Project != globalProject {
 		t.Fatalf("应改到全局哨兵，got %q", mem.Project)
 	}
@@ -266,10 +249,10 @@ func TestUpdateScopeValidates(t *testing.T) {
 // TestModelCanManageOtherProjects 记忆插件的用户只有模型自己：隔离是默认检索范围，
 // 不是权限。模型应当能按 id 修改/删除/迁移任意项目的记忆（先 scope=all 盘点拿 id）。
 func TestModelCanManageOtherProjects(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	foreign := addVia(t, "A 项目的结论", "current")
-	foreignID := int64(foreign["id"].(float64))
+	foreignID := foreign["id"].(string)
 
 	asProject(t, "/w/proj-b")
 	// B 项目里用 all 才能看到（默认 current 看不到）
@@ -289,7 +272,7 @@ func TestModelCanManageOtherProjects(t *testing.T) {
 		t.Fatalf("应允许把条目改到全局层: %v", err)
 	}
 	var mem Memory
-	DB.First(&mem, foreignID)
+	dbFor(t, globalProject).Where("id = ?", foreignID).First(&mem)
 	if mem.Project != globalProject {
 		t.Fatalf("归属应已改为全局，got %q", mem.Project)
 	}
@@ -297,7 +280,7 @@ func TestModelCanManageOtherProjects(t *testing.T) {
 	if _, err := handleDelete(context.Background(), mustJSON(map[string]any{"id": foreignID})); err != nil {
 		t.Fatalf("应允许跨项目删除: %v", err)
 	}
-	if err := DB.First(&Memory{}, foreignID).Error; err == nil {
+	if _, _, err := findMemory(foreignID); err == nil {
 		t.Fatal("删除后不应再存在")
 	}
 }
@@ -305,7 +288,7 @@ func TestModelCanManageOtherProjects(t *testing.T) {
 // TestScopeAcceptsProjectKey scope=project:<键> 可点名任意项目（读与写都支持），
 // 写入后可被该项目的默认检索看到。
 func TestScopeAcceptsProjectKey(t *testing.T) {
-	setupMemoryDB(t)
+	setupMemoryDir(t)
 	asProject(t, "/w/proj-a")
 	keyA := currentProjectKey()
 

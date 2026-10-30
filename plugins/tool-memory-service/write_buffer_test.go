@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"testing"
 )
 
@@ -13,30 +12,29 @@ import (
 // 每个请求加固定延迟（WAL 化前实测 8.3ms/条、之后 0.8ms），而这条路径不需要任何返回值
 // 给模型，完全可以推迟。现在 pre-step 只入队，后台协程按批（单事务）落盘。
 
-// openTestDB 初始化临时库，并返回统计辅助。
+// openTestDB 准备一个空的记忆目录并返回统计辅助（句柄按项目键取）。
 func openTestDB(t *testing.T) {
 	t.Helper()
-	if err := initDB(filepath.Join(t.TempDir(), "memory.db")); err != nil {
-		t.Fatalf("initDB: %v", err)
-	}
-	// 先关连接再让 t.TempDir 清理：Windows 上未关闭的 SQLite 句柄会锁住文件，
-	// 否则清理阶段报 "The process cannot access the file"。
-	t.Cleanup(func() {
-		resetPendingMemories()
-		if DB != nil {
-			if sqlDB, err := DB.DB(); err == nil {
-				_ = sqlDB.Close()
-			}
-			DB = nil
-		}
-	})
+	setupMemoryDir(t)
 }
 
+// testProject 是写入类测试固定的归属键（flush 分组依据）。
+const testProject = "proj"
+
+// countMemories 汇总所有项目库里的条数（分库之后「一共有几条」要跨库数）。
 func countMemories(t *testing.T) int64 {
 	t.Helper()
+	keys, err := projectDBKeys()
+	if err != nil {
+		t.Fatalf("list dbs: %v", err)
+	}
 	var n int64
-	if err := DB.Model(&Memory{}).Count(&n).Error; err != nil {
-		t.Fatalf("count: %v", err)
+	for _, key := range keys {
+		var c int64
+		if err := dbFor(t, key).Model(&Memory{}).Count(&c).Error; err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		n += c
 	}
 	return n
 }
@@ -46,7 +44,7 @@ func countMemories(t *testing.T) int64 {
 func TestWALEnabled(t *testing.T) {
 	openTestDB(t)
 	var mode string
-	if err := DB.Raw("PRAGMA journal_mode").Scan(&mode).Error; err != nil {
+	if err := dbFor(t, testProject).Raw("PRAGMA journal_mode").Scan(&mode).Error; err != nil {
 		t.Fatalf("读 journal_mode: %v", err)
 	}
 	if mode != "wal" {
@@ -69,7 +67,7 @@ func TestReasoningEnqueueDoesNotWrite(t *testing.T) {
 		t.Fatalf("flush 后应有 1 条，实际 %d 条", got)
 	}
 	var mem Memory
-	if err := DB.Where("source = ?", "reasoning").First(&mem).Error; err != nil {
+	if err := dbFor(t, currentProjectKey()).Where("source = ?", "reasoning").First(&mem).Error; err != nil {
 		t.Fatalf("应落盘 source=reasoning 的记录: %v", err)
 	}
 	if mem.Content != "这是一段只在队列里的推理内容" {
@@ -82,9 +80,9 @@ func TestReasoningEnqueueDoesNotWrite(t *testing.T) {
 func TestFlushBatchesAndDedups(t *testing.T) {
 	openTestDB(t)
 
-	enqueueMemory("同一条结论", "reasoning", "proj")
-	enqueueMemory("同一条结论", "reasoning", "proj")
-	enqueueMemory("另一条结论", "reasoning", "proj")
+	enqueueMemory("同一条结论", "reasoning", testProject)
+	enqueueMemory("同一条结论", "reasoning", testProject)
+	enqueueMemory("另一条结论", "reasoning", testProject)
 	flushPendingMemories()
 
 	if got := countMemories(t); got != 2 {
@@ -101,7 +99,7 @@ func TestEnqueueFlushesAtBatchThreshold(t *testing.T) {
 	openTestDB(t)
 
 	for i := 0; i < memoryFlushBatch; i++ {
-		enqueueMemory(fmt.Sprintf("批量条目 %d", i), "reasoning", "proj")
+		enqueueMemory(fmt.Sprintf("批量条目 %d", i), "reasoning", testProject)
 	}
 	if got := countMemories(t); got != int64(memoryFlushBatch) {
 		t.Fatalf("达到批量阈值应立即落盘 %d 条，实际 %d 条", memoryFlushBatch, got)
@@ -112,7 +110,7 @@ func TestEnqueueFlushesAtBatchThreshold(t *testing.T) {
 func TestReadToolFlushesPending(t *testing.T) {
 	openTestDB(t)
 
-	enqueueMemory("写入后立刻检索的标记词 zzzmarker", "reasoning", "proj")
+	enqueueMemory("写入后立刻检索的标记词 zzzmarker", "reasoning", testProject)
 	if got := countMemories(t); got != 0 {
 		t.Fatalf("前置条件：此时应仍在队列里，实际已落 %d 条", got)
 	}
