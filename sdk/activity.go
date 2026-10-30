@@ -1,9 +1,11 @@
 package dsc
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"dsc/proto"
 )
@@ -116,6 +118,12 @@ func (s *toolServiceServer) GetActivity(_ context.Context, req *proto.GetActivit
 		}
 	}
 	activityMu.Unlock()
+	// 尾部是要经 proto string 回给宿主的：非法 UTF-8 会让整个 GetActivity 响应
+	// marshal 失败（宿主只看到报错，活动和尾部一起丢）。工具侧该还原的还原，这里
+	// 只做止损——远程命令/外部程序吐什么字节我们控制不了。
+	if !utf8.Valid(tail) {
+		tail = bytes.ToValidUTF8(tail, []byte("\uFFFD"))
+	}
 	return &proto.GetActivityResponse{
 		LastActivityUnixMs: ts,
 		OutputTail:         tail,

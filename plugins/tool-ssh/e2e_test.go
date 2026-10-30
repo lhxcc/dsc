@@ -1,11 +1,14 @@
 package main
 
 import (
-	dsc "dsc-sdk"
 	"context"
+	dsc "dsc-sdk"
 	"encoding/json"
+	"fmt"
+	"net"
 	osexec "os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dsc/proto"
@@ -97,7 +100,7 @@ func TestE2EWithHostClient(t *testing.T) {
 	// ssh_list：空会话 → 表格视图（列定义 + "0" 徽标）
 	if resp := run("ssh_list", `{}`); resp.Error != "" {
 		t.Fatalf("ssh_list = %+v", resp)
-	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "SSH Sessions" || v.Badge == nil || v.Badge.Text != "0" || len(v.Columns) != 1 {
+	} else if v := assertView(t, resp); v.Kind != "table" || v.Title != "SSH Sessions" || v.Badge == nil || v.Badge.Text != "0" || len(v.Columns) != 3 {
 		t.Fatalf("ssh_list view = %+v", v)
 	}
 
@@ -113,5 +116,48 @@ func TestE2EWithHostClient(t *testing.T) {
 		t.Fatalf("ssh_close = %+v", resp)
 	} else if v := assertView(t, resp); v.Kind != "card" || v.Title != "SSH" || v.Badge == nil || v.Badge.Text != "not found" || v.Fields[0].Value != "ghost" {
 		t.Fatalf("ssh_close view = %+v", v)
+	}
+
+	// 6. 真实持久会话（本地最小 SSH 服务器）：一次连接、多条命令复用同一条 TCP。
+	srv := startFakeSSH(t)
+	host, portStr, err := net.SplitHostPort(srv.addr)
+	if err != nil {
+		t.Fatalf("split addr: %v", err)
+	}
+	connectResp := run("ssh_connect", fmt.Sprintf(`{"host":%q,"port":%s,"username":"tester","password":"secret"}`, host, portStr))
+	var connInfo SSHConnectResult
+	if err := json.Unmarshal([]byte(connectResp.Content), &connInfo); err != nil || !connInfo.Success || connInfo.SessionID == "" {
+		t.Fatalf("ssh_connect = %q (err %v)", connectResp.Content, err)
+	}
+	for i, cmd := range []string{"echo one", "echo two"} {
+		resp := run("ssh_exec", fmt.Sprintf(`{"session_id":%q,"command":%q}`, connInfo.SessionID, cmd))
+		var r SSHExecResult
+		if err := json.Unmarshal([]byte(resp.Content), &r); err != nil {
+			t.Fatalf("exec #%d 结果非法: %v", i, err)
+		}
+		if !r.Success || !strings.Contains(r.Output, "ok:"+cmd) {
+			t.Fatalf("exec #%d = %+v", i, r)
+		}
+		if r.Reconnected {
+			t.Fatalf("exec #%d 不该重连（连接一直活着）", i)
+		}
+	}
+	if conns, channels := srv.counts(); conns != 1 || channels != 2 {
+		t.Fatalf("两条命令应复用一条连接：conns=%d channels=%d", conns, channels)
+	}
+
+	listResp := run("ssh_list", `{}`)
+	var sessionList SSHListResult
+	if err := json.Unmarshal([]byte(listResp.Content), &sessionList); err != nil {
+		t.Fatalf("ssh_list 结果非法: %v", err)
+	}
+	if len(sessionList.Sessions) != 1 || !sessionList.Sessions[0].Alive || sessionList.Sessions[0].Host != srv.addr {
+		t.Fatalf("ssh_list = %+v", sessionList)
+	}
+
+	closeResp := run("ssh_close", fmt.Sprintf(`{"session_id":%q}`, connInfo.SessionID))
+	var closed SSHCloseResult
+	if err := json.Unmarshal([]byte(closeResp.Content), &closed); err != nil || !closed.Closed {
+		t.Fatalf("ssh_close = %q (err %v)", closeResp.Content, err)
 	}
 }
