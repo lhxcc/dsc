@@ -254,34 +254,39 @@ func injectRuntimeEnv(merged *core.Config, mode, workspaceRoot, sandboxPolicy st
 	}
 }
 
-// injectMaxOutputTokens 向 LLM 插件注入 DSC_MAX_OUTPUT_TOKENS（默认输出上限=有效上下文窗口值）。
-// 不分本地/云端一律注入，行为一致：探测命中（/v1/models 返回 meta.n_ctx——LLAMACPP 特有字段）
-// 时注入探测窗口值（最准）；探测不命中（云端）时注入配置 context_window 值（含 128K 兜底默认）
-// ——窗口来源随端点自然切换，注入行为不变，用户对 context_window 的调整在任何端点都生效。
-// anthropic 兼容口把 max_tokens 视为 required，字段缺席时服务端自填保守默认（laamaafung
-// server-chat.cpp 为 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带
-// 窗口值在 LLAMACPP 侧受上下文自然钳制（生成至 EOS 或窗口满），无害。
-// 插件侧优先级：请求级参数（压缩等场景的窗口净余值）> 插件 env 里显式配置的
-// DSC_MAX_OUTPUT_TOKENS（-1=不携带；0 表示未设置）或接口专属
-// DSC_<P>_MAX_OUTPUT_TOKENS（旧名兼容）> 本注入值 > 不携带（宿主未注入时）。
-// 注意：插件 env 已显式给出 DSC_MAX_OUTPUT_TOKENS 时必须尊重，不得覆盖——否则
-// 用户在 config.yaml 里写的 -1（不携带）会被这里静默改回窗口值。
-func injectMaxOutputTokens(merged *core.Config, maxTokens int) {
-	if maxTokens <= 0 {
+// injectMaxOutputBudget 把探测到的输出上限写进当前 provider 的 env。
+//
+// 只写**当前 provider** 的条目：预算是按这个端点的协议上限探出来的，套到另一个 provider
+// 上没有依据。找不到对应条目时退回全部 llm 条目（宁可保守也别漏）。
+func injectMaxOutputBudget(cfg *core.Config, provider string, budget int) {
+	if cfg == nil || budget <= 0 {
 		return
 	}
-	for i := range merged.Plugins {
-		e := &merged.Plugins[i]
-		if e.Type != "llm" {
-			continue
-		}
+	apply := func(e *core.PluginEntry) {
 		if e.Env == nil {
 			e.Env = map[string]string{}
 		}
-		if _, explicit := e.Env["DSC_MAX_OUTPUT_TOKENS"]; explicit {
-			continue // 用户显式配置优先
+		e.Env["DSC_MAX_OUTPUT_TOKENS"] = strconv.Itoa(budget)
+	}
+	want := "llm-" + provider
+	matched := false
+	for i := range cfg.Plugins {
+		e := &cfg.Plugins[i]
+		if e.Type != "llm" {
+			continue
 		}
-		e.Env["DSC_MAX_OUTPUT_TOKENS"] = strconv.Itoa(maxTokens)
+		if e.Name == want || e.Name == provider {
+			apply(e)
+			matched = true
+		}
+	}
+	if matched {
+		return
+	}
+	for i := range cfg.Plugins {
+		if cfg.Plugins[i].Type == "llm" {
+			apply(&cfg.Plugins[i])
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -109,42 +111,53 @@ func contextProbePaths(baseURL string) []string {
 //
 // 多个 model 条目时取**最大**的非零值：网关常把别名/小模型一起列出来，取第一条
 // （data[0]）会拿到错的容量。
-func probeContextWindow(baseURL string) int {
+// reachable 语义：服务端对这一轮探测给出了**有意义的应答**（任意 HTTP 状态码）。
+// 区分它是为了「该不该重试」：连不上/5xx 值得再试，服务端活着却说不出容量就没必要等
+// （实测：一个网关没有 /props、/models 也不吐 n_ctx，重试只让每次启动多花 3.5 秒）。
+func probeContextWindow(baseURL string) (window int, reachable bool) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		return 0
+		return 0, false
 	}
 	// ① 运行时属性先：/props 给的是**当前调度设置**，优先于 /v1/models 里可能陈旧的 meta。
 	for _, p := range []string{"/props", "/v1/props"} {
-		if v := probeWindowAt(base + p); v > 0 {
-			return v
+		v, ok := probeWindowAt(base + p)
+		reachable = reachable || ok
+		if v > 0 {
+			return v, true
 		}
 	}
 	// ② 模型表兜底：同一份数据的两个入口（带不带 /v1），各自内部取最大。
 	best := 0
 	for _, p := range []string{"/v1/models", "/models"} {
-		if v := probeWindowAt(base + p); v > best {
+		v, ok := probeWindowAt(base + p)
+		reachable = reachable || ok
+		if v > best {
 			best = v
 		}
 	}
-	return best
+	return best, reachable
 }
 
-// probeWindowAt 从单个 URL 读容量（0 = 这条路径没给出可用值）。
-func probeWindowAt(u string) int {
+// probeWindowAt 从单个 URL 读容量；第二返回值表示服务端是否给出了应答
+// （2xx/4xx 都算——它活着，只是这条路径不带容量）。
+func probeWindowAt(u string) (window int, answered bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0
+		return 0, false // 连不上：值得重试
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return 0, false // 服务端自己有事：值得重试
+	}
 	if resp.StatusCode != http.StatusOK {
-		return 0
+		return 0, true // 活着但这条路径没有：重试无益
 	}
 	// /props 的响应可能带完整 chat_template（实测 230KB），只解码需要的字段。
 	var payload struct {
@@ -166,7 +179,7 @@ func probeWindowAt(u string) int {
 		} `json:"default_generation_settings"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return 0
+		return 0, true
 	}
 	best := 0
 	for _, v := range []int{
@@ -186,7 +199,7 @@ func probeWindowAt(u string) int {
 			}
 		}
 	}
-	return best
+	return best, true
 }
 
 // probeContextWindowWithRetry 反复探测：本地服务在「模型加载中」「正在生成占满 slot」
@@ -195,7 +208,9 @@ func probeWindowAt(u string) int {
 //
 // 只对本地/内网端点重试：云端探测失败基本就是「没有这项信息」，白等几秒没有意义。
 func probeContextWindowWithRetry(baseURL string) (window int, attempts int) {
-	if w := probeContextWindow(baseURL); w > 0 {
+	w, reachable := probeContextWindow(baseURL)
+	if w > 0 || reachable {
+		// 拿到容量，或者服务端活着却明确说不出容量：两种情况重试都没有意义。
 		return w, 1
 	}
 	if !looksLikeLocalEndpoint(baseURL) {
@@ -205,7 +220,8 @@ func probeContextWindowWithRetry(baseURL string) (window int, attempts int) {
 	for _, delay := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
 		time.Sleep(delay)
 		attempts++
-		if w := probeContextWindow(baseURL); w > 0 {
+		w, reachable = probeContextWindow(baseURL)
+		if w > 0 || reachable {
 			return w, attempts
 		}
 	}
@@ -228,6 +244,188 @@ func looksLikeLocalEndpoint(baseURL string) bool {
 		return false // 域名：可能是云端，不重试
 	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// activeLLMProviderGroup 把 provider 后缀映射成 env 组名（openai → OPENAI）。
+func activeLLMProviderGroup(provider string) string {
+	return strings.ToUpper(strings.TrimSpace(provider))
+}
+
+// activeLLMFlavor 决定探测走哪种 wire 格式：anthropic 兼容口把 max_tokens 当 required。
+func activeLLMFlavor(provider string) string {
+	if strings.Contains(strings.ToLower(provider), "anthropic") {
+		return "anthropic"
+	}
+	return "openai"
+}
+
+// activeLLMEndpointValue 取当前 provider 组的某个 env（DSC_ 前缀优先、旧名回退）；
+// 目标组没配时借另一组——同一 llama.cpp 端口上 OpenAI/Anthropic 两组同源。
+func activeLLMEndpointValue(env map[string]string, provider, suffix string) string {
+	group := activeLLMProviderGroup(provider)
+	if v := groupEnv(env, group, envGroupPreferDSC(env, group), suffix); v != "" {
+		return v
+	}
+	for _, other := range []string{"OPENAI", "ANTHROPIC"} {
+		if other == group {
+			continue
+		}
+		if v := groupEnv(env, other, envGroupPreferDSC(env, other), suffix); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func activeLLMBaseURL(env map[string]string, provider string) string {
+	return activeLLMEndpointValue(env, provider, "BASE_URL")
+}
+
+func activeLLMAPIKey(env map[string]string, provider string) string {
+	return activeLLMEndpointValue(env, provider, "API_KEY")
+}
+
+// explicitMaxOutputTokens 报告用户是否在 LLM 插件 env 里显式写了输出上限。
+//
+// 只看 env 里有没有这个键（含接口专属名与旧名）：一旦显式，宿主不探也不填——请求级
+// 参数优先于插件 env，宿主填了等于把用户的值顶掉。
+func explicitMaxOutputTokens(cfg *core.Config, provider string) bool {
+	if cfg == nil {
+		return false
+	}
+	group := activeLLMProviderGroup(provider)
+	keys := []string{"DSC_MAX_OUTPUT_TOKENS", "DSC_" + group + "_MAX_OUTPUT_TOKENS", group + "_MAX_OUTPUT_TOKENS"}
+	for _, e := range cfg.Plugins {
+		if e.Type != "llm" {
+			continue
+		}
+		for _, k := range keys {
+			if _, ok := e.Env[k]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxTokensRangeRE / maxTokensUpperRE 从服务端 400 报文里挖出 max_tokens 上限。
+//
+// 两种写法都见过：DeepSeek 官网页给区间（`valid range of max_tokens is [1, 393216]`），
+// 网关/自建服务常写 `max_tokens must be less than or equal to 8192`。
+var (
+	// 区间写法：`valid range of max_tokens is [1, 393216]`
+	maxTokensRangeRE = regexp.MustCompile(`(?i)\[\s*[0-9]+\s*,\s*([0-9]{2,10})\s*\]`)
+	// 上限写法：`maximum value is 65535` / `must be less than or equal to 8192`
+	maxTokensUpperRE = regexp.MustCompile(`(?i)(?:≤|<=|less than or equal to|at most|maximum(?: value)?(?: is)?|must be)[^0-9]{0,12}([0-9]{2,10})`)
+)
+
+// maxTokensLimitFromError 从 400 报文里取 max_tokens 上限（0 = 报文没说）。
+func maxTokensLimitFromError(body string) int {
+	// 先定位 max_tokens 再只看它后面的一小段：报文里常同时出现「请求值」与「上下文长度」
+	// 两个数字（`max_tokens: -1 is invalid, maximum value is 65535`），全局撒网会抓错。
+	idx := strings.Index(strings.ToLower(body), "max_tokens")
+	if idx < 0 {
+		return 0
+	}
+	window := body[idx:]
+	if len(window) > 160 {
+		window = window[:160]
+	}
+	for _, re := range []*regexp.Regexp{maxTokensRangeRE, maxTokensUpperRE} {
+		if m := re.FindStringSubmatch(window); len(m) == 2 {
+			if v, err := strconv.Atoi(m[1]); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
+}
+
+// probeMaxOutputBudget 探测「服务端真正接受的 max_tokens 上限」。
+//
+// 为什么必须探：anthropic 兼容口把 max_tokens 当 required，缺席时服务端自填保守默认
+// （laamaafung 填 4096），一轮长回答就被腰斩；可按窗口值硬填又会被云端 400 拒
+// （DeepSeek 官网页：`valid range of max_tokens is [1, 393216]`）。两种错都只能靠
+// 问一次来避开。
+//
+// 手法：短 prompt + `max_tokens = n_ctx` + `stream=true`，**拿到状态码就断开**——只要
+// 结论，不要生成内容（探测不许变成一次真生成）。结论三档：
+//   - 2xx            → 服务端接受窗口值（本地 llama.cpp 会按上下文自行钳制）；
+//   - 4xx 报文明说上限 → 就用那个数（云端常见）；
+//   - 4xx 没给数字     → 退到 n_ctx/4（用户口径：宁可保守，也别每轮撞一次 400）。
+func probeMaxOutputBudget(baseURL, flavor, model, apiKey string, nCtx int) (int, string) {
+	if nCtx <= 0 || strings.TrimSpace(baseURL) == "" || strings.TrimSpace(model) == "" {
+		return 0, "unavailable"
+	}
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	var endpoint string
+	var payload map[string]any
+	anthropic := strings.EqualFold(flavor, "anthropic")
+	if anthropic {
+		if strings.HasSuffix(base, "/v1") {
+			endpoint = base + "/messages"
+		} else {
+			endpoint = base + "/v1/messages"
+		}
+		payload = map[string]any{
+			"model":      model,
+			"max_tokens": nCtx,
+			"stream":     true,
+			"messages":   []map[string]any{{"role": "user", "content": "ok"}},
+		}
+	} else {
+		if strings.HasSuffix(base, "/v1") {
+			endpoint = base + "/chat/completions"
+		} else {
+			endpoint = base + "/v1/chat/completions"
+		}
+		payload = map[string]any{
+			"model":      model,
+			"max_tokens": nCtx,
+			"stream":     true,
+			"messages":   []map[string]any{{"role": "user", "content": "ok"}},
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "unavailable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, "unavailable"
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if anthropic {
+		if apiKey != "" {
+			req.Header.Set("x-api-key", apiKey)
+		}
+		req.Header.Set("anthropic-version", "2023-06-01")
+	} else if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, "unreachable"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		// 2xx：服务端接受了这个 max_tokens。立刻断开，不读生成内容。
+		return nCtx, "accepted"
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return 0, "unauthorized"
+	case resp.StatusCode == http.StatusNotFound:
+		return 0, "endpoint-missing"
+	}
+	if limit := maxTokensLimitFromError(string(raw)); limit > 0 {
+		return limit, "server-range"
+	}
+	return nCtx / 4, "quarter-fallback"
 }
 
 // endpointForLog 只保留 scheme://host，供日志展示：base_url 里可能带 token/query，
@@ -972,9 +1170,12 @@ func main() {
 		logger.Info("context window probed from llm server", "window", probeWindow, "attempts", probeAttempts)
 	} else if probeBaseURL != "" {
 		// 失败必须说得出来：静默退回 128K 时，用户只能从界面上怀疑「容量怎么少了一半」。
+		hint := "服务端没给 n_ctx / max_model_len（网关/云端常见）。实际容量更大时请在 config.yaml 显式写 context_window"
+		if probeAttempts > 1 {
+			hint = "本地服务在加载模型或 slot 占满时会暂时不可达，已重试；" + hint
+		}
 		logger.Warn("context window probe returned nothing; falling back to config/default",
-			"endpoint", endpointForLog(probeBaseURL), "attempts", probeAttempts,
-			"hint", "服务端没给 n_ctx / max_model_len（云端常见）；本地服务在加载模型或 slot 占满时也会这样——已对本地端点重试。实际容量更大时请在 config.yaml 显式写 context_window")
+			"endpoint", endpointForLog(probeBaseURL), "attempts", probeAttempts, "hint", hint)
 	}
 	configuredWindow := 0
 	if mainCfg != nil && mainCfg.ContextWindow > 0 {
@@ -1009,6 +1210,25 @@ func main() {
 	mgr.SetModelName(llmModelName)
 	mgr.SetContextWindow(contextWindow)
 
+	// 输出预算（max_tokens）：anthropic 兼容口把它当 required，缺席时服务端自填保守默认
+	// （4096）会把长回答腰斩；按窗口值硬填又会被云端 400 拒（DeepSeek 报文明说 [1, 393216]）。
+	// 启动期问一次服务端真正接受的上限，把结论注入**当前 provider** 的 env；用户显式写过
+	// 就一律不碰。探不到则不注入，插件侧按「窗口 − 本帧输入」实时夹（见 llm-*/main.go）。
+	if explicitMaxOutputTokens(merged, activeLLMName) {
+		logger.Info("max output tokens set explicitly by config; host will not fill a default",
+			"provider", activeLLMName)
+	} else if base := activeLLMBaseURL(activeLLMEnv, activeLLMName); base != "" {
+		budget, src := probeMaxOutputBudget(base, activeLLMFlavor(activeLLMName), llmModelName,
+			activeLLMAPIKey(activeLLMEnv, activeLLMName), contextWindow)
+		if budget > 0 {
+			injectMaxOutputBudget(merged, activeLLMName, budget)
+			logger.Info("max output budget probed and injected", "max_tokens", budget, "source", src, "provider", activeLLMName)
+		} else {
+			logger.Warn("max output budget unknown; provider clamps per request from the window",
+				"endpoint", endpointForLog(base), "source", src)
+		}
+	}
+
 	// compaction 选择同样 preset 优先（preset 是具体预设、主导行为）；config.yaml 写了
 	// 不同的后端时明确提示，避免「改了 compaction 却不生效」的静默困惑。该字段现在真正
 	// 决定由哪个插件接管 pre-step 压缩（见 Manager.dispatchEventToPlugins）。
@@ -1027,17 +1247,14 @@ func main() {
 	injectContextWindow(merged, contextWindow)
 	logger.Info("context window injected to all plugins", "window", contextWindow, "plugins", len(merged.Plugins))
 
-	// 输出上限统一语义（不分本地/云端，行为一致）：向 LLM 插件注入 DSC_MAX_OUTPUT_TOKENS
-	// =有效上下文窗口值。探测命中（本地 LLAMACPP）注入探测窗口值；探测不命中（云端）注入
-	// 配置 context_window 值（含 128K 兜底默认）——窗口来源切换、注入行为不变，用户对
-	// context_window 的调整在任何端点都同样生效。anthropic 兼容口把 max_tokens 视为
-	// required，字段缺席时服务端自填保守默认（laamaafung server-chat.cpp 对缺席值填
-	// 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带窗口值在
-	// LLAMACPP 侧被服务端上下文自然钳制（生成至 EOS 或窗口满）。云端若模型输出上限低于
-	// 注入值而被 400 拒绝，属用户可显式调整的范围：下调 context_window，或设插件 env
-	// （DSC_ANTHROPIC_/DSC_OPENAI_MAX_OUTPUT_TOKENS=-1，旧名兼容；0 仍表示未设置）恢复不携带——可调整性优先于差异化默认。
-	injectMaxOutputTokens(merged, contextWindow)
-	logger.Info("max output tokens defaulted to effective context window", "max_tokens", contextWindow, "source", windowSource)
+	// 输出上限（max_tokens）**不由宿主兜底**：用户没显式给值就不携带该字段，等模型自然
+	// 结束。理由是两次实测：①DeepSeek 官网页把上限压在报文里（如 [1, 393216]），任何
+	// 「聪明」的默认值都会先吃一次 400；②llama.cpp 家族缺席时按上下文自行钳制，注入窗口
+	// 值反而让请求逼近「prompt+max_tokens > n_ctx」的边界。原先「不设就注入窗口值」的兜底
+	// 已删除（其唯一动机是 anthropic 兼容口对缺席值自填 4096，但那属于服务端选择，不该
+	// 由宿主替用户决定输出预算）。
+	// 需要限制输出时，在插件 env 里显式写 DSC_MAX_OUTPUT_TOKENS（或接口专属
+	// DSC_<P>_MAX_OUTPUT_TOKENS）：>0 携带该值，-1/0/不写=不携带。
 
 	// 声明式加载：Manager 内做依赖拓扑排序 + PENDING + 聚合 Tool 服务 + 一次性 RegisterServices。
 	// 失败则自愈：把 config.yaml 与 preset 各自备份当前（坏）版、分别还原各自最近正常
@@ -1100,7 +1317,6 @@ func main() {
 				}
 				core.ReportOrphanPlugins(pluginsDir, core.RequiredPluginDirBases(merged), logger)
 				injectRuntimeEnv(merged, mode, core.WorkspaceRoot, sandboxPolicyEnv())
-				injectMaxOutputTokens(merged, contextWindow)
 				logger.Warn("启动加载失败，已还原最近正常配置并重试（降级模式）",
 					"cause", loadErr, "recovered", recovered, "badConfig", badCfg, "badPreset", badPreset)
 				if err := mgr.LoadFromConfig(merged); err != nil {

@@ -36,24 +36,58 @@ func TestInjectContextWindow(t *testing.T) {
 	}
 }
 
-// TestInjectMaxOutputTokensRespectsExplicit 验证注入不覆盖插件 env 里显式写的
-// DSC_MAX_OUTPUT_TOKENS（含 -1=不携带）——否则示例配置里的 -1 会被静默改成窗口值。
-func TestInjectMaxOutputTokensRespectsExplicit(t *testing.T) {
-	merged := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-anthropic", Type: "llm", Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "-1"}},
+// TestAssembleDoesNotInjectMaxOutputTokens 装配阶段不碰 max_tokens：探测与注入发生在
+// main（拿到 URL/模型/凭据之后），装配只看配置本身。
+//
+// 语义现状（三次调整后的定论）：用户显式写了就按用户的（>0 用值、-1 不携带）；没写由
+// 宿主启动期探一次服务端上限再注入；连探都探不到就由插件每帧按「窗口 − 输入」现算。
+func TestAssembleDoesNotInjectMaxOutputTokens(t *testing.T) {
+	mainCfg := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "llm-anthropic", Type: "llm", Enabled: true, BinaryPath: "./plugins/llm-anthropic/a.exe"},
+		{Name: "llm-openai", Type: "llm", Enabled: true, BinaryPath: "./plugins/llm-openai/o.exe",
+			Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "8192"}},
+	}}
+	merged := assembleMerged(extractLLMs(mainCfg), extractAgent(mainCfg), mainCfg, nil, 262144, false, "")
+	for _, p := range merged.Plugins {
+		if p.Type != "llm" {
+			continue
+		}
+		got, ok := p.Env["DSC_MAX_OUTPUT_TOKENS"]
+		if p.Name == "llm-anthropic" && ok {
+			t.Fatalf("装配阶段不得凭空注入 max_tokens，got %q", got)
+		}
+		if p.Name == "llm-openai" && got != "8192" {
+			t.Fatalf("显式配置必须原样保留，got %q", got)
+		}
+	}
+}
+
+// TestInjectMaxOutputBudgetOnlyActiveProvider 探测出来的上限只写当前 provider 的条目：
+// 那是按这个端点探的，套到别的 provider 上没有依据。
+func TestInjectMaxOutputBudgetOnlyActiveProvider(t *testing.T) {
+	cfg := &core.Config{Plugins: []core.PluginEntry{
 		{Name: "llm-openai", Type: "llm"},
+		{Name: "llm-anthropic", Type: "llm"},
 		{Name: "tool-x", Type: "tool"},
 	}}
-	injectMaxOutputTokens(merged, 1048576)
-
-	if got := merged.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "-1" {
-		t.Fatalf("显式 -1 不得被覆盖，got %q", got)
+	injectMaxOutputBudget(cfg, "openai", 393216)
+	if got := cfg.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "393216" {
+		t.Fatalf("当前 provider 应被注入，got %q", got)
 	}
-	if got := merged.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "1048576" {
-		t.Fatalf("未显式配置时应注入窗口值，got %q", got)
+	if _, ok := cfg.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
+		t.Fatal("其它 provider 不应被注入")
 	}
-	if _, ok := merged.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("非 LLM 插件不应被注入 max_tokens")
+	if _, ok := cfg.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
+		t.Fatal("非 LLM 插件不应被注入")
+	}
+	// 找不到对应条目时退回全部 llm（宁可保守也别漏）
+	cfg2 := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "llm-openai", Type: "llm"},
+		{Name: "llm-anthropic", Type: "llm"},
+	}}
+	injectMaxOutputBudget(cfg2, "ollama", 8192)
+	if cfg2.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" || cfg2.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" {
+		t.Fatalf("找不到对应条目时应退回全部 llm 条目: %+v", cfg2.Plugins)
 	}
 }
 

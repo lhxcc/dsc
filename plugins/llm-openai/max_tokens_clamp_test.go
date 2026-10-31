@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	dsc "dsc-sdk"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -64,19 +66,19 @@ func TestMaxTokensRejectionLimitIgnoresOtherErrors(t *testing.T) {
 // 不再每次都先吃一次 400。
 func TestResolveMaxTokensClampedByLearnedLimit(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 1048576}
-	if got := p.resolveMaxTokens(0); got != 1048576 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 1048576 {
 		t.Fatalf("未知上限时按原值携带，got %d", got)
 	}
 
 	p.learnMaxTokensLimit(393216)
-	if got := p.resolveMaxTokens(0); got != 393216 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 393216 {
 		t.Fatalf("已知上限时应钳制到 393216，got %d", got)
 	}
 	// 请求级参数（压缩净余值）同样受钳制。
-	if got := p.resolveMaxTokens(500000); got != 393216 {
+	if got := p.resolveMaxTokens(500000, nil, nil); got != 393216 {
 		t.Fatalf("请求级参数超上限也应钳制，got %d", got)
 	}
-	if got := p.resolveMaxTokens(20000); got != 20000 {
+	if got := p.resolveMaxTokens(20000, nil, nil); got != 20000 {
 		t.Fatalf("未超上限不应被改动，got %d", got)
 	}
 }
@@ -145,10 +147,45 @@ func TestChatRetriesWithClampedMaxTokens(t *testing.T) {
 func TestNoMaxTokensAfterRangeLessRejection(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 1048576}
 	p.learnMaxTokensLimit(0)
-	if got := p.resolveMaxTokens(0); got != 0 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 0 {
 		t.Fatalf("应改为不携带 max_tokens，got %d", got)
 	}
-	if got := p.resolveMaxTokens(500000); got != 0 {
+	if got := p.resolveMaxTokens(500000, nil, nil); got != 0 {
 		t.Fatalf("请求级参数也不得携带，got %d", got)
+	}
+}
+
+// TestResolveMaxTokensFillsFromWindowWhenUnset 未配置时按「窗口 − 本帧输入」现算。
+//
+// 现场：anthropic 兼容口把 max_tokens 当 required，缺席时服务端自填 4096 —— 长回答被
+// 腰斩；而按窗口值硬填又会让 prompt+max_tokens 越过 n_ctx 直接 400。所以要按帧算。
+func TestResolveMaxTokensFillsFromWindowWhenUnset(t *testing.T) {
+	t.Setenv("DSC_CONTEXT_WINDOW", "10000")
+	p := &OpenAIProvider{model: "m"}                                          // maxTokens = 0（未配置）
+	msgs := []dsc.Message{{Role: "user", Content: strings.Repeat("u", 8000)}} // ~2k token
+
+	got := p.resolveMaxTokens(0, msgs, nil)
+	if got <= 0 {
+		t.Fatalf("未配置时必须按窗口余量补一个值，got %d", got)
+	}
+	if prompt := dsc.EstimateMessageValuesTokens(msgs); prompt+got > 10000 {
+		t.Fatalf("prompt(%d) + max_tokens(%d) 超过窗口 10000", prompt, got)
+	}
+
+	// 显式 -1：一律不携带（尊重）
+	pNeg := &OpenAIProvider{model: "m", maxTokens: -1}
+	if got := pNeg.resolveMaxTokens(0, msgs, nil); got != 0 {
+		t.Fatalf("显式 -1 应不携带，got %d", got)
+	}
+
+	// 插件级默认比余量小：用默认值（探测上限的意义）
+	pSmall := &OpenAIProvider{model: "m", maxTokens: 1024}
+	if got := pSmall.resolveMaxTokens(0, msgs, nil); got != 1024 {
+		t.Fatalf("默认值 1024 小于余量时应用默认值，got %d", got)
+	}
+	// 插件级默认比余量大：被余量夹住
+	pBig := &OpenAIProvider{model: "m", maxTokens: 999999}
+	if got := pBig.resolveMaxTokens(0, msgs, nil); got >= 999999 {
+		t.Fatalf("超过余量时必须夹住，got %d", got)
 	}
 }

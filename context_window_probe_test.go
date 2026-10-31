@@ -3,11 +3,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"dsc/core"
 )
 
 // TestProbeContextWindowFromModels 标准 OpenAI 兼容端点：`/v1/models` 的 `meta.n_ctx`
@@ -24,7 +27,7 @@ func TestProbeContextWindowFromModels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL + "/v1"); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL + "/v1"); got != 262144 {
 		t.Fatalf("probe = %d, want 262144", got)
 	}
 }
@@ -45,7 +48,7 @@ func TestProbeContextWindowFallsBackToProps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL); got != 262144 {
 		t.Fatalf("probe = %d, want 262144（应回退到 /props）", got)
 	}
 }
@@ -62,7 +65,7 @@ func TestProbeContextWindowTakesMaxAcrossModels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL + "/v1"); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL + "/v1"); got != 262144 {
 		t.Fatalf("probe = %d, want 262144（多个条目取最大）", got)
 	}
 }
@@ -72,12 +75,13 @@ func TestProbeContextWindowTakesMaxAcrossModels(t *testing.T) {
 func TestProbeContextWindowRetriesLocalEndpoint(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
-			http.NotFound(w, r)
+		// 模型还在加载时**所有**路径都 503（不是「活着但没容量」），这时才值得重试。
+		if atomic.AddInt32(&hits, 1) <= 4 { // 第一轮四条路径全 503
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		if atomic.AddInt32(&hits, 1) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable) // 模型还在加载
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
 			return
 		}
 		fmt.Fprint(w, `{"data":[{"id":"local","meta":{"n_ctx":262144}}]}`)
@@ -102,7 +106,7 @@ func TestProbeContextWindowNoRetryForCloud(t *testing.T) {
 	}))
 	defer srv.Close()
 	// httptest 监听在 127.0.0.1，但这里要验证「域名端点不重试」，所以直接调单次探测。
-	if got := probeContextWindow(srv.URL); got != 0 {
+	if got, _ := probeContextWindow(srv.URL); got != 0 {
 		t.Fatalf("probe = %d, want 0", got)
 	}
 	if n := atomic.LoadInt32(&hits); n > 5 {
@@ -172,5 +176,147 @@ func TestEndpointForLogDropsCredentials(t *testing.T) {
 	}
 	if net.ParseIP("127.0.0.1") == nil {
 		t.Fatal("sanity: net.ParseIP")
+	}
+}
+
+// TestProbeMaxOutputBudget 三档结论：服务端接受窗口值 / 报文里给了上限 / 都不给就退 1/4。
+func TestProbeMaxOutputBudget(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		want    int
+		wantSrc string
+	}{
+		{"接受窗口值", 200, "", 262144, "accepted"},
+		{"报文给区间（DeepSeek 写法）", 400,
+			`{"error":{"message":"Invalid max_tokens value, the valid range of max_tokens is [1, 393216]"}}`,
+			393216, "server-range"},
+		{"报文给上限（网关写法）", 400,
+			`{"error":"max_tokens must be less than or equal to 8192"}`, 8192, "server-range"},
+		{"报文没给数字：退 1/4", 400, `{"error":"max_tokens is invalid"}`, 65536, "quarter-fallback"},
+		{"没权限", 401, `{"error":"unauthorized"}`, 0, "unauthorized"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/chat/completions" {
+					http.NotFound(w, r)
+					return
+				}
+				// 探测必须带 max_tokens=n_ctx 且是流式（拿到状态码就断开）
+				var req struct {
+					MaxTokens int  `json:"max_tokens"`
+					Stream    bool `json:"stream"`
+				}
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &req); err != nil {
+					t.Errorf("探测请求体不是 JSON: %v", err)
+				}
+				if req.MaxTokens != 262144 {
+					t.Errorf("探测应先用窗口值当 max_tokens，实际 %d", req.MaxTokens)
+				}
+				if !req.Stream {
+					t.Error("探测必须用流式：只要状态码，不要生成内容")
+				}
+				if c.status != 200 {
+					w.WriteHeader(c.status)
+					fmt.Fprint(w, c.body)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			got, src := probeMaxOutputBudget(srv.URL+"/v1", "openai", "m", "k", 262144)
+			if got != c.want || src != c.wantSrc {
+				t.Fatalf("probeMaxOutputBudget = (%d,%q), want (%d,%q)", got, src, c.want, c.wantSrc)
+			}
+		})
+	}
+}
+
+// TestProbeMaxOutputBudgetAnthropicUsesMessagesEndpoint Anthropic 兼容口走 /v1/messages
+// （协议不同），探测不能拿 OpenAI 的 /chat/completions 去打。
+func TestProbeMaxOutputBudgetAnthropicUsesMessagesEndpoint(t *testing.T) {
+	var hit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = r.URL.Path
+		if r.Header.Get("anthropic-version") == "" {
+			t.Error("Anthropic 探测必须带 anthropic-version")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	if got, _ := probeMaxOutputBudget(srv.URL+"/v1", "anthropic", "m", "k", 8192); got != 8192 {
+		t.Fatalf("probe = %d", got)
+	}
+	if hit != "/v1/messages" {
+		t.Fatalf("Anthropic 应打 /v1/messages，实际 %q", hit)
+	}
+}
+
+// TestMaxTokensLimitFromError 报文解析的边界：别把 prompt 长度当成 max_tokens 上限。
+func TestMaxTokensLimitFromError(t *testing.T) {
+	cases := map[string]int{
+		"Invalid max_tokens value, the valid range of max_tokens is [1, 393216]": 393216,
+		"max_tokens must be less than or equal to 8192":                          8192,
+		"max_tokens: -1 is invalid, maximum value is 65535":                      65535,
+		"this model's maximum context length is 262144 tokens":                   0, // 说的是上下文，不是输出
+		"something else entirely":                                                0,
+	}
+	for body, want := range cases {
+		if got := maxTokensLimitFromError(body); got != want {
+			t.Errorf("maxTokensLimitFromError(%q) = %d, want %d", body, got, want)
+		}
+	}
+}
+
+// TestActiveLLMFlavorAndExplicit 探测格式与「用户是否显式给了上限」的判据。
+func TestActiveLLMFlavorAndExplicit(t *testing.T) {
+	if got := activeLLMFlavor("anthropic"); got != "anthropic" {
+		t.Fatalf("flavor = %q", got)
+	}
+	if got := activeLLMFlavor("openai"); got != "openai" {
+		t.Fatalf("flavor = %q", got)
+	}
+
+	cfg := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "llm-openai", Type: "llm"},
+		{Name: "tool-x", Type: "tool", Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "1"}},
+	}}
+	if explicitMaxOutputTokens(cfg, "openai") {
+		t.Fatal("非 LLM 插件上的同名键不算用户显式设置")
+	}
+	cfg.Plugins[0].Env = map[string]string{"DSC_OPENAI_MAX_OUTPUT_TOKENS": "8192"}
+	if !explicitMaxOutputTokens(cfg, "openai") {
+		t.Fatal("接口专属名应算显式设置")
+	}
+}
+
+// TestProbeContextWindowNoRetryWhenServerAnswersWithoutCapacity 服务端活着（/models 200
+// 但没有 n_ctx/max_model_len，/props 404）时**不该重试**：它不会因为多等 3.5 秒就变成
+// 会报容量。实测一个网关因此每次启动白等 3.5 秒。
+func TestProbeContextWindowNoRetryWhenServerAnswersWithoutCapacity(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.URL.Path == "/v1/models" || r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"gw"}]}`)
+			return
+		}
+		http.NotFound(w, r) // /props 等：活着但没有
+	}))
+	defer srv.Close()
+
+	w, attempts := probeContextWindowWithRetry(srv.URL + "/v1")
+	if w != 0 {
+		t.Fatalf("不该探到容量，got %d", w)
+	}
+	if attempts != 1 {
+		t.Fatalf("服务端活着时应只试一轮，实际 %d 轮（白等）", attempts)
+	}
+	if n := atomic.LoadInt32(&hits); n > 4 {
+		t.Fatalf("不该重复请求，实际 %d 次", n)
 	}
 }

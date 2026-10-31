@@ -33,10 +33,10 @@ type AnthropicProvider struct {
 	// 则吃 budget_tokens。两者同时下发互不冲突。
 	reasoningEffort string
 	// maxTokens 单轮输出上限（插件级默认）。取值来源：显式 DSC_ANTHROPIC_MAX_OUTPUT_TOKENS
-	//（旧名 ANTHROPIC_MAX_OUTPUT_TOKENS 回退）> 宿主注入 DSC_MAX_OUTPUT_TOKENS
-	//（一律注入=有效上下文窗口值：探测命中 LLAMACPP 时=探测窗口，云端=配置 context_window）
-	// > -1 = 明确不携带（必须写 -1；写 0 仍视为「未设置」走兜底）。请求级参数（压缩等场景的
-	// 窗口净余值）经 resolveMaxTokens 优先于本值。零值由 omitZeroMaxTokens 中间件从
+	//（旧名 ANTHROPIC_MAX_OUTPUT_TOKENS 回退）> 通用 DSC_MAX_OUTPUT_TOKENS；三态：>0 携带、
+	// -1/0/不写=不携带（**宿主不再按 context_window 兜底注入**：这只把请求顶到
+	// 「prompt + max_tokens > n_ctx」的边界，云端还会先吃一次 400）。
+	// 请求级参数（压缩等场景的窗口净余值）经 resolveMaxTokens 优先于本值。零值由 omitZeroMaxTokens 中间件从
 	// 请求体摘除（SDK 无 omitempty，不摘则会上送 "max_tokens":0 被服务端拒绝）；
 	// 负值因 `>0 才携带` 的判断天然被忽略。
 	maxTokens int64
@@ -567,18 +567,59 @@ func usageFromAnthropic(u *anthropic.Usage) *dsc.Usage {
 	}
 }
 
-// resolveMaxTokens 计算本请求实际携带的 max_tokens：请求级参数（压缩等场景的
-// 窗口净余值）优先，其次插件级默认（显式 env > 宿主注入），<=0 表示不携带
-// （omitZeroMaxTokens 摘除零值，等模型自然结束）。
-func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64) int64 {
-	if requestMaxTokens > 0 {
-		return requestMaxTokens
+// maxTokensReserve 是给「我们的估算 vs 服务端分词器」留的余量；maxTokensFloor 是
+// 「还值得给」的下限（比它小说明这一帧该由宿主滑窗收口）。
+const (
+	maxTokensReserve = 512
+	maxTokensFloor   = 128
+)
+
+// windowHeadroom 返回这一帧还能生成多少 token（窗口 − 消息 − 工具目录 − 余量）。
+// 窗口未知时返回 0（不做限制）。
+func windowHeadroom(messages []dsc.Message, tools []dsc.LLMTool) int {
+	window := dsc.ContextWindow()
+	if window <= 0 {
+		return 0
 	}
-	return p.maxTokens
+	room := window - dsc.EstimateMessageValuesTokens(messages) - dsc.EstimateToolTokens(tools) - maxTokensReserve
+	if room < maxTokensFloor {
+		return 0
+	}
+	return room
+}
+
+// resolveMaxTokens 计算本请求实际携带的 max_tokens。
+//
+// anthropic 协议把 max_tokens 当 **required**，缺席时服务端会自填保守默认（llama.cpp
+// 兼容口填 4096），一轮长回答直接腰斩。所以这里三态：
+//   - 请求级参数（压缩等场景的净余值）> 0：用它；
+//   - 插件 env 显式给出（含宿主按启动期探测结果注入的值）：用它；
+//   - 都没有：按「窗口 − 本帧输入」现算；
+//
+// 最后统一用余量夹一次，保证 prompt + max_tokens ≤ 窗口；显式 -1 表示不携带（尊重）。
+func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64, messages []dsc.Message, tools []dsc.LLMTool) int64 {
+	mt := requestMaxTokens
+	if mt <= 0 {
+		mt = p.maxTokens
+	}
+	if mt < 0 {
+		return 0 // 明确不携带
+	}
+	headroom := windowHeadroom(messages, tools)
+	if mt == 0 {
+		mt = int64(headroom)
+		if mt <= 0 {
+			return 0
+		}
+	}
+	if headroom > 0 && mt > int64(headroom) {
+		mt = int64(headroom)
+	}
+	return mt
 }
 
 func (p *AnthropicProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens)))
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens), messages, tools))
 	opts := p.requestOptions(beta)
 	resp, err := p.client.Messages.New(ctx, params, opts...)
 	if err != nil {
@@ -604,7 +645,7 @@ func (p *AnthropicProvider) requestOptions(beta bool) []option.RequestOption {
 }
 
 func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0))
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0, messages, tools))
 	stream := p.client.Messages.NewStreaming(ctx, params, p.requestOptions(beta)...)
 
 	ch := make(chan *dsc.ChatStreamResponse)
@@ -726,11 +767,10 @@ func main() {
 	if thinkingBudget == 0 {
 		thinkingBudget = 4096
 	}
-	// 单轮输出上限（插件级默认）：宿主注入 DSC_MAX_OUTPUT_TOKENS=有效上下文窗口值
-	// （一律注入，不分本地/云端——探测命中 LLAMACPP 时=探测窗口，云端=配置
-	// context_window），对抗 anthropic 兼容口对缺席 max_tokens 自填 4096 类保守默认；
-	// ANTHROPIC_MAX_OUTPUT_TOKENS 显式配置优先（部署方收紧/放宽的手段，显式 0=不
-	// 携带）；均缺席时 0 = 请求不携带，零值字段由 omitZeroMaxTokens 中间件摘除。
+	// 单轮输出上限（插件级默认）：只来自插件 env（ANTHROPIC_MAX_OUTPUT_TOKENS 或通用
+	// DSC_MAX_OUTPUT_TOKENS），宿主不再注入窗口值——「缺席是服务端自填 4096」属于服务端
+	// 的选择，不该由宿主替用户决定输出预算。均缺席时 0 = 请求不携带，零值字段由
+	// omitZeroMaxTokens 中间件摘除。
 	maxTokens := cfg.MaxOutputTokens
 
 	provider := &AnthropicProvider{
