@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -69,16 +71,68 @@ func osGroupEnv(prefix string, useDSC bool, suffix string) string {
 	return strings.TrimSpace(os.Getenv(name))
 }
 
-// probeContextWindow 探测兼容 OpenAI 的服务的上下文窗口容量，返回 0 表示「服务端没说」。
+// contextProbePaths 按探测顺序列出会尝试的 URL（相对 base_url），仅供诊断/测试。
+//
+// 三种形态都要覆盖（实测都遇过）：
+//   - llama.cpp / Strata 一族：`/props` 的 `default_generation_settings.n_ctx` 是**运行时**
+//     容量，最权威（与 /v1/models 的 meta 冲突时以它为准）；部分版本 /v1/models 干脆不吐 meta；
+//   - 标准 OpenAI 兼容：`/v1/models`，容量在 `data[].meta.n_ctx` / `max_model_len`；
+//   - 不带 /v1 的网关/内网服务：`/models`（base 已经含 /v1 时 `/v1/models` 会 404）。
+//
+// 顺序按「权威性」排：props 先。宁可多拉一次几百 KB 的 /props，也不要因为 models 那份
+// meta 缺失/陈旧而把整个进程按一半容量跑（现场：服务开 256K，DSC 报 128K）。
+func contextProbePaths(baseURL string) []string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range []string{"/props", "/v1/props", "/v1/models", "/models"} {
+		u := base + p
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	return out
+}
+
+// probeContextWindow 探测服务端的上下文窗口容量，返回 0 表示「服务端没说」。
 //
 // 字段按「谁最可信」排：llama.cpp 家族给 `meta.n_ctx`（真实运行时的 n_ctx，最准），
 // vLLM 给 `max_model_len`；网关/代理（LiteLLM、各类 OpenAI 兼容层）常见的写法是
 // `context_length`、`max_input_tokens`、`context_window`。多认几种是因为这条探测是
 // 「配置不得超过服务容量」这条规则的唯一信息来源——云端没有探测值时只能靠 4xx 事后教，
 // 那要白烧一次请求。
+//
+// 多个 model 条目时取**最大**的非零值：网关常把别名/小模型一起列出来，取第一条
+// （data[0]）会拿到错的容量。
 func probeContextWindow(baseURL string) int {
-	u := strings.TrimRight(baseURL, "/") + "/models"
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return 0
+	}
+	// ① 运行时属性先：/props 给的是**当前调度设置**，优先于 /v1/models 里可能陈旧的 meta。
+	for _, p := range []string{"/props", "/v1/props"} {
+		if v := probeWindowAt(base + p); v > 0 {
+			return v
+		}
+	}
+	// ② 模型表兜底：同一份数据的两个入口（带不带 /v1），各自内部取最大。
+	best := 0
+	for _, p := range []string{"/v1/models", "/models"} {
+		if v := probeWindowAt(base + p); v > best {
+			best = v
+		}
+	}
+	return best
+}
+
+// probeWindowAt 从单个 URL 读容量（0 = 这条路径没给出可用值）。
+func probeWindowAt(u string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -92,7 +146,9 @@ func probeContextWindow(baseURL string) int {
 	if resp.StatusCode != http.StatusOK {
 		return 0
 	}
+	// /props 的响应可能带完整 chat_template（实测 230KB），只解码需要的字段。
 	var payload struct {
+		// OpenAI 风格：/v1/models、/models
 		Data []struct {
 			Meta struct {
 				Nctx int `json:"n_ctx"`
@@ -101,26 +157,87 @@ func probeContextWindow(baseURL string) int {
 			ContextLength  int `json:"context_length"`
 			MaxInputTokens int `json:"max_input_tokens"`
 			ContextWindow  int `json:"context_window"`
+			Nctx           int `json:"n_ctx"`
 		} `json:"data"`
+		// llama.cpp 风格：/props
+		Nctx                     int `json:"n_ctx"`
+		DefaultGenerationSetting struct {
+			Nctx int `json:"n_ctx"`
+		} `json:"default_generation_settings"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return 0
 	}
-	if len(payload.Data) == 0 {
-		return 0
-	}
+	best := 0
 	for _, v := range []int{
-		payload.Data[0].Meta.Nctx,
-		payload.Data[0].MaxModelLen,
-		payload.Data[0].ContextLength,
-		payload.Data[0].MaxInputTokens,
-		payload.Data[0].ContextWindow,
+		payload.Nctx,
+		payload.DefaultGenerationSetting.Nctx,
 	} {
-		if v > 0 {
-			return v
+		if v > best {
+			best = v
 		}
 	}
-	return 0
+	for _, d := range payload.Data {
+		for _, v := range []int{
+			d.Meta.Nctx, d.Nctx, d.MaxModelLen, d.ContextLength, d.MaxInputTokens, d.ContextWindow,
+		} {
+			if v > best {
+				best = v
+			}
+		}
+	}
+	return best
+}
+
+// probeContextWindowWithRetry 反复探测：本地服务在「模型加载中」「正在生成占满 slot」
+// 时会回 503 或直接超时，一次失败就退回 128K 等于让整个进程按一半容量工作——实测过
+// 用户的服务开着 256K，DSC 却报 128K（他自己从界面上看出不对）。
+//
+// 只对本地/内网端点重试：云端探测失败基本就是「没有这项信息」，白等几秒没有意义。
+func probeContextWindowWithRetry(baseURL string) (window int, attempts int) {
+	if w := probeContextWindow(baseURL); w > 0 {
+		return w, 1
+	}
+	if !looksLikeLocalEndpoint(baseURL) {
+		return 0, 1
+	}
+	attempts = 1
+	for _, delay := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
+		time.Sleep(delay)
+		attempts++
+		if w := probeContextWindow(baseURL); w > 0 {
+			return w, attempts
+		}
+	}
+	return 0, attempts
+}
+
+// looksLikeLocalEndpoint 判断 base_url 是否指向本机/内网（决定探测失败要不要重试）。
+// 解析失败时按「本地」处理：宁可多等两秒，也不要因为一个怪 URL 少算一半容量。
+func looksLikeLocalEndpoint(baseURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Host == "" {
+		return true
+	}
+	host := u.Hostname()
+	if host == "localhost" || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // 域名：可能是云端，不重试
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// endpointForLog 只保留 scheme://host，供日志展示：base_url 里可能带 token/query，
+// 原样打出来会把凭据写进日志。
+func endpointForLog(baseURL string) string {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Host == "" {
+		return "(unparsable base_url)"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // resolveContextWindow 决定实际使用的上下文窗口，返回（窗口, 来源, 是否被服务端钳制）。
@@ -837,18 +954,27 @@ func main() {
 	// 结果每轮都靠 provider 的 4xx 教一遍。探测总是执行（OPENAI 组 BASE_URL 缺席回退
 	// ANTHROPIC 组，同一 llama.cpp 端口 /v1/models 同源）：命中即作为上限，未命中（云端）
 	// 才完全按配置/默认。该值同时是注入 LLM 插件的默认输出上限（见后）。
-	probeWindow := 0
+	probeWindow, probeAttempts := 0, 0
+	probeBaseURL := ""
 	// 上下文窗口探测同样按 provider 整组决定前缀（DSC_ 优先、旧名回退），不与终端
 	// 同名变量混用。
 	if baseURL := groupEnv(activeLLMEnv, "OPENAI", envGroupPreferDSC(activeLLMEnv, "OPENAI"), "BASE_URL"); baseURL != "" {
-		probeWindow = probeContextWindow(baseURL)
+		probeBaseURL = baseURL
 	} else if baseURL := groupEnv(activeLLMEnv, "ANTHROPIC", envGroupPreferDSC(activeLLMEnv, "ANTHROPIC"), "BASE_URL"); baseURL != "" {
 		// LLM provider 插件 直连同一 LLAMACPP 端口（/v1/models 与 /v1/messages 同源），
 		// OPENAI 组 BASE_URL 缺席时回退探测 anthropic 端点（两组均优先 DSC_ 前缀、旧名回退）。
-		probeWindow = probeContextWindow(baseURL)
+		probeBaseURL = baseURL
+	}
+	if probeBaseURL != "" {
+		probeWindow, probeAttempts = probeContextWindowWithRetry(probeBaseURL)
 	}
 	if probeWindow > 0 {
-		logger.Info("context window probed from llm server", "window", probeWindow)
+		logger.Info("context window probed from llm server", "window", probeWindow, "attempts", probeAttempts)
+	} else if probeBaseURL != "" {
+		// 失败必须说得出来：静默退回 128K 时，用户只能从界面上怀疑「容量怎么少了一半」。
+		logger.Warn("context window probe returned nothing; falling back to config/default",
+			"endpoint", endpointForLog(probeBaseURL), "attempts", probeAttempts,
+			"hint", "服务端没给 n_ctx / max_model_len（云端常见）；本地服务在加载模型或 slot 占满时也会这样——已对本地端点重试。实际容量更大时请在 config.yaml 显式写 context_window")
 	}
 	configuredWindow := 0
 	if mainCfg != nil && mainCfg.ContextWindow > 0 {

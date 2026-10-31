@@ -797,7 +797,7 @@ func (m *Manager) HotReload(name string, newBinaryPath string) error {
 	handshake := m.config.Handshake
 	coreLogger := m.coreLogger
 	broker := m.broker
-	refs := interconnectRefs{hasAggLLM: m.agentLLMServiceID != 0, agentLLMName: m.agentLLMName}
+	refs := m.interconnectRefsLocked()
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("core '%s' not found (no registered type)", name)
@@ -907,7 +907,7 @@ func (m *Manager) hotReloadPlugin(name, newBinaryPath string, execDir string, ha
 	var st *stagedTool
 	if hadTools && broker != nil {
 		toolClient := proto.NewToolServiceClient(grpcClient.Conn)
-		refs := interconnectRefs{hasAggLLM: m.agentLLMServiceID != 0, agentLLMName: m.agentLLMName}
+		refs := m.interconnectRefsLocked()
 		st, err = m.stageToolPlugin(name, grpcClient, toolClient, broker, refs)
 		if err != nil {
 			newClient.Kill()
@@ -2272,6 +2272,21 @@ func (m *Manager) reinjectToolInterconnectLocked() {
 	}
 }
 
+// interconnectRefsLocked 组装互通引用快照（需持读锁或已持写锁）。
+//
+// hasAggLLM 的判据是「有 LLM provider 可用」，不是「agent 已注册聚合服务」：
+// 聚合服务本身按 m 的实时状态路由（serveAggregateLLMOnBroker 的 primary 参数不参与
+// 路由决策），所以早于 agent 加载的 dsc/tool 插件也能安全拿到客户端。用旧判据时，
+// 这些插件在 agent 之前就完成握手（配置里 dsc 类与 tool 类通常排在 agent 之前），
+// 拿到的 ic.LLM() 是 (*llmclient.Client)(nil)——装进接口后不为 nil，压缩后端一到
+// 阈值就 nil deref 崩掉，表现成「压缩从不触发」。
+func (m *Manager) interconnectRefsLocked() interconnectRefs {
+	return interconnectRefs{
+		hasAggLLM:    m.agentLLMServiceID != 0 || len(m.llms) > 0,
+		agentLLMName: m.agentLLMName,
+	}
+}
+
 // interconnectToolPlugin 互通机制 1/2/4：聚合 LLM、聚合 Tool 与插件通知服务挂在
 // 本插件 client 自己的 broker 上（插件进程经自身 broker.Dial 访问），并把 serviceID 经
 // SetInterconnect 传入插件进程（旧插件未实现则 UNIMPLEMENTED 容错跳过）。
@@ -2595,7 +2610,7 @@ func (m *Manager) loadPluginWithBroker(entry PluginEntry, broker *plugin.GRPCBro
 		toolClient := proto.NewToolServiceClient(grpcClient.Conn)
 		// 「暂存 + 提交」：在无锁阶段完成 host broker 挂载、互通注入与工具列清单（慢速 RPC），
 		// 产出 stagedTool 后再在持锁（本流程调用方均已持有 m.mu）阶段一次性提交映射。
-		refs := interconnectRefs{hasAggLLM: m.agentLLMServiceID != 0, agentLLMName: m.agentLLMName}
+		refs := m.interconnectRefsLocked()
 		st, err := m.stageToolPlugin(entry.Name, grpcClient, toolClient, broker, refs)
 		if err != nil {
 			client.Kill()
@@ -2612,7 +2627,7 @@ func (m *Manager) loadPluginWithBroker(entry PluginEntry, broker *plugin.GRPCBro
 	case "dsc":
 		// 通用类型：注册 hook client + 探测并登记可选工具（对齐 DSH/Cordis 的
 		// 「插件类型与服务正交」模型）。TypeDsc 可同时声明 hook + tools + Provides。
-		refs := interconnectRefs{hasAggLLM: m.agentLLMServiceID != 0, agentLLMName: m.agentLLMName}
+		refs := m.interconnectRefsLocked()
 		m.registerDscCoreLocked(entry.Name, info, client, grpcClient, broker, refs)
 
 	default:

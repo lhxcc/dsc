@@ -643,3 +643,44 @@ func TestUnloadRefusesCompactionRoleHolder(t *testing.T) {
 		t.Fatalf("错误信息应说明它是压缩岗位持有者，got %v", err)
 	}
 }
+
+// TestInterconnectRefsOfferAggregateLLMBeforeAgent 互通握手的「有聚合 LLM」判据不能等
+// agent 注册：插件按配置顺序加载，dsc-system / tool-* 通常排在 agent 之前，用
+// agentLLMServiceID 当判据会让它们拿到 (*llmclient.Client)(nil)。那不是 nil 接口，
+// 插件里的 `if c == nil` 挡不住，压缩后端一到阈值就 nil deref 崩掉——症状是
+// 「到了阈值却不压缩」加窗口一路涨到滑窗报错。
+//
+// 聚合服务本身按 manager 的实时状态路由（primary 参数不参与路由），所以只要已经装了
+// 一个 LLM provider，早握手就是安全的。
+func TestInterconnectRefsOfferAggregateLLMBeforeAgent(t *testing.T) {
+	m, _ := hookManager()
+	m.mu.Lock()
+	m.agentLLMServiceID = 0 // agent 还没注册
+	m.llms["llm-a"] = nil   // 但 LLM provider 已装
+	refs := m.interconnectRefsLocked()
+	m.mu.Unlock()
+	if !refs.hasAggLLM {
+		t.Fatal("已有 LLM provider 时必须给出聚合 LLM（否则插件拿到 typed nil 客户端）")
+	}
+
+	// 一个 provider 都没有时仍然不给（避免拿到一个指向空路由的客户端）。
+	m2, _ := hookManager()
+	m2.mu.Lock()
+	m2.agentLLMServiceID = 0
+	m2.llms = map[string]LLMProvider{}
+	refs2 := m2.interconnectRefsLocked()
+	m2.mu.Unlock()
+	if refs2.hasAggLLM {
+		t.Fatal("没有任何 LLM provider 时不应声称有聚合 LLM")
+	}
+
+	// agent 已注册（老判据）依旧成立。
+	m3, _ := hookManager()
+	m3.mu.Lock()
+	m3.agentLLMServiceID = 7
+	refs3 := m3.interconnectRefsLocked()
+	m3.mu.Unlock()
+	if !refs3.hasAggLLM {
+		t.Fatal("agent 注册过聚合服务时必须给出聚合 LLM")
+	}
+}

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,7 +12,9 @@ import (
 // mkTurn 造一条「user + assistant(tool_call) + tool」的完整往返，便于验证裁剪不会
 // 留下孤儿工具结果。
 func mkTurn(i int, body string) []*proto.Message {
-	callID := "call-" + body
+	// 调用 id 必须**唯一**：真实历史里每次调用 id 都不同；夹具复用同一个 id 会让配对
+	// 整理把后续结果当成「同一调用的第二份」丢掉，测出来的东西与线上无关。
+	callID := "call-" + strconv.Itoa(i)
 	return []*proto.Message{
 		{Role: "user", Content: strings.Repeat(body, 40)},
 		{Role: "assistant", ToolCalls: []*proto.ToolCall{{Id: callID, Name: "shell", ArgumentsJson: `{}`}}},
@@ -75,8 +78,14 @@ func TestSlideKeepsOriginalMessages(t *testing.T) {
 	if kept[0] != msgs[0] {
 		t.Fatal("首条 system 应是原对象（指针相等）")
 	}
-	if !strings.HasPrefix(kept[1].GetContent(), "[滑窗]") || kept[1].GetRole() != "system" {
+	if !strings.HasPrefix(kept[1].GetContent(), "[滑窗]") {
 		t.Fatalf("第二条应是切除说明，实际 %+v", kept[1])
+	}
+	// 说明的角色取决于保留段的起点：保留段本身以 user 开头时用 system（常规形态）；
+	// 从对话中段开始（单轮长任务，唯一那条 user 早在窗口外）时改用 user，否则
+	// Anthropic 会因为「首条非 system 不是 user」直接拒掉整个请求。
+	if role := kept[1].GetRole(); role != "system" && role != "user" {
+		t.Fatalf("切除说明的角色只能是 system 或 user，实际 %q", role)
 	}
 	// 其余全部是原始指针，且内容未被改写
 	body := kept[2:]
@@ -483,5 +492,66 @@ func TestCeilingShrinksAfterEachRejection(t *testing.T) {
 	}
 	if second > int(float64(100_000)*overflowTrimRatio(2)) {
 		t.Fatalf("应按第 2 档目标收口：second=%d limit=%d", second, int(float64(100_000)*overflowTrimRatio(2)))
+	}
+}
+
+// TestCapMessagesToWindowSingleTurnNeverEmpties 单轮长任务（只有开头一条 user，之后全是
+// 「assistant 调工具 + 结果」）是滑窗最容易出错的地方：预算切点落在循环中间，按旧的
+// 「起点必须落到 user」规则会一路推到末尾，只留最后一条；若最后一条正好是被切掉调用的
+// 孤儿结果，下游配对修复再删一次——最终发出去的就只剩 [system, 切除说明]**空壳**，
+// 模型失去任务与工具结果却继续循环（实测过：请求体 2 条消息，模型反复执行同一个命令）。
+//
+// 现在的契约：切点只需自洽（不落在孤儿结果上），并在滑窗内部一次把配对修好；说明改用
+// user 角色以兼容 Anthropic；修完什么都不剩时**不裁**，交回调用方按超窗报错。
+func TestCapMessagesToWindowSingleTurnNeverEmpties(t *testing.T) {
+	msgs := []*proto.Message{{Role: "system", Content: "deployment instructions"}}
+	msgs = append(msgs, &proto.Message{Role: "user", Content: "长任务：把这件事做完"})
+	for i := 0; i < 40; i++ {
+		msgs = append(msgs, &proto.Message{Role: "assistant", ToolCalls: []*proto.ToolCall{{
+			Id: "call-" + strconv.Itoa(i), Name: "shell", ArgumentsJson: `{"command":"x"}`,
+		}}})
+		msgs = append(msgs, &proto.Message{Role: "tool", ToolCallId: "call-" + strconv.Itoa(i), Content: strings.Repeat("A", 4000)})
+	}
+	limit := EstimateProtoMessagesTokens(msgs) / 3
+
+	kept, dropped := CapMessagesToWindow(msgs, 0, limit)
+	if dropped == 0 {
+		t.Fatal("夹具应触发裁剪")
+	}
+	body := kept[2:]
+	if len(body) == 0 {
+		t.Fatal("绝不能只发 [system, 说明]：空壳请求会让模型失忆却继续跑")
+	}
+	if kept[1].GetRole() != "user" {
+		t.Fatalf("保留段不以 user 开头时，说明必须是 user 角色（Anthropic 要求首条非 system 是 user），实际 %q", kept[1].GetRole())
+	}
+	if body[0].GetRole() == "tool" {
+		t.Fatal("保留段不能以孤儿工具结果开头")
+	}
+	// 滑窗已把配对修好：再过一遍配对整理必须零改动。
+	if fixed, extra := SanitizeToolPairing(body); extra != 0 || len(fixed) != len(body) {
+		t.Fatalf("滑窗输出仍需配对修复：extra_dropped=%d len %d → %d", extra, len(body), len(fixed))
+	}
+	if got := EstimateProtoMessagesTokens(kept); got > limit {
+		t.Fatalf("裁剪后仍超预算：%d > %d", got, limit)
+	}
+}
+
+// TestCapMessagesToWindowRefusesShellOnly 连「system + 说明 + 一条」都装不下时不得硬凑：
+// 原样交回（dropped=0），由调用方报「本轮内容超出窗口」。
+func TestCapMessagesToWindowRefusesShellOnly(t *testing.T) {
+	msgs := []*proto.Message{
+		{Role: "system", Content: "s"},
+		{Role: "user", Content: strings.Repeat("u", 4000)},
+		{Role: "assistant", ToolCalls: []*proto.ToolCall{{Id: "c1", Name: "shell", ArgumentsJson: `{}`}}},
+		{Role: "tool", ToolCallId: "c1", Content: strings.Repeat("A", 40000)},
+	}
+	// 预算只够 system + 说明：切点只能落在最后那条 tool 上，它又是孤儿结果。
+	kept, dropped := CapMessagesToWindow(msgs, 0, 200)
+	if dropped != 0 {
+		t.Fatalf("无合法切点时必须原样返回（dropped=0），实际 dropped=%d kept=%d", dropped, len(kept))
+	}
+	if len(kept) != len(msgs) {
+		t.Fatalf("原样返回，条数应不变：%d != %d", len(kept), len(msgs))
 	}
 }

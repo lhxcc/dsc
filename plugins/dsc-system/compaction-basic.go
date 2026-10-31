@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,8 +145,17 @@ func newCompactionBasicServer() *compactionBasicServer {
 
 // attachLLM 缓存 interconnect 聚合 LLM 客户端（宿主挂载后回调注入）。
 // nil 不覆盖：未互联时保持 nil，摘要走截断式退化（对齐宿主引擎 nil-LLM 路径）。
+//
+// **接口里的 typed nil 不是 nil**：宿主在 agent 注册之前就给插件做互通握手时，
+// ic.LLM() 返回的是 (*llmclient.Client)(nil)，装进 llmChat 接口后 `c == nil` 为
+// false，下一次 summarize 就 nil deref——实测症状是「到达阈值的那一刻插件 panic
+// 退出，压缩永远不生效，上下文一路涨到滑窗」，而从会话日志上看只是「没压缩」。
+// 判空必须穿透接口看指针本身。
 func (s *compactionBasicServer) attachLLM(c llmChat) {
 	if c == nil {
+		return
+	}
+	if v := reflect.ValueOf(c); v.Kind() == reflect.Ptr && v.IsNil() {
 		return
 	}
 	s.mu.Lock()
