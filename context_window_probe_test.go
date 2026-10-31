@@ -27,7 +27,7 @@ func TestProbeContextWindowFromModels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL + "/v1"); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL + "/v1"); got != 262144 {
 		t.Fatalf("probe = %d, want 262144", got)
 	}
 }
@@ -48,7 +48,7 @@ func TestProbeContextWindowFallsBackToProps(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL); got != 262144 {
 		t.Fatalf("probe = %d, want 262144（应回退到 /props）", got)
 	}
 }
@@ -65,7 +65,7 @@ func TestProbeContextWindowTakesMaxAcrossModels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := probeContextWindow(srv.URL + "/v1"); got != 262144 {
+	if got, _ := probeContextWindow(srv.URL + "/v1"); got != 262144 {
 		t.Fatalf("probe = %d, want 262144（多个条目取最大）", got)
 	}
 }
@@ -75,12 +75,13 @@ func TestProbeContextWindowTakesMaxAcrossModels(t *testing.T) {
 func TestProbeContextWindowRetriesLocalEndpoint(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
-			http.NotFound(w, r)
+		// 模型还在加载时**所有**路径都 503（不是「活着但没容量」），这时才值得重试。
+		if atomic.AddInt32(&hits, 1) <= 4 { // 第一轮四条路径全 503
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		if atomic.AddInt32(&hits, 1) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable) // 模型还在加载
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
 			return
 		}
 		fmt.Fprint(w, `{"data":[{"id":"local","meta":{"n_ctx":262144}}]}`)
@@ -105,7 +106,7 @@ func TestProbeContextWindowNoRetryForCloud(t *testing.T) {
 	}))
 	defer srv.Close()
 	// httptest 监听在 127.0.0.1，但这里要验证「域名端点不重试」，所以直接调单次探测。
-	if got := probeContextWindow(srv.URL); got != 0 {
+	if got, _ := probeContextWindow(srv.URL); got != 0 {
 		t.Fatalf("probe = %d, want 0", got)
 	}
 	if n := atomic.LoadInt32(&hits); n > 5 {
@@ -290,5 +291,32 @@ func TestActiveLLMFlavorAndExplicit(t *testing.T) {
 	cfg.Plugins[0].Env = map[string]string{"DSC_OPENAI_MAX_OUTPUT_TOKENS": "8192"}
 	if !explicitMaxOutputTokens(cfg, "openai") {
 		t.Fatal("接口专属名应算显式设置")
+	}
+}
+
+// TestProbeContextWindowNoRetryWhenServerAnswersWithoutCapacity 服务端活着（/models 200
+// 但没有 n_ctx/max_model_len，/props 404）时**不该重试**：它不会因为多等 3.5 秒就变成
+// 会报容量。实测一个网关因此每次启动白等 3.5 秒。
+func TestProbeContextWindowNoRetryWhenServerAnswersWithoutCapacity(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.URL.Path == "/v1/models" || r.URL.Path == "/models" {
+			fmt.Fprint(w, `{"object":"list","data":[{"id":"gw"}]}`)
+			return
+		}
+		http.NotFound(w, r) // /props 等：活着但没有
+	}))
+	defer srv.Close()
+
+	w, attempts := probeContextWindowWithRetry(srv.URL + "/v1")
+	if w != 0 {
+		t.Fatalf("不该探到容量，got %d", w)
+	}
+	if attempts != 1 {
+		t.Fatalf("服务端活着时应只试一轮，实际 %d 轮（白等）", attempts)
+	}
+	if n := atomic.LoadInt32(&hits); n > 4 {
+		t.Fatalf("不该重复请求，实际 %d 次", n)
 	}
 }

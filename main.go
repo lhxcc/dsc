@@ -110,42 +110,53 @@ func contextProbePaths(baseURL string) []string {
 //
 // 多个 model 条目时取**最大**的非零值：网关常把别名/小模型一起列出来，取第一条
 // （data[0]）会拿到错的容量。
-func probeContextWindow(baseURL string) int {
+// reachable 语义：服务端对这一轮探测给出了**有意义的应答**（任意 HTTP 状态码）。
+// 区分它是为了「该不该重试」：连不上/5xx 值得再试，服务端活着却说不出容量就没必要等
+// （实测：一个网关没有 /props、/models 也不吐 n_ctx，重试只让每次启动多花 3.5 秒）。
+func probeContextWindow(baseURL string) (window int, reachable bool) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		return 0
+		return 0, false
 	}
 	// ① 运行时属性先：/props 给的是**当前调度设置**，优先于 /v1/models 里可能陈旧的 meta。
 	for _, p := range []string{"/props", "/v1/props"} {
-		if v := probeWindowAt(base + p); v > 0 {
-			return v
+		v, ok := probeWindowAt(base + p)
+		reachable = reachable || ok
+		if v > 0 {
+			return v, true
 		}
 	}
 	// ② 模型表兜底：同一份数据的两个入口（带不带 /v1），各自内部取最大。
 	best := 0
 	for _, p := range []string{"/v1/models", "/models"} {
-		if v := probeWindowAt(base + p); v > best {
+		v, ok := probeWindowAt(base + p)
+		reachable = reachable || ok
+		if v > best {
 			best = v
 		}
 	}
-	return best
+	return best, reachable
 }
 
-// probeWindowAt 从单个 URL 读容量（0 = 这条路径没给出可用值）。
-func probeWindowAt(u string) int {
+// probeWindowAt 从单个 URL 读容量；第二返回值表示服务端是否给出了应答
+// （2xx/4xx 都算——它活着，只是这条路径不带容量）。
+func probeWindowAt(u string) (window int, answered bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0
+		return 0, false // 连不上：值得重试
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return 0, false // 服务端自己有事：值得重试
+	}
 	if resp.StatusCode != http.StatusOK {
-		return 0
+		return 0, true // 活着但这条路径没有：重试无益
 	}
 	// /props 的响应可能带完整 chat_template（实测 230KB），只解码需要的字段。
 	var payload struct {
@@ -167,7 +178,7 @@ func probeWindowAt(u string) int {
 		} `json:"default_generation_settings"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return 0
+		return 0, true
 	}
 	best := 0
 	for _, v := range []int{
@@ -187,7 +198,7 @@ func probeWindowAt(u string) int {
 			}
 		}
 	}
-	return best
+	return best, true
 }
 
 // probeContextWindowWithRetry 反复探测：本地服务在「模型加载中」「正在生成占满 slot」
@@ -196,7 +207,9 @@ func probeWindowAt(u string) int {
 //
 // 只对本地/内网端点重试：云端探测失败基本就是「没有这项信息」，白等几秒没有意义。
 func probeContextWindowWithRetry(baseURL string) (window int, attempts int) {
-	if w := probeContextWindow(baseURL); w > 0 {
+	w, reachable := probeContextWindow(baseURL)
+	if w > 0 || reachable {
+		// 拿到容量，或者服务端活着却明确说不出容量：两种情况重试都没有意义。
 		return w, 1
 	}
 	if !looksLikeLocalEndpoint(baseURL) {
@@ -206,7 +219,8 @@ func probeContextWindowWithRetry(baseURL string) (window int, attempts int) {
 	for _, delay := range []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second} {
 		time.Sleep(delay)
 		attempts++
-		if w := probeContextWindow(baseURL); w > 0 {
+		w, reachable = probeContextWindow(baseURL)
+		if w > 0 || reachable {
 			return w, attempts
 		}
 	}
