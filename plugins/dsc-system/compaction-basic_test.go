@@ -389,3 +389,55 @@ func TestRetainBoundaryKeepsToolPairing(t *testing.T) {
 		}
 	}
 }
+
+// nilLLMClient 是一个「接口不为 nil、指针为 nil」的客户端——正是
+// (*llmclient.Client)(nil) 装进 llmChat 接口后的样子。
+type nilLLMClient struct{ called bool }
+
+func (n *nilLLMClient) Chat(context.Context, []*proto.Message, int32) (*proto.ChatResponse, error) {
+	n.called = true
+	panic("nil client must never be called")
+}
+
+// TestCompactionBasicTypedNilLLMDoesNotPanic 宿主在 agent 注册前完成互通握手时，
+// ic.LLM() 返回的是 (*llmclient.Client)(nil)。它装进接口后 `c == nil` 为 false，旧实现
+// 直接存下，下一次 summarize 就 nil deref——**插件进程 panic 退出**，而会话日志上看起来
+// 只是「到达阈值却没有压缩」（实测：331 步的单轮里窗口涨到 93%，最后滑窗兜不住而报错）。
+//
+// 真实地址无法在单测里构造，这里用同样的形状（接口非 nil、指针 nil）复现。
+func TestCompactionBasicTypedNilLLMDoesNotPanic(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 10000)
+	var typedNil *nilLLMClient
+	s.attachLLM(typedNil) // 接口里装着 nil 指针
+	if s.llm != nil {
+		t.Fatal("typed nil 不得被存为可用客户端")
+	}
+
+	msgs := bigMsgs(16, 1200)
+	res := mustPreStep(t, s, msgs) // 走到阈值：不得 panic
+	if res == "" {
+		t.Fatal("压力已过阈值：应返回改写结果")
+	}
+	if got := parseRewrite(t, res); !strings.Contains(got[0].GetContent(), "[压缩摘要]") {
+		t.Fatalf("无可用 LLM 时应退化为截断式摘要，got %q", got[0].GetContent())
+	}
+}
+
+// TestCompactionBasicAttachRealLLMStillWorks 正常的客户端仍然要被接受（别把判空做成永久关闭）。
+func TestCompactionBasicAttachRealLLMStillWorks(t *testing.T) {
+	s := newTestCompactionBasicServer(t, 10000)
+	fake := &fakeCompactionBasicLLM{content: "摘要正文"}
+	s.attachLLM(fake)
+
+	msgs := bigMsgs(16, 1200)
+	res := mustPreStep(t, s, msgs)
+	if res == "" {
+		t.Fatal("应返回改写结果")
+	}
+	if fake.calls == 0 {
+		t.Fatal("注入的 LLM 未被调用")
+	}
+	if got := parseRewrite(t, res); !strings.Contains(got[0].GetContent(), "摘要正文") {
+		t.Fatalf("应使用 LLM 摘要，got %q", got[0].GetContent())
+	}
+}
