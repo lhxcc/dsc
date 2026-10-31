@@ -151,8 +151,8 @@ DSC 以自身語言棧為準，理由只有一條：**Go 的零值就是 0**。�
 
 ### LLM 插件
 
-- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——窗口取值口徑是「**實測容量為上限，配置只能往下調**」：探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）時，配置 `context_window` 若比它大就按服務端值截斷（雲端把模型宣傳成 1M、或圖省事在 128K 後補個 0 都不再讓「發出去一定裝得下」失效），比它小則保留配置（用 32K 省成本是有意為之）；探測不到（雲端）時配置優先、缺省 128K；此外 provider 4xx 親口報過更小的上限時，宿主會把進程級窗口**一併降下來**（只降不升，標題欄與裁窗預算同步），不必每輪撞一次牆，不分本地/雲端、行為一致；`DSC_OPENAI_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `OPENAI_MAX_OUTPUT_TOKENS` 仍兼容；>0 隨請求攜帶，-1=不攜帶；0 仍表示未設置、會走宿主兜底）；壓縮等請求級參數優先於以上兩者）
-- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限=有效上下文窗口**：宿主一律注入 `DSC_MAX_OUTPUT_TOKENS`=有效上下文窗口值——窗口取值口徑與 openai 口一致（`/v1/models` 與 anthropic 口同端口）：**實測容量為上限、配置只能往下調**，探測不到（雲端）時配置優先、缺省 128K，provider 4xx 報過更小上限時進程級窗口一併降下來，不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，顯式攜帶窗口值在 llama.cpp 側受上下文自然鉗制、無害，並對抗其對缺席值自填的保守默認（laamaafung 為 4096）；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
+- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限不由宿主兜底**（不寫就不攜帶 `max_tokens`，由你自己的 `env:` 決定）——窗口取值口徑是「**實測容量為上限，配置只能往下調**」：探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）時，配置 `context_window` 若比它大就按服務端值截斷（雲端把模型宣傳成 1M、或圖省事在 128K 後補個 0 都不再讓「發出去一定裝得下」失效），比它小則保留配置（用 32K 省成本是有意為之）；探測不到（雲端）時配置優先、缺省 128K；此外 provider 4xx 親口報過更小的上限時，宿主會把進程級窗口**一併降下來**（只降不升，標題欄與裁窗預算同步），不必每輪撞一次牆，不分本地/雲端、行為一致；`DSC_OPENAI_MAX_OUTPUT_TOKENS` 顯式配置（舊名 `OPENAI_MAX_OUTPUT_TOKENS` 仍兼容；>0 隨請求攜帶，-1/0/不寫=不攜帶）；壓縮等請求級參數優先於以上兩者）
+- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限不由宿主兜底**（不寫就不攜帶 `max_tokens`）——窗口取值口徑與 openai 口一致（`/v1/models` 與 anthropic 口同端口）：**實測容量為上限、配置只能往下調**，探測不到（雲端）時配置優先、缺省 128K，provider 4xx 報過更小上限時進程級窗口一併降下來，不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，但「缺席由服務端自填」是服務端的選擇（laamaafung 填 4096），不該由宿主替用戶決定輸出預算；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
 - `llm-ollama`（Ollama 兼容端點：本地 Ollama server。與 `llm-openai`/`llm-anthropic` 同為 LLM provider 插件，經 Ollama Go SDK 直連 `/api/chat`；支持 reasoning/thinking 模型（默認開啓，`DSC_OLLAMA_THINKING=0` 可關閉，舊名 `OLLAMA_THINKING` 仍兼容），從響應 `Message.Thinking` 提取思維鏈幀渲染到 TUI；@文本附件引用（`dsc-txt://`）解析為文本串前綴拼入 user 消息 Content）
 
 #### LLM 相關環境變量
@@ -169,16 +169,18 @@ LLM 插件的配置全部走環境變量（寫在 `config.yaml` 插件條目的 
 | `DSC_<P>_REASONING_EFFORT` | 接口專屬推理強度覆蓋 | 直接傳端點字面量（如 `xhigh`），優先於統一檔位 |
 | `DSC_<P>_THINKING` | 擴展思考開關 | `0`/`false`/`off`/`no` 關閉；未設默認開啓（舊名 `<P>_THINKING` 回退） |
 | `DSC_ANTHROPIC_THINKING_BUDGET` | anthropic 思考 token 預算 | 正整數；未設時由統一檔位映射（舊名回退） |
-| `DSC_MAX_OUTPUT_TOKENS` | 單輪輸出上限（宿主通用） | `>0` 攜帶該值；`-1` 明確不攜帶 `max_tokens`；`0`/未設 = 由宿主按 `context_window` 注入。寫在插件 `env:` 裡時宿主不再覆蓋（顯式優先） |
+| `DSC_MAX_OUTPUT_TOKENS` | 單輪輸出上限（宿主通用） | `>0` 攜帶該值；`-1`/`0`/不寫 = 不攜帶 `max_tokens`（宿主不注入默認值） |
 | `DSC_<P>_MAX_OUTPUT_TOKENS` | 接口專屬輸出上限 | 三態同 `DSC_MAX_OUTPUT_TOKENS`，優先於它（舊名回退） |
 | `DSC_NO_VISION` | 強制關閉圖像輸入 | `1`/`true`/`on`/`yes` |
 | `DSC_LLM_DEBUG` | anthropic 思維鏈 stderr 調試打印 | 非空開啓（默認關閉） |
 
 幾點約定：
 
-- **輸出上限的三態語義**：`0`＝未設置（走 `DSC_MAX_OUTPUT_TOKENS` 兜底，即有效上下文窗口值）；
-  `-1`＝明確不攜帶 `max_tokens`；`>0`＝攜帶該值。雲端端點對 `max_tokens` 常有上限
-  （如 DeepSeek 393216），把上下文窗口值原樣當輸出上限會被 400 拒絕，故示例配置默認 `-1`。
+- **輸出上限的三態語義**：`>0`＝攜帶該值；`-1`＝明確不攜帶 `max_tokens`；**不寫或 `0`＝同樣不攜帶**。
+  宿主**不再**按 `context_window` 兜底注入：雲端端點對 `max_tokens` 常有上限（如 DeepSeek
+  官網報文裡的 `[1, 393216]`），任何「聰明」的默認值都只會先吃一次 400；本地 llama.cpp 缺席
+  時按上下文自行鉗制，注入窗口值反而把請求頂到「prompt + max_tokens > n_ctx」的邊界。
+  要限制輸出就在插件 `env:` 裡顯式寫值。
 - **憑據不外泄**：非 LLM 插件不繼承任何憑據類鍵（含 `DSC_<P>_API_KEY`）；確實需要宿主憑據的
   插件走白名單（目前僅 `tool-harness-webui` 可讀 `DSC_ADMIN_TOKEN`）。要給某插件憑據，寫進它
   自己的 `env:` 塊——顯式注入不受該過濾影響。

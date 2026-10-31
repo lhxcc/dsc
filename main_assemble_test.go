@@ -36,24 +36,35 @@ func TestInjectContextWindow(t *testing.T) {
 	}
 }
 
-// TestInjectMaxOutputTokensRespectsExplicit 验证注入不覆盖插件 env 里显式写的
-// DSC_MAX_OUTPUT_TOKENS（含 -1=不携带）——否则示例配置里的 -1 会被静默改成窗口值。
-func TestInjectMaxOutputTokensRespectsExplicit(t *testing.T) {
-	merged := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-anthropic", Type: "llm", Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "-1"}},
-		{Name: "llm-openai", Type: "llm"},
-		{Name: "tool-x", Type: "tool"},
+// TestNoHostDefaultMaxOutputTokens 宿主**不得**替用户决定输出预算。
+//
+// 未显式配置时不能注入 DSC_MAX_OUTPUT_TOKENS：一旦注入（曾经注入的是「有效窗口值」），
+// 云端会先吃一次 400（DeepSeek 官网页把上限写在报文里，如 [1, 393216]），本地则把请求
+// 顶到「prompt + max_tokens > n_ctx」的边界。语义分三种：>0 携带该值；-1 明确不携带；
+// 不写/0 同样不携带——所以合并后的插件 env 里不该凭空多出这个键。
+func TestNoHostDefaultMaxOutputTokens(t *testing.T) {
+	mainCfg := &core.Config{Plugins: []core.PluginEntry{
+		{Name: "llm-anthropic", Type: "llm", Enabled: true, BinaryPath: "./plugins/llm-anthropic/a.exe"},
+		{Name: "llm-openai", Type: "llm", Enabled: true, BinaryPath: "./plugins/llm-openai/o.exe",
+			Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "8192"}},
 	}}
-	injectMaxOutputTokens(merged, 1048576)
+	merged := assembleMerged(extractLLMs(mainCfg), extractAgent(mainCfg), mainCfg, nil, 262144, false, "")
 
-	if got := merged.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "-1" {
-		t.Fatalf("显式 -1 不得被覆盖，got %q", got)
-	}
-	if got := merged.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "1048576" {
-		t.Fatalf("未显式配置时应注入窗口值，got %q", got)
-	}
-	if _, ok := merged.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("非 LLM 插件不应被注入 max_tokens")
+	for _, p := range merged.Plugins {
+		if p.Type != "llm" {
+			continue
+		}
+		got, ok := p.Env["DSC_MAX_OUTPUT_TOKENS"]
+		switch p.Name {
+		case "llm-anthropic":
+			if ok {
+				t.Fatalf("未显式配置时不得注入 max_tokens（窗口=%d），got %q", 262144, got)
+			}
+		case "llm-openai":
+			if got != "8192" {
+				t.Fatalf("显式配置必须原样保留，got %q", got)
+			}
+		}
 	}
 }
 

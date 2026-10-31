@@ -49,7 +49,7 @@ plugins:
       #（旧名 ANTHROPIC_THINKING 仍兼容）。
       DSC_REASONING_EFFORT: "high"
       # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
-      # 不设或写 0=未设置，由宿主按 context_window 注入。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
+      # 不写或 0=同样不携带（宿主不再按 context_window 注入）。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
       # 可覆盖本值（见 README「LLM 環境變量」）；云端端点有上限（如 DeepSeek 393216），故默认 -1。
       DSC_MAX_OUTPUT_TOKENS: "-1"
   # - name: llm-openai
@@ -66,7 +66,7 @@ plugins:
   #     # 端点支持的字面量（如 xhigh 等文档外档位）绕过统一映射。仅对推理模型有效，非推理模型忽略。
   #     #DSC_REASONING_EFFORT: "high"
   #     # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
-  #     # 不设或写 0=未设置，由宿主按 context_window 注入。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
+  #     # 不写或 0=同样不携带（宿主不再按 context_window 注入）。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
   #     # 可覆盖本值（见 README「LLM 環境變量」）；云端端点有上限（如 DeepSeek 393216），故默认 -1。
   #     DSC_MAX_OUTPUT_TOKENS: "-1"
   - name: tool-filesystem

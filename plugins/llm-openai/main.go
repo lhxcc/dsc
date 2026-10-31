@@ -25,9 +25,9 @@ type OpenAIProvider struct {
 	client *openai.Client
 	model  string
 	// maxTokens 单轮输出上限（插件级默认）：取值来源显式 DSC_OPENAI_MAX_OUTPUT_TOKENS
-	//（旧名 OPENAI_MAX_OUTPUT_TOKENS 回退）> 宿主注入 DSC_MAX_OUTPUT_TOKENS
-	//（一律注入=有效上下文窗口值：探测命中 LLAMACPP 时=探测窗口，云端=配置 context_window）
-	// > -1 = 明确不携带（必须写 -1；写 0 仍视为「未设置」走兜底，`>0 才携带` 故负值被忽略）；
+	//（旧名 OPENAI_MAX_OUTPUT_TOKENS 回退）> 通用 DSC_MAX_OUTPUT_TOKENS；三态：>0 携带、
+	// -1/0/不写=不携带（**宿主不再按 context_window 兜底注入**——任何默认值都只会先吃
+	// 一次 400，或把请求顶到「prompt + max_tokens > n_ctx」的边界）。
 	// 请求级参数（压缩等场景）经 resolveMaxTokens 优先于本值。
 	maxTokens int
 	// vision 是否启用图像输入：默认按模型能力自动判断，DSC_NO_VISION=1 强制关闭。
@@ -316,7 +316,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 		Tools:    openaiTools,
 	}
 	// max_tokens：请求级参数（压缩等场景的窗口净余值）优先，其次插件级默认
-	//（显式 env > 宿主注入）；<=0 不携带，等模型自然结束。
+	//（只来自插件 env——宿主不注入默认值）；<=0 不携带，等模型自然结束。
 	if mt := p.resolveMaxTokens(maxTokens); mt > 0 {
 		req.MaxTokens = mt
 	}
@@ -369,7 +369,8 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 }
 
 // resolveMaxTokens 计算本请求实际携带的 max_tokens：请求级参数（压缩等场景的
-// 窗口净余值）优先，其次插件级默认（显式 env > 宿主注入），<=0 表示不携带。
+// 窗口净余值）优先，其次插件级默认（只来自插件 env——宿主不注入默认值），
+// <=0 表示不携带。
 // 已知服务端上限时提前钳制，避免每个新进程的首个请求都先吃一次 400。
 func (p *OpenAIProvider) resolveMaxTokens(requestMaxTokens int) int {
 	if p.noMaxTokens.Load() {

@@ -1011,17 +1011,14 @@ func main() {
 	injectContextWindow(merged, contextWindow)
 	logger.Info("context window injected to all plugins", "window", contextWindow, "plugins", len(merged.Plugins))
 
-	// 输出上限统一语义（不分本地/云端，行为一致）：向 LLM 插件注入 DSC_MAX_OUTPUT_TOKENS
-	// =有效上下文窗口值。探测命中（本地 LLAMACPP）注入探测窗口值；探测不命中（云端）注入
-	// 配置 context_window 值（含 128K 兜底默认）——窗口来源切换、注入行为不变，用户对
-	// context_window 的调整在任何端点都同样生效。anthropic 兼容口把 max_tokens 视为
-	// required，字段缺席时服务端自填保守默认（laamaafung server-chat.cpp 对缺席值填
-	// 4096），「不携带=等模型自然结束」在其上退化为服务端默认截断；显式携带窗口值在
-	// LLAMACPP 侧被服务端上下文自然钳制（生成至 EOS 或窗口满）。云端若模型输出上限低于
-	// 注入值而被 400 拒绝，属用户可显式调整的范围：下调 context_window，或设插件 env
-	// （DSC_ANTHROPIC_/DSC_OPENAI_MAX_OUTPUT_TOKENS=-1，旧名兼容；0 仍表示未设置）恢复不携带——可调整性优先于差异化默认。
-	injectMaxOutputTokens(merged, contextWindow)
-	logger.Info("max output tokens defaulted to effective context window", "max_tokens", contextWindow, "source", windowSource)
+	// 输出上限（max_tokens）**不由宿主兜底**：用户没显式给值就不携带该字段，等模型自然
+	// 结束。理由是两次实测：①DeepSeek 官网页把上限压在报文里（如 [1, 393216]），任何
+	// 「聪明」的默认值都会先吃一次 400；②llama.cpp 家族缺席时按上下文自行钳制，注入窗口
+	// 值反而让请求逼近「prompt+max_tokens > n_ctx」的边界。原先「不设就注入窗口值」的兜底
+	// 已删除（其唯一动机是 anthropic 兼容口对缺席值自填 4096，但那属于服务端选择，不该
+	// 由宿主替用户决定输出预算）。
+	// 需要限制输出时，在插件 env 里显式写 DSC_MAX_OUTPUT_TOKENS（或接口专属
+	// DSC_<P>_MAX_OUTPUT_TOKENS）：>0 携带该值，-1/0/不写=不携带。
 
 	// 声明式加载：Manager 内做依赖拓扑排序 + PENDING + 聚合 Tool 服务 + 一次性 RegisterServices。
 	// 失败则自愈：把 config.yaml 与 preset 各自备份当前（坏）版、分别还原各自最近正常
@@ -1084,7 +1081,6 @@ func main() {
 				}
 				core.ReportOrphanPlugins(pluginsDir, core.RequiredPluginDirBases(merged), logger)
 				injectRuntimeEnv(merged, mode, core.WorkspaceRoot, sandboxPolicyEnv())
-				injectMaxOutputTokens(merged, contextWindow)
 				logger.Warn("启动加载失败，已还原最近正常配置并重试（降级模式）",
 					"cause", loadErr, "recovered", recovered, "badConfig", badCfg, "badPreset", badPreset)
 				if err := mgr.LoadFromConfig(merged); err != nil {
