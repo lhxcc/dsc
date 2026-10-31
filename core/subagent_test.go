@@ -39,7 +39,7 @@ func (p *scriptedLLM) captureToolsLocked(tools []Tool) {
 	}
 }
 
-func (p *scriptedLLM) ChatStream(_ context.Context, _ []Message, tools []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *scriptedLLM) ChatStream(_ context.Context, _ []Message, tools []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.captureToolsLocked(tools)
@@ -149,7 +149,7 @@ func (p *ctxAwareLLM) Chat(_ context.Context, _ []Message, _ []Tool, _ int) (*Ch
 	return &ChatResponse{Content: "done", FinishReason: "stop"}, nil
 }
 
-func (p *ctxAwareLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *ctxAwareLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	if ctx.Err() != nil {
 		p.gotCancel = true
 		return nil, ctx.Err()
@@ -404,7 +404,7 @@ type slowStreamLLM struct {
 	calls int
 }
 
-func (p *slowStreamLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *slowStreamLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	p.mu.Lock()
 	p.calls++
 	p.mu.Unlock()
@@ -467,7 +467,7 @@ func (p *hungLLM) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, 
 	<-context.Background().Done()
 	return nil, context.Background().Err()
 }
-func (p *hungLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *hungLLM) ChatStream(ctx context.Context, _ []Message, _ []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	// 返回一个永不发帧也永不关闭的 channel——模拟 provider 建立连接后挂起
 	ch := make(chan *ChatStreamResponse)
 	go func() {

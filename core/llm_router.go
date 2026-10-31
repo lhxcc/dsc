@@ -379,18 +379,29 @@ func (s *llmAggregateServer) finishPreStep(req *proto.ChatRequest, msgs []*proto
 	if changed || dropped > 0 {
 		s.m.NoteActualSurface(session, surface)
 	}
-	if !changed && dropped == 0 {
+	// 输出预算（max_tokens）在这里算定，而不是让每个 provider 插件各自按窗口估一遍：
+	// 只有宿主持有「窗口」「本帧最终表面（含工具目录）」「服务端认过的上限」这三样。
+	// 调用方已经给了值（压缩等场景的净余值）就不动——那是它按自己的语义算过的。
+	budget := 0
+	if req.GetMaxTokens() == 0 {
+		budget = s.m.outputBudgetFor(surface, window)
+	}
+	if !changed && dropped == 0 && budget == 0 {
 		return req, nil
 	}
 	// 返回改写后的请求（不修改原 req，避免影响重试路径的原始数据）。
 	// 会话归属与新用户输入标记随写复制：重试路径再次分发 pre-step 时语义不变。
-	return &proto.ChatRequest{
+	out := &proto.ChatRequest{
 		Messages:     trimmed,
 		Tools:        req.Tools,
 		MaxTokens:    req.MaxTokens,
 		SessionId:    req.SessionId,
 		NewUserInput: req.NewUserInput,
-	}, nil
+	}
+	if budget > 0 {
+		out.MaxTokens = int32(budget)
+	}
+	return out, nil
 }
 
 // parsePreStepAppends 解析插件经 pre-step 返回的一次性插播消息：
@@ -741,7 +752,7 @@ func chatWithProvider(provider LLMProvider, ctx context.Context, req *proto.Chat
 // → 滑窗 → 重试）被跳过，用户直接看到原始 400。实测就是这么发生的。
 func chatStreamWithProvider(provider LLMProvider, req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer, call *LLMCall) error {
 	messages, tools := protoMessagesToPlugin(req)
-	ch, err := provider.ChatStream(stream.Context(), messages, tools)
+	ch, err := provider.ChatStream(stream.Context(), messages, tools, int(req.MaxTokens))
 	if err != nil {
 		call.Err = err
 		return err

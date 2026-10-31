@@ -29,7 +29,7 @@ func TestReasoningProbe(t *testing.T) {
 	}
 
 	messages := []dsc.Message{{Role: "user", Content: "3+4=? reply short"}}
-	ch, err := p.ChatStream(context.Background(), messages, nil)
+	ch, err := p.ChatStream(context.Background(), messages, nil, 0)
 	if err != nil {
 		t.Fatalf("ChatStream err: %v", err)
 	}

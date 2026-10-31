@@ -246,6 +246,45 @@ func slideNote(dropped, droppedTokens int) *proto.Message {
 	}
 }
 
+// 输出预算（max_tokens）的两个常量。
+const (
+	// outputBudgetReserve 是给「我们的估算 vs provider 分词器」留的余量：让 max_tokens
+	// 吃掉名义余量的最后一滴，prompt+max_tokens 就会越过 n_ctx，provider 直接 400。
+	outputBudgetReserve = 512
+	// outputBudgetMin 低于这个值就不填：那点余量只够吐半句话，说明请求本身该被滑窗
+	// 收口，而不是塞一个荒谬的输出上限。
+	outputBudgetMin = 128
+)
+
+// outputBudgetFor 返回本帧可携带的 max_tokens = min(探测到的服务端上限, 窗口 − 表面 − 余量)。
+//
+// 两个来源分工明确：maxOutputBudget 管「协议上限」（DeepSeek 报文明说 [1, 393216] 这类），
+// 窗口余量管「这一帧还剩多少地方能生成」。返回 0 表示不填，交给插件/服务端。
+//
+// 为什么必须按帧算：anthropic 兼容口把 max_tokens 当 required，缺席时服务端自填保守默认
+// （llama.cpp 兼容口填 4096）会把长回答腰斩；而按窗口值硬填又会与「prompt + max_tokens
+// ≤ n_ctx」打架。只填「这一帧真正能用的量」，两种错都避开。
+func (m *Manager) outputBudgetFor(surface, window int) int {
+	if m == nil || window <= 0 {
+		return 0
+	}
+	m.mu.RLock()
+	budget := m.maxOutputBudget
+	explicit := m.maxOutputExplicit
+	m.mu.RUnlock()
+	if explicit {
+		return 0 // 用户显式给了值：宿主不填，别用请求级参数把它顶掉
+	}
+	room := window - surface - outputBudgetReserve
+	if room < outputBudgetMin {
+		return 0
+	}
+	if budget > 0 && budget < room {
+		return budget
+	}
+	return room
+}
+
 // enforceRequestCeiling 保证「即将发出的请求」不超过窗口上限；返回（可能被裁剪的）
 // 消息、裁剪条数与被裁掉的估算量。
 //

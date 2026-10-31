@@ -35,7 +35,7 @@ func (p *mockLLMProvider) Chat(_ context.Context, msgs []Message, _ []Tool, _ in
 	return &ChatResponse{Content: "ok", FinishReason: "stop"}, nil
 }
 
-func (p *mockLLMProvider) ChatStream(ctx context.Context, _ []Message, _ []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *mockLLMProvider) ChatStream(ctx context.Context, _ []Message, _ []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.failStart > 0 {

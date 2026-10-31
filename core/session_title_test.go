@@ -18,7 +18,7 @@ func (m *mockLLMForTitle) Chat(ctx context.Context, messages []Message, tools []
 	return &ChatResponse{Content: m.response}, nil
 }
 
-func (m *mockLLMForTitle) ChatStream(ctx context.Context, messages []Message, tools []Tool) (<-chan *ChatStreamResponse, error) {
+func (m *mockLLMForTitle) ChatStream(ctx context.Context, messages []Message, tools []Tool, _ int) (<-chan *ChatStreamResponse, error) {
 	return nil, nil
 }
 

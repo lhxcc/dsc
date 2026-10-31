@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
-
 )
 
 // TestAnthropicEffortForLevel 验证统一档位 → output_config.effort 映射。
@@ -38,14 +37,14 @@ func TestAnthropicEffortForLevel(t *testing.T) {
 func TestBuildMessageParamsNegativeMaxTokensMeansOmit(t *testing.T) {
 	msgs := []dsc.Message{{Role: "user", Content: "hi"}}
 	p := &AnthropicProvider{model: "m", maxTokens: -1}
-	if got := p.resolveMaxTokens(0, nil, nil); got != 0 {
-		t.Fatalf("插件级 -1 表示「明确不携带」，应归一到 0（由 omitZeroMaxTokens 摘除），got %d", got)
+	if got := p.resolveMaxTokens(0); got != -1 {
+		t.Fatalf("插件级 -1 表示「无限」，应原样返回，got %d", got)
 	}
-	params, _ := p.buildMessageParams(msgs, nil, p.resolveMaxTokens(0, nil, nil))
-	if params.MaxTokens != 0 {
-		t.Fatalf("负值不得作为 max_tokens 上送，MaxTokens 应为零值，got %d", params.MaxTokens)
+	params, _ := p.buildMessageParams(msgs, nil, p.resolveMaxTokens(0))
+	if params.MaxTokens != -1 {
+		t.Fatalf("-1（无限）必须原样上送，got %d", params.MaxTokens)
 	}
-	params, _ = p.buildMessageParams(msgs, nil, p.resolveMaxTokens(8192, nil, nil))
+	params, _ = p.buildMessageParams(msgs, nil, p.resolveMaxTokens(8192))
 	if params.MaxTokens != 8192 {
 		t.Fatalf("请求级参数仍应优先，got %d", params.MaxTokens)
 	}

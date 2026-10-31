@@ -180,7 +180,7 @@ func (p *overflowProvider) Chat(_ context.Context, msgs []Message, _ []Tool, _ i
 	return &ChatResponse{Content: "ok", FinishReason: "stop"}, nil
 }
 
-func (p *overflowProvider) ChatStream(context.Context, []Message, []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *overflowProvider) ChatStream(context.Context, []Message, []Tool, int) (<-chan *ChatStreamResponse, error) {
 	return nil, errors.New("streaming not used in this test")
 }
 

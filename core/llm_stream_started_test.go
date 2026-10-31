@@ -24,7 +24,7 @@ type fakeStreamProvider struct{ items []*ChatStreamResponse }
 func (p *fakeStreamProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
 	return &ChatResponse{}, nil
 }
-func (p *fakeStreamProvider) ChatStream(context.Context, []Message, []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *fakeStreamProvider) ChatStream(context.Context, []Message, []Tool, int) (<-chan *ChatStreamResponse, error) {
 	ch := make(chan *ChatStreamResponse, len(p.items))
 	for _, it := range p.items {
 		ch <- it

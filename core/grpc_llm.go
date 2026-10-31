@@ -21,8 +21,13 @@ import (
 type LLMProvider interface {
 	// Chat 以非流式方式调用 LLM；maxTokens <= 0 表示使用服务端默认
 	Chat(ctx context.Context, messages []Message, tools []Tool, maxTokens int) (*ChatResponse, error)
-	// ChatStream 以流式方式调用 LLM，返回增量内容通道；通道关闭表示该轮结束
-	ChatStream(ctx context.Context, messages []Message, tools []Tool) (<-chan *ChatStreamResponse, error)
+	// ChatStream 以流式方式调用 LLM，返回增量内容通道；通道关闭表示该轮结束。
+	//
+	// maxTokens 是本帧的输出预算，由宿主统一决定（它才同时知道窗口、本帧表面与「服务端
+	// 亲口认过的上限」）。三种语义与 Chat 一致：>0 携带该值、0 = 用插件配置、<0 = 明确
+	// 不携带 max_tokens 字段。插件不该自己再按窗口算一遍——那会让每个 provider 各有一套
+	// 估算，且改了窗口策略要改 N 个插件。
+	ChatStream(ctx context.Context, messages []Message, tools []Tool, maxTokens int) (<-chan *ChatStreamResponse, error)
 	Name(ctx context.Context) string
 	Version(ctx context.Context) string
 	HealthCheck(ctx context.Context) error
@@ -282,7 +287,7 @@ func (s *llmGRPCServer) Chat(ctx context.Context, req *proto.ChatRequest) (*prot
 func (s *llmGRPCServer) ChatStream(req *proto.ChatRequest, stream proto.LLMService_ChatStreamServer) error {
 	messages, tools := convertLLMChatRequest(req)
 
-	ch, err := s.impl.ChatStream(stream.Context(), messages, tools)
+	ch, err := s.impl.ChatStream(stream.Context(), messages, tools, int(req.MaxTokens))
 	if err != nil {
 		return err
 	}
@@ -391,10 +396,11 @@ func (c *llmGRPCClient) Chat(ctx context.Context, messages []Message, tools []To
 	}, nil
 }
 
-func (c *llmGRPCClient) ChatStream(ctx context.Context, messages []Message, tools []Tool) (<-chan *ChatStreamResponse, error) {
+func (c *llmGRPCClient) ChatStream(ctx context.Context, messages []Message, tools []Tool, maxTokens int) (<-chan *ChatStreamResponse, error) {
 	req := &proto.ChatRequest{
-		Messages: convertToProtoMessages(messages),
-		Tools:    convertToProtoTools(tools),
+		Messages:  convertToProtoMessages(messages),
+		Tools:     convertToProtoTools(tools),
+		MaxTokens: int32(maxTokens),
 	}
 	stream, err := c.client.ChatStream(ctx, req)
 	if err != nil {

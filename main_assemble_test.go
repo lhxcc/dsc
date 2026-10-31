@@ -36,11 +36,12 @@ func TestInjectContextWindow(t *testing.T) {
 	}
 }
 
-// TestAssembleDoesNotInjectMaxOutputTokens 装配阶段不碰 max_tokens：探测与注入发生在
-// main（拿到 URL/模型/凭据之后），装配只看配置本身。
+// TestAssembleDoesNotInjectMaxOutputTokens 装配阶段不碰 max_tokens：装配只看配置本身，
+// 预算发生在别处（启动期探一次服务端上限 → Manager；每帧由 core.outputBudgetFor 按
+// 「窗口 − 本帧表面 − 余量」算出来，随 ChatStream 的 maxTokens 参数下发）。
 //
-// 语义现状（三次调整后的定论）：用户显式写了就按用户的（>0 用值、-1 不携带）；没写由
-// 宿主启动期探一次服务端上限再注入；连探都探不到就由插件每帧按「窗口 − 输入」现算。
+// 语义：用户显式写了就按用户的（>0 用值、-1 不携带），宿主一次都不填；配置里的显式值
+// 必须在装配后原样保留，不能被任何默认值改写。
 func TestAssembleDoesNotInjectMaxOutputTokens(t *testing.T) {
 	mainCfg := &core.Config{Plugins: []core.PluginEntry{
 		{Name: "llm-anthropic", Type: "llm", Enabled: true, BinaryPath: "./plugins/llm-anthropic/a.exe"},
@@ -59,35 +60,6 @@ func TestAssembleDoesNotInjectMaxOutputTokens(t *testing.T) {
 		if p.Name == "llm-openai" && got != "8192" {
 			t.Fatalf("显式配置必须原样保留，got %q", got)
 		}
-	}
-}
-
-// TestInjectMaxOutputBudgetOnlyActiveProvider 探测出来的上限只写当前 provider 的条目：
-// 那是按这个端点探的，套到别的 provider 上没有依据。
-func TestInjectMaxOutputBudgetOnlyActiveProvider(t *testing.T) {
-	cfg := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-openai", Type: "llm"},
-		{Name: "llm-anthropic", Type: "llm"},
-		{Name: "tool-x", Type: "tool"},
-	}}
-	injectMaxOutputBudget(cfg, "openai", 393216)
-	if got := cfg.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "393216" {
-		t.Fatalf("当前 provider 应被注入，got %q", got)
-	}
-	if _, ok := cfg.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("其它 provider 不应被注入")
-	}
-	if _, ok := cfg.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("非 LLM 插件不应被注入")
-	}
-	// 找不到对应条目时退回全部 llm（宁可保守也别漏）
-	cfg2 := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-openai", Type: "llm"},
-		{Name: "llm-anthropic", Type: "llm"},
-	}}
-	injectMaxOutputBudget(cfg2, "ollama", 8192)
-	if cfg2.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" || cfg2.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" {
-		t.Fatalf("找不到对应条目时应退回全部 llm 条目: %+v", cfg2.Plugins)
 	}
 }
 

@@ -77,24 +77,6 @@ func EstimateProtoMessagesTokens(msgs []*proto.Message) int {
 	return core.EstimateProtoMessagesTokens(msgs)
 }
 
-// EstimateMessageValuesTokens 估算值形态消息列表（[]dsc.Message）的 token 数。
-//
-// LLM 插件拿到的就是 []dsc.Message（宿主侧是 []*Message）：逐个套同一个单项公式，
-// 不另立一套估算——否则插件按窗口算输出余量时会与宿主算出两个数。
-func EstimateMessageValuesTokens(msgs []Message) int {
-	total := 0
-	for i := range msgs {
-		total += core.EstimateMessageTokens(&msgs[i])
-	}
-	return total
-}
-
-// EstimateToolTokens 估算工具目录（[]dsc.LLMTool，即宿主 core.Tool）的 token 数。
-//
-// 与宿主同一实现（core.EstimateToolTokens）：插件要按「窗口 − 消息 − 工具目录」算
-// 输出余量时必须能把工具目录也算进去，否则会系统性高估可用空间。
-func EstimateToolTokens(tools []LLMTool) int { return core.EstimateToolTokens(tools) }
-
 // EstimateProtoToolTokens 估算 proto 形态工具目录的 token 数。
 //
 // 工具目录是**每次请求都携带**的固定成本，必须与消息估算相加后再判定压力/裁剪；

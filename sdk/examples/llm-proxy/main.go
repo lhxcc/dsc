@@ -31,7 +31,7 @@ func (m *mockLLM) Chat(ctx context.Context, messages []core.Message, tools []cor
 	return &core.ChatResponse{Content: b.String(), FinishReason: "stop"}, nil
 }
 
-func (m *mockLLM) ChatStream(ctx context.Context, messages []core.Message, tools []core.Tool) (<-chan *core.ChatStreamResponse, error) {
+func (m *mockLLM) ChatStream(ctx context.Context, messages []core.Message, tools []core.Tool, _ int) (<-chan *core.ChatStreamResponse, error) {
 	ch := make(chan *core.ChatStreamResponse, 2)
 	go func() {
 		defer close(ch)

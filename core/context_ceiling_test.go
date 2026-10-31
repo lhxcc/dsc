@@ -284,16 +284,20 @@ func TestFinishPreStepTrimsOversizedRequest(t *testing.T) {
 	}
 }
 
-// TestFinishPreStepKeepsFittingRequestUntouched 装得下时原样返回同一个请求对象
-// （零改写 → 不产生新的请求、不动展示口径）。
+// TestFinishPreStepKeepsFittingRequestUntouched 装得下且无需填输出预算时，原样返回同一个
+// 请求对象（零改写 → 不产生新的请求、不动展示口径）。
+//
+// 用「用户显式配置了 max_tokens」来关掉预算填充：那是唯一会**为不改写而复制请求**的
+// 情形（其余复制都伴随裁剪）。默认路径会填预算，由 TestFinishPreStepFillsMaxTokens 覆盖。
 func TestFinishPreStepKeepsFittingRequestUntouched(t *testing.T) {
 	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
 	m.contextWindow = 1_000_000
+	m.SetMaxOutputExplicit(true)
 	srv := &llmAggregateServer{m: m}
 	msgs := []*proto.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: "hi"}}
 	req := &proto.ChatRequest{Messages: msgs, SessionId: "s"}
 	if out, err := srv.finishPreStep(req, msgs, false); err != nil || out != req {
-		t.Fatal("装得下应原样返回同一个请求且不裁")
+		t.Fatal("装得下且无需填预算时应原样返回同一个请求且不裁")
 	}
 }
 
@@ -553,5 +557,68 @@ func TestCapMessagesToWindowRefusesShellOnly(t *testing.T) {
 	}
 	if len(kept) != len(msgs) {
 		t.Fatalf("原样返回，条数应不变：%d != %d", len(kept), len(msgs))
+	}
+}
+
+// TestOutputBudgetFor 每帧输出预算 = min(探测到的服务端上限, 窗口 − 表面 − 余量)。
+//
+// 三态语义（跟随服务端真实含义）：>0 指定、-1 无限、0 禁用。宿主只在「用户没显式配置」
+// 时填；填的是**这一帧真正能用的量**，不是窗口总值——anthropic 兼容口把 max_tokens 当
+// required（缺席自填 4096，长回答腰斩），而按窗口总值硬填又与 prompt+max_tokens ≤ n_ctx
+// 打架。
+func TestOutputBudgetFor(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+
+	// 未探到服务端上限：纯按余量
+	if got, want := m.outputBudgetFor(100_000, 262_144), 262_144-100_000-outputBudgetReserve; got != want {
+		t.Fatalf("余量 = %d, want %d", got, want)
+	}
+	// 探测上限更小：用它（协议上限）
+	m.SetMaxOutputBudget(8_192)
+	if got := m.outputBudgetFor(100_000, 262_144); got != 8_192 {
+		t.Fatalf("探测上限更小时应采用，got %d", got)
+	}
+	// 探测上限更大：仍取余量（min 语义：先保证 prompt+max_tokens ≤ n_ctx）
+	m.SetMaxOutputBudget(393_216)
+	if got, want := m.outputBudgetFor(100_000, 262_144), 262_144-100_000-outputBudgetReserve; got != want {
+		t.Fatalf("探测上限较大时应取余量 %d，got %d", want, got)
+	}
+	// 余量不够吐一句话：不填（0 = 禁用），由滑窗收口
+	if got := m.outputBudgetFor(262_144-100, 262_144); got != 0 {
+		t.Fatalf("余量不足应返回 0，got %d", got)
+	}
+	// 用户显式配置（含 -1 无限 / 0 禁用）：宿主一次都不填，否则会顶掉用户的值
+	m.SetMaxOutputExplicit(true)
+	if got := m.outputBudgetFor(1_000, 262_144); got != 0 {
+		t.Fatalf("显式配置时宿主不得填默认值，got %d", got)
+	}
+}
+
+// TestFinishPreStepFillsMaxTokens 收口阶段把预算写进要发出的请求；已显式给值的请求不动。
+func TestFinishPreStepFillsMaxTokens(t *testing.T) {
+	m := NewManager(&ManagerConfig{ExecDir: t.TempDir()})
+	m.SetContextWindow(20_000)
+	srv := &llmAggregateServer{m: m}
+
+	msgs := []*proto.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: strings.Repeat("u", 400)}}
+	out, err := srv.finishPreStep(&proto.ChatRequest{Messages: msgs, SessionId: "s"}, msgs, false)
+	if err != nil {
+		t.Fatalf("finishPreStep: %v", err)
+	}
+	want := 20_000 - EstimateProtoMessagesTokens(msgs) - outputBudgetReserve
+	if int(out.GetMaxTokens()) != want {
+		t.Fatalf("max_tokens = %d, want %d（窗口 − 表面 − 余量）", out.GetMaxTokens(), want)
+	}
+	if surface := EstimateProtoMessagesTokens(out.Messages) + int(out.GetMaxTokens()); surface > 20_000 {
+		t.Fatalf("prompt + max_tokens = %d > n_ctx 20000", surface)
+	}
+
+	// 压缩等调用方已给值：不得覆盖
+	out2, err := srv.finishPreStep(&proto.ChatRequest{Messages: msgs, SessionId: "s", MaxTokens: 3072}, msgs, false)
+	if err != nil {
+		t.Fatalf("finishPreStep: %v", err)
+	}
+	if out2.GetMaxTokens() != 3072 {
+		t.Fatalf("已显式给值的请求不得被改写，got %d", out2.GetMaxTokens())
 	}
 }
