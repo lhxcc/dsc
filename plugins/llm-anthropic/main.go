@@ -32,13 +32,11 @@ type AnthropicProvider struct {
 	// 忽略 thinking.budget_tokens，改以 output_config.effort 控制思考强度；真实 Anthropic
 	// 则吃 budget_tokens。两者同时下发互不冲突。
 	reasoningEffort string
-	// maxTokens 单轮输出上限（插件级默认）。取值来源：显式 DSC_ANTHROPIC_MAX_OUTPUT_TOKENS
-	//（旧名 ANTHROPIC_MAX_OUTPUT_TOKENS 回退）> 通用 DSC_MAX_OUTPUT_TOKENS；三态：>0 携带、
-	// -1/0/不写=不携带（**宿主不再按 context_window 兜底注入**：这只把请求顶到
-	// 「prompt + max_tokens > n_ctx」的边界，云端还会先吃一次 400）。
-	// 请求级参数（压缩等场景的窗口净余值）经 resolveMaxTokens 优先于本值。零值由 omitZeroMaxTokens 中间件从
-	// 请求体摘除（SDK 无 omitempty，不摘则会上送 "max_tokens":0 被服务端拒绝）；
-	// 负值因 `>0 才携带` 的判断天然被忽略。
+	// maxTokens 单轮输出上限（插件级默认），三态跟随服务端真实语义：
+	// -1 = 无限（原样携带）、0 = 禁用（请求体不带该字段，由 omitZeroMaxTokens 摘除——
+	// SDK 无 omitempty，不摘会上送 "max_tokens":0）、N = 指定。
+	// 取值来源：显式 DSC_ANTHROPIC_MAX_OUTPUT_TOKENS（旧名回退）> 通用 DSC_MAX_OUTPUT_TOKENS。
+	// 宿主给的本帧预算（请求级参数）经 resolveMaxTokens 优先于本值。
 	maxTokens int64
 	// vision 是否启用图像输入：默认按模型能力自动判断，DSC_NO_VISION=1 强制关闭。
 	vision bool
@@ -59,9 +57,9 @@ var maxInlineImageBytes = 20 << 20 // 20 MiB
 
 // omitZeroMaxTokens 从请求体 JSON 中摘除值为 0 的 max_tokens 字段。
 // 本仓 anthropic SDK 的 MessageNewParams.MaxTokens 无 omitempty（协议标 required），
-// 零值会以 "max_tokens":0 上送——轻则参数错误，重则被理解为零输出。而「不人为
-// 限制输出」的语义必须是不携带该字段、等模型自然结束（对齐 llm-openai 行为：
-// 仅显式 >0 才携带）。故以中间件在 HTTP 层摘除零值，显式配置不受影响。
+// 零值会以 "max_tokens":0 上送——那是「一个 token 都不生成」，请求会立刻以 end_turn
+// 收尾，看起来像模型哑了。「0 = 禁用该字段」必须靠 HTTP 层摘除来实现；
+// 负值（-1 = 无限）原样上送，不在这一层改写。
 func omitZeroMaxTokens(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
 	if req.Body == nil {
 		return next(req)
@@ -209,9 +207,9 @@ func (p *AnthropicProvider) buildMessageParams(messages []dsc.Message, tools []d
 		Model:    anthropic.Model(p.model),
 		Messages: userMessages,
 	}
-	// max_tokens：仅当显式给定 >0 时设置；零值由 omitZeroMaxTokens 从请求体
-	// 摘除——不携带即等模型自然结束，不再有任何人写死的人为截断
-	if maxTokens > 0 {
+	// max_tokens：三态直接照搬（-1 无限 / 0 禁用 / >0 指定）。零值由 omitZeroMaxTokens
+	// 从请求体摘除；负值必须原样上送，否则「无限」在 SDK 的这一层就被悄悄吃掉了。
+	if maxTokens != 0 {
 		msgParams.MaxTokens = maxTokens
 	}
 	if systemMsg != "" {
@@ -567,59 +565,25 @@ func usageFromAnthropic(u *anthropic.Usage) *dsc.Usage {
 	}
 }
 
-// maxTokensReserve 是给「我们的估算 vs 服务端分词器」留的余量；maxTokensFloor 是
-// 「还值得给」的下限（比它小说明这一帧该由宿主滑窗收口）。
-const (
-	maxTokensReserve = 512
-	maxTokensFloor   = 128
-)
-
-// windowHeadroom 返回这一帧还能生成多少 token（窗口 − 消息 − 工具目录 − 余量）。
-// 窗口未知时返回 0（不做限制）。
-func windowHeadroom(messages []dsc.Message, tools []dsc.LLMTool) int {
-	window := dsc.ContextWindow()
-	if window <= 0 {
-		return 0
-	}
-	room := window - dsc.EstimateMessageValuesTokens(messages) - dsc.EstimateToolTokens(tools) - maxTokensReserve
-	if room < maxTokensFloor {
-		return 0
-	}
-	return room
-}
-
 // resolveMaxTokens 计算本请求实际携带的 max_tokens。
 //
-// anthropic 协议把 max_tokens 当 **required**，缺席时服务端会自填保守默认（llama.cpp
-// 兼容口填 4096），一轮长回答直接腰斩。所以这里三态：
-//   - 请求级参数（压缩等场景的净余值）> 0：用它；
-//   - 插件 env 显式给出（含宿主按启动期探测结果注入的值）：用它；
-//   - 都没有：按「窗口 − 本帧输入」现算；
+// 三态（跟随服务端真实语义）：
+//   - -1：**无限**，原样携带（llama.cpp 家族 n_predict=-1 = 生成到 EOS 或窗口满；
+//     官方 Anthropic 只接受 >=1，会以 400 拒绝——那是「用户要的语义该端点给不了」，
+//     由用户决定，不在插件里悄悄改写成别的值）；
+//   - 0：**禁用**，不带该字段（omitZeroMaxTokens 摘除零值）；
+//   - >0：**指定**，携带该值。
 //
-// 最后统一用余量夹一次，保证 prompt + max_tokens ≤ 窗口；显式 -1 表示不携带（尊重）。
-func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64, messages []dsc.Message, tools []dsc.LLMTool) int64 {
-	mt := requestMaxTokens
-	if mt <= 0 {
-		mt = p.maxTokens
+// 取值来源：宿主给的本帧预算（>0 优先）> 插件 env（DSC_ANTHROPIC_ / 通用 DSC_）。
+func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64) int64 {
+	if requestMaxTokens != 0 {
+		return requestMaxTokens
 	}
-	if mt < 0 {
-		return 0 // 明确不携带
-	}
-	headroom := windowHeadroom(messages, tools)
-	if mt == 0 {
-		mt = int64(headroom)
-		if mt <= 0 {
-			return 0
-		}
-	}
-	if headroom > 0 && mt > int64(headroom) {
-		mt = int64(headroom)
-	}
-	return mt
+	return p.maxTokens
 }
 
 func (p *AnthropicProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens), messages, tools))
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens)))
 	opts := p.requestOptions(beta)
 	resp, err := p.client.Messages.New(ctx, params, opts...)
 	if err != nil {
@@ -644,8 +608,8 @@ func (p *AnthropicProvider) requestOptions(beta bool) []option.RequestOption {
 	}
 }
 
-func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0, messages, tools))
+func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (<-chan *dsc.ChatStreamResponse, error) {
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens)))
 	stream := p.client.Messages.NewStreaming(ctx, params, p.requestOptions(beta)...)
 
 	ch := make(chan *dsc.ChatStreamResponse)

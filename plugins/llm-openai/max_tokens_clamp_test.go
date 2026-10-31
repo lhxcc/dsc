@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
-	dsc "dsc-sdk"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -66,19 +64,19 @@ func TestMaxTokensRejectionLimitIgnoresOtherErrors(t *testing.T) {
 // 不再每次都先吃一次 400。
 func TestResolveMaxTokensClampedByLearnedLimit(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 1048576}
-	if got := p.resolveMaxTokens(0, nil, nil); got != 1048576 {
+	if got := p.resolveMaxTokens(0); got != 1048576 {
 		t.Fatalf("未知上限时按原值携带，got %d", got)
 	}
 
 	p.learnMaxTokensLimit(393216)
-	if got := p.resolveMaxTokens(0, nil, nil); got != 393216 {
+	if got := p.resolveMaxTokens(0); got != 393216 {
 		t.Fatalf("已知上限时应钳制到 393216，got %d", got)
 	}
 	// 请求级参数（压缩净余值）同样受钳制。
-	if got := p.resolveMaxTokens(500000, nil, nil); got != 393216 {
+	if got := p.resolveMaxTokens(500000); got != 393216 {
 		t.Fatalf("请求级参数超上限也应钳制，got %d", got)
 	}
-	if got := p.resolveMaxTokens(20000, nil, nil); got != 20000 {
+	if got := p.resolveMaxTokens(20000); got != 20000 {
 		t.Fatalf("未超上限不应被改动，got %d", got)
 	}
 }
@@ -147,45 +145,97 @@ func TestChatRetriesWithClampedMaxTokens(t *testing.T) {
 func TestNoMaxTokensAfterRangeLessRejection(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 1048576}
 	p.learnMaxTokensLimit(0)
-	if got := p.resolveMaxTokens(0, nil, nil); got != 0 {
+	if got := p.resolveMaxTokens(0); got != 0 {
 		t.Fatalf("应改为不携带 max_tokens，got %d", got)
 	}
-	if got := p.resolveMaxTokens(500000, nil, nil); got != 0 {
+	if got := p.resolveMaxTokens(500000); got != 0 {
 		t.Fatalf("请求级参数也不得携带，got %d", got)
 	}
 }
 
-// TestResolveMaxTokensFillsFromWindowWhenUnset 未配置时按「窗口 − 本帧输入」现算。
+// TestResolveMaxTokensThreeStates 插件只按三态把宿主给的值发出去，不自己算窗口余量。
 //
-// 现场：anthropic 兼容口把 max_tokens 当 required，缺席时服务端自填 4096 —— 长回答被
-// 腰斩；而按窗口值硬填又会让 prompt+max_tokens 越过 n_ctx 直接 400。所以要按帧算。
-func TestResolveMaxTokensFillsFromWindowWhenUnset(t *testing.T) {
-	t.Setenv("DSC_CONTEXT_WINDOW", "10000")
-	p := &OpenAIProvider{model: "m"}                                          // maxTokens = 0（未配置）
-	msgs := []dsc.Message{{Role: "user", Content: strings.Repeat("u", 8000)}} // ~2k token
+// 语义：>0 = 宿主算好的本帧预算（直接发，再夹服务端认过的上限）；0 = 宿主没给（用户
+// 在 env 里显式配置了），用插件默认；<0 = 明确不携带。窗口余量的计算在宿主
+// （core.outputBudgetFor）——插件各算一套会让同一份窗口策略散落在 N 个 provider 里。
+func TestResolveMaxTokensThreeStates(t *testing.T) {
+	p := &OpenAIProvider{model: "m", maxTokens: 8192}
 
-	got := p.resolveMaxTokens(0, msgs, nil)
-	if got <= 0 {
-		t.Fatalf("未配置时必须按窗口余量补一个值，got %d", got)
+	if got := p.resolveMaxTokens(4096); got != 4096 {
+		t.Fatalf("宿主给了预算就照发，got %d", got)
 	}
-	if prompt := dsc.EstimateMessageValuesTokens(msgs); prompt+got > 10000 {
-		t.Fatalf("prompt(%d) + max_tokens(%d) 超过窗口 10000", prompt, got)
+	if got := p.resolveMaxTokens(0); got != 8192 {
+		t.Fatalf("宿主没给时用插件默认值，got %d", got)
+	}
+	if got := p.resolveMaxTokens(-1); got != -1 {
+		t.Fatalf("-1 = 无限，必须原样携带，got %d", got)
 	}
 
-	// 显式 -1：一律不携带（尊重）
+	// 显式 0：禁用该字段（不携带）
+	pZero := &OpenAIProvider{model: "m", maxTokens: 0}
+	if got := pZero.resolveMaxTokens(0); got != 0 {
+		t.Fatalf("0 = 禁用（不携带），got %d", got)
+	}
+
+	// 显式 -1：无限（尊重）
 	pNeg := &OpenAIProvider{model: "m", maxTokens: -1}
-	if got := pNeg.resolveMaxTokens(0, msgs, nil); got != 0 {
-		t.Fatalf("显式 -1 应不携带，got %d", got)
+	if got := pNeg.resolveMaxTokens(0); got != -1 {
+		t.Fatalf("显式 -1 应原样携带（无限），got %d", got)
 	}
 
-	// 插件级默认比余量小：用默认值（探测上限的意义）
-	pSmall := &OpenAIProvider{model: "m", maxTokens: 1024}
-	if got := pSmall.resolveMaxTokens(0, msgs, nil); got != 1024 {
-		t.Fatalf("默认值 1024 小于余量时应用默认值，got %d", got)
+	// 服务端学习到的上限优先于任何来源
+	pLimit := &OpenAIProvider{model: "m", maxTokens: 999999}
+	pLimit.maxTokensLimit.Store(int64(8192))
+	if got := pLimit.resolveMaxTokens(0); got != 8192 {
+		t.Fatalf("应被服务端上限夹住，got %d", got)
 	}
-	// 插件级默认比余量大：被余量夹住
-	pBig := &OpenAIProvider{model: "m", maxTokens: 999999}
-	if got := pBig.resolveMaxTokens(0, msgs, nil); got >= 999999 {
-		t.Fatalf("超过余量时必须夹住，got %d", got)
+
+	// 服务端报过「不接受该字段」后一律不携带
+	pNo := &OpenAIProvider{model: "m", maxTokens: 4096}
+	pNo.noMaxTokens.Store(true)
+	if got := pNo.resolveMaxTokens(4096); got != 0 {
+		t.Fatalf("noMaxTokens 学习位应压过一切，got %d", got)
+	}
+}
+
+// TestMaxTokensWireEncoding 三态在请求体上的字节形态：-1 必须原样上送（无限），
+// 0 必须不出现该字段（禁用）。
+//
+// 依赖 go-openai 的字段声明 `MaxTokens int \`json:"max_tokens,omitempty"\“：0 是零值被
+// 省略，-1 不是零值因此会序列化。这条测试就是钉住这个假设——换成指针类型或去掉
+// omitempty 都会让「0 禁用」或「-1 无限」静默失效。
+func TestMaxTokensWireEncoding(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		mt   int
+		want string // "" = 不应出现
+	}{
+		{"禁用（0）", 0, ""},
+		{"无限（-1）", -1, "-1"},
+		{"指定（8192）", 8192, "8192"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b, err := json.Marshal(openai.ChatCompletionRequest{Model: "m", MaxTokens: c.mt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatal(err)
+			}
+			raw, ok := m["max_tokens"]
+			if c.want == "" {
+				if ok {
+					t.Fatalf("0 不该出现在请求体，实际 %s", raw)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("缺 max_tokens 字段（期望 %s）", c.want)
+			}
+			if string(raw) != c.want {
+				t.Fatalf("max_tokens = %s, want %s", raw, c.want)
+			}
+		})
 	}
 }

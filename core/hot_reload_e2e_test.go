@@ -177,7 +177,7 @@ func (stubLLMProvider) HealthCheck(context.Context) error {
 func (stubLLMProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
 	return &ChatResponse{Content: "stub-reply", FinishReason: "stop"}, nil
 }
-func (stubLLMProvider) ChatStream(context.Context, []Message, []Tool) (<-chan *ChatStreamResponse, error) {
+func (stubLLMProvider) ChatStream(context.Context, []Message, []Tool, int) (<-chan *ChatStreamResponse, error) {
 	ch := make(chan *ChatStreamResponse, 1)
 	ch <- &ChatStreamResponse{Content: "stub-reply", FinishReason: "stop"}
 	close(ch)

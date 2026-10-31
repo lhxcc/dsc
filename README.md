@@ -160,8 +160,8 @@ DSC 以自身語言棧為準，理由只有一條：**Go 的零值就是 0**。�
 
 ### LLM 插件
 
-- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限**：`env:` 顯式值優先；未寫時宿主按啟動期探測結果注入，插件再按「窗口 − 本帧輸入」夾（`-1`=不攜帶）——窗口取值口徑是「**實測容量為上限，配置只能往下調**」：探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）時，配置 `context_window` 若比它大就按服務端值截斷（雲端把模型宣傳成 1M、或圖省事在 128K 後補個 0 都不再讓「發出去一定裝得下」失效），比它小則保留配置（用 32K 省成本是有意為之）；探測不到（雲端）時配置優先、缺省 128K；此外 provider 4xx 親口報過更小的上限時，宿主會把進程級窗口**一併降下來**（只降不升，標題欄與裁窗預算同步），不必每輪撞一次牆，不分本地/雲端、行為一致；`DSC_OPENAI_MAX_OUTPUT_TOKENS` 顯式配置（舊名 `OPENAI_MAX_OUTPUT_TOKENS` 仍兼容；>0 隨請求攜帶，-1/0/不寫=不攜帶）；壓縮等請求級參數優先於以上兩者）
-- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限**：`env:` 顯式值優先；未寫時宿主按啟動期探測結果注入，插件再按「窗口 − 本帧輸入」夾（`-1`=不攜帶）——窗口取值口徑與 openai 口一致（`/v1/models` 與 anthropic 口同端口）：**實測容量為上限、配置只能往下調**，探測不到（雲端）時配置優先、缺省 128K，provider 4xx 報過更小上限時進程級窗口一併降下來，不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，但「缺席由服務端自填」是服務端的選擇（laamaafung 填 4096），不該由宿主替用戶決定輸出預算；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
+- `llm-openai`（OpenAI 兼容端點：DeepSeek API / llama.cpp server 等。**輸出上限**：`env:` 顯式值三態——`-1`=無限（原樣攜帶，llama.cpp 即 `n_predict=-1`）、`0`=禁用該字段、`N`=指定；未寫時宿主啟動期探一次服務端上限，之後每帧按「窗口 − 表面 − 餘量」算好隨請求下發——窗口取值口徑是「**實測容量為上限，配置只能往下調**」：探測命中 LLAMACPP 家族端點（`/v1/models` 返回 `meta.n_ctx`）時，配置 `context_window` 若比它大就按服務端值截斷（雲端把模型宣傳成 1M、或圖省事在 128K 後補個 0 都不再讓「發出去一定裝得下」失效），比它小則保留配置（用 32K 省成本是有意為之）；探測不到（雲端）時配置優先、缺省 128K；此外 provider 4xx 親口報過更小的上限時，宿主會把進程級窗口**一併降下來**（只降不升，標題欄與裁窗預算同步），不必每輪撞一次牆，不分本地/雲端、行為一致；`DSC_OPENAI_MAX_OUTPUT_TOKENS` 顯式配置（舊名 `OPENAI_MAX_OUTPUT_TOKENS` 仍兼容；寫了就由它決定，宿主不再插手）；壓縮等請求級參數優先於以上兩者）
+- `llm-anthropic`（Anthropic 兼容端點：DeepSeek anthropic / llama.cpp server 等。**輸出上限**：`env:` 顯式值三態——`-1`=無限（原樣攜帶，llama.cpp 即 `n_predict=-1`）、`0`=禁用該字段、`N`=指定；未寫時宿主啟動期探一次服務端上限，之後每帧按「窗口 − 表面 − 餘量」算好隨請求下發——窗口取值口徑與 openai 口一致（`/v1/models` 與 anthropic 口同端口）：**實測容量為上限、配置只能往下調**，探測不到（雲端）時配置優先、缺省 128K，provider 4xx 報過更小上限時進程級窗口一併降下來，不分本地/雲端、行為一致；anthropic 協議把 max_tokens 視為 required，但「缺席由服務端自填」是服務端的選擇（laamaafung 填 4096），不該由宿主替用戶決定輸出預算；`DSC_ANTHROPIC_MAX_OUTPUT_TOKENS` 顯式配置優先（舊名 `ANTHROPIC_MAX_OUTPUT_TOKENS` 仍兼容；SDK 無 omitempty，零值字段由請求中間件摘除，不會以 `"max_tokens":0` 上送）；壓縮等請求級參數優先於以上兩者。思維鏈 stderr 調試打印默認關閉——reasoning 本就隨流式幀送宿主/TUI，需排查插件本身時設 `DSC_LLM_DEBUG` 才輸出）
 - `llm-ollama`（Ollama 兼容端點：本地 Ollama server。與 `llm-openai`/`llm-anthropic` 同為 LLM provider 插件，經 Ollama Go SDK 直連 `/api/chat`；支持 reasoning/thinking 模型（默認開啓，`DSC_OLLAMA_THINKING=0` 可關閉，舊名 `OLLAMA_THINKING` 仍兼容），從響應 `Message.Thinking` 提取思維鏈幀渲染到 TUI；@文本附件引用（`dsc-txt://`）解析為文本串前綴拼入 user 消息 Content）
 
 #### LLM 相關環境變量
@@ -178,22 +178,25 @@ LLM 插件的配置全部走環境變量（寫在 `config.yaml` 插件條目的 
 | `DSC_<P>_REASONING_EFFORT` | 接口專屬推理強度覆蓋 | 直接傳端點字面量（如 `xhigh`），優先於統一檔位 |
 | `DSC_<P>_THINKING` | 擴展思考開關 | `0`/`false`/`off`/`no` 關閉；未設默認開啓（舊名 `<P>_THINKING` 回退） |
 | `DSC_ANTHROPIC_THINKING_BUDGET` | anthropic 思考 token 預算 | 正整數；未設時由統一檔位映射（舊名回退） |
-| `DSC_MAX_OUTPUT_TOKENS` | 單輪輸出上限（宿主通用） | `>0` 攜帶該值；`-1` 明確不攜帶；不寫 = 宿主按啟動期探測上限注入，探不到就每次按「窗口 − 輸入」現算 |
-| `DSC_<P>_MAX_OUTPUT_TOKENS` | 接口專屬輸出上限 | 三態同 `DSC_MAX_OUTPUT_TOKENS`，優先於它（舊名回退） |
+| `DSC_MAX_OUTPUT_TOKENS` | 單輪輸出上限（宿主通用） | `-1`=無限（原樣攜帶）／`0`=禁用該字段／`>0`=指定；**不寫** = 宿主啟動期探測上限、每帧按「窗口 − 表面 − 餘量」算好下發 |
+| `DSC_<P>_MAX_OUTPUT_TOKENS` | 接口專屬輸出上限 | 三態同 `DSC_MAX_OUTPUT_TOKENS`（-1 無限 / 0 禁用 / N 指定），優先於它（舊名回退） |
 | `DSC_NO_VISION` | 強制關閉圖像輸入 | `1`/`true`/`on`/`yes` |
 | `DSC_LLM_DEBUG` | anthropic 思維鏈 stderr 調試打印 | 非空開啓（默認關閉） |
 
 幾點約定：
 
-- **輸出上限（`max_tokens`）的取值順序**：
-  1. 插件 `env:` 顯式寫的值（`>0` 用它；`-1` = 明確不攜帶）——用戶說了算；
+- **輸出上限（`max_tokens`）的三態與取值**（跟隨服務端真實語義，不自造）：
+  `-1` = **無限**（原樣攜帶；llama.cpp 家族 `n_predict=-1` 即「生成到 EOS 或窗口滿」）、
+  `0` = **禁用**（請求體裡沒有這個字段）、`N>0` = **指定**。取值順序：
+  1. 插件 `env:` 顯式寫的值——用戶說了算，宿主不探也不填（**寫 `0` 也算顯式**）；
   2. 沒寫：宿主在**啟動期探一次**「服務端真正接受的上限」（短 prompt + `max_tokens=n_ctx`
      + 流式，拿到狀態碼就斷開）——2xx 就用窗口值，400 報文裡有數字就用那個（如 DeepSeek
-     `[1, 393216]`），沒數字退到 `n_ctx/4`；結論注入 `DSC_MAX_OUTPUT_TOKENS`；
-  3. 連探都探不到：插件每次請求按「窗口 − 本帧輸入 − 餘量」現算。
-  最後插件都會用餘量夾一次，保證 `prompt + max_tokens ≤ n_ctx`——因為 anthropic 兼容口把
-  `max_tokens` 當 required（缺席時服務端自填 4096，長回答會被腰斬），而硬填窗口值又會直接
-  400。
+     `[1, 393216]`），沒數字退到 `n_ctx/4`；
+  3. 每帧的實際預算由宿主算：`min(探測上限, 窗口 − 本帧表面 − 512)`，隨 `ChatStream` 的
+     `maxTokens` 參數下發——只有宿主同時知道窗口、工具目錄與真實表面，插件不必各抄一份
+     估算（改了窗口策略也不用動 N 個 provider）。
+  於是 `prompt + max_tokens ≤ n_ctx` 恆成立，而 anthropic 兼容口（`max_tokens` 是 required，
+  缺席時服務端自填 4096 會把長回答腰斬）也不會再缺值。
 - **憑據不外泄**：非 LLM 插件不繼承任何憑據類鍵（含 `DSC_<P>_API_KEY`）；確實需要宿主憑據的
   插件走白名單（目前僅 `tool-harness-webui` 可讀 `DSC_ADMIN_TOKEN`）。要給某插件憑據，寫進它
   自己的 `env:` 塊——顯式注入不受該過濾影響。

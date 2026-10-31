@@ -18,14 +18,17 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-// applyMaxTokens 将请求级 max_tokens 转为 ollama 的 num_predict 选项。
+// applyMaxTokens 将 max_tokens 转为 ollama 的 num_predict 选项。
 //
-// 语义对齐 openai/anthropic 的 resolveMaxTokens：0 表示「用服务端默认」，此时
-// 不设置 Options，让 ollama 走自身默认——绝不能把 0 透传成 num_predict=0（ollama
-// 中 0 意为「无上限」，会覆盖服务端默认并破坏压缩路径的净余值上限）。
-// 仅当 maxTokens > 0 时才写入 num_predict。
+// 三态与 openai/anthropic 一致，且与 ollama 自己的语义对齐：
+//   - -1：无限（num_predict=-1 即「生成到 EOS 或窗口满」）；
+//   - 0：禁用，不写 num_predict，走服务端默认；
+//   - >0：指定上限。
+//
+// 0 绝不能透传成 num_predict=0：ollama 里那是「一个 token 都不生成」，请求会立刻
+// 以 stop 收尾（看起来像模型哑了）。
 func applyMaxTokens(req *api.ChatRequest, maxTokens int) {
-	if maxTokens > 0 {
+	if maxTokens != 0 {
 		req.Options = map[string]any{"num_predict": maxTokens}
 	}
 }
@@ -180,7 +183,7 @@ func (p *OllamaProvider) VisionEnabled() bool                   { return false }
 func (p *OllamaProvider) HealthCheck(ctx context.Context) error { return nil }
 
 // ChatStream 實現 LLMProvider.ChatStream 接口
-func (p *OllamaProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
+func (p *OllamaProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (<-chan *dsc.ChatStreamResponse, error) {
 	// 轉換消息
 	ollamaMessages := make([]api.Message, len(messages))
 	for i, m := range messages {
@@ -237,9 +240,9 @@ func (p *OllamaProvider) ChatStream(ctx context.Context, messages []dsc.Message,
 		Tools:    ollamaTools,
 		Stream:   boolPtr(true),
 	}
-	// 流式路径不接收请求级 maxTokens（SDK LLM 接口 ChatStream 无该参数，
-	// 与 openai/anthropic 流式行为一致）；传 0 = 不设置 num_predict，走服务端默认。
-	applyMaxTokens(&req, 0)
+	// 流式同样携带宿主算好的输出预算。此前 SDK 的 ChatStream 没有该参数，这里只能传 0
+	// （num_predict 永远是服务端默认），同一份配置在流式/非流式行为不一致。
+	applyMaxTokens(&req, maxTokens)
 	if p.thinking {
 		req.Think = &api.ThinkValue{Value: true}
 	}

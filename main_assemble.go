@@ -254,42 +254,6 @@ func injectRuntimeEnv(merged *core.Config, mode, workspaceRoot, sandboxPolicy st
 	}
 }
 
-// injectMaxOutputBudget 把探测到的输出上限写进当前 provider 的 env。
-//
-// 只写**当前 provider** 的条目：预算是按这个端点的协议上限探出来的，套到另一个 provider
-// 上没有依据。找不到对应条目时退回全部 llm 条目（宁可保守也别漏）。
-func injectMaxOutputBudget(cfg *core.Config, provider string, budget int) {
-	if cfg == nil || budget <= 0 {
-		return
-	}
-	apply := func(e *core.PluginEntry) {
-		if e.Env == nil {
-			e.Env = map[string]string{}
-		}
-		e.Env["DSC_MAX_OUTPUT_TOKENS"] = strconv.Itoa(budget)
-	}
-	want := "llm-" + provider
-	matched := false
-	for i := range cfg.Plugins {
-		e := &cfg.Plugins[i]
-		if e.Type != "llm" {
-			continue
-		}
-		if e.Name == want || e.Name == provider {
-			apply(e)
-			matched = true
-		}
-	}
-	if matched {
-		return
-	}
-	for i := range cfg.Plugins {
-		if cfg.Plugins[i].Type == "llm" {
-			apply(&cfg.Plugins[i])
-		}
-	}
-}
-
 // resolveActiveModelName 解析当前 provider 的模型名（DSC_ 前缀优先、旧名回退）。
 // 单一来源：TUI 展示与 request/header 的信封字段都用它，避免两处各解析一遍。
 func resolveActiveModelName(llmEntries []core.PluginEntry, activeLLMName string) string {

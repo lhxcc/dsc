@@ -285,12 +285,23 @@ func TestActiveLLMFlavorAndExplicit(t *testing.T) {
 		{Name: "llm-openai", Type: "llm"},
 		{Name: "tool-x", Type: "tool", Env: map[string]string{"DSC_MAX_OUTPUT_TOKENS": "1"}},
 	}}
-	if explicitMaxOutputTokens(cfg, "openai") {
+	if _, ok := explicitMaxOutputTokens(cfg, "openai"); ok {
 		t.Fatal("非 LLM 插件上的同名键不算用户显式设置")
 	}
 	cfg.Plugins[0].Env = map[string]string{"DSC_OPENAI_MAX_OUTPUT_TOKENS": "8192"}
-	if !explicitMaxOutputTokens(cfg, "openai") {
-		t.Fatal("接口专属名应算显式设置")
+	if v, ok := explicitMaxOutputTokens(cfg, "openai"); !ok || v != "8192" {
+		t.Fatalf("接口专属名应算显式设置，got (%q,%v)", v, ok)
+	}
+
+	// 三态里 0 也是「显式」（禁用该字段），不能被当成「没写」→ 宿主不该再填预算
+	cfg.Plugins[0].Env = map[string]string{"DSC_MAX_OUTPUT_TOKENS": "0"}
+	if v, ok := explicitMaxOutputTokens(cfg, "openai"); !ok || v != "0" {
+		t.Fatalf("0 应算显式（禁用），got (%q,%v)", v, ok)
+	}
+	// 空字符串等于没写
+	cfg.Plugins[0].Env = map[string]string{"DSC_MAX_OUTPUT_TOKENS": "  "}
+	if _, ok := explicitMaxOutputTokens(cfg, "openai"); ok {
+		t.Fatal("空值不算显式配置")
 	}
 }
 

@@ -52,6 +52,8 @@ type Manager struct {
 	// 一次性注入给 Agent（RegisterServices.ToolServiceId），热重载时沿用同一 ID。
 	agentToolServiceID  uint32
 	llmServiceIDs       map[string]uint32                  // llm name -> serviceID
+	maxOutputBudget     int                               // 启动期探测到的 max_tokens 上限（0 = 未探到）
+	maxOutputExplicit   bool                              // 用户在插件 env 里显式给了值：宿主不填，交给插件
 	llmOrder            []string                           // LLM provider 加载顺序（多 provider 路由的 fallback 序）
 	agentLLMServiceID   uint32                             // 聚合 LLM 服务 ID（多 provider 路由，agent 一次性注入）
 	agentLLMName        string                             // agent 声明的 primary LLM（路由优先）
@@ -327,6 +329,31 @@ func (m *Manager) ContextWindow() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.contextWindow
+}
+
+// SetMaxOutputBudget 记录启动期探测到的「服务端接受的 max_tokens 上限」。
+//
+// 0 表示没探到（网关不说、离线、无权限）：此时只用窗口余量，不额外压。
+func (m *Manager) SetMaxOutputBudget(n int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.maxOutputBudget = n
+	m.mu.Unlock()
+}
+
+// SetMaxOutputExplicit 标记「用户在插件 env 里显式写了输出上限」。
+//
+// 一旦显式，宿主就不再按窗口余量填 max_tokens：否则宿主算出来的值会被插件当成
+// 请求级参数，直接盖掉用户写的那一个。
+func (m *Manager) SetMaxOutputExplicit(explicit bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.maxOutputExplicit = explicit
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetContextWindow(window int) {

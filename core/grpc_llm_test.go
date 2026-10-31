@@ -19,7 +19,7 @@ type fakeVisionProvider struct {
 func (f *fakeVisionProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
 	return nil, nil
 }
-func (f *fakeVisionProvider) ChatStream(context.Context, []Message, []Tool) (<-chan *ChatStreamResponse, error) {
+func (f *fakeVisionProvider) ChatStream(context.Context, []Message, []Tool, int) (<-chan *ChatStreamResponse, error) {
 	return nil, nil
 }
 func (f *fakeVisionProvider) Name(context.Context) string    { return "fake" }
@@ -145,7 +145,7 @@ type scriptedProvider struct {
 func (p *scriptedProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
 	return &ChatResponse{}, nil
 }
-func (p *scriptedProvider) ChatStream(context.Context, []Message, []Tool) (<-chan *ChatStreamResponse, error) {
+func (p *scriptedProvider) ChatStream(context.Context, []Message, []Tool, int) (<-chan *ChatStreamResponse, error) {
 	ch := make(chan *ChatStreamResponse, len(p.stream))
 	for _, f := range p.stream {
 		ch <- f
@@ -174,3 +174,42 @@ func (s *captureChatStream) SendHeader(grpcmetadata.MD) error { return nil }
 func (s *captureChatStream) SetTrailer(grpcmetadata.MD)       {}
 func (s *captureChatStream) SendMsg(any) error                { return nil }
 func (s *captureChatStream) RecvMsg(any) error                { return nil }
+
+// TestChatStreamForwardsMaxTokens gRPC 桥必须把 max_tokens 透传给 provider 实现。
+//
+// 之前 LLMProvider.ChatStream 根本没有这个参数，于是「宿主算好的输出预算」只能靠插件
+// 自己再按窗口估一遍——三个 provider 各抄一份，ollama 干脆没抄（流式永远走默认值）。
+// 这条测试钉住桥本身：proto 里有值就必须落到实现里，三个插件谁都不用再算。
+func TestChatStreamForwardsMaxTokens(t *testing.T) {
+	p := &maxTokensRecordingProvider{}
+	stream := &captureChatStream{ctx: context.Background()}
+
+	for _, want := range []int32{0, 4096, -1} {
+		p.got = 12345
+		if err := NewLLMServiceServer(p).ChatStream(&proto.ChatRequest{MaxTokens: want}, stream); err != nil {
+			t.Fatalf("ChatStream(%d) 返回错误 %v", want, err)
+		}
+		if p.got != int(want) {
+			t.Fatalf("max_tokens 未透传：proto=%d provider=%d", want, p.got)
+		}
+	}
+}
+
+// maxTokensRecordingProvider 记录流式入口收到的 max_tokens。
+type maxTokensRecordingProvider struct {
+	got int
+}
+
+func (p *maxTokensRecordingProvider) Chat(context.Context, []Message, []Tool, int) (*ChatResponse, error) {
+	return &ChatResponse{}, nil
+}
+func (p *maxTokensRecordingProvider) ChatStream(_ context.Context, _ []Message, _ []Tool, maxTokens int) (<-chan *ChatStreamResponse, error) {
+	p.got = maxTokens
+	ch := make(chan *ChatStreamResponse)
+	close(ch)
+	return ch, nil
+}
+func (p *maxTokensRecordingProvider) Name(context.Context) string       { return "rec" }
+func (p *maxTokensRecordingProvider) Version(context.Context) string    { return "0" }
+func (p *maxTokensRecordingProvider) HealthCheck(context.Context) error { return nil }
+func (p *maxTokensRecordingProvider) VisionEnabled() bool               { return false }

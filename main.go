@@ -285,27 +285,29 @@ func activeLLMAPIKey(env map[string]string, provider string) string {
 	return activeLLMEndpointValue(env, provider, "API_KEY")
 }
 
-// explicitMaxOutputTokens 报告用户是否在 LLM 插件 env 里显式写了输出上限。
+// explicitMaxOutputTokens 取用户在 LLM 插件 env 里显式写的输出上限。
 //
-// 只看 env 里有没有这个键（含接口专属名与旧名）：一旦显式，宿主不探也不填——请求级
-// 参数优先于插件 env，宿主填了等于把用户的值顶掉。
-func explicitMaxOutputTokens(cfg *core.Config, provider string) bool {
+// 只看 env 里有没有这个键（含接口专属名与旧名）：一旦显式，宿主既不探也不填——
+// 请求级参数优先于插件 env，宿主填了等于把用户的值顶掉。**写 0 也算显式**（0 是
+// 「禁用该字段」的表达，不是「没写」）。
+func explicitMaxOutputTokens(cfg *core.Config, provider string) (string, bool) {
 	if cfg == nil {
-		return false
+		return "", false
 	}
 	group := activeLLMProviderGroup(provider)
-	keys := []string{"DSC_MAX_OUTPUT_TOKENS", "DSC_" + group + "_MAX_OUTPUT_TOKENS", group + "_MAX_OUTPUT_TOKENS"}
+	// 接口专属名优先于通用名（与插件侧取值顺序一致）。
+	keys := []string{"DSC_" + group + "_MAX_OUTPUT_TOKENS", group + "_MAX_OUTPUT_TOKENS", "DSC_MAX_OUTPUT_TOKENS"}
 	for _, e := range cfg.Plugins {
 		if e.Type != "llm" {
 			continue
 		}
 		for _, k := range keys {
-			if _, ok := e.Env[k]; ok {
-				return true
+			if v, ok := e.Env[k]; ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v), true
 			}
 		}
 	}
-	return false
+	return "", false
 }
 
 // maxTokensRangeRE / maxTokensUpperRE 从服务端 400 报文里挖出 max_tokens 上限。
@@ -1212,19 +1214,22 @@ func main() {
 
 	// 输出预算（max_tokens）：anthropic 兼容口把它当 required，缺席时服务端自填保守默认
 	// （4096）会把长回答腰斩；按窗口值硬填又会被云端 400 拒（DeepSeek 报文明说 [1, 393216]）。
-	// 启动期问一次服务端真正接受的上限，把结论注入**当前 provider** 的 env；用户显式写过
-	// 就一律不碰。探不到则不注入，插件侧按「窗口 − 本帧输入」实时夹（见 llm-*/main.go）。
-	if explicitMaxOutputTokens(merged, activeLLMName) {
+	// 启动期问一次服务端真正接受的上限，记进 Manager；每帧的实际预算由
+	// core.outputBudgetFor 按「窗口 − 本帧表面 − 余量」算，随 ChatStream 下发给插件。
+	// 用户显式写过就一次都不填（尊重配置）。
+	if v, ok := explicitMaxOutputTokens(merged, activeLLMName); ok {
+		mgr.SetMaxOutputExplicit(true)
 		logger.Info("max output tokens set explicitly by config; host will not fill a default",
-			"provider", activeLLMName)
+			"provider", activeLLMName, "max_tokens", v,
+			"semantics", "-1 = 无限（原样携带）/ 0 = 禁用（不带该字段）/ N = 指定")
 	} else if base := activeLLMBaseURL(activeLLMEnv, activeLLMName); base != "" {
 		budget, src := probeMaxOutputBudget(base, activeLLMFlavor(activeLLMName), llmModelName,
 			activeLLMAPIKey(activeLLMEnv, activeLLMName), contextWindow)
 		if budget > 0 {
-			injectMaxOutputBudget(merged, activeLLMName, budget)
-			logger.Info("max output budget probed and injected", "max_tokens", budget, "source", src, "provider", activeLLMName)
+			mgr.SetMaxOutputBudget(budget)
+			logger.Info("max output budget probed", "server_limit", budget, "source", src, "provider", activeLLMName)
 		} else {
-			logger.Warn("max output budget unknown; provider clamps per request from the window",
+			logger.Warn("max output budget unknown; using per-request window headroom",
 				"endpoint", endpointForLog(base), "source", src)
 		}
 	}

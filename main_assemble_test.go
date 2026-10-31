@@ -62,35 +62,6 @@ func TestAssembleDoesNotInjectMaxOutputTokens(t *testing.T) {
 	}
 }
 
-// TestInjectMaxOutputBudgetOnlyActiveProvider 探测出来的上限只写当前 provider 的条目：
-// 那是按这个端点探的，套到别的 provider 上没有依据。
-func TestInjectMaxOutputBudgetOnlyActiveProvider(t *testing.T) {
-	cfg := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-openai", Type: "llm"},
-		{Name: "llm-anthropic", Type: "llm"},
-		{Name: "tool-x", Type: "tool"},
-	}}
-	injectMaxOutputBudget(cfg, "openai", 393216)
-	if got := cfg.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"]; got != "393216" {
-		t.Fatalf("当前 provider 应被注入，got %q", got)
-	}
-	if _, ok := cfg.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("其它 provider 不应被注入")
-	}
-	if _, ok := cfg.Plugins[2].Env["DSC_MAX_OUTPUT_TOKENS"]; ok {
-		t.Fatal("非 LLM 插件不应被注入")
-	}
-	// 找不到对应条目时退回全部 llm（宁可保守也别漏）
-	cfg2 := &core.Config{Plugins: []core.PluginEntry{
-		{Name: "llm-openai", Type: "llm"},
-		{Name: "llm-anthropic", Type: "llm"},
-	}}
-	injectMaxOutputBudget(cfg2, "ollama", 8192)
-	if cfg2.Plugins[0].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" || cfg2.Plugins[1].Env["DSC_MAX_OUTPUT_TOKENS"] != "8192" {
-		t.Fatalf("找不到对应条目时应退回全部 llm 条目: %+v", cfg2.Plugins)
-	}
-}
-
 // TestAssembleMergedCopiesDefaultLLM 回归：config.yaml 的 default_llm 必须进入
 // 交给 Manager 的合并配置，否则多 LLM 并存时会退化为按名升序选 primary。
 // 同时校验 compaction 的 preset 优先、config 兜底语义。
