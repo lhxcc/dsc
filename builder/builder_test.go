@@ -115,3 +115,84 @@ func TestToolSearchRootsIncludesRepoRoot(t *testing.T) {
 		t.Fatalf("findTool(protoc) = %q，路径可疑", p)
 	}
 }
+
+// TestCopyAssetDirSkipsArchives 附带资源里的归档不随包，但字体与说明要随包。
+//
+// 真实形态：plugins/tool-pdf/fonts/ 同时有 NotoSansSC-Regular.ttf(10MB)、
+// HarmonyOS-Sans.zip(52MB) 与 字体下载.txt。整目录照拷 = 每个平台白多 52MB，
+// 而插件运行时只按文件名读 ttf 本体。
+func TestCopyAssetDirSkipsArchives(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "fonts")
+	write := func(name string) {
+		if err := os.WriteFile(filepath.Join(src, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("NotoSansSC-Regular.ttf")
+	write("HarmonyOS-Sans.zip")
+	write("字体下载.txt")
+
+	st := copyAssetDir(src, dst)
+	if st.fonts != 1 {
+		t.Fatalf("fonts = %d，应为 1", st.fonts)
+	}
+	if st.files != 2 {
+		t.Fatalf("files = %d，应为 2（ttf + 说明，压缩包不入包）", st.files)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "NotoSansSC-Regular.ttf")); err != nil {
+		t.Fatalf("字体没被拷入: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "字体下载.txt")); err != nil {
+		t.Fatalf("说明没被拷入: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "HarmonyOS-Sans.zip")); err == nil {
+		t.Fatal("压缩包不应随包")
+	}
+}
+
+// TestFontAssetsAreStaged 锁住「字体随包」这件事本身。
+//
+// 背景：tool-pdf 启动时硬校验 fonts 里至少一个 .ttf（有意设计，缺字形比装不上更糟），
+// 所以漏打包 = 新装的包里那 13 个 pdf 工具永远不可见，而打包日志看起来一切正常。
+// 这里同时检查两件事：白名单里有 fonts、真实仓库里的字体能被暂存进包。
+func TestFontAssetsAreStaged(t *testing.T) {
+	listed := false
+	for _, d := range pluginAssetDirs {
+		if d == fontAssetDir {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("%s 不在 pluginAssetDirs 里：字体不会随包，插件会在新机器上启动即 panic", fontAssetDir)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot := filepath.Dir(wd)
+	src := filepath.Join(repoRoot, "plugins", "tool-pdf", "fonts")
+	if info, err := os.Stat(src); err != nil || !info.IsDir() {
+		t.Skip("仓库里没有 plugins/tool-pdf/fonts（本机未放字体），跳过")
+	}
+
+	dst := filepath.Join(t.TempDir(), "fonts")
+	st := copyAssetDir(src, dst)
+	if st.fonts == 0 {
+		t.Fatalf("%s 里没有 .ttf：打出来的包在启动时会 panic（把 TrueType 字体放进去）", src)
+	}
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ttf := 0
+	for _, e := range entries {
+		if strings.EqualFold(filepath.Ext(e.Name()), ".ttf") {
+			ttf++
+		}
+	}
+	if ttf == 0 {
+		t.Fatal("暂存后包内没有 .ttf")
+	}
+}
