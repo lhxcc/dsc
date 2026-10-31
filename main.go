@@ -1154,9 +1154,12 @@ func main() {
 		logger.Info("context window probed from llm server", "window", probeWindow, "attempts", probeAttempts)
 	} else if probeBaseURL != "" {
 		// 失败必须说得出来：静默退回 128K 时，用户只能从界面上怀疑「容量怎么少了一半」。
+		hint := "服务端没给 n_ctx / max_model_len（网关/云端常见）。实际容量更大时请在 config.yaml 显式写 context_window"
+		if probeAttempts > 1 {
+			hint = "本地服务在加载模型或 slot 占满时会暂时不可达，已重试；" + hint
+		}
 		logger.Warn("context window probe returned nothing; falling back to config/default",
-			"endpoint", endpointForLog(probeBaseURL), "attempts", probeAttempts,
-			"hint", "服务端没给 n_ctx / max_model_len（云端常见）；本地服务在加载模型或 slot 占满时也会这样——已对本地端点重试。实际容量更大时请在 config.yaml 显式写 context_window")
+			"endpoint", endpointForLog(probeBaseURL), "attempts", probeAttempts, "hint", hint)
 	}
 	configuredWindow := 0
 	if mainCfg != nil && mainCfg.ContextWindow > 0 {
