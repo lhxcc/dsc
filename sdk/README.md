@@ -311,6 +311,60 @@ abs, err := dsc.AbsPath(path)                      // 絕對路徑規範化
 注意：本層不做 workspace 越界檢查——沙箱策略由宿主工具流水線統一判定，插件
 自行判定反而會在 full-access 模式下誤拒 workspace 外路徑。
 
+## 附件與穩定 ID
+
+### 圖像隨工具結果返回（多模態）
+
+插件要讓模型「看見」一張圖（截圖、圖表、渲染結果），唯一入口是 `Tool.ImagesFn`——
+它不是把圖塞進文本，而是把圖作為**圖像附件**隨工具結果一起回傳：
+
+```go
+sdk.Tool(dsc.Tool{
+	Name: "screenshot",
+	Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
+		data, err := capture()                    // 你的截圖/渲染字節
+		if err != nil { return "", err }
+		ref, err := dsc.SaveImageAttachment(data) // → dsc-img://<sha256>
+		if err != nil { return "", err }
+		return "screenshot: " + ref, nil
+	},
+	// 這裡只需返回「本次調用要交給模型的圖像引用」；文本結果仍以 Handler 的返回值為準。
+	// 下面從結果文本裏取引用是常見寫法（也可用閉包變量，但要自己處理併發）。
+	ImagesFn: func(_ context.Context, _ json.RawMessage, result string) []string {
+		if ref := strings.TrimPrefix(result, "screenshot: "); ref != "" {
+			return []string{ref}
+		}
+		return nil
+	},
+})
+```
+
+要點：
+
+- **兩種落盤策略，選錯會污染歷史**：`dsc.SaveImageAttachment` 進持久附件庫（`attachments/`，
+  內容尋址去重）；`dsc.SaveScreenshotAttachment` 進 `temp/screenshots/`（24 小時後隨 temp 清理
+  過期）。操作截圖這類只有短期觀察價值的圖用後者，別讓它們永久留在歷史裏。
+- **不要自己縮圖**。圖像引用在**請求時**才由 `dsc.ProjectImageRef(ref, dsc.DefaultProjectionMaxSide)`
+  按路由策略等比縮放並重編碼（不透明轉 JPEG、帶 alpha 保留 PNG），存儲保持原樣。自己在工具裏
+  縮一次只會多一份損耗，而且縮放比不再由宿主統一。
+- **圖像字節不進會話歷史與事件日誌**，只有引用進去；引用失效（temp 過期）時宿主降級為佔位
+  文本，不會讓整條歷史失效。
+- `data:image/...;base64,...` 也接受（宿主入庫時折算為引用），但直接給引用更省一次編碼。
+- 模型不支持圖像輸入時，宿主的圖像投影會跳過它——**不要**據此遍歷歷史清理附件，那不是插件的
+  職責。
+
+### 跨文件穩定的 id
+
+插件自有的狀態條目（記憶、產物索引、任務記錄）要「換個文件也認得出同一條」時：
+
+```go
+id := dsc.NewID("mem")   // → mem-1a2b3c4d5e6f7a8b（8 字節熵，16 位十六進制）
+```
+
+自增主鍵在不同文件裏必然重複（第 1 條在每個庫裏都叫 1），進程內序號會隨重啟歸零。宿主
+內部的 `ShortID`（7 位十六進制）靠「同表查重就重生成」兜底，**跨文件沒有那張可查重的表**，
+所以插件側要用這個更寬的版本。兩者共用同一實現，不要自己再寫一份隨機 id。
+
 ## 後台 goroutine
 
 所有後台 goroutine 一律經 `SafeGoroutine` 啓動（禁止裸 `go func()`）：
@@ -323,6 +377,23 @@ dsc.SafeGoroutine(func() {
 
 goroutine 裏的 panic 無法被工具執行鏈路的 recover 捕獲（recover 只對當前
 goroutine 有效），不在此接住會直接幹掉整個插件進程導致 LLM 連接中斷。
+
+### 長任務的輸出與活動上報
+
+「會被轉到後台」的流式工具（長命令、構建、下載）有兩件事要做，否則宿主與用户都只能乾等：
+
+```go
+dsc.AppendOutput(ctx, chunk)   // 已經產生的輸出：宿主可經 job_output 讀到尾部
+dsc.TouchActivity(ctx)         // 有新活動：宿主據此續命，而不是按固定時長判死
+```
+
+- 兩者都要**在寫自己的輸出緩衝時順手調**，不要事後補；`AppendOutput` 只保留尾部若干 KB，
+  完整輸出仍走工具結果，所以多調不會撐爆內存。
+- 不調 `TouchActivity` 的後果不是「少一個心跳」，而是**這個工具的前台等待預算變成固定上限**：
+  宿主唯一的續命來源是輪詢 `GetActivity`（`WithIdleDeadline` 的句柄在 ctx value 裏，過不了
+  gRPC，插件內對它調用是 no-op），沒有上報就只能按「完全沒有輸出」計時。
+- 用 `dsc.WithIdleDeadline(ctx, d)` 派生自己的看門狗上下文，語義是「**完全沒有輸出**達 d 就取消」，
+  有輸出即重新計時——與宿主的判定同源，不要另寫一套超時。
 
 ## LUA 插件開發
 

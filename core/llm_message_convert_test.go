@@ -55,3 +55,74 @@ func TestConvertLLMChatRequestDelegates(t *testing.T) {
 		t.Fatalf("tool_call_id 丢失: convert=%q plugin=%q", a[0].ToolCallID, b[0].ToolCallID)
 	}
 }
+
+// TestUnparseableArgsSurviveTheRoundTrip 回归：一份参数不合法的调用，其原文必须能走完
+// "proto → 插件 → proto" 的整个往返。
+//
+// 现场（2080 Ti）：模型漏写一个 </parameter>，引擎的解析器把后文折进第一个参数值，参数
+// 文本断在字符串中间。修这一处之前，每一层都用 `json.Unmarshal` 吞掉错误、得到空 map，
+// 再 `json.Marshal` 又写成 "null"——模型回看历史时只看到自己「调过 exec_command、参数
+// null」，无从知道错在哪，也就改不掉。原文只在拿到它的那一刻存在，任何一层重新序列化都
+// 等于销毁它。
+func TestUnparseableArgsSurviveTheRoundTrip(t *testing.T) {
+	// 现场那份参数：缺 </parameter>，于是后面整个 description 被折进 command 的值。
+	const broken = `{"command":"cd F:/X && sed -i '968d' a.xml <parameter=description> Delete line 968 </tool_call>`
+
+	// 1) proto → 插件：原文进入 RawArguments，解析错误一并带出。
+	args, raw, err := DecodeToolArguments("exec_command", broken)
+	if err == nil {
+		t.Fatal("the specimen must not parse; the test is meaningless otherwise")
+	}
+	if args != nil {
+		t.Fatalf("args = %v, 期望 nil（解析失败不得伪造一份参数）", args)
+	}
+	if raw != broken {
+		t.Fatalf("raw 原文丢失，得到 %q", raw)
+	}
+
+	tc := ToolCall{ID: "call_1", Name: "exec_command", Arguments: args, RawArguments: raw}
+
+	// 2) 回写给模型的那一份：必须是原文逐字节，不是 "null"。
+	if got := tc.ArgumentsJSON(); got != broken {
+		t.Fatalf("ArgumentsJSON() = %q, 期望原文（重新序列化会把原文写成 \"null\"）", got)
+	}
+	back := convertToolCallsToProto([]ToolCall{tc})
+	if len(back) != 1 || back[0].ArgumentsJson != broken {
+		t.Fatalf("proto 往返丢了原文: %+v", back)
+	}
+
+	// 3) 再转回来（历史回放）仍然完整——模型要靠它发现漏了闭合标签。
+	again := toolCallFromProto(back[0])
+	if again.RawArguments != broken {
+		t.Fatalf("历史回放丢了原文: %q", again.RawArguments)
+	}
+}
+
+// TestWellFormedCallKeepsNoRaw 合法调用不得被塞进 RawArguments。
+//
+// 这条不是洁癖：历史里助手的工具调用每次请求都会重新序列化一遍，若合法调用也开始携带
+// 原文，前缀缓存里的字节取决于「原文是否恰好等于我们这次的 marshal 结果」，一处不相等
+// 就是整段前缀作废。
+func TestWellFormedCallKeepsNoRaw(t *testing.T) {
+	const good = `{"p": "a"}`
+	args, raw, err := DecodeToolArguments("read", good)
+	if err != nil {
+		t.Fatalf("合法参数不该报错: %v", err)
+	}
+	if raw != "" {
+		t.Fatalf("raw = %q, 期望空（合法调用只走 Arguments）", raw)
+	}
+	// 序列化结果与历史实现一致（map 键排序后的紧凑 JSON）。
+	if got := (&ToolCall{Arguments: args}).ArgumentsJSON(); got != `{"p":"a"}` {
+		t.Fatalf("ArgumentsJSON() = %q, 期望紧凑 JSON", got)
+	}
+
+	// 空参数（工具不收参数）是合法调用，不是解析失败。
+	if _, raw, err := DecodeToolArguments("noargs", ""); err != nil || raw != "" {
+		t.Fatalf("空参数应视为合法: raw=%q err=%v", raw, err)
+	}
+	// nil 的 Arguments 也必须序列化成 {} 而不是 null——provider 端按对象解析。
+	if got := (ToolCall{}).ArgumentsJSON(); got != "{}" {
+		t.Fatalf("空 ToolCall 的 ArgumentsJSON() = %q, 期望 {}", got)
+	}
+}

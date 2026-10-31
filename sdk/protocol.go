@@ -121,6 +121,16 @@ type (
 	ChatStreamResponse = core.ChatStreamResponse
 )
 
+// DecodeToolArguments 解析一份工具调用的参数文本，**不吞**解析错误。
+//
+// 插件产出 ToolCall 时必须用它，不能用 `json.Unmarshal` 忽略错误：模型可以写出无法闭合的调用
+// （漏一个 </parameter>，引擎的解析器就把后文折进第一个值，参数于是断在字符串中间），原文那一刻
+// 只存在于这一层。丢弃它等于让模型在历史里看到自己「调过工具、参数 null」——它无从知道错在哪，
+// 也就改不了。失败时把原文放进 ToolCall.RawArguments（raw != ""），宿主会把它原样送回去。
+func DecodeToolArguments(name, argumentsJSON string) (args map[string]interface{}, raw string, err error) {
+	return core.DecodeToolArguments(name, argumentsJSON)
+}
+
 // ---- 工具视图（TUI 卡片渲染） ----
 
 // ToolView 工具结果的结构化视图 spec（其余视图类型见 view.go）。

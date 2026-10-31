@@ -443,6 +443,7 @@ func main() {
 	debuggerOpen := false   // -debugger：開放 /debugger 觀察路由（默認關閉，避免暴露會話隱私）
 	adminAddr := ""         // -admin：管理 API 監聽地址（預設取環境變量 DSC_ADMIN_ADDR，缺省 127.0.0.1:9999）
 	headless := false       // -headless：精简无头模式，专为 CI 单发（不开 ADMIN/热重载/cron，任务来自 -input）
+	withUserGrant := false  // -with-user-grant：把需审批的动作视作已获用户授权（仅 -input/-headless 有效）
 	hooksPath := ""         // -hooks：外部脚本钩子配置（hooks.json：严格 LUA / 原生可执行）
 	var patchFiles []string // -patch：配置 overlay 文件列表（可重复，按顺序合并）
 
@@ -488,6 +489,11 @@ func main() {
 		} else if arg == "-headless" {
 			// 精简无头模式：单发任务、不开 ADMIN 端口 / 热重载 / cron，专为 CI 脚本
 			headless = true
+		} else if arg == "-with-user-grant" {
+			// 无人值守入口的显式授权：没有问询通道时，审批门 fail-closed 会把所有写
+			// 操作拒掉（装插件、写工作区外文件……）。用户用这个开关一次性表态，
+			// 等价于他在 TUI 里对每次询问都点了 Allow。只对 -input/-headless 有意义。
+			withUserGrant = true
 		} else if arg == "-debugger" {
 			// 顯式開放 /debugger 觀察路由（含完整會話歷史，屬敏感信息，默認不開放）
 			debuggerOpen = true
@@ -712,6 +718,19 @@ func main() {
 	// 通知 Manager 动态注入/卸载要写回的 config.yaml 路径，
 	// 使运行期增删的插件在进程重启后依旧保留
 	mgr.SetConfigPath(core.ConfigPath)
+	// -with-user-grant：只对无人值守入口生效。TUI 有自己的审批 UI，在那里打开等于
+	// 悄悄关掉所有确认，比不加还危险——所以显式拒绝而不是静默忽略。
+	if withUserGrant {
+		if headless || strings.TrimSpace(inputText) != "" {
+			mgr.SetUserGrantAll(true)
+			logger.Warn("user grant enabled for every approval-gated action",
+				"flag", "-with-user-grant",
+				"effect", "tools declaring ApprovalRequester run without asking; sandbox escalation is approved automatically")
+		} else {
+			logger.Warn("-with-user-grant ignored: it only applies to -input / -headless",
+				"hint", "在 TUI 里请直接回答审批提示，或对当前会话使用 /approval")
+		}
+	}
 
 	// 「MCP 是否启用」不在这里：那是插件自己的状态（由插件写自己的状态文件）。
 	// 宿主不认识任何具体协议，插件不报工具，目录成本自然为 0。

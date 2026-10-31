@@ -137,10 +137,8 @@ func (p *AnthropicProvider) buildMessageParams(messages []dsc.Message, tools []d
 				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 			}
 			for _, tc := range m.ToolCalls {
-				input, err := json.Marshal(tc.Arguments)
-				if err != nil || len(input) == 0 {
-					input = []byte("{}")
-				}
+				// ArgumentsJSON() 保真回放：解析失败的调用带原文，重新 marshal 会写成 "null"
+				input := []byte(tc.ArgumentsJSON())
 				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, json.RawMessage(input), tc.Name))
 			}
 			if len(blocks) > 0 {
@@ -525,17 +523,14 @@ func extractToolCalls(blocks []anthropic.ContentBlockUnion) []dsc.ToolCall {
 			continue
 		}
 		toolUse := block.AsToolUse()
-		argsMap := make(map[string]any)
-		if err := json.Unmarshal(toolUse.Input, &argsMap); err != nil {
-			var rawArgs map[string]any
-			if err2 := json.Unmarshal(toolUse.Input, &rawArgs); err2 == nil {
-				argsMap = rawArgs
-			}
-		}
+		// 解析失败时保留原文（RawArguments）：toolUse.Input 是模型交付的原始 JSON 片段，
+		// 也是模型唯一能据以自纠的东西——换成空 map 后历史里只剩「调过工具、参数空」。
+		argsMap, raw, _ := dsc.DecodeToolArguments(toolUse.Name, string(toolUse.Input))
 		toolCalls = append(toolCalls, dsc.ToolCall{
-			ID:        toolUse.ID,
-			Name:      toolUse.Name,
-			Arguments: argsMap,
+			ID:           toolUse.ID,
+			Name:         toolUse.Name,
+			Arguments:    argsMap,
+			RawArguments: raw,
 		})
 	}
 	return toolCalls

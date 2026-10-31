@@ -450,3 +450,109 @@ func TestIsTruncatedFinishReason(t *testing.T) {
 		}
 	}
 }
+
+// TestMalformedToolCallReturnedToModel 回归 2080 Ti 那份现场，但**不带截断**。
+//
+// 现场：模型漏写一个 </parameter>，引擎的解析器把后文折进第一个参数值（command 的值里
+// 嵌着 "<parameter=description> Delete line 968"）。旧行为只有 finish_reason 表示截断时
+// 才拦；这次 finish 是正常的 tool_calls，于是残缺参数被直接下发——sed 已经改完文件才在
+// 标签处失败。另一种「修法」更糟：core 曾把它当本轮失败中止，模型连错在哪都看不到。
+//
+// 期望：不派发执行，落一条配对完整的 tool/result 说明原因；并且第二次请求的历史里，
+// 那条 assistant 消息携带的仍是**模型自己写下的原文**——它靠这个才能发现少了闭合标签。
+func TestMalformedToolCallReturnedToModel(t *testing.T) {
+	const broken = `{"command":"cd F:/X && sed -i '968d' a.xml <parameter=description> Delete line 968 </tool_call>`
+
+	a := newTestAgent(t)
+	a.llmServiceID = 1
+	a.toolServiceID = 1
+	llm := &truncMockLLM{
+		firstContent:   "我來改這一行。",
+		firstFinish:    "tool_calls", // 正常结束，不是截断
+		firstToolCalls: []*proto.ToolCall{{Id: "call_1", Name: "shell", ArgumentsJson: broken}},
+		secondContent:  "補上 </parameter> 後重新發出。",
+	}
+	a.llmClient = llm
+	tools := &recordingToolClient{}
+	a.toolClient = tools
+
+	res, err := a.runLoop(context.Background(), "把 968 行刪掉", nil, nil)
+	if err != nil {
+		t.Fatalf("runLoop: %v", err)
+	}
+	// 关键：整轮不能因为一次格式错误就死掉——模型要能拿到回执继续。
+	if res.Status != "success" {
+		t.Fatalf("结果状态 = %s, 期望 success（一次畸形调用不得终止本轮）", res.Status)
+	}
+
+	tools.mu.Lock()
+	execCalls := append([]string(nil), tools.execTools...)
+	tools.mu.Unlock()
+	if len(execCalls) != 0 {
+		t.Fatalf("被执行的工具 = %v, 期望空（参数不合法不得下发执行）", execCalls)
+	}
+
+	llm.mu.Lock()
+	var secondMsgs []*proto.Message
+	if len(llm.streamMsgs) >= 2 {
+		secondMsgs = llm.streamMsgs[1]
+	}
+	llm.mu.Unlock()
+	if len(secondMsgs) == 0 {
+		t.Fatal("模型只被调用了一次：回执没有回到模型，它不会有第二次机会")
+	}
+
+	var resultText, assistantArgs string
+	for _, m := range secondMsgs {
+		if m.Role == "tool" && m.ToolCallId == "call_1" {
+			resultText = m.Content
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Id == "call_1" {
+				assistantArgs = tc.ArgumentsJson
+			}
+		}
+	}
+	if resultText == "" {
+		t.Fatal("第二次请求缺少 call_1 的 tool/result（tool_use/tool_result 未配对，provider 会 422）")
+	}
+	for _, want := range []string{"没有执行", "不是合法 JSON", "</parameter>"} {
+		if !strings.Contains(resultText, want) {
+			t.Errorf("回执应含 %q，让模型知道怎么改；实际: %s", want, resultText)
+		}
+	}
+	// 原文必须还在历史里：这是模型唯一的自纠依据（换成 "null" 就等于销毁它）。
+	if assistantArgs != broken {
+		t.Fatalf("历史里的参数原文被改写:\n 得到 %q\n 期望 %q", assistantArgs, broken)
+	}
+}
+
+// TestNoArgumentToolCallStillRuns 回归一个容易踩到的边界：不收参数的工具，参数文本是空串。
+//
+// json.Valid("") 是 false，所以「参数不合法就不执行」这条判断若直接写上来，会把所有无参
+// 工具（ask_user_question、exit_plan_mode、todo_write 的空调用……）全部挡死。畸形判定必须
+// 先排除空参数——空不是坏。
+func TestNoArgumentToolCallStillRuns(t *testing.T) {
+	a := newTestAgent(t)
+	a.llmServiceID = 1
+	a.toolServiceID = 1
+	llm := &truncMockLLM{
+		firstContent:   "我先查工具。",
+		firstFinish:    "tool_calls",
+		firstToolCalls: []*proto.ToolCall{{Id: "call_1", Name: "list_tools", ArgumentsJson: ""}},
+		secondContent:  "查完了。",
+	}
+	a.llmClient = llm
+	tools := &recordingToolClient{}
+	a.toolClient = tools
+
+	if _, err := a.runLoop(context.Background(), "有哪些工具", nil, nil); err != nil {
+		t.Fatalf("runLoop: %v", err)
+	}
+	tools.mu.Lock()
+	n := len(tools.execTools)
+	tools.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("无参工具被执行的次数 = %d, 期望 1（空参数不是畸形）", n)
+	}
+}

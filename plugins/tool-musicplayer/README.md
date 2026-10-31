@@ -3,6 +3,15 @@
 DSC 宿主上的 tool 類型插件：提供音樂/音頻播放工具，支持播放內置音效與本地 MP3/WAV
 文件，全局採樣率統一為 44100Hz 立體聲 16bit。
 
+## 工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `music_play` | 後台播放 mp3/wav，異步、不阻塞其它工作。`path` 可為單個文件或目錄（省略則用 `music_setdir` 設過的默認目錄）；`loop` 為 `off`/`one`/`list`；`shuffle` 僅對目錄有意義；`volume` 為 1–100 百分比（省略或 0 為 100，-1 為顯式靜音）。播放即返回，隨時可 `music_stop` |
+| `music_stop` | 停止當前後台播放 |
+| `music_status` | 查詢狀態：是否在播、loop 模式、是否隨機、當前曲目與時長/已播時長、音量、來源 |
+| `music_setdir` | 設定默認播放目錄並持久化（重啟後仍生效），之後 `music_play` 可省略 `path` |
+
 ## 平台説明
 
 本插件依賴 `github.com/ebitengine/oto/v3` 音頻庫輸出 PCM。

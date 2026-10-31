@@ -137,6 +137,12 @@ type Manager struct {
 	// false 时全局级生效值回退「沙箱预设绑定」：full→never、其餘→ask（对齐 DSH
 	// permission-presets）；显式设置后则尊重显式值。会话级覆盖仍优先于全局。
 	approvalGlobalExplicit atomic.Bool
+	// userGrantAll 把本进程内一切「需要审批」的动作视作已获用户授权（`-with-user-grant`）。
+	//
+	// 只用于无人值守入口（-input / -headless）：那里没有问询通道，审批门 fail-closed
+	// 会把所有写操作拒掉，模型连「装个插件」都做不到。开关是**进程级**的——用户启动
+	// 时一次性表态，等价于他在 TUI 里对每一次都点了 Allow；不是模型能触碰的会话状态。
+	userGrantAll atomic.Bool
 	// sessionApproval 按会话覆盖的审批策略（per-session，对齐 DSH approval/policy 会话态）；
 	// 缺省回退全局 approvalPolicyVal。key = 调用方会话标识（agent 每次工具调用随 SessionId 传入）。
 	sessionApproval   map[string]ApprovalPolicy
@@ -161,9 +167,6 @@ type Manager struct {
 	calibRecent    map[string][]float64 // 每模型最近若干帧比值（算离散度，不落盘原始值）
 	calibDriftHits map[string]int       // 连续漂移计数的当前段
 	calibMu        sync.RWMutex
-
-	// stalePluginsWarned 记录已经提示过「插件比宿主旧」的插件，避免每次拉起都刷一条。
-	stalePluginsWarned map[string]bool
 
 	// stopHooks 对称清理 hook：插件名 -> 按注册顺序执行的清理函数序列。
 	stopHooks map[string][]func() error
@@ -2687,6 +2690,28 @@ func buildEnv(pluginName string, custom map[string]string, allowSecrets bool) []
 	return env
 }
 
+// setEnv 把 key=value 合并进 env 列表：先剔掉已有同名键，再追加。
+//
+// 不能图省事直接 append。env 里本来就可能已有同名键：宿主环境自己就常带着
+// DSC_TOKEN_COEF（启动脚本会导出，dsc 再拉插件时就继承了它），DSC_PLUGIN_CONFIG
+// 也可能由上一级进程带下来。直接 append 会让子进程收到两个同名项，谁胜出取决于
+// os/exec 与操作系统的装配细节（Windows 的 CreateProcess env 块尤其如此），而这
+// 正是现场事故的形状——配置里写着新值，插件读到的却是旧值。
+//
+// 按 key 合并之后，pluginCmd 注释里那句「恒为完整列表且天然去重」对所有注入的键
+// 都成立，而不只是 buildEnv 里经过 map 合并的那部分。
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, prefix+value)
+}
+
 // coreEnv 计算插件进程 env：宿主环境 + 插件自定义 env。
 // 互通服务 ID 不再经 env 注入（握手时序问题）：改为宿主加载工具插件后经
 // ToolService.SetInterconnect 把挂载在本插件 client broker 上的服务 ID 传入
@@ -2702,7 +2727,7 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 	// 的配置形状——换个人接 MCP 就得改核心。
 	if len(entry.Config) > 0 {
 		if data, err := json.Marshal(entry.Config); err == nil {
-			env = append(env, "DSC_PLUGIN_CONFIG="+string(data))
+			env = setEnv(env, "DSC_PLUGIN_CONFIG", string(data))
 		}
 	}
 	if entry.Type == "llm" {
@@ -2712,7 +2737,7 @@ func (m *Manager) coreEnv(entry PluginEntry) []string {
 	}
 	// 估算系数随进程注入：插件进程启动时读同一份，宿主与插件永远用一把尺子。
 	// 不能让各进程各自读文件——启动时序不同时会读到不同版本（见 token_coef.go）。
-	env = append(env, tokenCoefEnvKey+"="+FormatTokenCoefSpec(ActiveTokenCoefs()))
+	env = setEnv(env, tokenCoefEnvKey, FormatTokenCoefSpec(ActiveTokenCoefs()))
 	return env
 }
 
@@ -2792,75 +2817,12 @@ func (m *Manager) pluginCmd(entry PluginEntry, binaryPath, execDir string) *exec
 	if execDir == "" {
 		execDir = m.config.ExecDir
 	}
-	m.warnIfPluginStale(entry.Name, binaryPath)
 	cmd := exec.Command(binaryPath)
 	if execDir != "" {
 		cmd.Dir = execDir
 	}
 	cmd.Env = m.coreEnv(entry)
 	return cmd
-}
-
-// warnIfPluginStale 提示「插件二进制比宿主旧」。
-//
-// 现场代价：连续几次部署只替换了 dsc.exe，插件仍是几小时前的版本——宿主已按新的估算
-// 系数/收口策略工作，插件却还在用旧口径算压缩预算，而现象看起来是「修复没生效」。
-// 部署漏拷不是运行时能修的，但至少要说出来，而不是让人对着「明明改了却没变化」猜。
-func (m *Manager) warnIfPluginStale(name, binaryPath string) {
-	if m == nil || strings.TrimSpace(binaryPath) == "" {
-		return
-	}
-	hostMTime, err := hostExeMTime()
-	if err != nil {
-		return
-	}
-	info, err := os.Stat(binaryPath)
-	if err != nil {
-		return
-	}
-	// 留 1 分钟余量：构建与拷贝的时间差不该报警。
-	if !info.ModTime().Before(hostMTime.Add(-time.Minute)) {
-		return
-	}
-	m.mu.Lock()
-	if m.stalePluginsWarned == nil {
-		m.stalePluginsWarned = make(map[string]bool)
-	}
-	warned := m.stalePluginsWarned[name]
-	m.stalePluginsWarned[name] = true
-	m.mu.Unlock()
-	if warned {
-		return
-	}
-	m.logger.Warn("plugin binary is older than the host executable",
-		"plugin", name, "binary", binaryPath,
-		"plugin_built", info.ModTime().Format(time.RFC3339),
-		"host_built", hostMTime.Format(time.RFC3339),
-		"hint", "部署只替换了主程序：插件仍是旧版，行为可能与宿主的新口径不一致——请整包重新部署并重启")
-}
-
-// hostExeMTime 返回宿主可执行文件的修改时间（构建时间的近似）。缓存：一次进程内不变。
-var (
-	hostExeMTimeOnce sync.Once
-	hostExeMTimeVal  time.Time
-	hostExeMTimeErr  error
-)
-
-func hostExeMTime() (time.Time, error) {
-	hostExeMTimeOnce.Do(func() {
-		exe, err := os.Executable()
-		if err != nil {
-			hostExeMTimeErr = err
-			return
-		}
-		info, err := os.Stat(exe)
-		if err != nil {
-			hostExeMTimeErr = err
-			return
-		}
-		hostExeMTimeVal = info.ModTime()
-	})
-	return hostExeMTimeVal, hostExeMTimeErr
 }
 
 // newPluginClientConfig 是插件客户端配置的唯一构造入口（与 pluginCmd 配套）。

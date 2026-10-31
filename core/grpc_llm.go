@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"dsc/proto"
@@ -65,10 +66,96 @@ type ChatStreamResponse struct {
 }
 
 // ToolCall 工具调用结构体
+// unparseableArgs reports a tool call whose arguments are not valid JSON.
+//
+// The service hands the model's text through, and a model can write a call it cannot close: one missing </parameter>
+// makes the engine's parser fold the rest of the call into the first value, and the assembled arguments then end
+// inside a string (reported from a 2080 Ti box: `{"command":"cd F:/X && sed -i '968d' a.xml <parameter=description>
+// Delete line 968 </tool_call>`).  Running that call with an empty argument set - which this file used to do - runs
+// the tool on a guess.  The message keeps the beginning of what arrived, because that is what tells a reader whether
+// the model or the parser is at fault.
+//
+// The message is for the MODEL, not for this process: it travels back as that call's tool result, so the model reads
+// what it actually wrote and can close the tag on the next step.  Ending the turn instead (which is what this file
+// did once) turns one malformed call into a dead session - the model never learns what was wrong, and a user's only
+// recovery is to say "continue".  See DecodeToolArguments for where the original text is kept.
+func unparseableArgs(name, argumentsJSON string, cause error) error {
+	shown := argumentsJSON
+	if len(shown) > 200 {
+		shown = shown[:200] + "..."
+	}
+	return fmt.Errorf("tool call %q has arguments that are not valid JSON (%v); the model's call was probably left "+
+		"unterminated (a missing </parameter> folds the rest of the call into the first value). Arguments as received: %s",
+		name, cause, shown)
+}
+
+// DecodeToolArguments parses a call's argument text, returning the parse error instead of swallowing it.
+//
+// On failure the caller must keep raw: it is the only copy of what the model wrote, and it is what the model needs to
+// see in order to fix its own call (it comes back as the tool result and stays in the history verbatim).  Success
+// returns raw == "" so that callers serialise Arguments exactly as they always did - the history then keeps the very
+// same bytes the model emitted, which is what keeps a prompt prefix stable.
+//
+// Exported because LLM provider plugins sit on the other side of a process boundary: the argument text arrives there
+// as a string, and that is the last place the original exists (see sdk.DecodeToolArguments).
+func DecodeToolArguments(name, argumentsJSON string) (args map[string]interface{}, raw string, err error) {
+	if strings.TrimSpace(argumentsJSON) == "" {
+		// Nothing at all: a call with no arguments is well formed (a tool taking none), so this is not a failure.
+		return nil, "", nil
+	}
+	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return nil, argumentsJSON, unparseableArgs(name, argumentsJSON, err)
+	}
+	return args, "", nil
+}
+
+// toolCallFromProto converts a proto tool call to the local form. It never fails: arguments that do not parse are
+// carried as RawArguments, so dispatch still happens and the tool itself decides what to say about them.
+func toolCallFromProto(tc *proto.ToolCall) ToolCall {
+	args, raw, _ := DecodeToolArguments(tc.GetName(), tc.GetArgumentsJson())
+	return ToolCall{ID: tc.GetId(), Name: tc.GetName(), Arguments: args, RawArguments: raw}
+}
+
 type ToolCall struct {
 	ID        string                 `json:"id"`
 	Name      string                 `json:"name"`
 	Arguments map[string]interface{} `json:"arguments"`
+
+	// RawArguments 是模型交付这份调用时的参数**原文**（未经解析的 JSON 文本）。
+	//
+	// 存在的理由只有一个：让参数解析失败的调用也能原样回到模型眼前。字段名照「原文」
+	// 写，不叫 Parsed/Valid，因为唯一用处就是别把它重新序列化一遍。
+	//
+	// 为什么不能只靠 Arguments：参数不合法时那份 map 是空的，再 json.Marshal 出来是
+	// "null"。模型随后在历史里看到自己「调过 exec_command、参数 null」，无从知道它
+	// 写错在哪（漏了一个 </parameter>），也就改不了——它只会换个工具或换个说法蒙一次。
+	//
+	// 只有「解析失败」的调用填这个字段：成功的调用照旧走 Arguments，于是模型在历史里
+	// 看到的字节与它当初发出的完全一致（json.Marshal 对 map 键排序，而原文本来也是
+	// 同一条 marshal 出来的）。空值表示「原文没有保留」，消费方必须回退到 Arguments，
+	// **不能**把它读成"参数为空"。
+	RawArguments string `json:"raw_arguments,omitempty"`
+}
+
+// ArgumentsJSON 返回这份调用的参数文本，供**保真**传递（proto 往返、历史回放）。
+//
+// 解析失败时返回原文——这是本方法唯一的存在理由，也是它必须被用在每一条
+// 「把调用交给别处」的路径上的原因（见 protoToolCallArguments）。
+func (tc ToolCall) ArgumentsJSON() string {
+	if tc.RawArguments != "" {
+		return tc.RawArguments
+	}
+	if tc.Arguments == nil {
+		// nil map 会被 json.Marshal 写成 "null"，而 provider 端把参数当 JSON 对象解析
+		//（OpenAI 的 function.arguments 是对象文本，null 让整项 tool_call 不合法）。
+		// 一个不带参数的工具调用应当序列化成 {}。
+		return "{}"
+	}
+	b, err := json.Marshal(tc.Arguments)
+	if err != nil || len(b) == 0 {
+		return "{}"
+	}
+	return string(b)
 }
 
 // LLMGRPCPlugin 是 go-core 的 LLM 适配器
@@ -135,12 +222,14 @@ func convertLLMChatRequest(req *proto.ChatRequest) ([]Message, []Tool) {
 	return protoMessagesToPlugin(req)
 }
 
-// convertToolCallsToProto 将内部工具调用列表转换为 proto 形式
+// convertToolCallsToProto 将内部工具调用列表转换为 proto 形式。
+//
+// 走 ArgumentsJSON() 而不是 json.Marshal(tc.Arguments)：解析失败的调用带的是原文（RawArguments），
+// 重新序列化会把原文换成 "null"，模型就再也看不到自己写错了什么。
 func convertToolCallsToProto(toolCalls []ToolCall) []*proto.ToolCall {
 	out := make([]*proto.ToolCall, len(toolCalls))
 	for i, tc := range toolCalls {
-		argsJSON, _ := json.Marshal(tc.Arguments)
-		out[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: string(argsJSON)}
+		out[i] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: tc.ArgumentsJSON()}
 	}
 	return out
 }
@@ -246,8 +335,7 @@ func convertToProtoMessages(messages []Message) []*proto.Message {
 		if len(m.ToolCalls) > 0 {
 			pm.ToolCalls = make([]*proto.ToolCall, len(m.ToolCalls))
 			for j, tc := range m.ToolCalls {
-				argsJSON, _ := json.Marshal(tc.Arguments)
-				pm.ToolCalls[j] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: string(argsJSON)}
+				pm.ToolCalls[j] = &proto.ToolCall{Id: tc.ID, Name: tc.Name, ArgumentsJson: tc.ArgumentsJSON()}
 			}
 		}
 		protoMessages[i] = pm
@@ -289,13 +377,11 @@ func (c *llmGRPCClient) Chat(ctx context.Context, messages []Message, tools []To
 		return nil, fmt.Errorf("LLM call failed after retries: %w", err)
 	}
 
+	// 参数不解析不是「这次调用失败」：照常把调用交给上层，原文留在 RawArguments 里，
+	// 由工具把它当作结果回给模型（模型自己改）。这里中止会把一次格式错误变成死会话。
 	toolCalls := make([]ToolCall, len(resp.ToolCalls))
 	for i, tc := range resp.ToolCalls {
-		var args map[string]interface{}
-		if err := json.Unmarshal([]byte(tc.ArgumentsJson), &args); err != nil {
-			return nil, fmt.Errorf("failed to parse tool call arguments for %s: %w", tc.Name, err)
-		}
-		toolCalls[i] = ToolCall{ID: tc.Id, Name: tc.Name, Arguments: args}
+		toolCalls[i] = toolCallFromProto(tc)
 	}
 
 	return &ChatResponse{
@@ -327,13 +413,16 @@ func (c *llmGRPCClient) ChatStream(ctx context.Context, messages []Message, tool
 				ch <- &ChatStreamResponse{Error: err.Error()}
 				return
 			}
+			// 参数不解析**不**中止这一帧（更不中止整轮）：调用照常交给 agent，原文留在
+			// RawArguments 里。agent 派发它，工具把「你这段参数不是合法 JSON，这是你写下
+			// 的原文」当作结果回给模型，模型在下一步补齐 </parameter> 重试。
+			//
+			// 早先这里是 `ch <- Error; return`，而 loop 收到帧里的 Error 就结束整轮——
+			// 一次漏写的闭合标签于是变成一个死会话：模型永远不知道自己错在哪，用户只能
+			// 手动说「继续」。
 			toolCalls := make([]ToolCall, len(resp.ToolCalls))
 			for i, tc := range resp.ToolCalls {
-				var args map[string]interface{}
-				if err := json.Unmarshal([]byte(tc.ArgumentsJson), &args); err != nil {
-					args = map[string]interface{}{}
-				}
-				toolCalls[i] = ToolCall{ID: tc.Id, Name: tc.Name, Arguments: args}
+				toolCalls[i] = toolCallFromProto(tc)
 			}
 			ch <- &ChatStreamResponse{
 				Content:      resp.Content,

@@ -968,47 +968,154 @@ func parseFieldList(body string, delimiter Delimiter, strict bool) ([]fieldNode,
 	if body == "" {
 		return nil, errors.New("empty field list")
 	}
+	// 外分隔符只需在最外层检查一次。递归传入的永远是本层 body 的**子串**，所以内层
+	// 出现的字符必然也出现在外层；而 IndexUnquoted 只认引号、不认括号，结论是
+	// 「外层通过 ⟹ 内层通过」。此前每层都扫一遍，是 O(depth²) 的一半来源。
 	if err := checkForeignDelimiters(body, delimiter); err != nil {
 		return nil, err
 	}
-	entries, err := splitFieldEntries(body, delimiter.rune())
-	if err != nil {
-		return nil, err
+	return parseFieldListRange(body, 0, len(body), delimiter, strict)
+}
+
+// parseFieldListRange 用**一次扫描 + 显式栈**解析 body[start:end) 里的字段列表。
+//
+// 旧实现是「每层切成 entry 再递归」：切分要复制（strings.Builder）、外分隔符要重扫、
+// 括号匹配又扫一遍，于是每一层的代价都正比于**剩余整段长度**，嵌套深度 d 时总计 O(d²)。
+// 一份 24 KB、8000 层的输入要 1.5s / 815 MB（issue #33），足够做内存与 CPU 拒绝服务，
+// 而这类文本来自不可信调用方（本仓用它解析工具结果与模型输出）。
+//
+// 现在整段只遍历一次：`{` 压栈、`}` 出栈、当前层遇到分隔符就收一条 entry，嵌套结构
+// 在栈里自然成形。entry 的边界是索引，不再是复制出来的字符串；每层额外只分配一个
+// 结果切片与去重表。总代价 O(n)。
+func parseFieldListRange(body string, start, end int, delimiter Delimiter, strict bool) ([]fieldNode, error) {
+	type frame struct {
+		nodes []fieldNode
+		seen  map[string]bool
+		name  string // 本层挂载到父层的字段名（由 `{` 之前那段决定）
+		// justClosed 标记「本层刚因嵌套组出栈而挂进一条完整 entry」：紧随其后的
+		// `}` 或分隔符都不能再把它当成一条待结算（或空）的 entry。
+		justClosed bool
 	}
 
-	nodes := make([]fieldNode, 0, len(entries))
-	seen := make(map[string]bool, len(entries))
-	for _, entry := range entries {
-		if entry == "" {
-			return nil, errors.New("empty field entry")
+	// 根帧：结果直接返回，没有名字。
+	root := &frame{nodes: make([]fieldNode, 0, 4), seen: make(map[string]bool, 4)}
+	frames := []*frame{root}
+	cur := root
+
+	// nameStart 是「当前 entry 名字的起点」：遇到 `{`、分隔符或末尾时结算。
+	nameStart := start
+	inQuotes := false
+
+	// finishEntry 结算 body[nameStart:nameEnd) 这一条非嵌套 entry。
+	finishEntry := func(nameEnd int) error {
+		if nameEnd <= nameStart {
+			return errors.New("empty field entry")
 		}
-		namePart := entry
-		var children []fieldNode
-		if brace := topLevelBrace(entry); brace >= 0 {
-			end := matchBrace(entry[brace:])
-			if end < 0 || brace+end != len(entry)-1 {
-				return nil, errors.New("malformed nested field group")
+		name, err := decodeKeyToken(body[nameStart:nameEnd])
+		if err != nil {
+			return err
+		}
+		if cur.seen[name] && strict {
+			// Non-strict mode keeps the duplicate so that the field walk of
+			// §9.3 yields last-write-wins in every decoded element (§14.3).
+			return fmt.Errorf("duplicate field name %q", name)
+		}
+		cur.seen[name] = true
+		cur.nodes = append(cur.nodes, fieldNode{name: name})
+		return nil
+	}
+
+	for i := start; i < end; i++ {
+		c := body[i]
+		if inQuotes {
+			switch c {
+			case '\\':
+				i++ // 转义：连同下一个字节一起属于名字，跳过
+			case '"':
+				inQuotes = false
 			}
-			nested, err := parseFieldList(entry[brace+1:len(entry)-1], delimiter, strict)
+			continue
+		}
+		switch c {
+		case '"':
+			inQuotes = true
+			cur.justClosed = false
+		case '{':
+			// `{` 之前是本层的字段名；先解码再压栈，出栈时用它挂到父层。
+			if i <= nameStart {
+				return nil, errors.New("empty field entry")
+			}
+			name, err := decodeKeyToken(body[nameStart:i])
 			if err != nil {
 				return nil, err
 			}
-			children = nested
-			namePart = entry[:brace]
+			if cur.seen[name] && strict {
+				return nil, fmt.Errorf("duplicate field name %q", name)
+			}
+			cur.seen[name] = true
+			frames = append(frames, &frame{nodes: make([]fieldNode, 0, 4), seen: make(map[string]bool, 4), name: name})
+			cur = frames[len(frames)-1]
+			nameStart = i + 1
+		case '}':
+			// 关闭当前层：先结算它最后一条 entry（若还没结算），再挂到父层。
+			if len(frames) == 1 {
+				return nil, errors.New("unmatched brace in field list")
+			}
+			if !cur.justClosed {
+				if err := finishEntry(i); err != nil {
+					return nil, err
+				}
+			}
+			closed := frames[len(frames)-1]
+			frames = frames[:len(frames)-1]
+			cur = frames[len(frames)-1]
+			cur.nodes = append(cur.nodes, fieldNode{name: closed.name, children: closed.nodes})
+			cur.justClosed = true
+			nameStart = i + 1
+			// 嵌套组必须是本 entry 的结尾：后继只能是分隔符、父层的 `}`，或整段结束。
+			// `x{y}z` 属畸形（旧实现同样拒绝）。注意不能只看「分隔符或末尾」——嵌套组
+			// 后面紧跟的往往是父层的 `}`，那是合法的。
+			if i+1 < end {
+				next := body[i+1]
+				isDelim := next < 0x80 && rune(next) == delimiter.rune()
+				if !isDelim && next != '}' {
+					return nil, errors.New("malformed nested field group")
+				}
+			}
+		default:
+			// 分隔符作用于**当前层**（栈顶），不是只在最外层：`a{name,country}` 里
+			// 的逗号切的是 a 那一层的字段。旧实现每层各切各的，正是这个语义。
+			if c < 0x80 && rune(c) == delimiter.rune() {
+				// 刚出栈那条已经挂进本层，这里的逗号是它后面的分隔符，不是空 entry。
+				if !cur.justClosed {
+					if err := finishEntry(i); err != nil {
+						return nil, err
+					}
+				}
+				cur.justClosed = false
+				nameStart = i + 1
+				continue
+			}
+			cur.justClosed = false
 		}
-		name, err := decodeKeyToken(namePart)
-		if err != nil {
+	}
+
+	if inQuotes {
+		return nil, errors.New("unterminated quoted field name")
+	}
+	if len(frames) != 1 {
+		return nil, errors.New("unmatched brace in field list")
+	}
+	// 末尾结算：以 `}` 收尾的层已经在出栈那步结算过了（settled），不能再当空 entry；
+	// 而 `x,` 这种以分隔符结尾的输入，旧实现会拆出一个空 entry 并报错。
+	if nameStart < end {
+		if err := finishEntry(end); err != nil {
 			return nil, err
 		}
-		if seen[name] && strict {
-			// Non-strict mode keeps the duplicate so that the field walk of
-			// §9.3 yields last-write-wins in every decoded element (§14.3).
-			return nil, fmt.Errorf("duplicate field name %q", name)
-		}
-		seen[name] = true
-		nodes = append(nodes, fieldNode{name: name, children: children})
+	} else if !cur.justClosed {
+		return nil, errors.New("empty field entry")
 	}
-	return nodes, nil
+	return cur.nodes, nil
 }
 
 // checkForeignDelimiters rejects a field list that uses an unquoted delimiter
