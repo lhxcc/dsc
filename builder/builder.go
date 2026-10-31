@@ -62,7 +62,7 @@ func warnIfBuilderStale(exePath, scriptDir string) {
 			newestName, filepath.Base(exePath)))
 	}
 }
-func printError(msg string)   { printColored(colorRed, msg) }
+func printError(msg string) { printColored(colorRed, msg) }
 
 // platform 定义目标平台
 type platform struct {
@@ -134,21 +134,74 @@ var internalPlugins = []string{
 //   - dsp/       tool-sql-host 的 .dsp 插件载体（含示例载体）
 //   - examples/  tool-sql-host 的插件源码示例（.dsp 的源目录布局；发布包不随附各插件
 //     README，故这份示例同时充当包内的格式说明）
+//   - fonts/     CJK 字体（tool-pdf）：该插件启动时**硬校验** fonts 目录里至少有一个
+//     .ttf，缺了直接 panic——这是有意设计（标准 14 字体没有 CJK 字形，缺字形比装不上
+//     更糟）。所以字体必须随包，否则新装的包里这些工具永远不可见。
 //
 // 只认这几个白名单目录名，避免把源码/测试/构建脚本一并带进发布包；新增插件的运行时
 // 资源目录时在此登记（插件自带 README 须写明该目录的作用）。
-var pluginAssetDirs = []string{"scripts", "dsp", "examples"}
+var pluginAssetDirs = []string{"scripts", "dsp", "examples", fontAssetDir}
+
+// fontAssetDir 是需要「至少一个 .ttf」的附带资源目录名（插件启动硬校验的对象）。
+const fontAssetDir = "fonts"
+
+// assetArchiveExt 是附带资源里**不随包**的归档扩展名：字体目录里常留着下载来的字体
+// 压缩包（几十 MB），插件运行时只按文件名读 ttf 本体，把归档 ×7 平台复制一遍纯属浪费。
+var assetArchiveExt = []string{".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz"}
+
+// assetCopy 是一次附带资源拷贝的统计：随包文件数与其中的 .ttf 数。
+type assetCopy struct {
+	files int
+	fonts int
+}
 
 // stagePluginAssets 把插件目录下的附带资源目录拷入发布包对应插件目录（缺失即跳过）。
+//
+// 字体目录额外做一次「有没有 .ttf」的构建期检查：插件缺字体是启动即 panic，而打包
+// 的人不会看到——等用户装完才发现整份工具集不见了。构建期吼一声最省事。
 func stagePluginAssets(repoRoot, releaseDir, name string) {
 	for _, dir := range pluginAssetDirs {
 		src := filepath.Join(repoRoot, "plugins", name, dir)
 		if info, err := os.Stat(src); err != nil || !info.IsDir() {
 			continue
 		}
-		copyDir(src, filepath.Join(releaseDir, "plugins", name, dir))
-		printInfo(fmt.Sprintf("    + 附带资源: plugins/%s/%s/\n", name, dir))
+		st := copyAssetDir(src, filepath.Join(releaseDir, "plugins", name, dir))
+		printInfo(fmt.Sprintf("    + 附带资源: plugins/%s/%s/（%d 个文件）\n", name, dir, st.files))
+		if dir == fontAssetDir && st.fonts == 0 {
+			printWarning(fmt.Sprintf(
+				"    ！plugins/%s/%s/ 里没有任何 .ttf：这个包里的该插件会**启动即 panic**"+
+					"（字体是启动硬校验）。把 TrueType 字体放进 %s 再打包。\n",
+				name, dir, src))
+		}
 	}
+}
+
+// copyAssetDir 拷附带资源目录：归档文件不随包（见 assetArchiveExt），并统计可用字体数。
+func copyAssetDir(src, dst string) assetCopy {
+	var st assetCopy
+	copyDirFiltered(src, dst, func(path string) bool {
+		if isAssetArchive(path) {
+			printInfo(fmt.Sprintf("    - 不随包: %s（归档，插件运行时不读）\n", filepath.Base(path)))
+			return false
+		}
+		if strings.EqualFold(filepath.Ext(path), ".ttf") {
+			st.fonts++
+		}
+		st.files++
+		return true
+	})
+	return st
+}
+
+// isAssetArchive 报告该文件是否属于「下载来的归档」而非运行时资源。
+func isAssetArchive(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, a := range assetArchiveExt {
+		if ext == a {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -230,7 +283,7 @@ func main() {
 // 因此对任何后端都成立。
 //
 // DSC_SKIP_BACKENDCHECK=false 可显式关闭（opt-out）：仅在确认检查本身不可用
-//（如目标平台无法启动插件）时用于紧急出包，正常构建不应关闭。
+// （如目标平台无法启动插件）时用于紧急出包，正常构建不应关闭。
 func verifyBackendContracts(repoRoot string, p platform) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DSC_SKIP_BACKENDCHECK"))) {
 	case "false", "0":
@@ -1060,7 +1113,11 @@ func isBackupDir(name string) bool {
 }
 
 // copyDir 递归拷贝目录（含空目录结构），跳过任何备份性质目录；源不存在则忽略。
-func copyDir(src, dst string) {
+func copyDir(src, dst string) { copyDirFiltered(src, dst, nil) }
+
+// copyDirFiltered 拷贝目录树；skip 非空时对**每个文件**求值，返回 false 即不入包
+// （目录仍会被建出来——附带资源目录为空时包内布局保持一致，读起来不意外）。
+func copyDirFiltered(src, dst string, skip func(path string) bool) {
 	info, err := os.Stat(src)
 	if err != nil || !info.IsDir() {
 		return
@@ -1077,6 +1134,9 @@ func copyDir(src, dst string) {
 		target := filepath.Join(dst, rel)
 		if fi.IsDir() {
 			_ = os.MkdirAll(target, 0755)
+			return nil
+		}
+		if skip != nil && !skip(path) {
 			return nil
 		}
 		_ = os.MkdirAll(filepath.Dir(target), 0755)
