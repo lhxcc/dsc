@@ -416,10 +416,15 @@ func (bc *BillionContext) handlePreStep(ctx context.Context, dataJSON string) (s
 
 	// 转回 proto.Message
 	rewrittenProto := bcadapter.FromCoreMessages(renderedMsgs)
-	rewrittenJSON, _ := json.Marshal(rewrittenProto)
 
-	// 返回改写后的消息列表（宿主会用此替换原消息列表发给 LLM）
-	return fmt.Sprintf(`{"messages": %s}`, string(rewrittenJSON)), nil
+	// 返回改写后的消息列表（宿主会用此替换原消息列表发给 LLM）。
+	// 信封交给 json.Marshal：手拼 `{"messages": %s}` 在内层编码失败时会吐出坏 JSON，
+	// 宿主只能整条忽略（本轮投影白跑），而且这条结果本身也要过 TOON 归一化。
+	envelope, err := json.Marshal(map[string]any{"messages": rewrittenProto})
+	if err != nil {
+		return "", fmt.Errorf("billion-context: marshal projection result: %w", err)
+	}
+	return string(envelope), nil
 }
 
 // handleCompress 处理 compress 工具调用。

@@ -1125,6 +1125,21 @@ func webSearchImpl(sessionID, query string, engines []string, userMode bool) (st
 	return string(b), nil
 }
 
+// failResult 生成標準失敗載荷。
+//
+// 必須走 json.Marshal，不能手拼：錯誤文本裏常帶引號、換行與 Windows 路徑的反斜杆
+// （`C:\Users\...` 的 `\U` 不是合法 JSON 轉義），手拼出來的是**壞 JSON**——模型收到
+// 半截結構，投影層的 TOON 歸一化也只能整條放棄、退回原文。錯誤信息越詳細，越容易
+// 踩這個坑，所以「詳細」不該以「結構壞掉」爲代價。
+func failResult(message string) string {
+	b, err := json.Marshal(map[string]any{"success": false, "error": message})
+	if err != nil {
+		// 兜底也必須是合法 JSON（此處只放字符串，正常不會失敗）。
+		return `{"success":false,"error":"unserializable error"}`
+	}
+	return string(b)
+}
+
 // BrowserClickResult 點擊結果
 type BrowserClickResult struct {
 	Success bool   `json:"success"`
@@ -1136,12 +1151,12 @@ type BrowserClickResult struct {
 func browserClickImpl(sessionID, url, selector string) (string, error) {
 	page, _, err := getOrCreatePage(sessionID, "default", url, true)
 	if err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"%s"}`, err.Error()), nil
+		return failResult(err.Error()), nil
 	}
 
 	element, err := page.Element(selector)
 	if err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"未找到元素 '%s': %s"}`, selector, err.Error()), nil
+		return failResult(fmt.Sprintf("未找到元素 '%s': %s", selector, err.Error())), nil
 	}
 
 	if err := element.ScrollIntoView(); err != nil {
@@ -1174,12 +1189,12 @@ type BrowserTypeResult struct {
 func browserTypeImpl(sessionID, url, selector, text string, submit bool) (string, error) {
 	page, _, err := getOrCreatePage(sessionID, "default", url, true)
 	if err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"%s"}`, err.Error()), nil
+		return failResult(err.Error()), nil
 	}
 
 	element, err := page.Element(selector)
 	if err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"未找到輸入框 '%s': %s"}`, selector, err.Error()), nil
+		return failResult(fmt.Sprintf("未找到輸入框 '%s': %s", selector, err.Error())), nil
 	}
 
 	element.MustClick()
@@ -1216,7 +1231,7 @@ type BrowserScreenshotResult struct {
 func browserScreenshotImpl(sessionID, url string, fullPage bool) (string, error) {
 	page, _, err := getOrCreatePage(sessionID, "default", url, true)
 	if err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"%s"}`, err.Error()), nil
+		return failResult(err.Error()), nil
 	}
 
 	time.Sleep(1 * time.Second)
@@ -1233,7 +1248,7 @@ func browserScreenshotImpl(sessionID, url string, fullPage bool) (string, error)
 	// 保存截圖到工作區目錄（沙箱限制寫入系統臨時目錄，如 %TEMP%，故存到 workspace 內）
 	downloadDir := dsc.PJoin(dsc.WorkspaceRoot(), "screenshots")
 	if err := dsc.MkdirAll(downloadDir); err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"創建下載目錄失敗: %s"}`, err.Error()), nil
+		return failResult(fmt.Sprintf("創建下載目錄失敗: %s", err.Error())), nil
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
@@ -1241,7 +1256,7 @@ func browserScreenshotImpl(sessionID, url string, fullPage bool) (string, error)
 	filePath := dsc.PJoin(downloadDir, fileName)
 
 	if err := dsc.WriteFile(filePath, screenshot); err != nil {
-		return fmt.Sprintf(`{"success":false,"error":"保存截圖失敗: %s"}`, err.Error()), nil
+		return failResult(fmt.Sprintf("保存截圖失敗: %s", err.Error())), nil
 	}
 
 	result := BrowserScreenshotResult{
