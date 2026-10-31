@@ -45,10 +45,10 @@ func TestMaxTokensFromEnvAbsentOrInvalid(t *testing.T) {
 // 插件级 -1 + 请求级 0 → 不携带；请求级 >0 仍优先。
 func TestResolveMaxTokensNegativeMeansOmit(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: -1}
-	if got := p.resolveMaxTokens(0); got != 0 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 0 {
 		t.Fatalf("负值应视为不携带（返回 0），got %d", got)
 	}
-	if got := p.resolveMaxTokens(4096); got != 4096 {
+	if got := p.resolveMaxTokens(4096, nil, nil); got != 4096 {
 		t.Fatalf("请求级参数仍应优先，got %d", got)
 	}
 }
@@ -56,14 +56,14 @@ func TestResolveMaxTokensNegativeMeansOmit(t *testing.T) {
 // TestResolveMaxTokens 请求级参数（压缩等场景的窗口净余值）优先于插件级默认。
 func TestResolveMaxTokens(t *testing.T) {
 	p := &OpenAIProvider{maxTokens: 131072}
-	if got := p.resolveMaxTokens(26000); got != 26000 {
+	if got := p.resolveMaxTokens(26000, nil, nil); got != 26000 {
 		t.Fatalf("请求级参数未被优先: got %d", got)
 	}
-	if got := p.resolveMaxTokens(0); got != 131072 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 131072 {
 		t.Fatalf("插件级默认未被回填: got %d", got)
 	}
 	zero := &OpenAIProvider{}
-	if got := zero.resolveMaxTokens(0); got != 0 {
+	if got := zero.resolveMaxTokens(0, nil, nil); got != 0 {
 		t.Fatalf("无任何配置应返回 0（不携带）: got %d", got)
 	}
 }

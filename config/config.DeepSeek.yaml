@@ -48,8 +48,8 @@ plugins:
       # 直接指定预算（默认 4096）。DSC_ANTHROPIC_THINKING=0 可整体关闭扩展思考
       #（旧名 ANTHROPIC_THINKING 仍兼容）。
       DSC_REASONING_EFFORT: "high"
-      # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
-      # 不写或 0=同样不携带（宿主不再按 context_window 注入）。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
+      # 单轮输出上限（可选）：>0=携带该值（会被「窗口 − 输入」夹）；-1=明确不携带；
+      # 不写=宿主启动期探一次服务端上限（2xx 用窗口值 / 400 报文给数值 / 都不给退 n_ctx÷4）后注入。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
       # 可覆盖本值（见 README「LLM 環境變量」）；云端端点有上限（如 DeepSeek 393216），故默认 -1。
       DSC_MAX_OUTPUT_TOKENS: "-1"
   # - name: llm-openai
@@ -65,8 +65,8 @@ plugins:
   #     # reasoning_effort 字面量（6 档 1:1 透传）；或用 DSC_OPENAI_REASONING_EFFORT 传
   #     # 端点支持的字面量（如 xhigh 等文档外档位）绕过统一映射。仅对推理模型有效，非推理模型忽略。
   #     #DSC_REASONING_EFFORT: "high"
-  #     # 单轮输出上限（可选）：-1=明确不携带 max_tokens（等模型自然结束）；>0=携带该值；
-  #     # 不写或 0=同样不携带（宿主不再按 context_window 注入）。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
+  #     # 单轮输出上限（可选）：>0=携带该值（会被「窗口 − 输入」夹）；-1=明确不携带；
+  #     # 不写=宿主启动期探一次服务端上限（2xx 用窗口值 / 400 报文给数值 / 都不给退 n_ctx÷4）后注入。接口专属名 DSC_<PROVIDER>_MAX_OUTPUT_TOKENS
   #     # 可覆盖本值（见 README「LLM 環境變量」）；云端端点有上限（如 DeepSeek 393216），故默认 -1。
   #     DSC_MAX_OUTPUT_TOKENS: "-1"
   - name: tool-filesystem

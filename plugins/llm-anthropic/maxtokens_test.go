@@ -127,14 +127,14 @@ func TestMaxTokensFromEnvNegativeOmit(t *testing.T) {
 // TestResolveMaxTokens 请求级参数（压缩等场景的窗口净余值）优先于插件级默认。
 func TestResolveMaxTokens(t *testing.T) {
 	p := &AnthropicProvider{maxTokens: 131072}
-	if got := p.resolveMaxTokens(26000); got != 26000 {
+	if got := p.resolveMaxTokens(26000, nil, nil); got != 26000 {
 		t.Fatalf("请求级参数未被优先: got %d", got)
 	}
-	if got := p.resolveMaxTokens(0); got != 131072 {
+	if got := p.resolveMaxTokens(0, nil, nil); got != 131072 {
 		t.Fatalf("插件级默认未被回填: got %d", got)
 	}
 	zero := &AnthropicProvider{}
-	if got := zero.resolveMaxTokens(0); got != 0 {
+	if got := zero.resolveMaxTokens(0, nil, nil); got != 0 {
 		t.Fatalf("无任何配置应返回 0（不携带）: got %d", got)
 	}
 }

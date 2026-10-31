@@ -567,18 +567,59 @@ func usageFromAnthropic(u *anthropic.Usage) *dsc.Usage {
 	}
 }
 
-// resolveMaxTokens 计算本请求实际携带的 max_tokens：请求级参数（压缩等场景的
-// 窗口净余值）优先，其次插件级默认（只来自插件 env——宿主不注入默认值），<=0 表示不携带
-// （omitZeroMaxTokens 摘除零值，等模型自然结束）。
-func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64) int64 {
-	if requestMaxTokens > 0 {
-		return requestMaxTokens
+// maxTokensReserve 是给「我们的估算 vs 服务端分词器」留的余量；maxTokensFloor 是
+// 「还值得给」的下限（比它小说明这一帧该由宿主滑窗收口）。
+const (
+	maxTokensReserve = 512
+	maxTokensFloor   = 128
+)
+
+// windowHeadroom 返回这一帧还能生成多少 token（窗口 − 消息 − 工具目录 − 余量）。
+// 窗口未知时返回 0（不做限制）。
+func windowHeadroom(messages []dsc.Message, tools []dsc.LLMTool) int {
+	window := dsc.ContextWindow()
+	if window <= 0 {
+		return 0
 	}
-	return p.maxTokens
+	room := window - dsc.EstimateMessageValuesTokens(messages) - dsc.EstimateToolTokens(tools) - maxTokensReserve
+	if room < maxTokensFloor {
+		return 0
+	}
+	return room
+}
+
+// resolveMaxTokens 计算本请求实际携带的 max_tokens。
+//
+// anthropic 协议把 max_tokens 当 **required**，缺席时服务端会自填保守默认（llama.cpp
+// 兼容口填 4096），一轮长回答直接腰斩。所以这里三态：
+//   - 请求级参数（压缩等场景的净余值）> 0：用它；
+//   - 插件 env 显式给出（含宿主按启动期探测结果注入的值）：用它；
+//   - 都没有：按「窗口 − 本帧输入」现算；
+//
+// 最后统一用余量夹一次，保证 prompt + max_tokens ≤ 窗口；显式 -1 表示不携带（尊重）。
+func (p *AnthropicProvider) resolveMaxTokens(requestMaxTokens int64, messages []dsc.Message, tools []dsc.LLMTool) int64 {
+	mt := requestMaxTokens
+	if mt <= 0 {
+		mt = p.maxTokens
+	}
+	if mt < 0 {
+		return 0 // 明确不携带
+	}
+	headroom := windowHeadroom(messages, tools)
+	if mt == 0 {
+		mt = int64(headroom)
+		if mt <= 0 {
+			return 0
+		}
+	}
+	if headroom > 0 && mt > int64(headroom) {
+		mt = int64(headroom)
+	}
+	return mt
 }
 
 func (p *AnthropicProvider) Chat(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool, maxTokens int) (*dsc.ChatResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens)))
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(int64(maxTokens), messages, tools))
 	opts := p.requestOptions(beta)
 	resp, err := p.client.Messages.New(ctx, params, opts...)
 	if err != nil {
@@ -604,7 +645,7 @@ func (p *AnthropicProvider) requestOptions(beta bool) []option.RequestOption {
 }
 
 func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []dsc.Message, tools []dsc.LLMTool) (<-chan *dsc.ChatStreamResponse, error) {
-	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0))
+	params, beta := p.buildMessageParams(messages, tools, p.resolveMaxTokens(0, messages, tools))
 	stream := p.client.Messages.NewStreaming(ctx, params, p.requestOptions(beta)...)
 
 	ch := make(chan *dsc.ChatStreamResponse)

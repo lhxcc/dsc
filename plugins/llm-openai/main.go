@@ -317,7 +317,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 	}
 	// max_tokens：请求级参数（压缩等场景的窗口净余值）优先，其次插件级默认
 	//（只来自插件 env——宿主不注入默认值）；<=0 不携带，等模型自然结束。
-	if mt := p.resolveMaxTokens(maxTokens); mt > 0 {
+	if mt := p.resolveMaxTokens(maxTokens, messages, tools); mt > 0 {
 		req.MaxTokens = mt
 	}
 	// reasoning_effort：DeepSeek 等推理端点的思考强度；空=不携带（非推理模型忽略）。
@@ -368,11 +368,38 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []dsc.Message, tools
 	return result, nil
 }
 
-// resolveMaxTokens 计算本请求实际携带的 max_tokens：请求级参数（压缩等场景的
-// 窗口净余值）优先，其次插件级默认（只来自插件 env——宿主不注入默认值），
-// <=0 表示不携带。
-// 已知服务端上限时提前钳制，避免每个新进程的首个请求都先吃一次 400。
-func (p *OpenAIProvider) resolveMaxTokens(requestMaxTokens int) int {
+// maxTokensReserve 是给「我们的估算 vs 服务端分词器」留的余量：max_tokens 吃掉最后
+// 一滴名义余量，就会让 prompt+max_tokens 越过窗口，服务端直接 400。
+// maxTokensFloor 是「还值得给」的下限：比它更小说明这一帧本来就该被宿主滑窗收口。
+const (
+	maxTokensReserve = 512
+	maxTokensFloor   = 128
+)
+
+// windowHeadroom 返回这一帧还能生成多少 token（窗口 − 消息 − 工具目录 − 余量）。
+// 窗口未知（宿主没注入 DSC_CONTEXT_WINDOW）时返回 0，表示不做限制。
+func windowHeadroom(messages []dsc.Message, tools []dsc.LLMTool) int {
+	window := dsc.ContextWindow()
+	if window <= 0 {
+		return 0
+	}
+	room := window - dsc.EstimateMessageValuesTokens(messages) - dsc.EstimateToolTokens(tools) - maxTokensReserve
+	if room < maxTokensFloor {
+		return 0
+	}
+	return room
+}
+
+// resolveMaxTokens 计算本请求实际携带的 max_tokens。
+//
+// 三态：请求级参数（压缩等场景的净余值）> 插件级默认（插件 env 的
+// DSC_<P>_MAX_OUTPUT_TOKENS / DSC_MAX_OUTPUT_TOKENS，由宿主按启动期探测结果注入）>
+// 未设置时按「窗口 − 本帧输入」现算。
+//
+// 为什么未设置也要给：anthropic 兼容口把 max_tokens 当 required，缺席时服务端自填保守
+// 默认（4096），长回答被腰斩；补齐后再用余量夹一次，保证 prompt + max_tokens ≤ 窗口。
+// 显式 -1 = 明确不携带（尊重）；服务端报过「不接受这个字段」时同样不携带。
+func (p *OpenAIProvider) resolveMaxTokens(requestMaxTokens int, messages []dsc.Message, tools []dsc.LLMTool) int {
 	if p.noMaxTokens.Load() {
 		return 0
 	}
@@ -380,8 +407,18 @@ func (p *OpenAIProvider) resolveMaxTokens(requestMaxTokens int) int {
 	if mt <= 0 {
 		mt = p.maxTokens
 	}
-	if mt <= 0 {
-		return 0
+	if mt < 0 {
+		return 0 // 明确不携带
+	}
+	headroom := windowHeadroom(messages, tools)
+	if mt == 0 {
+		mt = headroom
+		if mt <= 0 {
+			return 0
+		}
+	}
+	if headroom > 0 && mt > headroom {
+		mt = headroom
 	}
 	if limit := int(p.maxTokensLimit.Load()); limit > 0 && mt > limit {
 		mt = limit
@@ -477,7 +514,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []dsc.Message,
 	// 宿主一律注入 DSC_MAX_OUTPUT_TOKENS=有效上下文窗口值（不分本地/云端），在此
 	// 显式携带（LLAMACPP 侧受上下文自然钳制，无害；云端值可经 context_window 或
 	// 插件 env 调整）。
-	if mt := p.resolveMaxTokens(0); mt > 0 {
+	if mt := p.resolveMaxTokens(0, messages, tools); mt > 0 {
 		req.MaxTokens = mt
 	}
 	// reasoning_effort：DeepSeek 等推理端点的思考强度；空=不携带（非推理模型忽略）。
