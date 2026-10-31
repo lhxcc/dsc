@@ -278,6 +278,27 @@ func HasUserGrant(ctx context.Context) bool {
 	return granted
 }
 
+// SetUserGrantAll 声明「本进程内一切需要审批的动作都已获用户授权」（`-with-user-grant`）。
+//
+// 与 WithUserGrant 的区别只在作用域：那个是一次调用的 ctx 标记（前端手打命令），
+// 这个是进程级声明，用给**没有问询通道**的无人值守入口（-input / -headless）。
+// 那里审批门 fail-closed，模型连安装插件、写工作区外文件都做不到——不是它没有权限，
+// 而是没有人可以问。启动时显式打开这个开关，等价于用户预先对每次询问都点了 Allow。
+//
+// 不是「把 approval 设成 never」：never 是确定拒绝，语义相反（见 WithUserGrant 注释）。
+// 也只应由启动参数设置——模型没有任何工具能碰到它。
+func (m *Manager) SetUserGrantAll(v bool) {
+	if m == nil {
+		return
+	}
+	m.userGrantAll.Store(v)
+}
+
+// UserGrantAll 报告本进程是否已声明「一切审批动作均获授权」。
+func (m *Manager) UserGrantAll() bool {
+	return m != nil && m.userGrantAll.Load()
+}
+
 // ApprovalRequester 可选接口（入口②工具声明需审批，对齐 DSH tools kind:'ask' 决策 /
 // serviceAsk）：工具实现它并对本次调用返回非空 reason 时，执行前经审批门问人。
 // reason 会展示给用户并写入审计；空串表示正常执行。工具按每次调用的参数自行判定。
@@ -336,7 +357,8 @@ func (m *Manager) toolApprovalGate() WaterfallListener {
 			reason += "（本次需要授权范围：" + strings.Join(missing, ", ") + "）"
 		}
 		// 用户在前端手打命令即授权：不再问一次（审计事件照旧记）。
-		if HasUserGrant(ev.Context) {
+		// UserGrantAll 同理，只是授权来自启动参数而不是这一次按键（见 SetUserGrantAll）。
+		if HasUserGrant(ev.Context) || m.UserGrantAll() {
 			return next(ev)
 		}
 		if m.executionApprovalPolicy(inv) == ApprovalNever {
@@ -410,6 +432,14 @@ func (m *Manager) approvalEscalation() WaterfallListener {
 		}
 		if err := validateEscalationArgs(perm, just); err != nil {
 			return err
+		}
+		// 进程级预授权（-with-user-grant）：与下面「人点了 Allow」走同一条路——
+		// 标记本次已升级，交回沙箱以更宽档复审。少了这一步，无人值守下连
+		// 「写工作区外的文件」都升不上去，与工具审批门的行为不一致。
+		if m.UserGrantAll() {
+			inv.Escalated = true
+			inv.EscalatedMode = target
+			return next(ev)
 		}
 		if m.executionApprovalPolicy(inv) == ApprovalNever {
 			// 'never'：不问人，自动拒绝（对齐 DSH NEVER 语义）。

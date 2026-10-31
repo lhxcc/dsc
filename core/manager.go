@@ -131,6 +131,12 @@ type Manager struct {
 	// false 时全局级生效值回退「沙箱预设绑定」：full→never、其餘→ask（对齐 DSH
 	// permission-presets）；显式设置后则尊重显式值。会话级覆盖仍优先于全局。
 	approvalGlobalExplicit atomic.Bool
+	// userGrantAll 把本进程内一切「需要审批」的动作视作已获用户授权（`-with-user-grant`）。
+	//
+	// 只用于无人值守入口（-input / -headless）：那里没有问询通道，审批门 fail-closed
+	// 会把所有写操作拒掉，模型连「装个插件」都做不到。开关是**进程级**的——用户启动
+	// 时一次性表态，等价于他在 TUI 里对每一次都点了 Allow；不是模型能触碰的会话状态。
+	userGrantAll atomic.Bool
 	// sessionApproval 按会话覆盖的审批策略（per-session，对齐 DSH approval/policy 会话态）；
 	// 缺省回退全局 approvalPolicyVal。key = 调用方会话标识（agent 每次工具调用随 SessionId 传入）。
 	sessionApproval   map[string]ApprovalPolicy

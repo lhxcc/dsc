@@ -32,6 +32,9 @@ const helpText = `DSC — 纯 Go 的 AI Agent 宿主（TUI + 插件化工具/模
                       内置 minimal/standard/creation/ptc）
   -input <文本>       非 TUI 自动化入口；-input 后跟的值若以 - 开头视为缺失
   -headless           精简单发模式（须同时给 -input，否则用法错误退出 1）
+  -with-user-grant    把需审批的动作视作已获授权（工具免问、沙箱升级自动放行）。
+                      只对 -input / -headless 生效；TUI 有自己的审批界面，忽略并告警。
+                      用于无人值守场景：否则装插件、写工作区外文件都会被直接拒绝（没有可问的人）
   -admin <地址>       管理 API 监听地址（默认 127.0.0.1:9999；远程管理需配 DSC_ADMIN_TOKEN）
   -debugger           开放 /debugger 观察路由（含完整会话历史，敏感，默认关闭）
   -log [<文件>]       日志：带文件名写文件，单独 -log 输出到屏幕；默认静默。
@@ -107,7 +110,7 @@ func requiredValueFlag(a string) bool {
 func knownFlag(a string) bool {
 	switch a {
 	case "-h", "-help", "--help", "-?", "-mode", "-input", "-headless",
-		"-admin", "-debugger", "-log", "-hooks", "-patch":
+		"-admin", "-debugger", "-log", "-hooks", "-patch", "-with-user-grant":
 		return true
 	}
 	return false
