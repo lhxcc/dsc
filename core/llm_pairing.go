@@ -77,7 +77,13 @@ func SanitizeToolPairing(msgs []*proto.Message) ([]*proto.Message, int) {
 				out = append(out, copyMessageWithoutCalls(m))
 				continue
 			}
-			out = append(out, copyMessageWithCalls(m, kept))
+			// 一条调用都没丢时保留**原对象**：滑窗的不变量是「窗口里每条都是原文」，
+			// 复制出来的等价副本会让「消息身份 = 指针/稳定 id」的下游对不上；顺带也省一次分配。
+			if len(kept) == len(m.GetToolCalls()) {
+				out = append(out, m)
+			} else {
+				out = append(out, copyMessageWithCalls(m, kept))
+			}
 			for _, tc := range kept {
 				if used[tc.GetId()] {
 					continue

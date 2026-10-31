@@ -144,6 +144,14 @@ func (m *Manager) ceilingInflation(sessionID, model string) float64 {
 //   - 保留段的起点不能是 tool 消息：那会留下一个没有对应调用的孤儿结果（provider
 //     直接 400），并且要落到 user 上（Anthropic 要求首条非 system 是 user）；
 //   - 至少保留最后一条：用户这一句或最新的工具结果绝不能丢。
+//
+// **配对由这里一次做完**：切点定下来之后立刻对保留段跑一遍配对整理（SanitizeToolPairing），
+// 于是「滑窗」与「修配对」不是两步。这样做有两个好处：
+//   - 窗口内部本身可能有残配对（工具被中断、插话落在调用与结果之间），滑窗后的视图必须
+//     自带完整配对，而不是交给下游再删一遍——下游删的时候已经不知道「本来还有多少可留」；
+//   - 下游的删除会让「按预算算好的保留段」再缩水，实测过一次滑窗保留 3 条、下游配对修复
+//     又删掉 1 条，最后只发出去 [system, 切除说明]——**空壳请求**：模型失去任务与工具结果，
+//     却继续循环。所以这里若修完什么也不剩，就不裁（原样交回调用方按超窗报错）。
 func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []*proto.Message, dropped int) {
 	if len(msgs) == 0 || limit <= 0 {
 		return msgs, 0
@@ -177,23 +185,45 @@ func CapMessagesToWindow(msgs []*proto.Message, toolsTokens, limit int) (kept []
 		acc += per[i]
 		cut = i
 	}
-	// 起点必须是「可独立阅读」的消息：跳过 tool 结果（它的调用已被丢掉），并尽量落到
-	// user 上——Anthropic 一侧要求首条非 system 消息是 user，落在 assistant 上会被直接
-	// 拒掉（OpenAI 兼容端点不挑，但没理由只为一侧让步）。
-	for cut < len(msgs)-1 && msgs[cut].GetRole() != "user" {
-		cut++
-	}
-	if cut <= head {
-		return msgs, 0 // 无处可丢（甚至装不下的就是 system + 最后一条）：原样发
+	// 起点校正一：跳过孤儿工具结果（它们的调用已被切掉）。
+	cut = skipOrphanResults(msgs, cut)
+	if cut <= head || cut >= len(msgs) {
+		// 可留的都在 system 之前 / 全是孤儿结果：没有合法切点，原样交回调用方报错。
+		return msgs, 0
 	}
 
-	kept = make([]*proto.Message, 0, len(msgs)-cut+head+1)
+	// 起点校正二：对保留段做配对整理（幂等；正常切点下是零改动）。
+	body, bodyDropped := SanitizeToolPairing(msgs[cut:])
+	if len(body) == 0 {
+		return msgs, 0 // 修完一条不剩：宁可报错，也不发空壳
+	}
+
+	note := slideNote(cut-head, EstimateProtoMessagesTokens(msgs[head:cut]))
+	if body[0].GetRole() != "user" {
+		// 窗口从对话中段开始（单轮长任务里唯一那条 user 早已在窗口之外）：Anthropic 要求
+		// 首条非 system 是 user，让切除说明充当这一条，别为此再多丢一段历史。
+		note.Role = "user"
+	}
+
+	kept = make([]*proto.Message, 0, len(body)+2)
 	if head == 1 {
 		kept = append(kept, msgs[0])
 	}
-	kept = append(kept, slideNote(cut-head, EstimateProtoMessagesTokens(msgs[head:cut])))
-	kept = append(kept, msgs[cut:]...)
-	return kept, cut - head
+	kept = append(kept, note)
+	kept = append(kept, body...)
+	return kept, cut - head + bodyDropped
+}
+
+// skipOrphanResults 把起点向后挪过孤儿工具结果。
+//
+// 预算是按 token 累加出来的，落点无法预知：落在 tool 消息上就等于留下一个「没有调用
+// 的结果」，provider 会直接 400。向后挪（丢掉这条结果）永远比向前挪（把它的调用也拉
+// 进来）更省，且不会破坏预算。
+func skipOrphanResults(msgs []*proto.Message, cut int) int {
+	for cut < len(msgs) && msgs[cut].GetRole() == "tool" {
+		cut++
+	}
+	return cut
 }
 
 // slideNoteCap 切除说明的预算上限（token）。说明本身只有一行，固定留这点余量，
