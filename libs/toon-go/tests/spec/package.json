@@ -1,0 +1,42 @@
+{
+  "name": "@toon-format/spec",
+  "type": "module",
+  "version": "4.1.1",
+  "packageManager": "pnpm@11.17.0",
+  "description": "Official specification for Token-Oriented Object Notation (TOON)",
+  "author": "Johann Schopplich <hello@johannschopplich.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/toon-format/spec",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toon-format/spec.git"
+  },
+  "bugs": {
+    "url": "https://github.com/toon-format/spec/issues"
+  },
+  "keywords": [
+    "toon",
+    "format",
+    "specification",
+    "llm",
+    "token-efficiency",
+    "data-format"
+  ],
+  "files": [
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SPEC.md",
+    "VERSIONING.md",
+    "examples",
+    "tests"
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "release": "bumpp"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^9.2.0",
+    "bumpp": "^12.0.0",
+    "eslint": "^10.8.0"
+  }
+}

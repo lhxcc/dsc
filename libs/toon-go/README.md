@@ -8,6 +8,13 @@
 
 `toon-spec: 4.1` — this implementation targets specification v4.1 and passes the full conformance fixture suite of [toon-format/spec](https://github.com/toon-format/spec) v4.1.1.
 
+> **This directory is DSC's fork** (wired in via `replace` in the host `go.mod`). The
+> conformance fixtures live in `tests/spec/` and are **vendored, not a submodule**:
+> they come from toon-format/spec **v4.1.1** — the release matching the `toon-spec: 4.1`
+> above — so `go test ./...` verifies conformance without network access. Upstream's
+> `v1.0.1` gitlink has since moved to spec v4.4.0; using that tag instead produces
+> failures for behaviour this implementation never claimed to support.
+
 ## Example
 
 **JSON** (verbose):
